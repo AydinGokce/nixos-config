@@ -58,6 +58,8 @@
     cargo
     gcc
     probe-rs
+    anki
+    i3
   ];
 
   environment.sessionVariables = {
