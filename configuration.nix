@@ -21,6 +21,14 @@
   services.xserver.enable = true;
   services.xserver.desktopManager.xfce.enable = true;
   services.xserver.libinput.enable = true;
+  services.xserver.windowManager.i3 = {
+    enable = true;
+    extraPackages = with pkgs; [
+      dmenu
+      i3status
+      i3lock
+    ];	
+  };
 
   sound.enable = true;
 
@@ -59,7 +67,6 @@
     gcc
     probe-rs
     anki
-    i3
   ];
 
   environment.sessionVariables = {
@@ -74,6 +81,8 @@
 
   xdg.portal.enable = true; 
   xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-kde ]; 
-  
+ 
+  programs.dconf.enable = true;
+ 
   system.stateVersion = "24.05";
 }
