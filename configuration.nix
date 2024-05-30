@@ -35,6 +35,18 @@
   hardware.asahi.peripheralFirmwareDirectory = ./firmware;
   hardware.bluetooth.enable = true;
   hardware.bluetooth.powerOnBoot = true;
+  
+  nix = {
+    settings = {
+      trusted-users = [ "root" "aydin" ];
+      auto-optimise-store = true;
+      substituters = [ "https://cache.iog.io"  ];
+    };
+    package = pkgs.nixFlakes;
+    extraOptions = ''
+      experimental-features = nix-command flakes
+    '';
+  };
 
   users.users.aydin = {
     isNormalUser = true;
@@ -64,9 +76,10 @@
     psst
     git
     cargo
-    gcc
     probe-rs
     anki
+    qemu
+    zip
   ];
 
   environment.sessionVariables = {
@@ -83,6 +96,10 @@
   xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-kde ]; 
  
   programs.dconf.enable = true;
- 
+  programs.bash.shellAliases = {
+    jfu = "journalctl -fu";
+    rs = "sudo nixos-rebuild --flake ~/nixos-config/flake.nix#nixos-asahi switch";
+  };
+
   system.stateVersion = "24.05";
 }
