@@ -80,6 +80,7 @@
     anki
     qemu
     zip
+    tailscale
   ];
 
   environment.sessionVariables = {
@@ -91,6 +92,7 @@
   services.openssh.enable = true;
   services.blueman.enable = true;
   services.flatpak.enable = true;
+  services.tailscale.enable = true;
 
   xdg.portal.enable = true; 
   xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-kde ]; 
