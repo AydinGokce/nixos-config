@@ -128,10 +128,10 @@
   };
 
   # block twitter
-  #networking.extraHosts = ''
-  #  0.0.0.0 twitter.com
-  #  0.0.0.0 x.com
-  #s'';
+  networking.extraHosts = ''
+   0.0.0.0 twitter.com
+   0.0.0.0 x.com
+  '';
 
   system.stateVersion = "24.05";
 }
