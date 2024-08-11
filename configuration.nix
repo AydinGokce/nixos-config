@@ -25,7 +25,7 @@
 
   services.xserver.enable = true;
   services.xserver.desktopManager.xfce.enable = true;
-  services.xserver.libinput.enable = true;
+  services.libinput.enable = true;
   services.xserver.windowManager.i3 = {
     enable = true;
     extraPackages = with pkgs; [
