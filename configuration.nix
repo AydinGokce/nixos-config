@@ -80,6 +80,7 @@
     gnumake
     keepassxc
     kicad
+    mullvad-vpn
     neofetch
     nixfmt-rfc-style
     opkg-utils
@@ -106,6 +107,8 @@
 
   nixpkgs.config.allowUnfree = true;
 
+  services.resolved.enable = true;
+  services.mullvad-vpn.enable = true;
   services.openssh.enable = true;
   services.blueman.enable = true;
   services.flatpak.enable = true;
