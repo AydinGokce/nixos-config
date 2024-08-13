@@ -15,11 +15,11 @@
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
 
-  # networking.wireless.iwd = {
-  #   enable = true;
-  #   settings.General.EnableNetworkConfiguration = true;
-  # };
-  networking.networkmanager.enable = true;
+  networking.wireless.iwd = {
+    enable = true;
+    settings.General.EnableNetworkConfiguration = true;
+  };
+  # networking.networkmanager.enable = true;
 
   time.timeZone = "America/Chicago";
 
@@ -34,8 +34,6 @@
       i3lock
     ];
   };
-
-  sound.enable = true;
 
   hardware.asahi.peripheralFirmwareDirectory = ./firmware;
   hardware.bluetooth.enable = true;
@@ -73,7 +71,6 @@
     bluez
     calibre
     cargo
-    chromium
     electrum
     firefox
     git
@@ -129,12 +126,6 @@
     jfu = "journalctl -fu";
     r = "sudo nixos-rebuild --flake ~/nixos-config/flake.nix#nixos-asahi";
   };
-
-  # block twitter
-  networking.extraHosts = ''
-   0.0.0.0 twitter.com
-   0.0.0.0 x.com
-  '';
 
   system.stateVersion = "24.05";
 }

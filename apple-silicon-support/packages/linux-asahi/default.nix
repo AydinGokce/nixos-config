@@ -3,7 +3,6 @@
 , callPackage
 , writeShellScriptBin
 , writeText
-, removeReferencesTo
 , linuxPackagesFor
 , withRust ? false
 , _kernelPatches ? [ ]
@@ -87,43 +86,21 @@ let
     (linuxKernel.manualConfig rec {
       inherit stdenv lib;
 
-      version = "6.6.0-asahi";
+      version = "6.9.12-asahi";
       modDirVersion = version;
-      extraMeta.branch = "6.6";
+      extraMeta.branch = "6.9";
 
       src = fetchFromGitHub {
         # tracking: https://github.com/AsahiLinux/linux/tree/asahi-wip (w/ fedora verification)
         owner = "AsahiLinux";
         repo = "linux";
-        rev = "asahi-6.6-16";
-        hash = "sha256-73ye5JE3YKRgrxGfdQN0+YMIVO1QAJeDuUjTcFhcwI0=";
+        rev = "asahi-6.9.12-1";
+        hash = "sha256-LCMrG+RVONK/eIvygRExaVvY/ATV3IfvSsFbVsHVu48=";
       };
 
       kernelPatches = [
         { name = "coreutils-fix";
           patch = ./0001-fs-fcntl-accept-more-values-as-F_DUPFD_CLOEXEC-args.patch;
-        }
-        # speaker enablement; we assert on the relevant lsp-plugins patch
-        # before installing speakersafetyd to let the speakers work
-        { name = "speakers-1";
-          patch = fetchpatch {
-            url = "https://github.com/AsahiLinux/linux/commit/385ea7b5023486aba7919cec8b6b3f6a843a1013.patch";
-            hash = "sha256-u7IzhJbUgBPfhJXAcpHw1I6OPzPHc1UKYjH91Ep3QHQ=";
-          };
-        }
-        { name = "speakers-2";
-          patch = fetchpatch {
-            url = "https://github.com/AsahiLinux/linux/commit/6a24102c06c95951ab992e2d41336cc6d4bfdf23.patch";
-            hash = "sha256-wn5x2hN42/kCp/XHBvLWeNLfwlOBB+T6UeeMt2tSg3o=";
-          };
-        }
-      ] ++ lib.optionals (rustAtLeast "1.75.0") [
-        { name = "rustc-1.75.0";
-          patch = ./0001-check-in-new-alloc-for-1.75.0.patch;
-        }
-      ] ++ lib.optionals (rustAtLeast "1.76.0") [
-        { name = "rustc-1.76.0";
-          patch = ./rust_1_76_0.patch;
         }
       ] ++ _kernelPatches;
 
@@ -136,16 +113,7 @@ let
         rust-bindgen
         rustfmt
         rustc
-        removeReferencesTo
       ];
-      # HACK: references shouldn't have been there in the first place
-      # TODO: remove once 23.05 is obsolete
-      postFixup = (old.postFixup or "") + ''
-        if [ -f $dev/lib/modules/${old.version}/build/vmlinux ]; then
-          remove-references-to -t $out $dev/lib/modules/${old.version}/build/vmlinux
-        fi
-        remove-references-to -t $dev $out/Image
-      '';
       RUST_LIB_SRC = rustPlatform.rustLibSrc;
     } else {});
 

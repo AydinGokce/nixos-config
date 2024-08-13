@@ -1,4 +1,4 @@
-{ config, pkgs, lib, ... }:
+{ options, config, pkgs, lib, ... }:
 {
   config = let
     isMode = mode: (config.hardware.asahi.useExperimentalGPUDriver
@@ -15,10 +15,15 @@
         EndSection
       '';
     }
-    (lib.mkIf config.hardware.asahi.useExperimentalGPUDriver {
+    (lib.mkIf config.hardware.asahi.useExperimentalGPUDriver (
       # install the drivers
-      hardware.opengl.package = config.hardware.asahi.pkgs.mesa-asahi-edge.drivers;
-
+      if builtins.hasAttr "graphics" options.hardware then {
+        hardware.graphics.package = config.hardware.asahi.pkgs.mesa-asahi-edge.drivers;
+      } else { # for 24.05
+        hardware.opengl.package = config.hardware.asahi.pkgs.mesa-asahi-edge.drivers;
+      })
+    )
+    (lib.mkIf config.hardware.asahi.useExperimentalGPUDriver {
       # required for in-kernel GPU driver
       hardware.asahi.withRust = true;
     })
@@ -37,7 +42,8 @@
       # (and in a way compatible with pure evaluation)
       nixpkgs.overlays = [
         (final: prev: {
-          mesa = final.mesa-asahi-edge;
+          # prevent cross-built Mesas that might be evaluated using this config (e.g. Steam emulation via box64) from using the special Asahi Mesa
+          mesa = if prev.targetPlatform.isAarch64 then final.mesa-asahi-edge else prev.mesa;
         })
       ];
     })
