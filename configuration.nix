@@ -14,6 +14,9 @@
   # Use the systemd-boot EFI boot loader.
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
+  
+  # wifi bugfix
+  boot.kernelParams = [ "brcmfmac.feature_disable=0x82000" ];
 
   networking.wireless.iwd = {
     enable = true;
@@ -51,7 +54,23 @@
     package = pkgs.nixFlakes;
     extraOptions = ''
       experimental-features = nix-command flakes
+      builders-use-substitutes = true
     '';
+
+
+    buildMachines = [ {
+      hostName = "arm64-builder";
+      system = "aarch64-linux";
+      protocol = "ssh-ng";
+      # if the builder supports building for multiple architectures, 
+      # replace the previous line by, e.g.
+      # systems = ["x86_64-linux" "aarch64-linux"];
+      maxJobs = 1;
+      speedFactor = 2;
+      supportedFeatures = [ "nixos-test" "benchmark" "big-parallel" "kvm" ];
+      mandatoryFeatures = [ ];
+    }];
+    distributedBuilds = true;
   };
 
   users.users.aydin = {
@@ -71,10 +90,12 @@
     bluez
     calibre
     cargo
+    # chromium
     electrum
-    firefox
+    # firefox
     git
     gnumake
+    htop
     keepassxc
     kicad
     mullvad-vpn
@@ -126,6 +147,12 @@
     jfu = "journalctl -fu";
     r = "sudo nixos-rebuild --flake ~/nixos-config/flake.nix#nixos-asahi";
   };
+
+  programs.ssh.extraConfig = ''
+    Host arm64-builder
+      HostName 3.145.97.57
+      User root
+  '';
 
   system.stateVersion = "24.05";
 }
