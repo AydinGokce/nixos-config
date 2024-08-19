@@ -16,11 +16,11 @@
   boot.loader.efi.canTouchEfiVariables = false;
   
   # wifi bugfix
-  boot.kernelParams = [ "brcmfmac.feature_disable=0x82000" ];
-
+  # boot.kernelParams = [ "brcmfmac.feature_disable=0x00000" ];
+  # networking.wireless.enable = true;
   networking.wireless.iwd = {
-    enable = true;
-    settings.General.EnableNetworkConfiguration = true;
+   enable = true;
+   settings.General.EnableNetworkConfiguration = true;
   };
   # networking.networkmanager.enable = true;
 
@@ -90,9 +90,9 @@
     bluez
     calibre
     cargo
-    # chromium
+    chromium
     electrum
-    # firefox
+    firefox
     git
     gnumake
     htop
@@ -117,6 +117,8 @@
     x2goclient
     x2goserver
     zip
+    wpa_supplicant
+    wpa_supplicant_gui
   ];
 
   environment.sessionVariables = {
