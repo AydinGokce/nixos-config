@@ -15,9 +15,6 @@
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
   
-  # wifi bugfix
-  boot.kernelParams = [ "brcmfmac.feature_disable=0x82000" ];
-
   networking.wireless.iwd = {
     enable = true;
     settings.General.EnableNetworkConfiguration = true;
