@@ -14,12 +14,8 @@
   # Use the systemd-boot EFI boot loader.
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
-  
-  networking.wireless.iwd = {
-    enable = true;
-    settings.General.EnableNetworkConfiguration = true;
-  };
-  # networking.networkmanager.enable = true;
+
+  networking.networkmanager.enable = true;
 
   time.timeZone = "America/Chicago";
 
