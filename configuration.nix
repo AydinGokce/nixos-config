@@ -119,7 +119,7 @@
   nixpkgs.config.allowUnfree = true;
 
   services.resolved.enable = true;
-  services.mullvad-vpn.enable = true;
+  services.mullvad-vpn.enable = false;
   services.openssh.enable = true;
   services.blueman.enable = true;
   services.flatpak.enable = true;

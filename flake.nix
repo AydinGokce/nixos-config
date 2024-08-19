@@ -2,7 +2,7 @@
     description = "Aydin's Nix Config";
 
     inputs = {
-        nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";#8348deaf95ec17e19753ff689abb753a5832912c";
+        nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
         rust-overlay.url = "github:oxalica/rust-overlay";
         nix-flatpak.url = "github:gmodena/nix-flatpak/?ref=v0.4.1";
     };
