@@ -6,22 +6,30 @@
 }:
 
 {
-  imports = [
-    ./hardware-configuration.nix
-    ./apple-silicon-support
-  ];
-
   # Use the systemd-boot EFI boot loader.
   boot.loader.systemd-boot.enable = true;
-  boot.loader.efi.canTouchEfiVariables = false;
 
   networking.networkmanager.enable = true;
 
   time.timeZone = "America/Chicago";
 
+  # Select internationalisation properties.
+  i18n.defaultLocale = "en_US.UTF-8";
+
+  i18n.extraLocaleSettings = {
+    LC_ADDRESS = "en_US.UTF-8";
+    LC_IDENTIFICATION = "en_US.UTF-8";
+    LC_MEASUREMENT = "en_US.UTF-8";
+    LC_MONETARY = "en_US.UTF-8";
+    LC_NAME = "en_US.UTF-8";
+    LC_NUMERIC = "en_US.UTF-8";
+    LC_PAPER = "en_US.UTF-8";
+    LC_TELEPHONE = "en_US.UTF-8";
+    LC_TIME = "en_US.UTF-8";
+  };
+
   services.xserver.enable = true;
   services.xserver.desktopManager.xfce.enable = true;
-  services.libinput.enable = true;
   services.xserver.windowManager.i3 = {
     enable = true;
     extraPackages = with pkgs; [
@@ -30,10 +38,6 @@
       i3lock
     ];
   };
-
-  hardware.asahi.peripheralFirmwareDirectory = ./firmware;
-  hardware.bluetooth.enable = true;
-  hardware.bluetooth.powerOnBoot = true;
 
   nix = {
     settings = {
@@ -121,15 +125,7 @@
   services.resolved.enable = true;
   services.mullvad-vpn.enable = false;
   services.openssh.enable = true;
-  services.blueman.enable = true;
   services.flatpak.enable = true;
-  services.flatpak.remotes = lib.mkOptionDefault [
-    {
-      name = "flathub-beta";
-      location = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo";
-    }
-  ];
-  services.flatpak.packages = [ "org.nanuc.Axolotl" ];
   services.tailscale.enable = true;
 
   xdg.portal.enable = true;
@@ -146,6 +142,4 @@
       HostName 3.145.97.57
       User root
   '';
-
-  system.stateVersion = "24.05";
 }
