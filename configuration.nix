@@ -73,7 +73,7 @@
   users.users.aydin = {
     isNormalUser = true;
     home = "/home/aydin";
-    extraGroups = [ "wheel" ];
+    extraGroups = [ "networkmanager" "wheel" ];
   };
 
   environment.systemPackages = with pkgs; [
@@ -134,7 +134,6 @@
   programs.dconf.enable = true;
   programs.bash.shellAliases = {
     jfu = "journalctl -fu";
-    r = "sudo nixos-rebuild --flake ~/nixos-config/flake.nix#nixos-asahi";
   };
 
   programs.ssh.extraConfig = ''
