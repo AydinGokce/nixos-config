@@ -41,7 +41,7 @@
   };
 
   programs.bash.shellAliases = {
-    r = "nixos-rebuild --flake .#workstation-x86_64 boot --use-remote-sudo" 
+    r = "nixos-rebuild --flake .#workstation-x86_64 --use-remote-sudo";
   };
 
   # This value determines the NixOS release from which the default
