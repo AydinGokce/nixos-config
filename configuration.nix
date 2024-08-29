@@ -87,9 +87,9 @@
     bluez
     calibre
     cargo
-    # chromium
+    chromium
     electrum
-    # firefox
+    firefox
     git
     gnumake
     htop
@@ -114,16 +114,19 @@
     x2goclient
     x2goserver
     zip
-  ];
+  ] ++ lib.optionals (stdenv.isx86_64) [ logseq ];
 
   environment.sessionVariables = {
     TERM = "alacritty";
   };
 
   nixpkgs.config.allowUnfree = true;
+  nixpkgs.config.permittedInsecurePackages = [
+    "electron-27.3.11"
+  ];
 
   services.resolved.enable = true;
-  services.mullvad-vpn.enable = false;
+  services.mullvad-vpn.enable = true;
   services.openssh.enable = true;
   services.flatpak.enable = true;
   services.tailscale.enable = true;
@@ -140,5 +143,10 @@
     Host arm64-builder
       HostName 3.145.97.57
       User root
+  '';
+
+  networking.extraHosts = ''
+    0.0.0.0 twitter.com
+    0.0.0.0 x.com
   '';
 }

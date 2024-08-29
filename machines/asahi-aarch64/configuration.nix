@@ -30,7 +30,7 @@
   services.flatpak.packages = [];
 
   programs.bash.shellAliases = {
-    r = "nixos-rebuild --flake .#asahi-aarch64 boot --use-remote-sudo" 
+    r = "nixos-rebuild --flake .#asahi-aarch64 --use-remote-sudo";
   };
 
   system.stateVersion = "24.05";
