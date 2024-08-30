@@ -19,14 +19,13 @@
         };
     in {
         nixosConfigurations = {
-            asahi-aarch64 = mkSystem "asahi-aarch64" "aarch64-linux" [ nix-flatpak.nixosModules.nix-flatpak ] {
-                nixpkgs.overlays = [ rust-overlay.overlays.default ];
-                environment.systemPackages = [
-                    (nixpkgs.pkgs.rust-bin.stable.latest.default.override {
-                        targets = [ "thumbv7em-none-eabi" ];
-                    }) 
-                ];
-            };
+            asahi-aarch64 = mkSystem "asahi-aarch64" "aarch64-linux" [
+                nix-flatpak.nixosModules.nix-flatpak
+                ({ pkgs, ... }: {
+                    nixpkgs.overlays = [ rust-overlay.overlays.default ];
+                    environment.systemPackages = [ pkgs.rust-bin.stable.latest.default ];
+                })
+            ] { };
             workstation-x86_64 = mkSystem "workstation-x86_64" "x86_64-linux" [] {};
         };
     };
