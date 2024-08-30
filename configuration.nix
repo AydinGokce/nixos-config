@@ -95,6 +95,7 @@
     htop
     keepassxc
     kicad
+    killall
     mullvad-vpn
     neofetch
     nixfmt-rfc-style
@@ -108,6 +109,7 @@
     tailscale
     tmux
     tree
+    unzip
     vim
     vscode
     wget
