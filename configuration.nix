@@ -102,6 +102,7 @@
     opkg-utils
     probe-rs
     psst
+    pymol
     qalculate-qt
     qbittorrent
     qemu
@@ -116,7 +117,7 @@
     x2goclient
     x2goserver
     zip
-  ] ++ lib.optionals (stdenv.isx86_64) [ logseq ];
+  ] ++ lib.optionals (stdenv.isx86_64) [ logseq discord whatsapp-for-linux ];
 
   environment.sessionVariables = {
     TERM = "alacritty";
