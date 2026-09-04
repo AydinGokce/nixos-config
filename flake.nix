@@ -2,7 +2,7 @@
     description = "Aydin's Nix Config";
 
     inputs = {
-        nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+        nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
         rust-overlay.url = "github:oxalica/rust-overlay";
         nix-flatpak.url = "github:gmodena/nix-flatpak/?ref=v0.4.1";
     };
@@ -27,6 +27,17 @@
                 })
             ] { };
             workstation-x86_64 = mkSystem "workstation-x86_64" "x86_64-linux" [] {};
+
+            # generate an iso with `nix build .#nixosConfigurations.rescue-aarch64.config.system.build.isoImage`
+            rescue-aarch64 = nixpkgs.lib.nixosSystem {
+                system = "aarch64-linux";
+                modules = [
+                    ({ pkgs, modulesPath, ... }: {
+                        imports = [ (modulesPath + "/installer/cd-dvd/installation-cd-minimal.nix") ];
+                        environment.systemPackages = [ pkgs.neovim ];
+                    })
+                ];
+            };
         };
     };
 }

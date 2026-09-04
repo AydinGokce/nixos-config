@@ -1,0 +1,12 @@
+# EVOLVEpro — core (CPU) env: the top-layer regression / active-learning stack.
+# scikit-learn-extra (k-medoids first-round selection) is installed separately
+# and treated as optional because it frequently fails to build.
+numpy==1.26.4
+pandas==2.2.3
+openpyxl==3.1.5
+scikit-learn==1.4.2
+xgboost==2.1.4
+matplotlib==3.9.4
+seaborn==0.13.2
+biopython==1.84
+scipy==1.13.1

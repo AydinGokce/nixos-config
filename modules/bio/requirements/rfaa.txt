@@ -1,0 +1,26 @@
+# RoseTTAFold-All-Atom — Python 3.10, torch 2.0.1 + cu118.
+# dgl 1.1.2 (cu118), torch-scatter/sparse/cluster (pyg, matched to torch 2.0.1+cu118),
+# dllogger and SE3Transformer are installed imperatively by bio-setup.
+# signalp6 (gated) and the ~399GB MSA databases are intentionally NOT installed.
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.0.2+cu118
+e3nn==0.3.3
+opt-einsum-fx==0.1.4
+hydra-core==1.3.2
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+numpy==1.26.4
+scipy==1.12.0
+pandas==2.2.1
+scikit-learn==1.4.2
+pyyaml==6.0.1
+assertpy==1.1
+configparser==6.0.1
+pynvml==11.0.0
+wandb==0.12.0
+# imported by rf2aa but absent from the upstream env spec:
+icecream==2.2.0
+deepdiff==9.1.0
+openbabel==3.2.1

@@ -1,0 +1,9 @@
+# EVOLVEpro — PLM (GPU) env: produces per-variant ESM-2 embeddings.
+# Use the 650M model on 8GB (paper default 15B needs ~30GB VRAM).
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.4.1+cu124
+numpy==1.26.4
+fair-esm==2.0.0
+transformers==4.44.2
+biopython==1.84
+pandas==2.2.3

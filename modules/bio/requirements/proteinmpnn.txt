@@ -1,0 +1,5 @@
+# ProteinMPNN — pure PyTorch, weights ship in-repo. (The repo has no
+# requirements.txt of its own; these are the deps we supply.)
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.4.1+cu124
+numpy==1.26.4

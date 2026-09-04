@@ -4,9 +4,26 @@
   imports =
     [
       ./hardware-configuration.nix
+      ../../modules/bio
     ];
 
+  # Protein-design / ML-biology toolkit (bio-* CLIs). Tuned for this box's
+  # RTX 3070 (8GB); a cloud-GPU machine reuses modules/bio and raises these.
+  bio = {
+    enable = true;
+    gpu.vramGB = 8;
+    esm.defaultModel = "esm2_t33_650M_UR50D";
+  };
+
   boot.loader.efi.canTouchEfiVariables = true;
+  boot.loader.systemd-boot.enable = false;
+  boot.loader.grub = {
+  enable = true;
+  device = "nodev";
+  efiSupport = true;
+  useOSProber = true;
+};
+  boot.loader.efi.efiSysMountPoint = "/boot/efi";
 
   networking.hostName = "nixos";
 
@@ -39,6 +56,8 @@
     # no need to redefine it in your config for now)
     #media-session.enable = true;
   };
+
+  hardware.nvidia.open=true;
 
   programs.bash.shellAliases = {
     r = "nixos-rebuild --flake .#workstation-x86_64 --use-remote-sudo";

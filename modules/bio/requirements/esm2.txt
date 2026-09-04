@@ -1,0 +1,14 @@
+# ESM-2 (single-sequence protein language model; weights ungated, auto-download).
+# fair-esm gives the reference CLI scripts; transformers gives programmatic
+# logits/embeddings used by bio-esm's esm_cli.py.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.4.1+cu124
+numpy==1.26.4
+fair-esm==2.0.0
+transformers==4.44.2
+tokenizers==0.19.1
+safetensors==0.4.5
+huggingface-hub==0.24.6
+scipy==1.14.1
+pandas==2.2.2
+biotite==0.41.2

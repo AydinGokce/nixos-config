@@ -1,0 +1,10 @@
+# AlphaFold 3 pins its own dependencies in pyproject.toml; bio-setup installs it
+# with `uv sync` (jax==0.10.2 + jax[cuda12]) then `uv run build_data` to compile
+# the C++ data pipeline. This file is intentionally a note, not a pip input.
+#
+# BLOCKED on this machine for real inference:
+#   * model parameters are GATED (request from Google + EULA; cannot be scripted)
+#   * genetic databases are ~630GB decompressed (won't fit ~330GB free)
+#   * 8GB VRAM is below AF3's ~16GB practical floor
+# bio-setup installs the code + builds the pipeline so `import`/CPU data-pipeline
+# work; see modules/bio/README.md.
