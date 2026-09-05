@@ -50,10 +50,45 @@ dc ssh "$id" -- 'cat /data/out/*'        # or rsync results back to the head/NFS
 dc rm "$id"
 ```
 
-Next layer (not yet built): a `bio-submit <model> <input>` wrapper that picks the
-right GPU tier per model, runs the model container, retrieves outputs, and
-destroys the node — plus shared storage for the AF3/RFAA databases so they're
-downloaded once. The `dc` primitives above are what it will build on.
+…but for the built-in models, use **`bio-submit`** (below), which does all of this.
+
+## Shared NFS (`/mnt/bio-shared`)
+
+A DataCrunch `NVMe_Shared` volume (`bio-shared`, 100 GB, FIN-02, ~$0.20/GB/mo =
+$20/mo) mounted at `/mnt/bio-shared` on the head and on every ephemeral GPU node.
+Holds per-tool venvs, cloned repos, model weights, caches, and run outputs, so
+they're built/downloaded **once** and reused across jobs. Structure:
+`envs/ src/ weights/ dbs/ runs/ cache/`.
+
+- Truly shared: a venv/weight written by one node is visible to the next.
+- **Region-locked** to FIN-02 — `bio-submit` therefore launches GPU nodes in
+  FIN-02 (its `--loc`). If FIN-02 lacks capacity for a GPU, the job fails fast;
+  retry or pick another type.
+- Nodes mount it with `nolock` (their `rpc.statd` is masked) after the volume is
+  attached at launch (`dc launch --volume <id>`).
+- **Scaling for AF3/RFAA databases:** the ~630 GB AF3 + ~399 GB RFAA DB set would
+  need ~1.5 TB ≈ **$300/mo** — a deliberate cost decision. Resize the volume (or
+  make a bigger one) before enabling those; the 100 GB share here is sized for the
+  no-DB models' envs/weights/outputs.
+
+## `bio-submit` — run a model on an ephemeral GPU
+
+Launches a GPU node, mounts the share, builds the tool's env on it (once, cached),
+runs the model, and **always destroys the node**. Outputs persist on the shared FS.
+
+```bash
+bio-submit esm score  --fasta prot.fasta [--model esm2_t33_650M_UR50D] [--gpu 1A100.22V] [--spot]
+bio-submit esm embed  --fasta prots.fasta
+bio-submit mpnn --pdb backbone.pdb [--num-seqs 8]
+# results: /mnt/bio-shared/runs/<jobid>/out   (readable here on the head)
+```
+
+Supported now: **esm** (score/embed/logits/mutate) and **mpnn** — both pure
+torch-cu124. The venv is built against the node's **system python3** (so it's
+portable across ephemeral nodes) and cached on the share, so the first run per
+tool downloads torch (~minutes) and later runs are fast. GPU defaults per tool;
+override with `--gpu` (see `dc types --gpu`). rfdiffusion/rfaa/af3 come next
+(they need the DGL/CUDA-11 handling and, for rfaa/af3, the databases).
 
 ## Credentials & security
 

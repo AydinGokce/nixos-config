@@ -65,9 +65,10 @@ case "$cmd" in
     s=$(spend_now); printf "estimated spend: \$%.2f / \$%s ceiling  (\$%.2f remaining)\n" "$s" "$CEILING" "$(awk -v c="$CEILING" -v s="$s" 'BEGIN{print c-s}')" ;;
 
   launch)
-    type=""; spot=false; name="gpu-$$"; image="ubuntu-24.04-cuda-12.8-open-docker"; loc="FIN-02"
+    type=""; spot=false; name="gpu-$$"; image="ubuntu-24.04-cuda-12.8-open-docker"; loc="FIN-02"; vols=""
     while [ $# -gt 0 ]; do case "$1" in
       --spot) spot=true;; --name) name="$2"; shift;; --image) image="$2"; shift;; --loc) loc="$2"; shift;;
+      --volume) vols="$vols $2"; shift;;
       -*) echo "dc launch: unknown $1" >&2; exit 2;; *) type="$1";; esac; shift; done
     [ -n "$type" ] || { echo "dc launch <instance_type> (see: dc types --gpu)" >&2; exit 2; }
     # budget guard
@@ -76,8 +77,10 @@ case "$cmd" in
     price=$(api GET /instance-types | jq -r --arg t "$type" --argjson spot "$spot" '.[]|select(.instance_type==$t)|(if $spot then .spot_price else .price_per_hour end)')
     [ -n "$price" ] && [ "$price" != null ] || { echo "dc: unknown instance type '$type'" >&2; exit 2; }
     keyids=$(api GET /sshkeys | jq -c '[.[].id]')
-    body=$(jq -nc --arg t "$type" --arg img "$image" --arg n "$name" --arg loc "$loc" --argjson keys "$keyids" --argjson spot "$spot" \
-      '{instance_type:$t,image:$img,ssh_key_ids:$keys,hostname:$n,description:"ephemeral GPU job",location_code:$loc,is_spot:$spot}')
+    # shellcheck disable=SC2086
+    volsjson=$(printf '%s\n' $vols | sed '/^$/d' | jq -R . | jq -sc .)
+    body=$(jq -nc --arg t "$type" --arg img "$image" --arg n "$name" --arg loc "$loc" --argjson keys "$keyids" --argjson spot "$spot" --argjson vols "$volsjson" \
+      '{instance_type:$t,image:$img,ssh_key_ids:$keys,hostname:$n,description:"ephemeral GPU job",location_code:$loc,is_spot:$spot} + (if ($vols|length)>0 then {existing_volumes:$vols} else {} end)')
     id=$(api POST /instances "$body" | tr -d '"')
     # a successful deploy returns a bare UUID; anything else (e.g. a
     # {code:service_unavailable,...} capacity error) is a failure.
@@ -109,8 +112,9 @@ case "$cmd" in
     id=$(resolve "$target"); [ -n "$id" ] || { echo "dc: no such instance '$target'" >&2; exit 2; }
     ip=$(api GET "/instances/$id" | jq -r '.ip // "-"')
     [ "$ip" != "-" ] || { echo "dc: instance has no ip yet" >&2; exit 1; }
-    exec ssh -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-      -o UserKnownHostsFile=/root/.ssh/known_hosts_dc root@"$ip" "$@" ;;
+    # ephemeral nodes reuse IPs, so don't persist/verify host keys (throwaway compute)
+    exec ssh -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR root@"$ip" "$@" ;;
 
   run)
     # dc run <type> [launch opts] -- <cmd...>  : launch, run, ALWAYS destroy.

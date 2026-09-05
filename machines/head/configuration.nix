@@ -42,7 +42,21 @@
       export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused ])}''${PATH:+:$PATH}
       ${builtins.readFile ./dc.sh}
     '')
+    (pkgs.writeShellScriptBin "bio-submit" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused ])}''${PATH:+:$PATH}
+      ${builtins.readFile ./bio-submit.sh}
+    '')
   ];
+
+  # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
+  # to the head; bio-submit rsyncs these onto the shared FS for the GPU nodes.
+  environment.etc = {
+    "bio-tools/py/esm_cli.py".source = ../../modules/bio/py/esm_cli.py;
+    "bio-tools/py/evolvepro_cli.py".source = ../../modules/bio/py/evolvepro_cli.py;
+    "bio-tools/requirements/esm2.txt".source = ../../modules/bio/requirements/esm2.txt;
+    "bio-tools/requirements/proteinmpnn.txt".source = ../../modules/bio/requirements/proteinmpnn.txt;
+    "bio-tools/requirements/evolvepro-plm.txt".source = ../../modules/bio/requirements/evolvepro-plm.txt;
+  };
 
   systemd.tmpfiles.rules = [
     "d /var/lib/dc            0700 root root - -"
@@ -53,6 +67,17 @@
 
   # Tailscale daemon (join the tailnet later with `tailscale up --auth-key=...`).
   services.tailscale.enable = true;
+
+  # Shared NFS (DataCrunch NVMe_Shared volume "bio-shared", FIN-02) for model
+  # envs / weights / databases / run outputs — mounted here and on ephemeral GPU
+  # nodes. automount + noauto so the head still boots if the share is detached.
+  # NOTE: the export path is specific to this volume; update if it's recreated.
+  boot.supportedFilesystems = [ "nfs" ];
+  fileSystems."/mnt/bio-shared" = {
+    device = "nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH";
+    fsType = "nfs";
+    options = [ "nconnect=16" "x-systemd.automount" "noauto" "x-systemd.idle-timeout=600" ];
+  };
 
   time.timeZone = "UTC";
   system.stateVersion = "24.11";
