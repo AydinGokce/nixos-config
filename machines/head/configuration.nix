@@ -51,11 +51,9 @@
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
   # to the head; bio-submit rsyncs these onto the shared FS for the GPU nodes.
   environment.etc = {
-    "bio-tools/py/esm_cli.py".source = ../../modules/bio/py/esm_cli.py;
-    "bio-tools/py/evolvepro_cli.py".source = ../../modules/bio/py/evolvepro_cli.py;
-    "bio-tools/requirements/esm2.txt".source = ../../modules/bio/requirements/esm2.txt;
-    "bio-tools/requirements/proteinmpnn.txt".source = ../../modules/bio/requirements/proteinmpnn.txt;
-    "bio-tools/requirements/evolvepro-plm.txt".source = ../../modules/bio/requirements/evolvepro-plm.txt;
+    "bio-tools/py".source = ../../modules/bio/py;                # esm_cli, rfaa patch, etc.
+    "bio-tools/requirements".source = ../../modules/bio/requirements;
+    "bio-tools/recipes".source = ./recipes;                     # per-tool bio-submit recipes
   };
 
   systemd.tmpfiles.rules = [
