@@ -93,12 +93,43 @@ mkdir -p "$ROUT"
 source /mnt/bio-shared/tools/recipes/_common.sh
 source /mnt/bio-shared/tools/recipes/$recipe.sh
 echo "[bio-submit] done; outputs in $ROUT"; ls -la "$ROUT"
+sync
 REMOTE
 )
 
 echo "bio-submit: job $jobid  tool=$tool gpu=$gpu ${spot:+(spot)}"
-echo "bio-submit: results will be at $run/out  (on the shared FS)"
 b64=$(printf '%s' "$remote" | base64 -w0)
-dc run "$gpu" --loc "$LOC" $spot --volume "$SHARED_VOL" -- "echo $b64 | base64 -d | bash"
-echo "bio-submit: DONE — results on the head at $run/out"
-ls -la "$run/out" 2>/dev/null || true
+NODESSH="-i /root/.ssh/datacrunch_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+LOCALOUT="/var/lib/bio-runs/$jobid"; mkdir -p "$LOCALOUT"
+
+# Launch a GPU node (FIN-02 capacity churns — fall back across GPU types).
+id=""; ip=""
+for g in "$gpu" 1L40S.20V 1RTXPRO6000.30V 1H100.80S.32V 1A100.22V; do
+  echo "bio-submit: launching $g ..."
+  out=$(dc launch "$g" --loc "$LOC" $spot --volume "$SHARED_VOL" 2>&1) || { printf '%s\n' "$out" | tail -1; continue; }
+  id=$(printf '%s' "$out" | grep -oE 'id=[0-9a-f-]{36}' | head -1 | cut -d= -f2)
+  ip=$(printf '%s' "$out" | grep -oE 'ip=[0-9.]+' | head -1 | cut -d= -f2)
+  [ -n "$id" ] && [ -n "$ip" ] && break
+  [ -n "$id" ] && dc rm "$id" >/dev/null 2>&1; id=""
+done
+[ -n "$id" ] || { echo "bio-submit: no GPU capacity across candidates (retry later, or --gpu <type>)" >&2; exit 5; }
+# always destroy the node, even on error/interrupt
+trap 'dc rm "$id" >/dev/null 2>&1 || true' EXIT INT TERM
+
+echo "bio-submit: waiting for sshd on $ip ..."
+# shellcheck disable=SC2086
+for _ in $(seq 1 30); do ssh $NODESSH -o ConnectTimeout=10 root@"$ip" true 2>/dev/null && break; sleep 8; done
+echo "bio-submit: running $tool on $id ($ip) ..."
+# shellcheck disable=SC2086
+ssh $NODESSH root@"$ip" "echo $b64 | base64 -d | bash"
+
+# The NixOS head cannot read node-written files over this shared FS (asymmetric
+# NFS incoherence), so PULL results off the node (which reads its own writes)
+# to head-local disk. The shared FS still caches envs/weights for reuse.
+echo "bio-submit: fetching results -> $LOCALOUT"
+# shellcheck disable=SC2086
+rsync -a -e "ssh $NODESSH" root@"$ip":"$ROUT"/ "$LOCALOUT"/ || echo "bio-submit: WARN rsync fetch failed"
+
+dc rm "$id" >/dev/null 2>&1 || true; trap - EXIT INT TERM
+echo "bio-submit: DONE — results at $LOCALOUT (head-local)"
+ls -laR "$LOCALOUT" 2>/dev/null | head -40

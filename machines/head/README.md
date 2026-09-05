@@ -73,22 +73,43 @@ they're built/downloaded **once** and reused across jobs. Structure:
 
 ## `bio-submit` — run a model on an ephemeral GPU
 
-Launches a GPU node, mounts the share, builds the tool's env on it (once, cached),
-runs the model, and **always destroys the node**. Outputs persist on the shared FS.
+Launches a GPU node (falling back across GPU types when FIN-02 capacity is tight),
+waits for sshd, runs a per-tool recipe (`recipes/<tool>.sh`) that builds the env +
+weights on the shared FS (once, cached), folds/designs, then **rsyncs the results
+to head-local `/var/lib/bio-runs/<jobid>/` and always destroys the node**.
 
 ```bash
-bio-submit esm score  --fasta prot.fasta [--model esm2_t33_650M_UR50D] [--gpu 1A100.22V] [--spot]
-bio-submit esm embed  --fasta prots.fasta
+# Folding (no local DBs — remote ColabFold MSA server or single-seq):
+bio-submit boltz2    --fasta prot.fasta        # MIT, AF3-class (+affinity) — VALIDATED
+bio-submit protenix  --fasta prot.fasta        # ByteDance AF3 repro (Apache-2)
+bio-submit openfold3 --fasta prot.fasta        # OpenFold3 (Apache-2)
+bio-submit rfaa      --fasta prot.fasta         # RoseTTAFold-All-Atom, single-seq/template-free
+bio-submit af3       --json fold.json           # BLOCKED unless gated af3.bin on the share
+# Design / LM:
+bio-submit rfdiffusion --contigs '[100-100]' [--num-designs 4] [--input-pdb t.pdb]
 bio-submit mpnn --pdb backbone.pdb [--num-seqs 8]
-# results: /mnt/bio-shared/runs/<jobid>/out   (readable here on the head)
+bio-submit esm  <score|embed|logits|mutate> --fasta prot.fasta [--model M]
+# common: --gpu <type> (see `dc types --gpu`), --spot, -- <extra passthrough>
+# results: /var/lib/bio-runs/<jobid>/   (head-local; NOT the shared FS — see below)
 ```
 
-Supported now: **esm** (score/embed/logits/mutate) and **mpnn** — both pure
-torch-cu124. The venv is built against the node's **system python3** (so it's
-portable across ephemeral nodes) and cached on the share, so the first run per
-tool downloads torch (~minutes) and later runs are fast. GPU defaults per tool;
-override with `--gpu` (see `dc types --gpu`). rfdiffusion/rfaa/af3 come next
-(they need the DGL/CUDA-11 handling and, for rfaa/af3, the databases).
+Per-tool venvs build against the node's **system python3.12** (portable across
+ephemeral nodes) except RFdiffusion/RFAA, which use a relocatable **py3.10** copied
+onto the share (their old torch has no cp312). Weights/caches persist on the share,
+so first run per tool is slow (installs + weights) and later runs reuse the cache.
+
+**Why results go to head-local, not the shared FS:** the DataCrunch shared FS is
+read/written fine *between GPU nodes* (so env/weight caching works), but the NixOS
+head reads *node-written* files as zero-filled (an asymmetric NFS incoherence,
+verified: the data is durable on the server — a node re-reads it after dropping its
+cache — the head just can't see it). So `bio-submit` pulls outputs off the node via
+`rsync` to `/var/lib/bio-runs/` while the node is alive.
+
+**Status:** **Boltz-2 validated end-to-end** (real PDB retrieved). The others share
+the identical framework (recipe + launch/fallback/sshd-wait/rsync-pull/teardown)
+and are implemented + deployed but not each individually shaken out — a first run
+per tool may need a small tweak (as Boltz-2's framework bring-up did). AF3 inference
+stays blocked on gated weights; place `af3.bin` in `weights/alphafold3/` to enable.
 
 ## Credentials & security
 

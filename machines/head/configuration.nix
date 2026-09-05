@@ -61,6 +61,7 @@
     "d /root/.config         0700 root root - -"
     "d /root/.config/datacrunch 0700 root root - -"
     "d /root/.ssh            0700 root root - -"
+    "d /var/lib/bio-runs     0755 root root - -"   # bio-submit pulls results here
   ];
 
   # Tailscale daemon (join the tailnet later with `tailscale up --auth-key=...`).
