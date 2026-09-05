@@ -114,7 +114,7 @@ for g in "$gpu" 1L40S.20V 1RTXPRO6000.30V 1H100.80S.32V 1A100.22V; do
 done
 [ -n "$id" ] || { echo "bio-submit: no GPU capacity across candidates (retry later, or --gpu <type>)" >&2; exit 5; }
 # always destroy the node, even on error/interrupt
-trap 'dc rm "$id" >/dev/null 2>&1 || true' EXIT INT TERM
+trap 'dc rm "$id" >/dev/null 2>&1 || true' EXIT INT TERM HUP
 
 echo "bio-submit: waiting for sshd on $ip ..."
 # shellcheck disable=SC2086
