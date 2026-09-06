@@ -63,7 +63,7 @@ def command(arguments, config, scratch):
             env['PYTHONPATH'] = os.pathsep.join(runtime['pythonpath'])
             env['LD_LIBRARY_PATH'] = os.pathsep.join(runtime['library_paths'])
         else:
-            name = {'boltz2': 'boltz', 'openfold3': 'openfold3', 'protenix': 'protenix'}[model]
+            name = {'boltz2': 'boltz', 'openfold3': 'openfold3', 'protenix': 'protenix', 'rf3': 'rf3'}[model]
             site = Path(config['shared'])/'envs'/name/'lib/python3.12/site-packages'
             if not site.is_dir():
                 raise ValueError(f'Native parser environment is missing: {site}')
@@ -72,6 +72,8 @@ def command(arguments, config, scratch):
                                                      str(site/'torch/lib'), *config['library_paths']])
             env['BOLTZ_CACHE'] = str(Path(config['shared'])/'cache/boltz')
             env['PROTENIX_ROOT_DIR'] = str(Path(config['shared'])/'protenix/release_data')
+            if model == 'rf3':
+                env['RF3_SOURCE_DIR'] = str(Path(config['shared'])/'src/foundry-rf3-b02eed6a6bdf8f44d14a80cc36e3da13c9f2291c')
     return interpreter + [str(Path(__file__).with_name('adapters.py')), 'compile', *arguments], env
 
 

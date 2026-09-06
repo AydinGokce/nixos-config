@@ -81,7 +81,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertNotIn("PYTHONPATH", env)
 
     def test_native_model_uses_matching_readonly_shared_packages_and_local_cache(self):
-        for model, environment in [("boltz2", "boltz"), ("openfold3", "openfold3"), ("protenix", "protenix")]:
+        for model, environment in [("boltz2", "boltz"), ("openfold3", "openfold3"), ("protenix", "protenix"), ("rf3", "rf3")]:
             site = self.environment(environment)
             arguments = list(self.arguments)
             arguments[arguments.index("--model") + 1] = model
@@ -251,6 +251,13 @@ class CheckCommandTests(unittest.TestCase):
                 patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout="", stderr="")) as run:
             cli.main()
         self.assertIn("--plain-fasta", run.call_args.args[0])
+
+    def test_rf3_private_check_keeps_native_multichain_chemistry(self):
+        with patch.object(sys, "argv", ["bio-library", "check", "assembly:complex@1", "--model", "rf3", "--msa-backend", "private"]), \
+                patch.object(cli.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, stdout="", stderr="")) as run:
+            cli.main()
+        self.assertNotIn("--plain-fasta", run.call_args.args[0])
+        self.assertIn("private", run.call_args.args[0])
 
     def test_rfaa_private_check_cannot_report_a_unsupported_submission_as_compatible(self):
         with patch.object(sys, "argv", ["bio-library", "check", "enzyme", "--model", "rfaa", "--msa-backend", "private"]), \

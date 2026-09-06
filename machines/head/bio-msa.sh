@@ -17,6 +17,7 @@ bio-msa install --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
 bio-msa convert [--worker TYPE --timeout SECONDS]
 bio-msa panel --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
 bio-msa prepare --model openfold3|boltz2|protenix --fasta FILE [--worker TYPE]
+bio-msa prepare --model rf3 --json CHAIN_QUERIES.json [--worker TYPE]
 bio-msa serve [--worker TYPE --timeout SECONDS]
 bio-msa status
 bio-msa compare --help
@@ -27,6 +28,10 @@ it does not make the databases ready for preparation. Database volumes and
 prepared inputs remain after compute is removed. To prepare then predict:
   bio-submit openfold3 --fasta FILE --msa-backend private
 Public MSA remains the default until prediction-quality comparisons pass.
+Preparation selects available FIN-02 compute with at least 768 GiB RAM and a
+$13/hour instance-price ceiling, including spot capacity. --spot selects only
+spot offers; --worker TYPE overrides automatic selection. dc rechecks the quote
+and total project budget before launch. Conversion keeps its smaller CPU default.
 Panel preparation keeps one private API worker for all manifest targets, runs
 them serially without inference, and records failures without dropping targets.
 Install with --json prepares that panel after installation on the same worker,

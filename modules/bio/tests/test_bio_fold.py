@@ -15,7 +15,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bio-fold.sh"
 STUB = r'''
-import json, os
+import hashlib, json, os
 from pathlib import Path
 import sys
 
@@ -41,6 +41,24 @@ if command == "rsync":
             predicted = out / "boltz_results_input" / "predictions" / "input" / "input_model_0.cif"
             predicted.parent.mkdir(parents=True)
             predicted.write_text("prediction\n")
+        if os.environ.get("BIO_TEST_RF3"):
+            raw = out / 'rf3' / 'seed-101_sample-0' / 'raw_model.cif'
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text('raw sample failed chemistry\n')
+            selected = out / 'rf3' / 'rf3_model.cif'
+            selected.write_text('selected sample passed chemistry\n')
+            audit = {'status': 'passed', 'selected': {'raw_directory': 'seed-101_sample-2'}}
+            audit_path = out / 'rf3-output-validation.json'
+            audit_path.write_text(json.dumps(audit))
+            receipt = {'status': 'complete', 'output_validation': audit,
+                'output_validation_sha256': hashlib.sha256(audit_path.read_bytes()).hexdigest(),
+                'outputs': {'model': 'rf3/rf3_model.cif',
+                    'model_sha256': hashlib.sha256(selected.read_bytes()).hexdigest()}}
+            if os.environ.get('BIO_TEST_RF3') == 'failed':
+                receipt['output_validation']['status'] = 'failed'
+            if os.environ.get('BIO_TEST_RF3') == 'tampered':
+                selected.write_text('changed output\n')
+            (out / 'rf3-runtime.json').write_text(json.dumps(receipt))
     sys.exit(status)
 if command == "bio-viz":
     status = int(os.environ.get("BIO_TEST_RENDER_STATUS", "0")) if "--render" in sys.argv else 0
@@ -61,6 +79,7 @@ class BioFoldTests(unittest.TestCase):
             path = self.bin / name
             path.write_text("#!" + sys.executable + "\n" + STUB)
             path.chmod(0o755)
+        (self.bin / 'python3').symlink_to(sys.executable)
         self.fasta = self.root / "input with spaces.fasta"
         self.fasta.write_text(">query\nMKTAYIAKQRQISFVKSHFSRQDILDLWIYHTQGYFP\n")
         self.config = self.root / "config.sh"
@@ -98,6 +117,28 @@ class BioFoldTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(self.commands("bio-viz"), [])
         self.assertEqual(len(self.commands("rsync")), 1)
+
+    def test_rf3_library_private_input_dispatch(self):
+        result = self.run_arguments("rf3", "--assembly", "target-complex", "--msa-backend", "private", BIO_TEST_RF3='passed')
+        self.assert_success(result)
+        remote = self.commands("ssh")[0][-1]
+        self.assertIn("bio-submit rf3 --assembly target-complex", remote)
+        self.assertIn("--msa-backend private", remote)
+        self.assertEqual(self.commands("scp"), [])
+
+    def test_rf3_renders_only_audited_selected_sample(self):
+        result = self.run_arguments('rf3', '--assembly', 'target-complex', '--render', BIO_TEST_RF3='passed')
+        self.assert_success(result)
+        self.assertEqual(self.commands('bio-viz'), [
+            ['--render', str(self.out / 'rf3' / 'rf3_model.cif'), '-o', str(self.out / 'render.png')]])
+
+    def test_rf3_rejects_missing_failed_or_tampered_output_audit(self):
+        for mode in ('', 'failed', 'tampered'):
+            with self.subTest(mode=mode):
+                result = self.run_arguments('rf3', '--assembly', 'target-complex', '--render', BIO_TEST_RF3=mode)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.commands('bio-viz'), [])
+                self.assertIn('RF3 output verification failed', result.stderr)
 
     def test_successful_render_only_returns_zero(self):
         result = self.run_fold("--render")

@@ -16,7 +16,7 @@ from registry import Registry, digest_json, load_json, no_symlinks, reference, r
 from chemistry import components, polymer, bonds, require, write_json
 
 MODELS = {'boltz2': 'boltz_adapter', 'openfold3': 'openfold3_adapter',
-          'protenix': 'protenix_adapter', 'rfaa': 'rfaa_adapter'}
+          'protenix': 'protenix_adapter', 'rfaa': 'rfaa_adapter', 'rf3': 'rf3_adapter'}
 
 
 def file_digest(path):
@@ -130,7 +130,7 @@ def compile_input(root, ref, model, destination, *, plain_fasta=False, msa_backe
             metadata = fasta(snapshot, staging)
             preflight = dict(native_parser=False, canonical_single_protein=True, model_inference=False, msa_queries=False)
         else:
-            require(msa_backend == 'public', 'Mixed/native construct input currently requires the public MSA path; private preparation supports a single canonical protein. No fallback was performed.')
+            require(msa_backend == 'public' or model == 'rf3', 'Mixed/native construct input currently requires the public MSA path; private preparation supports a single canonical protein, or native RF3 chains. No fallback was performed.')
             module = importlib.import_module(MODELS[model])
             # Native parsers can print informational messages. Keep stdout
             # reserved for the machine-readable result returned by this CLI.

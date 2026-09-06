@@ -53,7 +53,7 @@ adapters accept only representations they can preserve. They do not replace an
 unknown modification with its nearest ordinary base.
 At present, no adapter accepts arbitrary custom amidites as polymer residues,
 custom `linkages` or explicit `termini` fields. A modification can be
-submitted to Boltz, Protenix or OpenFold3 only when a supported CCD residue
+submitted to Boltz, Protenix, OpenFold3 or RF3 only when a supported CCD residue
 represents the incorporated chemistry. Use a pinned `monomer_ref` whose monomer
 `identity` contains only `ccd`; this is their shared representation.
 Keep supplier annotations in `provenance`, `notes` and attachments. RFAA rejects
@@ -62,13 +62,13 @@ and exportable even when these models cannot predict it.
 
 ## Current adapters
 
-| Input | Boltz 2.2.1 | Protenix 2.0.0 | OpenFold3 0.5.0 | RFAA pinned source |
-|---|---|---|---|---|
-| Canonical protein / DNA / RNA, multiple chains | Yes | Yes | Yes | Yes |
-| CCD residue substitutions | Native checks required | Native checks required | Native checks required | Rejected |
-| Circular polymers | Yes | Explicit terminal bond | Yes | Rejected |
-| Small molecules | CCD / SMILES / SDF→SMILES | CCD / SMILES / single 3D SDF | CCD / SMILES / SDF→SMILES | SMILES / single V2000 SDF |
-| Explicit covalent bonds | Named atoms, single bonds; CCD ligands | Named atoms, single bonds | Rejected: pinned pipeline ignores them | Rejected pending reliable atom mapping |
+| Input | Boltz 2.2.1 | Protenix 2.0.0 | OpenFold3 0.5.0 | RFAA pinned source | RF3 pinned source |
+|---|---|---|---|---|---|
+| Canonical protein / DNA / RNA, multiple chains | Yes | Yes | Yes | Yes | Yes; each polymer needs at least 4 residues |
+| CCD residue substitutions | Native checks required | Native checks required | Native checks required | Rejected | Native chemical and feature checks required |
+| Circular polymers | Yes | Explicit terminal bond | Yes | Rejected | Peptides, through native cyclic-chain conditioning |
+| Small molecules | CCD / SMILES / SDF→SMILES | CCD / SMILES / single 3D SDF | CCD / SMILES / SDF→SMILES | SMILES / single V2000 SDF | CCD / exact SMILES / exact single SDF |
+| Explicit covalent bonds | Named atoms, single bonds; CCD ligands | Named atoms, single bonds | Rejected: pinned pipeline ignores them | Rejected pending reliable atom mapping | Named single bonds only when retained in model token features; ordinary polymer crosslinks rejected |
 
 These are supported input representations, subject to the selected model's
 compatibility check. Protenix rejects MSE because its native loader converts it
@@ -76,6 +76,51 @@ to MET. Boltz rejects assemblies containing the same base sequence with differen
 modifications or circularity; OpenFold3 also rejects identical sequence strings
 assigned to different polymer types. Those native entity-grouping cases would
 otherwise merge distinct identities.
+
+RF3 uses Foundry commit `b02eed6a6bdf8f44d14a80cc36e3da13c9f2291c` and
+AtomWorks 2.2.1. `bio-library check REF --model rf3 --msa-backend private`
+checks the complete native assembly; it does not flatten it to one FASTA.
+Both public and private RF3 preparation search every protein chain separately,
+with canonical amino acids mapped to their letters and other CCD residues to
+`X` in the MSA query. The native structural input retains the exact CCD code.
+Server-paired rows retain their partners through explicit synthetic pairing
+keys; these are not biological taxonomy IDs. Raw responses remain in the job.
+There is no automatic single-sequence fallback.
+
+RF3 compatibility checks execute the pinned native parser and actual chemical,
+reference-conformer, chiral and bond transforms on CPU, without model weights
+or MSA queries. They compare heavy atom identities, formal charges, ligand
+connectivity/stereochemistry, valid reference masks and requested token bonds.
+They retain native atom names and residue mappings in `preflight.json`.
+For a custom SDF/SMILES covalent attachment, inspect those exact names first;
+the adapter never guesses a supplied atom index. The original SDF bytes remain
+in the immutable bundle. Ligand coordinates encode chemistry, not a requested
+structural restraint.
+
+RF3 also checks every predicted sample against the native atom inventory,
+elements, formal charges, declared bonds and assigned tetrahedral/E/Z stereo,
+using the predicted coordinates. It retains all raw samples and the original
+ranking, then publishes the highest native-ranked sample that passes. If none
+passes, the job fails with retained diagnostics. CPU input compatibility alone
+does not guarantee output stereochemistry; these output checks also do not
+establish folding or binding accuracy.
+
+An ordinary protein-to-protein disulfide or other crosslink can survive RF3's
+parser but be absent from the model's token bond features. The compatibility
+check rejects that input. Circular peptides use RF3's explicit `cyclic_chains`
+option and must pass the token-feature check. Reactions that cause the parser
+to change heavy atoms, formal charges or existing bond orders are also rejected,
+apart from the native peptide cyclization leaving oxygen. Arbitrary custom
+polymer monomers, backbone/terminal chemistry, isotope/radical labels, enhanced
+stereochemistry and special bond orders remain unsupported. Exact records stay
+in the library for export or later model support.
+
+The pinned RF3 model omits standard polymer terminal `OXT`/`OP3` atoms; the
+preflight records these omissions explicitly. Its AtomWorks parser can retain a
+temporary `atom_id` annotation for ligand-only input that conflicts with the
+model's fresh indexing transform. The same source-verified compatibility helper
+runs at preflight and inference, removing only that annotation from a private
+copy and checking that every molecular array remains unchanged.
 
 ESM accepts one canonical, linear protein from the library for its existing
 scoring, embedding, logits and mutation commands. EVOLVEpro's library path also
@@ -95,10 +140,11 @@ bio-fold evolvepro --fasta variants.fasta --labels activity.csv --sub rank
 ProteinMPNN and RFdiffusion still require their structure/design inputs. AF3 is
 outside this integration.
 
-For the four folding models' native inputs, `check` executes the installed
-model's real CPU parser without inference or MSA queries. ESM, EVOLVEpro and
-`--msa-backend private` instead check that the record can be exported as one
-canonical protein; their report says `native_parser: false`. Those checks do not
+For the folding models' native inputs, `check` executes the installed model's
+real CPU parser without inference or MSA queries. ESM, EVOLVEpro and the private
+Boltz/Protenix/OpenFold3 path instead check that the record can be exported as
+one canonical protein; their report says `native_parser: false`. Private RF3
+checks the complete native assembly. Those checks do not
 validate EVOLVEpro label files or execute its ranking pipeline. Checks are
 serialized and limited to 6 GiB and ten minutes on the head. A passing check does
 not prove that inference will succeed, fit GPU memory, or produce an accurate
@@ -107,7 +153,7 @@ the full model's assembly tensors.
 
 Use canonical letters for portable inputs. Protenix can retain native `X` protein
 or `N` nucleotide placeholders, but these remain unspecified residues; the other
-three folding adapters reject sequence ambiguity. Isotopes, radicals, unsupported
+folding adapters reject sequence ambiguity. Isotopes, radicals, unsupported
 stereochemical features and unresolved attachment chemistry have additional
 model-specific limits. Models can also reject particular CCD residues.
 Input conformers may be regenerated by the model; retaining the original SDF
@@ -129,8 +175,9 @@ Each job retains `library-input/` with the complete resolved source, original
 attachments, native input, CPU parser report and checksummed manifest. `job.json`
 records the source revision, source hash and bundle hash. The worker verifies
 the bundle and compiler source before using it. Rejected compilations cannot
-rent a GPU. Raw multirecord FASTA is refused for the four folding models; use an
-assembly to preserve chain boundaries. Raw folding JSON must first be imported
+rent a GPU. Boltz, Protenix, OpenFold3 and RFAA refuse raw multirecord FASTA; use
+an assembly to preserve chain boundaries. RF3 also accepts multirecord canonical
+protein FASTA, assigning a separate chain to each record. Raw folding JSON must first be imported
 as typed library records instead of passed through `bio-fold --json`.
 
 Use recorded chain mappings when interpreting output. `library-input/bundle.json`

@@ -87,6 +87,12 @@ in
       export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-msa.sh}
     '')
+    (pkgs.writeShellScriptBin "bio-msa-worker" ''
+      set -euo pipefail
+      source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+      export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/msa/worker.py "$@"
+    '')
     (pkgs.writeShellScriptBin "bio-msa-build-queue" ''
       set -euo pipefail
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd util-linux coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
@@ -111,6 +117,7 @@ in
     "bio-tools/requirements".source = ../../modules/bio/requirements;
     "bio-tools/recipes".source = ./recipes;                     # per-tool bio-submit recipes
     "bio-tools/rfaa".source = ./rfaa;
+    "bio-tools/rf3".source = ./rf3;
     "bio-tools/msa".source = ./msa;
     "bio-tools/library".source = ./library;
     "bio-tools/library-runtime.json".text = builtins.toJSON {
@@ -219,6 +226,8 @@ in
   # One explicitly registered full-database validation. Its private artifact
   # records durable intent before submission and never automatically retries.
   systemd.services.bio-rfaa-validation-trigger = {
+    # RFAA is parked while RF3 and the other production tools are completed.
+    enable = false;
     description = "Observe or submit the registered full RFAA validation once";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -232,6 +241,7 @@ in
     };
   };
   systemd.timers.bio-rfaa-validation-trigger = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnCalendar = "*-*-* *:00/15:00";

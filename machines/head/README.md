@@ -19,11 +19,11 @@ Workstation backups retain and restore-check the complete library hourly.
 bio-fold boltz2 --seq NLYIQWLKDGGPSSGRPPPS --render
 bio-fold openfold3 --fasta protein.fasta --render
 bio-fold protenix --fasta protein.fasta --render
-bio-fold rfaa --fasta protein.fasta --render
-bio-fold rfaa --fasta protein.fasta --sub single-seq --render
+bio-fold rf3 --fasta protein.fasta --render
+bio-fold rf3 --assembly enzyme-oligo --render
 bio-fold rfdiffusion --contigs '[50-50]' --num 1 --render
 bio-fold mpnn --pdb backbone.pdb --num 4
-bio-fold esm --fasta proteins.fasta --sub score --model esm2_t6_8M_UR50D
+bio-fold esm --fasta proteins.fasta --sub score
 bio-fold evolvepro --fasta variants.fasta --labels measured.csv --num 4
 ```
 
@@ -36,6 +36,12 @@ in `1A100.22V` denotes CPU allocation: that instance has an **80 GB A100**.
 EVOLVEpro accepts CSV columns `variant,activity`, ranks unmeasured variants and
 writes selected sequences. See [EVOLVEPRO.md](EVOLVEPRO.md) for first-round
 selection and embedding-only runs.
+
+RF3 uses the pinned official Foundry checkpoint and explicit MSAs for every
+protein chain. Its defaults are 10 recycles, 50 diffusion steps and five samples;
+`--num N` changes the sample count. See [RF3 setup and input support](rf3/README.md).
+ESM and EVOLVEpro use the cached 650M ESM-2 checkpoint by default. Larger optional
+ESM variants download on first use and need sufficient GPU memory.
 
 ## Head and storage
 
@@ -56,11 +62,12 @@ Torch/Triton kernels do not support Blackwell, and its compiled LayerNorm needs
 the matching CUDA toolkit and Ninja. Unsupported explicit GPU choices are
 rejected before renting a worker.
 
-Boltz, Protenix and OpenFold3 use the remote ColabFold MSA server by default.
+Boltz, Protenix, OpenFold3 and RF3 use the remote ColabFold MSA server by default.
 That server searches large sequence databases and returns alignments;
 we keep the model weights and query results locally. The private path described
-below is being installed and remains subject to quality comparison. Full RFAA runs its
-sequence and template searches against the dedicated databases described below.
+below remains subject to full installation and quality comparison. RF3 shares
+this ColabFold path. The separate RFAA database installation is parked; its
+verified archives and completed data are retained for a later decision.
 This is a difference in preprocessing and hosting, not evidence that OpenFold3
 does not use databases. Reusing externally prepared RFAA alignments and template
 coordinates would require a separately validated input path.
@@ -73,7 +80,7 @@ and confidentiality requirements explicitly.
 
 ## Private MSA preparation
 
-The separate 3000 GB ColabFold volume has persistent retention. It holds the
+The separate 3000 GiB ColabFold volume has persistent retention. It holds the
 complete classic CPU sequence databases, pairing taxonomy and template data.
 `bio-msa install` provisions that snapshot on a transient high-memory worker;
 installation is explicit and must finish before preparation can succeed.
@@ -84,14 +91,24 @@ bio-msa prepare --model openfold3 --fasta protein.fasta --timeout 14400
 bio-submit openfold3 --fasta protein.fasta --msa-backend private
 # From the updated workstation wrapper:
 bio-fold boltz2 --fasta protein.fasta --msa-backend private --render
+bio-fold rf3 --assembly enzyme-oligo --msa-backend private --render
 ```
 
-Private submissions first run the native model's preparation against a
-localhost-only MSA API on a CPU worker. They retain and validate the input bundle,
+Private submissions first run preparation against a localhost-only MSA API.
+The default selects available FIN-02 compute with at least 768 GiB RAM and an
+instance price of at most $13/hour, including spot offers. Searches still use the
+pinned CPU pipeline when the available host also has GPUs. `--worker TYPE`
+overrides selection, and `--spot` restricts it to spot offers. The fresh launch
+quote and total project budget are checked separately before allocation.
+Submissions retain and validate the input bundle,
 remove the preparation worker, then rent the prediction GPU. An explicit private
 request fails if preparation is unavailable; it never switches to the public
 server. Retained bundles bind their exact sequences, native inputs and database
 provenance. The full RFAA HHsuite pipeline stays separate.
+RF3 searches all distinct protein-chain sequences together, retains the raw
+unpaired and paired responses, and binds each chain's A3M to its typed input.
+Server-paired rows receive explicit synthetic RF3 pairing keys; these are
+documented as pairing identifiers, not biological taxonomy annotations.
 
 Public remains the default until comparisons establish suitable alignment,
 pairing, template-feature and prediction quality. Miniature API tests and native
@@ -117,12 +134,17 @@ Failed jobs preserve partial outputs when available and return a nonzero status.
 
 ## Full RoseTTAFold All-Atom databases
 
+**Parked as of 2026-09-06.** The BFD extraction exceeded the managed filesystem's
+observed 1 TiB per-file limit. Its verified archive and partial extraction remain;
+the full-mode validation trigger is disabled. Storage is still retained and billed.
+Resume requires resolving that storage limit and completing validation first.
+
 RFAA defaults to full UniRef30/BFD MSA searches, PSIPRED secondary structure and
 pdb100 template searches. `--sub single-seq` is an explicit database-free option;
 failed full searches never silently become single-sequence predictions.
-The cloud wrapper currently accepts one protein FASTA chain. Supporting other
-upstream assembly types, such as protein–ligand or protein–DNA/RNA complexes,
-also requires extending input staging and validation.
+The cloud wrapper accepts a protein FASTA or a supported typed construct/library
+assembly. Its explicit single-sequence path has passed mixed-input GPU checks;
+those checks do not qualify full-database inference.
 
 Full datasets expand to approximately 2.5 TiB. Use a **separate dedicated shared
 volume** with at least 3 TiB capacity plus appropriate temporary-download
@@ -130,7 +152,7 @@ headroom, not the 100 GB model cache. Provisioning and retention are separate
 from merely installing the model. Configure its ID and NFS export in
 [`rfaa-storage.nix`](rfaa-storage.nix), then deploy. An empty configuration rejects
 full RFAA submissions before renting a GPU. The 3300 GB allocation is now
-registered with persistent retention, and its full download is in progress.
+registered with persistent retention. Its full installation is incomplete and paused.
 Full-mode submission runs the fast database validator on the head before renting
 a worker; the worker repeats validation against its own mount. Private MSA
 preparation and serving also require a nonempty final installation receipt on the

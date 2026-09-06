@@ -13,22 +13,22 @@ import registry
 def main():
     if len(sys.argv) == 1 or sys.argv[1:] in (['--help'], ['-h']):
         print('Check model input compatibility: bio-library check REF --model MODEL\n'
-              'Native folding inputs use the CPU parser; ESM/EVOLVEpro and private MSA inputs use canonical FASTA checks.\n'
+              'Native folding inputs use the CPU parser; private RF3 supports native assemblies. Other private MSA inputs and ESM/EVOLVEpro use canonical FASTA checks.\n'
               'No prediction or MSA queries.\n')
     if len(sys.argv) < 2 or sys.argv[1] != 'check':
         return registry.main()
-    parser = argparse.ArgumentParser(description='Check model input compatibility for a pinned construct/assembly. Native folding inputs use the CPU parser; ESM/EVOLVEpro and private MSA inputs use canonical FASTA checks. No prediction or MSA queries.')
+    parser = argparse.ArgumentParser(description='Check model input compatibility for a pinned construct/assembly. Native folding inputs and private RF3 use the CPU parser; other private MSA inputs and ESM/EVOLVEpro use canonical FASTA checks. No prediction or MSA queries.')
     parser.add_argument('ref')
-    parser.add_argument('--model', required=True, choices=['boltz2', 'protenix', 'openfold3', 'rfaa', 'esm', 'evolvepro'])
+    parser.add_argument('--model', required=True, choices=['boltz2', 'protenix', 'openfold3', 'rfaa', 'rf3', 'esm', 'evolvepro'])
     parser.add_argument('--root', default=os.environ.get('BIO_LIBRARY_ROOT', '/var/lib/bio-library'))
     parser.add_argument('--msa-backend', choices=['public', 'private'], default='public')
     args = parser.parse_args(sys.argv[2:])
-    if args.msa_backend == 'private' and args.model not in {'boltz2', 'protenix', 'openfold3'}:
+    if args.msa_backend == 'private' and args.model not in {'boltz2', 'protenix', 'openfold3', 'rf3'}:
         raise ValueError('This model does not use the shared private MSA backend')
     with tempfile.TemporaryDirectory(prefix='bio-library-check-') as work:
         command = [sys.executable, str(Path(__file__).with_name('runtime.py')), '--root', args.root,
                    '--ref', args.ref, '--model', args.model, '--out', work+'/input', '--msa-backend', args.msa_backend]
-        if args.msa_backend == 'private':
+        if args.msa_backend == 'private' and args.model != 'rf3':
             command.append('--plain-fasta')
         result = subprocess.run(command, text=True, capture_output=True)
         if result.stderr:

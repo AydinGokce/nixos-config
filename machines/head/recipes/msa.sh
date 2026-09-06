@@ -96,6 +96,13 @@ for attempt in range(30):
 else:
     raise SystemExit('msa: API audit proxy did not become ready')
 PY
+  if [ "$MODEL" = rf3 ]; then
+    python3 "$TOOLS/rf3/msa.py" search --queries "$IN" --out "$OUT/prepared" \
+      --server-url http://127.0.0.1:8081 --source private \
+      --database-provenance "$OUT/msa-server.provenance.json" --deadline "$BIO_JOB_DEADLINE_EPOCH"
+    cp "$OUT/msa-server.provenance.json" "$OUT/preparation-provenance.json"
+    exit 0
+  fi
   case "$MODEL" in
     openfold3)
       venv="$SHARED/envs/openfold3"

@@ -3,7 +3,7 @@
 # the head node's `bio-submit` + a local `bio-viz`.
 #
 #   bio-fold [model] (--construct REF | --assembly REF | --seq SEQ | --fasta F | --pdb F | --contigs 'STR') [flags]
-#     models: boltz2 (default) | protenix | openfold3 | rfaa | rfdiffusion | mpnn | esm | evolvepro
+#     models: boltz2 (default) | protenix | openfold3 | rf3 | rfaa | rfdiffusion | mpnn | esm | evolvepro
 #     --view          open the predicted structure in PyMOL (GUI)
 #     --render        save a ray-traced PNG next to the result
 #     --out DIR       local output dir (default ~/bio-runs/<jobid>)
@@ -26,7 +26,7 @@ KEY="${BIO_CLUSTER_SSHKEY:-$HOME/.ssh/datacrunch_ed25519}"
 
 usage() { cat <<'USAGE'
 bio-fold [MODEL] (--construct REF | --assembly REF | --seq SEQUENCE | --fasta FILE | --pdb FILE | --contigs STRING)
-  Models: boltz2 (default), openfold3, protenix, rfaa, rfdiffusion, mpnn, esm, evolvepro
+  Models: boltz2 (default), openfold3, protenix, rf3, rfaa, rfdiffusion, mpnn, esm, evolvepro
   --construct REF        use a construct stored on the head (alias or pinned reference)
   --assembly REF         use an assembly stored on the head
   --render / --view       render PNG / open PyMOL after fetching a structure
@@ -34,7 +34,7 @@ bio-fold [MODEL] (--construct REF | --assembly REF | --seq SEQUENCE | --fasta FI
   --labels FILE          EVOLVEpro measured activity CSV
   --sub COMMAND          ESM command, EVOLVEpro embed|rank, RFAA full|single-seq
   --model NAME           model variant (ESM/EVOLVEpro/MPNN)
-  --msa-backend BACKEND   public|private for Boltz2, OpenFold3 or Protenix
+  --msa-backend BACKEND   public|private for Boltz2, OpenFold3, Protenix or RF3
   --num N --gpu TYPE --spot --timeout SECONDS -- MODEL_ARGUMENTS
   Import construct/assembly JSON with bio-library import --json FILE, then use its reference.
 USAGE
@@ -91,7 +91,7 @@ if [ -n "$contigs" ] && [ "$model" != rfdiffusion ]; then
 fi
 if [ -n "$msa_backend" ]; then
   case "$msa_backend" in public|private) ;; *) echo 'bio-fold: --msa-backend must be public or private' >&2; exit 2 ;; esac
-  case "$model" in boltz2|openfold3|protenix) ;; *) echo "bio-fold: --msa-backend is unsupported for $model" >&2; exit 2 ;; esac
+  case "$model" in boltz2|openfold3|protenix|rf3) ;; *) echo "bio-fold: --msa-backend is unsupported for $model" >&2; exit 2 ;; esac
 fi
 
 rand="$$-$(date +%s)"
@@ -105,12 +105,12 @@ stage() { # localfile remoteflag  -> scp to head, append flag+remote-path
 
 if [ -n "$library_ref" ]; then
   case "$model" in
-    boltz2|protenix|openfold3|rfaa|esm|evolvepro) rargs+=("$input_option" "$library_ref") ;;
+    boltz2|protenix|openfold3|rf3|rfaa|esm|evolvepro) rargs+=("$input_option" "$library_ref") ;;
     *) echo "bio-fold: $model needs a structure input; construct/assembly references are unsupported" >&2; exit 2 ;;
   esac
 else
 case "$model" in
-  boltz2|protenix|openfold3|rfaa|esm|evolvepro)
+  boltz2|protenix|openfold3|rf3|rfaa|esm|evolvepro)
     if [ -n "$seq" ]; then seq_tmp="$(mktemp --suffix=.fasta)"; infile="$seq_tmp"; printf '>query\n%s\n' "$seq" > "$infile"; fi
     [ -n "$infile" ] || { echo "bio-fold: $model needs --construct, --assembly, --seq or a supported input file" >&2; exit 2; }
     case "$input_option" in
@@ -161,11 +161,39 @@ rsync -a -e "ssh ${SSHO[*]}" "$RUSER@$HEAD:$rpath/" "$outdir/" || { echo "bio-fo
 # and exclude preparation directories from the fallback used by other models.
 struct=""
 case "$model" in
+  rf3)
+    # Raw RF3 samples remain available even when their requested chemistry fails.
+    # Use only the audited selection, bound to the successful runtime receipt.
+    struct=$(python3 - "$outdir" <<'RF3OUTPUT'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+try:
+    receipt = json.loads((root / 'rf3-runtime.json').read_text())
+    if receipt.get('status') != 'complete' or receipt.get('output_validation', {}).get('status') != 'passed':
+        raise ValueError('prediction has no successful chemistry audit')
+    files = ((receipt['outputs']['model'], receipt['outputs']['model_sha256']),
+             ('rf3-output-validation.json', receipt['output_validation_sha256']))
+    for name, expected in files:
+        relative = pathlib.Path(name)
+        path = root / relative
+        if relative.is_absolute() or '..' in relative.parts or not path.resolve().is_relative_to(root):
+            raise ValueError('audited output path escapes the result directory')
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ValueError('audited output is missing or its checksum differs')
+    audit = json.loads((root / 'rf3-output-validation.json').read_text())
+    if audit.get('status') != 'passed' or audit != receipt['output_validation']:
+        raise ValueError('chemistry audit does not match the runtime receipt')
+    print(root / receipt['outputs']['model'])
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    print('bio-fold: RF3 output verification failed: ' + str(exc), file=sys.stderr)
+    sys.exit(1)
+RF3OUTPUT
+    ) || exit 1 ;;
   openfold3) struct="$(find "$outdir" -type f -name '*_model.cif' -print -quit 2>/dev/null)" ;;
   boltz2|protenix) struct="$(find "$outdir" -type f -path '*/predictions/*' \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)" ;;
 esac
 if [ -z "$struct" ]; then
-  struct="$(find "$outdir" -type d \( -name prepared -o -name prepared-bundle -o -name prepared-native -o -name template_data -o -name api-jobs -o -name api-audit \) -prune -o -type f \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)"
+  struct="$(find "$outdir" -type d \( -name prepared -o -name prepared-bundle -o -name prepared-native -o -name native-input -o -name library-input -o -name template_data -o -name api-jobs -o -name api-audit \) -prune -o -type f \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)"
 fi
 echo "bio-fold: results in $outdir${struct:+  (structure: $struct)}"
 if [ -n "$struct" ]; then

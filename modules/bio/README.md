@@ -6,8 +6,11 @@ tools behind uniform `bio-*` command-line wrappers, plus PyMOL for visualization
 For cloud runs, `bio-fold MODEL --fasta input.fasta --render` submits to the
 configured head, downloads results to `~/bio-runs/JOB`, and renders locally.
 `--view` opens PyMOL interactively. Folding models include Boltz-2, OpenFold3,
-Protenix and RFAA; the same interface also supports RFdiffusion, ProteinMPNN,
+Protenix and RF3; the same interface also supports RFdiffusion, ProteinMPNN,
 ESM-2 and EVOLVEpro. See [cloud setup and usage](../../machines/head/README.md).
+RFAA remains available for explicit single-sequence runs while its separate full
+database installation is parked. RF3 is installed on cloud workers through
+`bio-fold rf3`; it does not require a workstation RF3 environment.
 
 Use `bio-library` to store versioned proteins, oligos, small molecules and
 assemblies on the head, then `bio-fold MODEL --construct NAME` or `--assembly NAME`.

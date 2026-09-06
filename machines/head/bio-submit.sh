@@ -11,7 +11,7 @@ LOC=FIN-02
 [ ! -r "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}" ] || source "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}"
 usage() { cat <<'USAGE'
 bio-submit MODEL --fasta FILE [options]
-Models: boltz2, openfold3, protenix, rfaa, rfdiffusion, mpnn, esm, evolvepro
+Models: boltz2, openfold3, protenix, rf3, rfaa, rfdiffusion, mpnn, esm, evolvepro
 Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
 Library: --construct REF | --assembly REF (pinned and checked before GPU rental)
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
@@ -30,6 +30,7 @@ case "$tool" in
   esm|esm2) recipe=esm; inkind=fasta; tier=modern ;;
   mpnn|proteinmpnn) recipe=mpnn; inkind=pdb; tier=modern ;;
   rfdiffusion|rfd) recipe=rfdiffusion; inkind=optpdb; tier=ampere ;;
+  rf3) recipe=rf3; inkind=fasta; tier=cuda128 ;;
   rfaa) recipe=rfaa; inkind=fasta; tier=ampere ;;
   evolvepro) recipe=evolvepro; inkind=fasta; tier=modern ;;
   boltz2|boltz) recipe=boltz2; inkind=fasta; tier=latest ;;
@@ -44,7 +45,7 @@ gpu=""; spot=""; infile=""; labels=""; model=""; sub=""; contigs=""; num=""; tem
 msa_backend="${BIO_MSA_DEFAULT_BACKEND:-public}"; msa_bundle=""; bundle_result=""
 library_ref=""; library_kind=""; library_bundle=""; library_sha=""; library_format=""; library_has_protein=""; input_flag=""
 panel_manifest_sha=""
-case "$recipe" in openfold3|boltz2|protenix) ;; *) msa_backend=public;; esac
+case "$recipe" in openfold3|boltz2|protenix|rf3) ;; *) msa_backend=public;; esac
 if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
   case "${1:-}" in ""|-*) ;; *) sub="$1"; shift ;; esac
 fi
@@ -77,17 +78,17 @@ done
 [ -n "$infile$library_ref" ] || [[ "$inkind" = opt* ]] || { echo 'bio-submit: input required' >&2; exit 2; }
 [ -z "$library_ref" ] || [ -z "$infile$contigs$msa_bundle" ] || { echo 'bio-submit: library references conflict with raw input, contigs or prepared bundles' >&2; exit 2; }
 [ "$recipe" != rfdiffusion ] || [ -n "$contigs" ] || { echo 'bio-submit: --contigs required' >&2; exit 2; }
-if [ "$recipe" = protenix ] && [ -n "$gpu" ]; then
+if [[ "$recipe" = protenix || "$recipe" = rf3 ]] && [ -n "$gpu" ]; then
   case "$gpu" in
     1A100.22V|1A100.40S.22V|1L40S.20V|1H100.80S.32V) ;;
-    *) echo 'bio-submit: Protenix requires an A100, L40S or H100 worker with CUDA 12.8; its pinned kernels do not support Blackwell' >&2; exit 2 ;;
+    *) echo "bio-submit: ${recipe^} requires a validated A100, L40S or H100 worker with CUDA 12.8" >&2; exit 2 ;;
   esac
 fi
 case "$msa_backend" in public|private) ;; *) echo 'bio-submit: --msa-backend must be public or private' >&2; exit 2;; esac
 if [ -n "$library_ref" ]; then
-  case "$recipe" in boltz2|openfold3|protenix|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
+  case "$recipe" in boltz2|openfold3|protenix|rf3|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
   if [ "$msa_backend" = private ]; then
-    case "$recipe" in boltz2|openfold3|protenix) ;; *) echo 'bio-submit: this model does not use the shared private MSA backend' >&2; exit 2;; esac
+    case "$recipe" in boltz2|openfold3|protenix|rf3) ;; *) echo 'bio-submit: this model does not use the shared private MSA backend' >&2; exit 2;; esac
   fi
   # Resolve aliases once, before compiling; all later work uses this exact revision.
   library_ref=$(python3 - "$TOOLS_SRC/library" "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" "$library_ref" "$library_kind" <<'PY'
@@ -103,7 +104,7 @@ PY
   mkdir -p "$RESULTS_DIR/library-inputs"
   library_bundle="$RESULTS_DIR/library-inputs/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   compile_args=(--root "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" --ref "$library_ref" --model "$recipe" --out "$library_bundle" --msa-backend "$msa_backend")
-  [ "$msa_backend" != private ] || compile_args+=(--plain-fasta)
+  if [ "$msa_backend" = private ] && [ "$recipe" != rf3 ]; then compile_args+=(--plain-fasta); fi
   python3 "$TOOLS_SRC/library/runtime.py" "${compile_args[@]}"
   library_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$library_bundle/bundle.json")
   library_format=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["format"])' "$library_bundle/bundle.json")
@@ -137,7 +138,9 @@ if [ "$recipe" = msa ]; then
       [ -z "$bundle_result" ] || { echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2; } ;;
     prepare)
       [ -n "$infile" ] || { echo 'bio-submit: MSA preparation needs --fasta' >&2; exit 2; }
-      case "$model" in openfold3|boltz2|protenix) ;; *) echo 'bio-submit: MSA preparation needs --model openfold3|boltz2|protenix' >&2; exit 2;; esac ;;
+      case "$model" in openfold3|boltz2|protenix) ;;
+        rf3) python3 "$TOOLS_SRC/rf3/msa.py" validate-queries --input "$infile" ;;
+        *) echo 'bio-submit: MSA preparation needs --model openfold3|boltz2|protenix|rf3' >&2; exit 2;; esac ;;
     panel)
       [ -n "$infile" ] || { echo 'bio-submit: MSA panel needs --json MANIFEST.json' >&2; exit 2; } ;;
     *) echo 'bio-submit: MSA --sub must be install, convert, panel, prepare or serve' >&2; exit 2;;
@@ -194,8 +197,56 @@ if [ "$recipe" = evolvepro ]; then
   [ -z "$labels" ] || check+=(--labels "$labels")
   python3 "$TOOLS_SRC/py/evolvepro_cloud.py" "${check[@]}" "${extra[@]}"
 fi
+# RF3 accepts explicit per-chain A3Ms. Search on the head/public API or a
+# separately accounted private MSA worker before renting an inference GPU.
+if [ "$recipe" = rf3 ]; then
+  [ -z "$sub$model$contigs$temp$labels" ] || { echo 'bio-submit: unsupported RF3 option' >&2; exit 2; }
+  [ -z "$num" ] || extra+=("diffusion_batch_size=$num")
+  for arg in "${extra[@]}"; do
+    case "$arg" in
+      n_recycles=*|num_steps=*|seed=*|diffusion_batch_size=*) ;;
+      *) echo "bio-submit: unsupported RF3 override $arg; input/checkpoint/MSA settings are managed" >&2; exit 2 ;;
+    esac
+  done
+  python3 - "$TOOLS_SRC/rf3/runtime.py" "${extra[@]}" <<'RF3SETTINGS'
+import runpy, sys
+runpy.run_path(sys.argv[1])['settings'](sys.argv[2:])
+RF3SETTINGS
+  [ "$input_flag" != --json ] || { echo 'bio-submit: import typed RF3 constructs/assemblies with bio-library; raw JSON assets cannot be staged implicitly' >&2; exit 2; }
+  rf3_root="$RESULTS_DIR/rf3-inputs/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  mkdir -p "$rf3_root"
+  if [ -n "$library_bundle" ]; then
+    infile=$(python3 "$TOOLS_SRC/library/adapters.py" materialize --bundle "$library_bundle" \
+      --model rf3 --out "$rf3_root/native" --expected-sha256 "$library_sha")
+    rf3_input_args=(--native-json "$infile")
+  else
+    rf3_input_args=(--fasta "$infile")
+  fi
+  python3 "$TOOLS_SRC/rf3/msa.py" queries "${rf3_input_args[@]}" > "$rf3_root/queries.json"
+  if [ -n "$msa_bundle" ]; then
+    python3 "$TOOLS_SRC/rf3/prepare.py" validate --input "$msa_bundle/input.json" >/dev/null
+    python3 - "$TOOLS_SRC/rf3" "$msa_bundle/msa-manifest.json" "$infile" <<'RF3CHECK'
+import sys
+sys.path.insert(0,sys.argv[1])
+from prepare import read_json, file_hash
+if read_json(sys.argv[2])['source_sha256'] != file_hash(sys.argv[3]):
+    raise SystemExit('bio-submit: RF3 prepared input differs from supplied input file')
+RF3CHECK
+  else
+    rf3_search_args=(--server-url "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}" --source public)
+    if [ "$msa_backend" = private ] && [ "$(cat "$rf3_root/queries.json")" != '{}' ]; then
+      bio-msa prepare --model rf3 --json "$rf3_root/queries.json" --timeout "$seconds" \
+        --bundle-result "$rf3_root/search-result.json"
+      rf3_search=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle"])' "$rf3_root/search-result.json")
+      rf3_search_args=(--search-bundle "$rf3_search")
+    fi
+    timeout --signal=TERM --kill-after=20 "$seconds" python3 "$TOOLS_SRC/rf3/msa.py" prepare \
+      "${rf3_input_args[@]}" "${rf3_search_args[@]}" --out "$rf3_root/prepared" --name "${name:-rf3_job}"
+    msa_bundle="$rf3_root/prepared"
+  fi
+fi
 # Prepare and validate complete native inputs before renting an inference GPU.
-if [ "$recipe" != msa ] && { [ "$msa_backend" = private ] || [ -n "$msa_bundle" ]; }; then
+if [ "$recipe" != msa ] && [ "$recipe" != rf3 ] && { [ "$msa_backend" = private ] || [ -n "$msa_bundle" ]; }; then
   case "$recipe" in openfold3|boltz2|protenix) ;; *) echo 'bio-submit: this model does not use the shared MSA backend' >&2; exit 2;; esac
   if [ -z "$msa_bundle" ]; then
     mkdir -p "$STATE_DIR"
@@ -251,7 +302,7 @@ fi
 if [ -n "$library_bundle" ]; then
   python3 "$TOOLS_SRC/library/adapters.py" validate --bundle "$library_bundle" --model "$recipe" --expected-sha256 "$library_sha" >/dev/null
   cp -a "$library_bundle" "$LOCALOUT/library-input"
-  if [ "$library_format" != protein-fasta ]; then
+  if [ "$library_format" != protein-fasta ] && [ "$recipe" != rf3 ]; then
     RNATIVE="$run/in/native-bundle"
     cp -a "$library_bundle" "$RNATIVE"
     python3 "$TOOLS_SRC/library/adapters.py" validate --bundle "$RNATIVE" --model "$recipe" --expected-sha256 "$library_sha" >/dev/null
@@ -265,10 +316,13 @@ bundle="$LOCALOUT/tools.tar.gz"
 bundle_dirs=(recipes py requirements rfaa)
 [ ! -d "$TOOLS_SRC/msa" ] || bundle_dirs+=(msa)
 [ ! -d "$TOOLS_SRC/library" ] || bundle_dirs+=(library)
+[ ! -d "$TOOLS_SRC/rf3" ] || bundle_dirs+=(rf3)
 tar -czhf "$bundle" -C "$TOOLS_SRC" "${bundle_dirs[@]}"
 bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 # printf %q preserves argument boundaries and prevents input text becoming code.
 remote_file="$LOCALOUT/remote.sh"
+remote_msa_bundle="$RPREP"
+[ "$recipe" != rf3 ] || remote_msa_bundle=""
 {
   printf 'set -euo pipefail\n'
   printf 'export BIO_JOB_DEADLINE_EPOCH=$(( $(date +%%s) + 10#%s ))\n' "$seconds"
@@ -280,7 +334,8 @@ remote_file="$LOCALOUT/remote.sh"
   printf 'SHARED_NFS=%q\n' "$SHARED_NFS"
   if [ "$recipe" = rfaa ]; then printf 'RFAA_DB_NFS=%q\n' "$db_nfs"; else printf 'RFAA_DB_NFS=""\n'; fi
   if [ "$recipe" = msa ]; then printf 'MSA_DB_NFS=%q\n' "$db_nfs"; else printf 'MSA_DB_NFS=""\n'; fi
-  printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$RPREP"
+  printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$remote_msa_bundle"
+  if [ "$recipe" = rf3 ]; then printf 'export BIO_RF3_INPUT=%q\n' "$RPREP/input.json"; fi
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
   printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
@@ -403,6 +458,33 @@ trap 'exit 129' HUP
 if [ -n "$db_nfs" ]; then
   "$storage_tool" track --volume "$db_volume" --job-dir "$LOCALOUT" --pid "$$"
 fi
+msa_worker_image=""; launch_environment=()
+if [ "$recipe" = msa ] && [ "$sub" != convert ] && [ -z "$gpu" ]; then
+  selection_args=(select --tools-root "$TOOLS_SRC")
+  [ -z "$spot" ] || selection_args+=(--spot-only)
+  bio-msa-worker "${selection_args[@]}" > "$LOCALOUT/worker-choice.json"
+  selection=$(python3 - "$LOCALOUT/worker-choice.json" <<'MSAWORKER'
+import json, math, os, re, sys
+value=json.load(open(sys.argv[1]))
+kind=value['instance_type']; image=value['image']; spot=value['spot']
+cap=float(os.environ.get('DC_MAX_INSTANCE_HOURLY') or 13)
+valid=(value['schema']==1 and value['kind']=='msa-worker-choice' and value['reserved'] is False
+       and value['location']=='FIN-02' and type(spot) is bool
+       and isinstance(kind,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*',kind)
+       and image in ('ubuntu-24.04','ubuntu-24.04-cuda-12.8-open-docker')
+       and math.isfinite(cap) and cap>0 and 0<float(value['price_per_hour'])<=13
+       and float(value['conservative_gib'])>=768 and value['maximum_instance_hourly']==13)
+if not valid:
+    raise SystemExit('bio-submit: invalid MSA worker choice; no instance was launched')
+print('\t'.join((kind,'yes' if spot else 'no',image,str(min(cap,13)))))
+MSAWORKER
+  )
+  IFS=$'\t' read -r gpu selected_spot msa_worker_image msa_max_hourly <<< "$selection"
+  spot=""; [ "$selected_spot" != yes ] || spot=--spot
+  # The selector's availability/price is advisory. dc rechecks its own fresh
+  # quote, budget and watchdog before POST, with this same upper bound.
+  launch_environment=(env "DC_MAX_INSTANCE_HOURLY=$msa_max_hourly")
+fi
 # Older CUDA wheels do not support Blackwell. CUDA 11 RF stacks use Ampere.
 if [ -n "$gpu" ]; then candidates=("$gpu")
 else
@@ -422,7 +504,8 @@ for g in "${candidates[@]}"; do
   image_args=()
   [ "$g" != 1A6000.10V ] || image_args=(--image ubuntu-24.04-cuda-12.6-docker)
   if [ "$recipe" = msa ] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
-  if out=$(dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --max-hours "$max_hours" 2>&1); then
+  [ -z "$msa_worker_image" ] || image_args=(--image "$msa_worker_image")
+  if out=$("${launch_environment[@]}" dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --max-hours "$max_hours" 2>&1); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)
     ip=$(printf '%s\n' "$out" | sed -n 's/.*READY.*ip=\([^ ]*\).*/\1/p' | tail -1)
     [ -n "$id" ] && [ -n "$ip" ] && break
@@ -467,7 +550,11 @@ with open(p,'w') as f: json.dump(data,f,indent=2)
 PY
 [ "$status" -eq 0 ] || { echo "bio-submit: FAILED ($status); logs at $LOCALOUT" >&2; exit "$status"; }
 if [ "$recipe" = msa ] && [ "$sub" = prepare ]; then
-  python3 "$TOOLS_SRC/msa/prepared.py" validate --bundle "$LOCALOUT/prepared" --model "$model" --fasta "$infile"
+  if [ "$model" = rf3 ]; then
+    python3 "$TOOLS_SRC/rf3/msa.py" validate-search --input "$LOCALOUT/prepared" --queries "$infile" >/dev/null
+  else
+    python3 "$TOOLS_SRC/msa/prepared.py" validate --bundle "$LOCALOUT/prepared" --model "$model" --fasta "$infile"
+  fi
 fi
 if [ -n "$panel_manifest_sha" ]; then
   python3 "$TOOLS_SRC/msa/panel.py" verify --manifest "$LOCALOUT/panel-manifest.json" \

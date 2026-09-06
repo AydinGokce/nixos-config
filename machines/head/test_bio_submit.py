@@ -64,6 +64,7 @@ set -eu
 if [ "$1" = launch ]; then
   echo "launch:$2" >> "$AUDIT/events"
   echo "$*" >> "$AUDIT/launch-args"
+  echo "${DC_MAX_INSTANCE_HOURLY:-unset}" >> "$AUDIT/launch-price-caps"
   if [ "${DENY_BUDGET:-0}" = 1 ]; then echo 'BUDGET HALT'; exit 4; fi
   echo "$2" >> "$AUDIT/launches"
   if [ "${NO_GPU_CAPACITY:-0}" = 1 ]; then exit 1; fi
@@ -147,6 +148,20 @@ receipt.write_text('invalid json' if os.environ.get('PREPARATION_BAD_RECEIPT') =
 PY
 ''',
         }
+        stubs["bio-msa-worker"] = '''#!/usr/bin/env bash
+set -eu
+echo "$*" >> "$AUDIT/worker-selection-calls"
+[ "${MSA_SELECTOR_EXIT:-0}" = 0 ] || exit "$MSA_SELECTOR_EXIT"
+python3 - <<'PY'
+import json, os
+kind=os.environ.get('MSA_SELECTED_TYPE','CPU.360V.1440G')
+print(json.dumps(dict(schema=1,kind='msa-worker-choice',reserved=False,location='FIN-02',
+    instance_type=kind,spot=os.environ.get('MSA_SELECTED_SPOT')=='1',
+    image='ubuntu-24.04' if kind.startswith('CPU.') else 'ubuntu-24.04-cuda-12.8-open-docker',
+    price_per_hour=float(os.environ.get('MSA_SELECTED_PRICE','8')),conservative_gib=1000,
+    maximum_instance_hourly=13)))
+PY
+'''
         stubs["bio-msa-storage"] = stubs["bio-rfaa-storage"].replace("storage-checks", "msa-storage-checks").replace("RFAA", "MSA")
         for name, body in stubs.items():
             path = commands / name
@@ -435,6 +450,64 @@ mkdir -p "$LOCALOUT"
                 self.assertIn("export MMSEQS_SERVICE_HOST_URL=" + expected + "\n",
                               (self.root / "transmitted.sh").read_text())
 
+    def rf3_fixture(self):
+        shutil.copytree(SCRIPT.parent / "rf3", self.root / "tools" / "rf3",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        sequence = "".join(self.input.read_text().splitlines()[1:])
+        alignment = self.root / "query.a3m"
+        alignment.write_text(f">query\n{sequence}\n>homolog TaxID=42\n{sequence}\n")
+        mapping = self.root / "mapping.json"
+        mapping.write_text(json.dumps({"A": str(alignment)}))
+        bundle = self.root / "rf3 prepared bundle"
+        subprocess.run([sys.executable, str(SCRIPT.parent / "rf3/prepare.py"), "prepare",
+                        "--fasta", str(self.input), "--msa-map", str(mapping), "--out", str(bundle)],
+                       check=True, capture_output=True, text=True)
+        return bundle
+
+    def test_rf3_prepared_input_is_validated_staged_and_bound_before_launch(self):
+        bundle = self.rf3_fixture()
+        result = subprocess.run(["bash", str(SCRIPT), "rf3", "--fasta", str(self.input),
+                                 "--msa-bundle", str(bundle)], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        transmitted = (self.root / "transmitted.sh").read_text()
+        self.assertIn("export BIO_RF3_INPUT=", transmitted)
+        self.assertIn("/in/prepared/input.json", transmitted)
+        self.assertIn('recipes/rf3.sh', transmitted)
+        run = next((self.root / "shared/runs").iterdir())
+        self.assertEqual((run / "in/prepared/msas/A.a3m").read_bytes(),
+                         (bundle / "msas/A.a3m").read_bytes())
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["1A100.22V"])
+
+    def test_rf3_tampered_or_wrong_query_input_never_rents(self):
+        bundle = self.rf3_fixture()
+        self.input.write_text(">different\nACDEFGHIK\n")
+        result = subprocess.run(["bash", str(SCRIPT), "rf3", "--fasta", str(self.input),
+                                 "--msa-bundle", str(bundle)], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('differs from supplied input', result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_rf3_failed_search_does_not_fall_back_or_rent(self):
+        self.rf3_fixture()
+        result = subprocess.run(["bash", str(SCRIPT), "rf3", "--fasta", str(self.input)],
+                                env=dict(self.env, MMSEQS_SERVICE_HOST_URL="http://invalid.example"),
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('requires HTTPS', result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_rf3_private_malformed_queries_never_rent_msa_worker(self):
+        self.rf3_fixture()
+        queries = self.root / "invalid-queries.json"
+        queries.write_text('{"A": "NOT A SEQUENCE"}')
+        result = subprocess.run(["bash", str(SCRIPT), "msa", "--sub", "prepare",
+                                 "--model", "rf3", "--json", str(queries)], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
     def test_full_rfaa_without_database_configuration_never_rents_a_gpu(self):
         result = subprocess.run(["bash", str(SCRIPT), "rfaa", "--fasta", str(self.input)],
                                 env=dict(self.env, RFAA_DB_VOLUME="", RFAA_DB_NFS=""),
@@ -591,6 +664,32 @@ sleep() { :; }
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.root / "launches").read_text().splitlines(),
                          ["CPU.360V.1440G", "CPU.16V.64G"])
+
+    def test_default_msa_uses_available_worker_image_spot_and_fresh_price_cap(self):
+        result=self.submit('msa','--sub','install','--spot',
+                           **self.msa_settings(MSA_SELECTED_TYPE='8H100.80S.176V',MSA_SELECTED_SPOT='1',DC_MAX_INSTANCE_HOURLY='9'))
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        args=(self.root/'launch-args').read_text()
+        self.assertIn('launch 8H100.80S.176V',args)
+        self.assertIn('--spot',args)
+        self.assertIn('--image ubuntu-24.04-cuda-12.8-open-docker',args)
+        self.assertEqual((self.root/'launch-price-caps').read_text().strip(),'9.0')
+        self.assertIn('--spot-only',(self.root/'worker-selection-calls').read_text())
+        choice=next((self.root/'results').glob('*/worker-choice.json'))
+        self.assertFalse(json.loads(choice.read_text())['reserved'])
+
+    def test_msa_no_capacity_or_overpriced_selection_never_launches(self):
+        for settings in ({'MSA_SELECTOR_EXIT':'4'},{'MSA_SELECTED_PRICE':'14'}):
+            with self.subTest(settings=settings):
+                result=self.submit('msa','--sub','install',**self.msa_settings(**settings))
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse((self.root/'launches').exists())
+
+    def test_explicit_msa_worker_bypasses_automatic_selection(self):
+        result=self.submit('msa','--sub','install','--worker','CPU.360V.1440G',
+                           **self.msa_settings(MSA_SELECTOR_EXIT='4'))
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse((self.root/'worker-selection-calls').exists())
 
     def test_msa_convert_worker_failure_preserves_status_and_cleans_exact_worker(self):
         (self.msa_root / ".msa-databases.json").unlink()
