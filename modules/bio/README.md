@@ -9,6 +9,11 @@ configured head, downloads results to `~/bio-runs/JOB`, and renders locally.
 Protenix and RFAA; the same interface also supports RFdiffusion, ProteinMPNN,
 ESM-2 and EVOLVEpro. See [cloud setup and usage](../../machines/head/README.md).
 
+Use `bio-library` to store versioned proteins, oligos, small molecules and
+assemblies on the head, then `bio-fold MODEL --construct NAME` or `--assembly NAME`.
+The [construct library guide](../../machines/head/library/README.md) covers native
+model adapters, modified chemistry and hourly verified local backups.
+
 | Tool | Wrapper | What it does | On the 8GB 3070 |
 |------|---------|--------------|-----------------|
 | **ProteinMPNN** | `bio-mpnn` | fixed-backbone sequence design | ✅ runs great |

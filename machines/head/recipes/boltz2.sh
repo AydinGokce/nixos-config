@@ -1,6 +1,15 @@
 # Boltz-2 — AF3-class folding (MIT; commercial OK). Weights auto-download (~7.6GB)
 # to the shared cache. No local DBs: MSAs come from the remote ColabFold server
 # (--use_msa_server). IN = query FASTA (single protein chain).
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  [ -z "${BIO_MSA_BUNDLE:-}" ] || { echo 'boltz2: conflicting native/prepared inputs' >&2; exit 2; }
+  for arg in "${EXTRA_ARGS[@]}"; do
+    case "$arg" in
+      --use_msa_server*|--msa_*|--templates*|--out*|--cache*|--data*|--model*|--checkpoint*)
+        echo "boltz2: native input conflicts with $arg" >&2; exit 2 ;;
+    esac
+  done
+fi
 if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   python3 "$TOOLS/msa/prepared.py" validate --bundle "$BIO_MSA_BUNDLE" --model boltz2 --fasta "$IN"
   for arg in "${EXTRA_ARGS[@]}"; do
@@ -76,14 +85,21 @@ else:
                 sys.exit(f"Boltz kernel preflight failed: {type(layer).__name__}")
             print(f"Boltz CUDA kernel passed: {type(layer).__name__}", flush=True)
 PY
-SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t')
 YAML="$OUT/input.yaml"
 msa_args=(--use_msa_server)
-if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+output_format=pdb
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  YAML=$("$P" "$TOOLS/library/adapters.py" materialize --bundle "$BIO_NATIVE_BUNDLE" \
+      --model boltz2 --out "$OUT/native-input")
+  cd "$OUT/native-input"
+  output_format=mmcif
+  [ "$BIO_NATIVE_HAS_PROTEIN" = 1 ] || msa_args=()
+elif [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   YAML=$("$P" "$TOOLS/msa/prepared.py" materialize --bundle "$BIO_MSA_BUNDLE" \
       --model boltz2 --fasta "$IN" --out "$OUT/prepared-native")
   msa_args=()
 else
+SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t')
 cp "$IN" "$OUT/reference_input.fasta"
 cat > "$YAML" <<YAML
 version: 1
@@ -95,7 +111,7 @@ YAML
 fi
 # shellcheck disable=SC2086
 "$VENV/bin/boltz" predict "$YAML" "${msa_args[@]}" --accelerator gpu --devices 1 \
-  --out_dir "$OUT" --output_format pdb --cache "$BOLTZ_CACHE" "${EXTRA_ARGS[@]}"
+  --out_dir "$OUT" --output_format "$output_format" --cache "$BOLTZ_CACHE" "${EXTRA_ARGS[@]}"
 # Boltz catches preprocessing and prediction failures and can still exit zero.
 # Input files and intermediate caches are not evidence of a completed structure.
 "$VENV/bin/python" - "$OUT" <<'PY'
@@ -108,7 +124,7 @@ if not structures:
     sys.exit("Boltz finished without a predicted PDB/CIF; inspect preprocessing/prediction errors above")
 print(f"Boltz completed {len(structures)} predicted structure(s)")
 PY
-if [ -z "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -z "${BIO_MSA_BUNDLE:-}" ] && [ -z "${BIO_NATIVE_BUNDLE:-}" ]; then
   "$P" "$TOOLS/msa/prepared.py" capture --model boltz2 --run-dir "$OUT" \
     --out "$OUT/prepared-bundle" --source public --endpoint https://api.colabfold.com
 fi

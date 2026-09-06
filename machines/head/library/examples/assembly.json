@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "kind": "assembly",
+  "id": "example-peptide-oligo",
+  "name": "Example peptide and oligo assembly",
+  "tags": ["example"],
+  "status": "draft",
+  "identity": {
+    "components": [
+      {"chain_id": "A", "construct_ref": "construct:example-peptide@1"},
+      {"chain_id": "R", "construct_ref": "construct:example-oligo@1"}
+    ],
+    "bonds": []
+  },
+  "provenance": {"source": "Illustrative schema example; import the component records first"}
+}

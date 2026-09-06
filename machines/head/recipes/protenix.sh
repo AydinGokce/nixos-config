@@ -1,8 +1,19 @@
 # Protenix (ByteDance AF3 reproduction; Apache-2.0, commercial OK). Weights
-# auto-download. Uses the remote ColabFold MSA server. IN = query FASTA.
+# auto-download. Uses the remote ColabFold MSA server. IN = query FASTA, or
+# BIO_NATIVE_BUNDLE supplies a validated model-native molecular assembly.
 # Uses torch 2.7.1+cu128 and the default cuEquivariance kernels. Importing its
 # fused LayerNorm also requires nvcc and Ninja. Weights download can be slow.
-if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  [ -z "${BIO_MSA_BUNDLE:-}" ] || {
+    echo 'protenix: native molecular and prepared single-protein bundles conflict' >&2; exit 2
+  }
+  for arg in "${EXTRA_ARGS[@]}"; do
+    case "$arg" in
+      -i*|-o*|--input*|--out_dir*|--dump_dir*|--use_default_params*)
+        echo "protenix: native input conflicts with $arg" >&2; exit 2 ;;
+    esac
+  done
+elif [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   python3 "$TOOLS/msa/prepared.py" validate --bundle "$BIO_MSA_BUNDLE" --model protenix --fasta "$IN"
   for arg in "${EXTRA_ARGS[@]}"; do
     case "$arg" in
@@ -82,9 +93,13 @@ with torch.no_grad():
                                rtol=1e-4, atol=1e-4)
 print("Protenix fused CUDA LayerNorm check passed", flush=True)
 PY
-SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-protenix_job}"
 J="$OUT/input.json"
-if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  J=$(python3 "$TOOLS/library/adapters.py" materialize --bundle "$BIO_NATIVE_BUNDLE" \
+      --model protenix --out "$OUT/native-input")
+  # Native FILE_ ligand paths remain relative to this verified bundle.
+  cd "$OUT/native-input"
+elif [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   J=$("$P" "$TOOLS/msa/prepared.py" materialize --bundle "$BIO_MSA_BUNDLE" \
       --model protenix --fasta "$IN" --out "$OUT/prepared-native")
   # Prepared inference must never fall back to a public search. Keep MSA
@@ -102,6 +117,7 @@ assert queries and not any(need_msa_search(query) for query in queries), (
 print("Protenix prepared MSA paths verified; remote generation disabled", flush=True)
 PY
 else
+SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-protenix_job}"
 cp "$IN" "$OUT/reference_input.fasta"
 cat > "$J" <<JSON
 [ { "name": "$JOB", "sequences": [ { "proteinChain": { "sequence": "$SEQ", "count": 1 } } ] } ]
@@ -121,7 +137,7 @@ have_gpu
   echo 'protenix: no predicted CIF produced; inspect the inference/MSA errors above' >&2
   exit 1
 }
-if [ -z "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -z "${BIO_MSA_BUNDLE:-}" ] && [ -z "${BIO_NATIVE_BUNDLE:-}" ]; then
   "$P" "$TOOLS/msa/prepared.py" capture --model protenix --run-dir "$OUT" \
     --out "$OUT/prepared-bundle" --source public --endpoint "$MMSEQS_SERVICE_HOST_URL"
 fi

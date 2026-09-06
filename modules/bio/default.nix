@@ -46,6 +46,10 @@ let
   mkBioCmd = { name, runtimeInputs ? [ ] }:
     pkgs.writeShellScriptBin name ''
       export PATH=${lib.makeBinPath (commonRuntime ++ runtimeInputs)}''${PATH:+:$PATH}
+      ${lib.optionalString (builtins.elem name [ "bio-library" "bio-library-backup" ]) ''
+        export BIO_LIBRARY_CLIENT=''${BIO_LIBRARY_CLIENT:-${./py/library_client.py}}
+        export BIO_LIBRARY_REGISTRY=''${BIO_LIBRARY_REGISTRY:-${../../machines/head/library/registry.py}}
+      ''}
       set -o pipefail
       ${builtins.readFile (./scripts + "/${name}.sh")}
     '';
@@ -59,6 +63,8 @@ let
       (mkBioCmd { name = "bio-setup"; })
       # laptop-side: run a cluster model, fetch the result, view/render locally
       (mkBioCmd { name = "bio-fold"; runtimeInputs = [ pkgs.openssh pkgs.rsync ]; })
+      (mkBioCmd { name = "bio-library"; runtimeInputs = [ pkgs.openssh ]; })
+      (mkBioCmd { name = "bio-library-backup"; runtimeInputs = [ pkgs.openssh ]; })
     ]
     # Per-tool run wrappers, gated on their enable flag.
     ++ lib.optional cfg.tools.esm.enable (mkBioCmd { name = "bio-esm"; })
@@ -195,6 +201,12 @@ in
       };
     };
 
+    library.backup.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Pull and restore-check an hourly construct-library snapshot while this user's workstation is running.";
+    };
+
     tools = lib.mapAttrs
       (name: default: {
         enable = lib.mkOption {
@@ -215,6 +227,9 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Keep scheduled pulls running while the workstation is on, including
+    # after logout; Persistent timers catch up after the machine was offline.
+    users.users.${cfg.user}.linger = lib.mkIf cfg.library.backup.enable true;
     # Run foreign (PyPI/CUDA) ELF binaries natively on NixOS.
     programs.nix-ld.enable = true;
     programs.nix-ld.libraries = with pkgs; [
@@ -285,6 +300,27 @@ in
       "bio/py/viz.py".source = ./py/viz.py;
       "bio/py/clear_execstack.py".source = ./py/clear_execstack.py;
       "bio/py/rfaa_singleseq_patch.py".source = ./py/rfaa_singleseq_patch.py;
+      "bio/py/library_client.py".source = ./py/library_client.py;
+      "bio/library/registry.py".source = ../../machines/head/library/registry.py;
+    };
+
+    systemd.user.services.bio-library-backup = lib.mkIf cfg.library.backup.enable {
+      description = "Fetch and restore-check the head construct library";
+      unitConfig.ConditionUser = cfg.user;
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${mkBioCmd { name = "bio-library-backup"; runtimeInputs = [ pkgs.openssh ]; }}/bin/bio-library-backup";
+        UMask = "0077";
+        TimeoutStartSec = "30min";
+      };
+    };
+    systemd.user.timers.bio-library-backup = lib.mkIf cfg.library.backup.enable {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = "hourly";
+        Persistent = true;
+        RandomizedDelaySec = "5min";
+      };
     };
 
     environment.systemPackages =

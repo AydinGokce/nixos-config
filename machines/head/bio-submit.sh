@@ -1,5 +1,6 @@
 # Run a model on a temporary GPU and fetch results before deleting the instance.
 set -euo pipefail
+umask 077
 SHARED_NFS="nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH"
 SHARED_VOL="b8b3b446-e464-44dd-9e01-6402489f8c5a"
 SHARED_MNT=${BIO_SHARED_MNT:-/mnt/bio-shared}
@@ -12,6 +13,7 @@ usage() { cat <<'USAGE'
 bio-submit MODEL --fasta FILE [options]
 Models: boltz2, openfold3, protenix, rfaa, rfdiffusion, mpnn, esm, evolvepro
 Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
+Library: --construct REF | --assembly REF (pinned and checked before GPU rental)
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
          --gpu TYPE, --spot, --timeout SECONDS (default 7200), -- EXTRA_ARGS
 MSA: --msa-backend public|private, or --msa-bundle DIRECTORY for a prepared input.
@@ -40,6 +42,7 @@ case "$tool" in
 esac
 gpu=""; spot=""; infile=""; labels=""; model=""; sub=""; contigs=""; num=""; temp=""; name=""; seconds=7200; extra=()
 msa_backend="${BIO_MSA_DEFAULT_BACKEND:-public}"; msa_bundle=""; bundle_result=""
+library_ref=""; library_kind=""; library_bundle=""; library_sha=""; library_format=""; library_has_protein=""; input_flag=""
 panel_manifest_sha=""
 case "$recipe" in openfold3|boltz2|protenix) ;; *) msa_backend=public;; esac
 if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
@@ -47,14 +50,19 @@ if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
 fi
 while [ $# -gt 0 ]; do
   case "$1" in
-    --gpu|--worker|--model|--fasta|--pdb|--json|--in|--input-pdb|--labels|--sub|--contigs|--num-designs|--num|--num-seqs|--temp|--name|--timeout|--msa-backend|--msa-bundle|--bundle-result)
+    --gpu|--worker|--model|--fasta|--pdb|--json|--in|--input-pdb|--labels|--sub|--contigs|--num-designs|--num|--num-seqs|--temp|--name|--timeout|--msa-backend|--msa-bundle|--bundle-result|--construct|--assembly)
       [ $# -ge 2 ] || { echo "bio-submit: $1 needs a value" >&2; exit 2; }
       case "$1" in
         --gpu|--worker) gpu="$2";; --model) model="$2";; --labels) labels="$2";;
         --msa-backend) msa_backend="$2";; --msa-bundle) msa_bundle="$2";; --bundle-result) bundle_result="$2";;
+        --construct|--assembly)
+          [ -z "$library_ref" ] || { echo 'bio-submit: choose one library reference' >&2; exit 2; }
+          library_ref="$2"; library_kind="${1#--}" ;;
         --sub) sub="$2";; --contigs) contigs="$2";; --temp) temp="$2";;
         --name) name="$2";; --timeout) seconds="$2";;
-        --num-designs|--num|--num-seqs) num="$2";; *) infile="$2";;
+        --num-designs|--num|--num-seqs) num="$2";; *)
+          [ -z "$infile" ] || { echo 'bio-submit: choose one input file' >&2; exit 2; }
+          infile="$2"; input_flag="$1" ;;
       esac; shift ;;
     --spot) spot=--spot ;;
     --) shift; extra+=("$@"); break ;;
@@ -66,7 +74,8 @@ done
 [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 60 && seconds <= 85500 )) || { echo 'bio-submit: timeout must be 60..85500 seconds' >&2; exit 2; }
 [ -z "$infile" ] || [ -f "$infile" ] || { echo "bio-submit: input not found: $infile" >&2; exit 2; }
 [ -z "$labels" ] || [ -f "$labels" ] || { echo "bio-submit: labels not found: $labels" >&2; exit 2; }
-[ -n "$infile" ] || [[ "$inkind" = opt* ]] || { echo 'bio-submit: input required' >&2; exit 2; }
+[ -n "$infile$library_ref" ] || [[ "$inkind" = opt* ]] || { echo 'bio-submit: input required' >&2; exit 2; }
+[ -z "$library_ref" ] || [ -z "$infile$contigs$msa_bundle" ] || { echo 'bio-submit: library references conflict with raw input, contigs or prepared bundles' >&2; exit 2; }
 [ "$recipe" != rfdiffusion ] || [ -n "$contigs" ] || { echo 'bio-submit: --contigs required' >&2; exit 2; }
 if [ "$recipe" = protenix ] && [ -n "$gpu" ]; then
   case "$gpu" in
@@ -75,6 +84,52 @@ if [ "$recipe" = protenix ] && [ -n "$gpu" ]; then
   esac
 fi
 case "$msa_backend" in public|private) ;; *) echo 'bio-submit: --msa-backend must be public or private' >&2; exit 2;; esac
+if [ -n "$library_ref" ]; then
+  case "$recipe" in boltz2|openfold3|protenix|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
+  if [ "$msa_backend" = private ]; then
+    case "$recipe" in boltz2|openfold3|protenix) ;; *) echo 'bio-submit: this model does not use the shared private MSA backend' >&2; exit 2;; esac
+  fi
+  # Resolve aliases once, before compiling; all later work uses this exact revision.
+  library_ref=$(python3 - "$TOOLS_SRC/library" "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" "$library_ref" "$library_kind" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from registry import Registry, reference
+record = Registry(sys.argv[2]).show(sys.argv[3])
+if record['kind'] != sys.argv[4]:
+    raise SystemExit('bio-submit: reference kind does not match --'+sys.argv[4])
+print(reference(record))
+PY
+  )
+  mkdir -p "$RESULTS_DIR/library-inputs"
+  library_bundle="$RESULTS_DIR/library-inputs/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  compile_args=(--root "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" --ref "$library_ref" --model "$recipe" --out "$library_bundle" --msa-backend "$msa_backend")
+  [ "$msa_backend" != private ] || compile_args+=(--plain-fasta)
+  python3 "$TOOLS_SRC/library/runtime.py" "${compile_args[@]}"
+  library_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$library_bundle/bundle.json")
+  library_format=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["format"])' "$library_bundle/bundle.json")
+  library_has_protein=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["has_protein"]))' "$library_bundle/bundle.json")
+  infile="$library_bundle/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["entrypoint"])' "$library_bundle/bundle.json")"
+  if [ "$library_format" != protein-fasta ]; then
+    for arg in "${extra[@]}"; do
+      case "$arg" in
+        --input*|--query*|--msa*|--use_msa*|--use-msa*|--template*|--use_template*|--use-template*|--runner_yaml*|--runner-yaml*|--out*|--dump*|--data*|--load*|--cache*|--ccd*|--protein*|--ligand*|--num_workers*|--num-workers*|--no_boltz2*|--model*|--checkpoint*|--config*|--use_template*|*.yaml|*.json)
+          echo "bio-submit: native input conflicts with override $arg" >&2; exit 2 ;;
+      esac
+    done
+  fi
+elif [ -n "$infile" ] && [[ "$recipe" = boltz2 || "$recipe" = protenix || "$recipe" = openfold3 ]]; then
+  [ "$input_flag" != --json ] || { echo 'bio-submit: raw JSON is not a FASTA; import typed constructs/assemblies with bio-library' >&2; exit 2; }
+  python3 - "$infile" <<'PY'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+lines = [s.strip() for s in text.splitlines() if s.strip()]
+if not lines or not lines[0].startswith('>') or sum(s.startswith('>') for s in lines) != 1:
+    raise SystemExit('bio-submit: use one protein FASTA record; use a library assembly for multiple chains')
+seq = ''.join(lines[1:])
+if not seq or set(seq) - set('ACDEFGHIKLMNPQRSTVWY'):
+    raise SystemExit('bio-submit: FASTA requires canonical protein letters; use typed library inputs for DNA/RNA or modifications')
+PY
+fi
 if [ "$recipe" = msa ]; then
   sub="${sub:-prepare}"
   case "$sub" in
@@ -103,16 +158,22 @@ if [ "$recipe" = rfaa ]; then
     [[ -z "${!setting:-}" || "${!setting}" =~ ^[1-9][0-9]*$ ]] \
       || { echo "bio-submit: $setting must be a positive integer" >&2; exit 2; }
   done
-  python3 "$TOOLS_SRC/rfaa/prepare.py" --fasta "$infile" --validate-only
+  if [ -z "$library_bundle" ]; then python3 "$TOOLS_SRC/rfaa/prepare.py" --fasta "$infile" --validate-only; fi
   case "${sub:-full}" in
     full)
       # The default 64 GiB HHsuite limit needs the A100 nodes' 120 GB host RAM.
       # A6000 workers have only 60 GB; keep those for single-sequence jobs.
       tier=ampere_full
+      if [ -n "$library_bundle" ] && [ "$library_has_protein" = 0 ]; then
+        # No protein chains means no HHsuite searches or protein templates.
+        # Preserve the native assembly while avoiding an unrelated DB gate.
+        :
+      else
       [ -n "${RFAA_DB_VOLUME:-}" ] && [ -n "${RFAA_DB_NFS:-}" ] \
         || { echo 'bio-submit: full RFAA needs the database volume configured in rfaa-storage.nix' >&2; exit 2; }
       bio-rfaa-storage check --volume "$RFAA_DB_VOLUME"
-      db_nfs="$RFAA_DB_NFS"; db_volume="$RFAA_DB_VOLUME"; volumes+=(--volume "$db_volume") ;;
+      db_nfs="$RFAA_DB_NFS"; db_volume="$RFAA_DB_VOLUME"; volumes+=(--volume "$db_volume")
+      fi ;;
     single-seq) ;;
     *) echo 'bio-submit: RFAA --sub must be full or single-seq' >&2; exit 2 ;;
   esac
@@ -176,7 +237,7 @@ jobid="$recipe-$(date -u +%Y%m%d-%H%M%S)-$$"
 LOCALOUT="$RESULTS_DIR/$jobid"; mkdir -p "$LOCALOUT"
 exec > >(tee -a "$LOCALOUT/run.log") 2>&1
 run="$SHARED_MNT/runs/$jobid"; mkdir -p "$run/in" "$run/out"
-RIN=""; RLABELS=""; RPREP=""
+RIN=""; RLABELS=""; RPREP=""; RNATIVE=""; native_has_protein=""
 if [ -n "$infile" ]; then cp "$infile" "$run/in/input.${infile##*.}"; RIN="$run/in/input.${infile##*.}"; fi
 if [ -n "$panel_manifest_sha" ]; then
   python3 "$TOOLS_SRC/msa/panel.py" validate --manifest "$RIN" --expected-sha256 "$panel_manifest_sha"
@@ -187,12 +248,23 @@ if [ -n "$msa_bundle" ]; then
   RPREP="$run/in/prepared"; mkdir -p "$RPREP"
   cp -a "$msa_bundle/." "$RPREP/"
 fi
+if [ -n "$library_bundle" ]; then
+  python3 "$TOOLS_SRC/library/adapters.py" validate --bundle "$library_bundle" --model "$recipe" --expected-sha256 "$library_sha" >/dev/null
+  cp -a "$library_bundle" "$LOCALOUT/library-input"
+  if [ "$library_format" != protein-fasta ]; then
+    RNATIVE="$run/in/native-bundle"
+    cp -a "$library_bundle" "$RNATIVE"
+    python3 "$TOOLS_SRC/library/adapters.py" validate --bundle "$RNATIVE" --model "$recipe" --expected-sha256 "$library_sha" >/dev/null
+    native_has_protein=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["has_protein"]))' "$RNATIVE/bundle.json")
+  fi
+fi
 ROUT="$run/out"
 # NFS clients have returned stale recipe contents after deployment. Snapshot
 # authoritative code on the head and transmit it with the script over SSH.
 bundle="$LOCALOUT/tools.tar.gz"
 bundle_dirs=(recipes py requirements rfaa)
 [ ! -d "$TOOLS_SRC/msa" ] || bundle_dirs+=(msa)
+[ ! -d "$TOOLS_SRC/library" ] || bundle_dirs+=(library)
 tar -czhf "$bundle" -C "$TOOLS_SRC" "${bundle_dirs[@]}"
 bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 # printf %q preserves argument boundaries and prevents input text becoming code.
@@ -210,6 +282,7 @@ remote_file="$LOCALOUT/remote.sh"
   if [ "$recipe" = msa ]; then printf 'MSA_DB_NFS=%q\n' "$db_nfs"; else printf 'MSA_DB_NFS=""\n'; fi
   printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$RPREP"
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
+  printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
   printf 'export RFAA_CPU=%q RFAA_MEM_GB=%q\n' "${RFAA_CPU:-4}" "${RFAA_MEM_GB:-64}"
   # Protenix's ColabFold mode does not select the ColabFold host automatically.
@@ -370,10 +443,14 @@ for _ in $(seq 1 30); do
   sleep 8
 done
 [ "$ready" = 1 ] || { echo 'bio-submit: sshd never became ready' >&2; exit 1; }
-python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" "$db_volume" "$bundle_sha256" <<'PY'
+python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" "$db_volume" "$bundle_sha256" "$library_bundle" <<'PY'
 import json,sys,datetime
-p,job,model,instance,ip,gpu,timeout,db_volume,bundle_sha256=sys.argv[1:]
-with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
+p,job,model,instance,ip,gpu,timeout,db_volume,bundle_sha256,library=sys.argv[1:]
+source = None
+if library:
+    with open(library+'/bundle.json') as f: native=json.load(f)
+    source = {k: native[k] for k in ('source_ref', 'source_snapshot_sha256', 'sha256', 'format', 'msa_backend')}
+with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,library_input=source,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
 PY
 echo "bio-submit: running $recipe on $id ($ip), timeout ${seconds}s"
 status=0

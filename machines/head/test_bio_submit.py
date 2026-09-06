@@ -228,6 +228,67 @@ except (OSError, ValueError, KeyError, AssertionError):
         (path / "native-input.bin").write_bytes(b"opaque native model input")
         return path
 
+    def library_fixture(self):
+        """Use the real registry/compiler and mock only paid-model CPU setup.
+
+        The translated native input and all compiler/source checks are real.
+        Native model parser correctness is verified in separate library tests;
+        this fixture verifies that those checks must complete before rental.
+        """
+        source = SCRIPT.parent / "library"
+        destination = self.root / "tools/library"
+        shutil.copytree(source, destination, ignore=shutil.ignore_patterns("__pycache__"))
+        Registry = runpy.run_path(str(source / "registry.py"))["Registry"]
+        self.library_root = self.root / "library with 'quote"
+        library = Registry(self.library_root)
+        library.init()
+        library.import_record({"kind": "construct", "id": "enzyme", "aliases": ["target"],
+            "identity": {"molecule_type": "protein", "sequence": "ACDEFGHIK"}}, {"original.fasta": self.input})
+        library.import_record({"kind": "construct", "id": "oligo",
+            "identity": {"molecule_type": "rna", "sequence": "ACGU"}})
+        library.import_record({"kind": "assembly", "id": "complex", "identity": {
+            "components": [{"chain_id": "A", "construct_ref": "enzyme"},
+                           {"chain_id": "R", "construct_ref": "oligo"}], "bonds": []}})
+        self.env["BIO_LIBRARY_ROOT"] = str(self.library_root)
+        # Replace runtime environment provisioning, not the compiler. Ordinary
+        # protein/DNA/RNA translation uses only the standard library here.
+        (destination / "runtime.py").write_text('''import argparse, importlib, json, os
+from pathlib import Path
+from adapters import compile_input, MODELS
+from registry import Registry
+p=argparse.ArgumentParser()
+p.add_argument('--root', required=True)
+p.add_argument('--ref', required=True)
+p.add_argument('--model', required=True)
+p.add_argument('--out', required=True)
+p.add_argument('--msa-backend', default='public')
+p.add_argument('--plain-fasta', action='store_true')
+a=p.parse_args()
+audit=Path(os.environ['AUDIT'])
+def event(value):
+    with (audit/'events').open('a') as stream: stream.write(value+'\\n')
+event('library-compile:'+a.ref)
+if os.environ.get('LIBRARY_COMPILE_FAIL') == '1':
+    raise SystemExit('fixture compiler refused this input')
+if not a.plain_fasta and a.model in MODELS:
+    native=importlib.import_module(MODELS[a.model])
+    def preflight(directory, metadata):
+        event('library-native-preflight')
+        if os.environ.get('LIBRARY_PREFLIGHT_FAIL') == '1':
+            raise ValueError('fixture native parser refused this input')
+        return dict(native_parser=True, model_inference=False, msa_queries=False,
+                    test_fixture='Mock native CPU parser gate; translation/compiler are real')
+    native.preflight=preflight
+result=compile_input(a.root,a.ref,a.model,a.out,plain_fasta=a.plain_fasta,msa_backend=a.msa_backend)
+event('library-compiled:'+result['sha256'])
+if os.environ.get('LIBRARY_TAMPER_AFTER_COMPILE') == '1':
+    Path(result['entrypoint']).write_text('tampered input after successful compilation')
+if os.environ.get('LIBRARY_REVISE_AFTER_COMPILE') == '1':
+    Registry(a.root).revise('enzyme',dict(identity=dict(molecule_type='protein',sequence='YYYY')))
+print(json.dumps(result))
+''')
+        return library
+
     def panel_fixture(self):
         # Use the actual portable bundle validator for panel fetches; the
         # simpler single-preparation boundary stub remains unchanged elsewhere.
@@ -823,6 +884,163 @@ sleep() { :; }
                 self.assertFalse(receipt.exists())
                 metadata, = set((self.root / "results").glob("*/job.json")) - before
                 self.assertNotEqual(json.loads(metadata.read_text())["exit_status"], 0)
+
+    def test_library_construct_is_pinned_compiled_and_copied_before_gpu_launch(self):
+        library = self.library_fixture()
+        result = self.submit("boltz2", "--construct", "target")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = (self.root / "events").read_text().splitlines()
+        self.assertLess(events.index("library-compile:construct:enzyme@1"), events.index("library-native-preflight"))
+        self.assertLess(next(i for i, event in enumerate(events) if event.startswith("library-compiled:")),
+                        next(i for i, event in enumerate(events) if event.startswith("launch:")))
+        job = next((self.root / "results").glob("boltz2-*/job.json"))
+        metadata = json.loads(job.read_text())
+        copied = job.parent / "library-input"
+        bundle = json.loads((copied / "bundle.json").read_text())
+        snapshot = json.loads((copied / "source.json").read_text())
+        self.assertEqual(snapshot, library.snapshot("construct:enzyme@1"))
+        self.assertEqual(metadata["library_input"]["source_ref"], "construct:enzyme@1")
+        self.assertEqual(metadata["library_input"]["sha256"], bundle["sha256"])
+        self.assertEqual(metadata["library_input"]["source_snapshot_sha256"], snapshot["sha256"])
+        attached = copied / "assets/construct/enzyme/1/attachments/original.fasta"
+        self.assertEqual(attached.read_bytes(), self.input.read_bytes())
+        remote = (self.root / "transmitted.sh").read_text()
+        self.assertIn("BIO_NATIVE_SHA256=" + bundle["sha256"], remote)
+        self.assertIn("BIO_NATIVE_HAS_PROTEIN=1", remote)
+        self.assertIn("native-bundle", remote)
+        with tarfile.open(job.parent / "tools.tar.gz") as tools:
+            self.assertIn("library/adapters.py", tools.getnames())
+
+    def test_library_assembly_preserves_native_chain_types_and_source_snapshot(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--assembly", "complex")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied = next((self.root / "results").glob("boltz2-*/library-input"))
+        native = json.loads((copied / "input.yaml").read_text())
+        self.assertEqual([next(iter(item)) for item in native["sequences"]], ["protein", "rna"])
+        self.assertEqual([next(iter(item.values()))["id"] for item in native["sequences"]], ["A", "R"])
+        source = json.loads((copied / "source.json").read_text())
+        self.assertEqual(source["source_ref"], "assembly:complex@1")
+        self.assertEqual([item["construct_ref"] for item in source["components"]],
+                         ["construct:enzyme@1", "construct:oligo@1"])
+
+    def test_library_nucleic_acid_input_sets_native_has_protein_false(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--construct", "oligo")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("BIO_NATIVE_HAS_PROTEIN=0", (self.root / "transmitted.sh").read_text())
+
+    def test_rfaa_library_nucleic_acid_needs_no_protein_database(self):
+        self.library_fixture()
+        result = self.submit("rfaa", "--construct", "oligo", RFAA_DB_VOLUME="", RFAA_DB_NFS="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("BIO_NATIVE_HAS_PROTEIN=0", (self.root / "transmitted.sh").read_text())
+        metadata = json.loads(next((self.root / "results").glob("*/job.json")).read_text())
+        self.assertIsNone(metadata["database_volume"])
+        self.assertEqual(metadata["library_input"]["msa_backend"], "local-hhsuite")
+
+    def test_rfaa_library_protein_still_requires_full_database_and_rejects_shared_private_backend(self):
+        self.library_fixture()
+        for args in ((), ("--msa-backend", "private")):
+            with self.subTest(args=args):
+                result = self.submit("rfaa", "--construct", "enzyme", *args, RFAA_DB_VOLUME="", RFAA_DB_NFS="")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "launches").exists())
+
+    def test_private_library_protein_uses_plain_fasta_and_existing_preparation(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--construct", "enzyme", "--msa-backend", "private")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = (self.root / "events").read_text().splitlines()
+        compiled = next(i for i, event in enumerate(events) if event.startswith("library-compiled:"))
+        prepared = next(i for i, event in enumerate(events) if event.startswith("prepare:"))
+        launched = next(i for i, event in enumerate(events) if event.startswith("launch:"))
+        self.assertLess(compiled, prepared)
+        self.assertLess(prepared, launched)
+        self.assertNotIn("library-native-preflight", events)
+        source = next((self.root / "results").glob("boltz2-*/library-input/input.fasta"))
+        self.assertEqual(source.read_text(), ">construct\nACDEFGHIK\n")
+        remote = (self.root / "transmitted.sh").read_text()
+        self.assertIn("BIO_MSA_BUNDLE=", remote)
+        self.assertIn("BIO_NATIVE_BUNDLE=''", remote)
+        job = json.loads(next((self.root / "results").glob("boltz2-*/job.json")).read_text())
+        self.assertEqual(job["library_input"]["format"], "protein-fasta")
+        self.assertEqual(job["library_input"]["msa_backend"], "private")
+
+    def test_private_library_assembly_never_falls_back_to_public_or_rents(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--assembly", "complex", "--msa-backend", "private")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "preparation-calls").exists())
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_library_kind_mismatch_and_input_conflicts_fail_before_compilation(self):
+        self.library_fixture()
+        cases = [
+            ["--construct", "complex"], ["--assembly", "enzyme"], ["--construct", "unknown"],
+            ["--construct", "enzyme", "--assembly", "complex"],
+            ["--construct", "enzyme", "--fasta", self.input],
+            ["--construct", "enzyme", "--contigs", "[20-20]"],
+            ["--construct", "enzyme", "--msa-bundle", self.valid_bundle()],
+        ]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                result = self.submit("boltz2", *arguments)
+                self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "events").exists())
+
+    def test_failed_library_compiler_or_native_parser_never_rents_a_worker(self):
+        self.library_fixture()
+        for settings in [{"LIBRARY_COMPILE_FAIL": "1"}, {"LIBRARY_PREFLIGHT_FAIL": "1"}]:
+            with self.subTest(settings=settings):
+                result = self.submit("boltz2", "--construct", "enzyme", **settings)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "launches").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+        self.assertEqual(list((self.root / "results/library-inputs").iterdir()), [])
+
+    def test_library_bundle_tampering_after_compile_fails_before_gpu(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--construct", "enzyme", LIBRARY_TAMPER_AFTER_COMPILE="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inventory/checksums", result.stdout + result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_library_alias_revision_changes_do_not_change_the_pinned_job(self):
+        library = self.library_fixture()
+        result = self.submit("boltz2", "--construct", "target", LIBRARY_REVISE_AFTER_COMPILE="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(library.resolve("target"), "construct:enzyme@2")
+        job = json.loads(next((self.root / "results").glob("boltz2-*/job.json")).read_text())
+        self.assertEqual(job["library_input"]["source_ref"], "construct:enzyme@1")
+        copied = next((self.root / "results").glob("boltz2-*/library-input/source.json"))
+        self.assertEqual(json.loads(copied.read_text())["components"][0]["record"]["identity"]["sequence"], "ACDEFGHIK")
+
+    def test_library_input_override_options_are_rejected_before_rental(self):
+        self.library_fixture()
+        result = self.submit("boltz2", "--construct", "enzyme", "--", "--use_msa_server", "false")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("native input conflicts", result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_raw_json_is_not_silently_reinterpreted_as_protein_fasta(self):
+        source = self.root / "native.json"
+        source.write_text('{"queries":{}}\n')
+        result = self.submit("openfold3", "--json", source)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("raw JSON is not a FASTA", result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_canonical_esm_library_input_preserves_audited_plain_fasta(self):
+        self.library_fixture()
+        result = self.submit("esm", "--construct", "enzyme")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        copied = next((self.root / "results").glob("esm-*/library-input"))
+        self.assertEqual((copied / "input.fasta").read_text(), ">construct\nACDEFGHIK\n")
+        self.assertEqual(json.loads((copied / "bundle.json").read_text())["format"], "protein-fasta")
 
 
 class MsaRecipeTests(unittest.TestCase):

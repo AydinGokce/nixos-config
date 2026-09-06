@@ -1,8 +1,17 @@
 # RoseTTAFold-All-Atom. Full MSA/template preparation is the default; select
-# SUB=single-seq explicitly for a database-free smoke test. IN = one-chain FASTA.
+# SUB=single-seq explicitly for a database-free smoke test. IN = one-chain FASTA,
+# or BIO_NATIVE_BUNDLE supplies a verified native assembly.
 MODE="${SUB:-full}"
 case "$MODE" in full|single-seq) ;; *) echo 'rfaa: --sub must be full or single-seq' >&2; exit 2 ;; esac
-if [ "$MODE" = full ]; then
+NATIVE_CONFIG=""; HAS_PROTEIN=1
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  [ "${#EXTRA_ARGS[@]}" -eq 0 ] || { echo 'rfaa: extra native overrides are not supported for checked assemblies' >&2; exit 2; }
+  NATIVE_CONFIG=$(python3 "$TOOLS/library/adapters.py" materialize \
+    --bundle "$BIO_NATIVE_BUNDLE" --model rfaa --out "$OUT/native-input")
+  HAS_PROTEIN=$(python3 "$TOOLS/library/rfaa_adapter.py" info --config "$NATIVE_CONFIG" --field has-protein)
+  python3 "$TOOLS/library/rfaa_adapter.py" info --config "$NATIVE_CONFIG" --field proteins > "$OUT/native-proteins.tsv"
+fi
+if [ "$MODE" = full ] && [ "$HAS_PROTEIN" = 1 ]; then
   RFAA_MEM_GB="${RFAA_MEM_GB:-64}"
   [[ "$RFAA_MEM_GB" =~ ^[1-9][0-9]*$ ]] \
     || { echo 'rfaa: RFAA_MEM_GB must be a positive integer' >&2; exit 2; }
@@ -17,8 +26,10 @@ if [ "$MODE" = full ]; then
 fi
 RFAA_SCRIPTS="$TOOLS/rfaa"
 export RFAA_DB_DIR="${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
-python3 "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --validate-only
-if [ "$MODE" = full ]; then
+if [ -z "$NATIVE_CONFIG" ]; then
+  python3 "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --validate-only
+fi
+if [ "$MODE" = full ] && [ "$HAS_PROTEIN" = 1 ]; then
   python3 "$RFAA_SCRIPTS/databases.py" validate --root "$RFAA_DB_DIR"
 fi
 PY=$(nfs_py310)
@@ -46,23 +57,39 @@ uv pip install --python "$P" --no-deps "$SRC/rf2aa/SE3Transformer"
 # as the explicitly selected single-seq mode. Never alter a real template DB.
 "$P" "$TOOLS/py/rfaa_singleseq_patch.py" "$SRC/rf2aa/data/protein.py"
 "$P" "$RFAA_SCRIPTS/patch_templates.py" "$SRC/rf2aa/data/parsers.py"
+if [ -n "$NATIVE_CONFIG" ]; then
+  "$P" "$TOOLS/library/rfaa_adapter.py" verify-source --config "$NATIVE_CONFIG" --source "$SRC" \
+    > "$OUT/native-source-verification.json"
+fi
 WEIGHTS="$SRC/RFAA_paper_weights.pt"
 if [ "$(stat -c %s "$WEIGHTS" 2>/dev/null || echo 0)" != 1336673865 ]; then
   dl "https://files.ipd.uw.edu/pub/RF-All-Atom/weights/RFAA_paper_weights.pt" "$WEIGHTS.part"
   [ "$(stat -c %s "$WEIGHTS.part")" = 1336673865 ] || { echo 'rfaa: incomplete model weights' >&2; exit 1; }
   mv "$WEIGHTS.part" "$WEIGHTS"
 fi
-CH="$OUT/$NAME/A"
-if [ "$MODE" = full ]; then
+if [ "$MODE" = full ] && [ "$HAS_PROTEIN" = 1 ]; then
   source "$RFAA_SCRIPTS/tools.sh"
   HHDB="$RFAA_DB_DIR/pdb100_2021Mar03/pdb100_2021Mar03"
-  "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --out "$CH" --root "$RFAA_DB_DIR" \
-    --mode full --cpu "${RFAA_CPU:-4}" --mem "${RFAA_MEM_GB:-64}"
 else
   HHDB="$SHARED/cache/rfaa/blank-template/pdb100"
   mkdir -p "$(dirname "$HHDB")"
   : > "${HHDB}_pdb.ffindex"; printf '\0' > "${HHDB}_pdb.ffdata"
-  "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --out "$CH" --mode single-seq
+fi
+prepare_chain() {
+  local chain="$1" fasta="$2" prepared="$OUT/$NAME/$1"
+  if [ "$MODE" = full ]; then
+    "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$fasta" --out "$prepared" --root "$RFAA_DB_DIR" \
+      --mode full --cpu "${RFAA_CPU:-4}" --mem "${RFAA_MEM_GB:-64}"
+  else
+    "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$fasta" --out "$prepared" --mode single-seq
+  fi
+}
+if [ -n "$NATIVE_CONFIG" ]; then
+  while IFS=$'\t' read -r chain fasta; do
+    prepare_chain "$chain" "$fasta"
+  done < "$OUT/native-proteins.tsv"
+else
+  prepare_chain A "$IN"
 fi
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 WANDB_MODE=disabled
@@ -79,6 +106,12 @@ print("RFAA CUDA graph check passed", torch.__version__, dgl.__version__)
 PY
 have_gpu
 cd "$SRC"
-"$P" -m rf2aa.run_inference --config-name protein job_name="$NAME" output_path="$OUT" \
-  checkpoint_path="$WEIGHTS" protein_inputs.A.fasta_file="$IN" \
-  database_params.hhdb="$HHDB" database_params.sequencedb="$HHDB" "${EXTRA_ARGS[@]}"
+if [ -n "$NATIVE_CONFIG" ]; then
+  "$P" "$TOOLS/library/rfaa_adapter.py" run --config "$NATIVE_CONFIG" --source "$SRC" \
+    --output "$OUT" --name "$NAME" --weights "$WEIGHTS" --hhdb "$HHDB" \
+    --mode "$MODE" --receipt "$OUT/native-runtime.json"
+else
+  "$P" -m rf2aa.run_inference --config-name protein job_name="$NAME" output_path="$OUT" \
+    checkpoint_path="$WEIGHTS" protein_inputs.A.fasta_file="$IN" \
+    database_params.hhdb="$HHDB" database_params.sequencedb="$HHDB" "${EXTRA_ARGS[@]}"
+fi

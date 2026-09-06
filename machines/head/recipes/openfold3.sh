@@ -1,6 +1,15 @@
 # OpenFold3 (AF3-class open reimpl; Apache-2.0 code+weights, commercial OK). Weights
 # fetched by setup_openfold from public S3 (not gated). No local DBs via
 # --use_msa_server=True (remote ColabFold API; rate-limited). IN = query FASTA.
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  [ -z "${BIO_MSA_BUNDLE:-}" ] || { echo 'openfold3: conflicting native/prepared inputs' >&2; exit 2; }
+  for arg in "${EXTRA_ARGS[@]}"; do
+    case "$arg" in
+      --query*|--use_msa*|--use-msa*|--use_template*|--use-template*|--runner_yaml*|--runner-yaml*|--out*)
+        echo "openfold3: native input conflicts with $arg" >&2; exit 2 ;;
+    esac
+  done
+fi
 if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   python3 "$TOOLS/msa/prepared.py" validate --bundle "$BIO_MSA_BUNDLE" --model openfold3 --fasta "$IN"
   for arg in "${EXTRA_ARGS[@]}"; do
@@ -25,11 +34,17 @@ export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
 CFG="$OPENFOLD_CACHE/setup_config.json"
 printf '{"openfold_cache":"%s","param_directory":"%s"}\n' "$OPENFOLD_CACHE" "$OPENFOLD_CACHE" > "$CFG"
 HOME="$OF3_HOME" "$VENV/bin/setup_openfold" --config "$CFG"
-SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-of3_job}"
+JOB="${NAME:-of3_job}"
 J="$OUT/query.json"
 runner_cfg="$OUT/preparation-runner.yaml"
 msa_args=(--use_msa_server=True)
-if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -n "${BIO_NATIVE_BUNDLE:-}" ]; then
+  J=$("$P" "$TOOLS/library/adapters.py" materialize --bundle "$BIO_NATIVE_BUNDLE" \
+      --model openfold3 --out "$OUT/native-input")
+  cd "$OUT/native-input"
+  [ "$BIO_NATIVE_HAS_PROTEIN" = 1 ] || msa_args=(--use_msa_server=False)
+  "$P" "$TOOLS/msa/prepared.py" openfold-runner-config --out "$OUT" --write "$runner_cfg"
+elif [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   J=$("$P" "$TOOLS/msa/prepared.py" materialize --bundle "$BIO_MSA_BUNDLE" \
       --model openfold3 --fasta "$IN" --out "$OUT/prepared-native")
   "$P" "$TOOLS/msa/prepared.py" openfold-runner-config --out "$OUT" \
@@ -39,6 +54,7 @@ if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
   # the final template-cache NPZ as a raw hit alignment would lose templates.
   msa_args=(--use_msa_server=False --use_templates=False)
 else
+SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t')
 cp "$IN" "$OUT/reference_input.fasta"
 cat > "$J" <<JSON
 { "queries": { "$JOB": { "chains": [ { "molecule_type": "protein", "chain_ids": ["A"], "sequence": "$SEQ" } ] } } }
@@ -77,7 +93,7 @@ if (not success or int(success[1]) < 1 or not failed or int(failed[1]) != 0
         or not any(path.stat().st_size for path in out.rglob("*_model.cif"))):
     sys.exit("openfold3: incomplete prediction; inspect summary.txt and inference errors")
 PY
-if [ -z "${BIO_MSA_BUNDLE:-}" ]; then
+if [ -z "${BIO_MSA_BUNDLE:-}" ] && [ -z "${BIO_NATIVE_BUNDLE:-}" ]; then
   "$P" "$TOOLS/msa/prepared.py" capture --model openfold3 --run-dir "$OUT" \
     --out "$OUT/prepared-bundle" --source public --endpoint https://api.colabfold.com \
     --trust-native-npz

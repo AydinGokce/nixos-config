@@ -79,6 +79,10 @@ class BioFoldTests(unittest.TestCase):
                                "--out", str(self.out), *flags], env=dict(self.env, **env),
                               text=True, capture_output=True, timeout=15)
 
+    def run_arguments(self, *arguments, **env):
+        return subprocess.run(["bash", str(SCRIPT), *arguments, "--out", str(self.out)],
+                              env=dict(self.env, **env), text=True, capture_output=True, timeout=15)
+
     def commands(self, name):
         if not self.calls.exists():
             return []
@@ -149,6 +153,106 @@ class BioFoldTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(self.commands("bio-viz")[0][1], str(
             self.out / "boltz_results_input" / "predictions" / "input" / "input_model_0.cif"))
+
+    def test_construct_reference_is_forwarded_without_upload(self):
+        result = self.run_arguments("boltz2", "--construct", "construct:enzyme@3", "--render")
+        self.assert_success(result)
+        self.assertEqual(self.commands("scp"), [])
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote, ["bio-submit", "boltz2", "--construct", "construct:enzyme@3"])
+        self.assertEqual(len(self.commands("bio-viz")), 1)
+
+    def test_assembly_reference_and_private_backend_are_forwarded_separately(self):
+        result = self.run_arguments("openfold3", "--assembly", "enzyme-oligo", "--msa-backend", "private")
+        self.assert_success(result)
+        self.assertEqual(self.commands("scp"), [])
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote[remote.index("--assembly") + 1], "enzyme-oligo")
+        self.assertEqual(remote[remote.index("--msa-backend") + 1], "private")
+
+    def test_construct_input_still_stages_evolvepro_measurement_labels(self):
+        labels = self.root / "labels with spaces.csv"
+        labels.write_text("variant,activity\nACD,1.0\n")
+        result = self.run_arguments("evolvepro", "--construct", "enzyme", "--labels", str(labels))
+        self.assert_success(result)
+        self.assertEqual(len(self.commands("scp")), 1)
+        self.assertIn(str(labels), self.commands("scp")[0])
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote[remote.index("--construct") + 1], "enzyme")
+        self.assertIn("--labels", remote)
+        self.assertNotIn("--fasta", remote)
+
+    def test_library_reference_cannot_override_an_existing_input(self):
+        combinations = [
+            ["--construct", "a", "--assembly", "b"],
+            ["--construct", "a", "--construct", "b"],
+            ["--construct", "a", "--seq", "ACD"],
+            ["--assembly", "a", "--fasta", str(self.fasta)],
+            ["--json", str(self.fasta), "--construct", "a"],
+            ["--construct", "a", "--contigs", "[20-20]"],
+            ["--seq", "ACD", "--fasta", str(self.fasta)],
+        ]
+        for arguments in combinations:
+            with self.subTest(arguments=arguments):
+                result = self.run_arguments("boltz2", *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(self.commands("scp"), [])
+        self.assertEqual(self.commands("ssh"), [])
+
+    def test_library_reference_missing_or_empty_value_fails_before_network(self):
+        for flag in ["--construct", "--assembly"]:
+            with self.subTest(flag=flag):
+                result = subprocess.run(["bash", str(SCRIPT), "boltz2", flag], env=self.env,
+                                        text=True, capture_output=True, timeout=15)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("needs a value", result.stderr)
+                result = self.run_arguments("boltz2", flag, "")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("nonempty", result.stderr)
+        self.assertEqual(self.commands("ssh"), [])
+
+    def test_library_reference_rejected_for_backbone_tools(self):
+        for model in ["mpnn", "rfdiffusion"]:
+            with self.subTest(model=model):
+                result = self.run_arguments(model, "--construct", "enzyme")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("structure input", result.stderr)
+        self.assertEqual(self.commands("scp"), [])
+        self.assertEqual(self.commands("ssh"), [])
+
+    def test_json_input_keeps_its_type_in_remote_submission(self):
+        source = self.root / "native input.json"
+        source.write_text('{"queries":{}}\n')
+        result = self.run_arguments("openfold3", "--json", str(source))
+        self.assert_success(result)
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertIn("--json", remote)
+        self.assertNotIn("--fasta", remote)
+        self.assertTrue(remote[remote.index("--json") + 1].endswith(".json"))
+        self.assertEqual(len(self.commands("scp")), 1)
+
+    def test_library_ref_is_shell_quoted_without_interpretation(self):
+        ref = "enzyme'; touch /tmp/unwanted; echo '"
+        result = self.run_arguments("boltz2", "--construct", ref)
+        self.assert_success(result)
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote, ["bio-submit", "boltz2", "--construct", ref])
+        self.assertEqual(self.commands("scp"), [])
+
+    def test_rfdiffusion_contigs_and_optional_pdb_remain_supported(self):
+        source = self.root / "backbone.pdb"
+        source.write_text("END\n")
+        result = self.run_arguments("rfdiffusion", "--contigs", "[20-20]", "--pdb", str(source))
+        self.assert_success(result)
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote[remote.index("--contigs") + 1], "[20-20]")
+        self.assertIn("--input-pdb", remote)
+
+    def test_explicit_sequence_temporary_file_is_removed_after_submission(self):
+        result = self.run_arguments("esm", "--seq", "ACDEFGHIK")
+        self.assert_success(result)
+        uploaded = Path(self.commands("scp")[0][-2])
+        self.assertFalse(uploaded.exists())
 
 
 if __name__ == "__main__":

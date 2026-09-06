@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "kind": "construct",
+  "id": "example-oligo",
+  "name": "Example modified RNA (unresolved chemistry)",
+  "tags": ["example"],
+  "status": "draft",
+  "identity": {
+    "molecule_type": "rna",
+    "sequence": "ACGU",
+    "modifications": [{"position": 2, "monomer_ref": "monomer:example-custom-residue@1"}]
+  },
+  "provenance": {"source": "Illustrative schema example; import custom-monomer.json first"}
+}

@@ -43,11 +43,18 @@ in
   ]) ++ [
     (pkgs.writeShellScriptBin "dc" ''
       export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused python3 ])}''${PATH:+:$PATH}
+      # Let provider cleanup settle across all submission controllers.
+      export DC_LAUNCH_COOLDOWN_SECONDS="''${DC_LAUNCH_COOLDOWN_SECONDS-180}"
       ${builtins.readFile ./dc.sh}
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
       export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-submit.sh}
+    '')
+    (pkgs.writeShellScriptBin "bio-library" ''
+      export PATH=${lib.makeBinPath [ pkgs.systemd pkgs.python3 ]}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      umask 077
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/library/cli.py "$@"
     '')
     (pkgs.writeShellScriptBin "bio-rfaa-databases" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 curl gnutar gzip coreutils util-linux ])}''${PATH:+:$PATH}
@@ -105,6 +112,15 @@ in
     "bio-tools/recipes".source = ./recipes;                     # per-tool bio-submit recipes
     "bio-tools/rfaa".source = ./rfaa;
     "bio-tools/msa".source = ./msa;
+    "bio-tools/library".source = ./library;
+    "bio-tools/library-runtime.json".text = builtins.toJSON {
+      python = "${pkgs.python312}/bin/python3.12";
+      path = lib.makeBinPath [ pkgs.git pkgs.coreutils ];
+      shared = "/mnt/bio-shared";
+      library_paths = [ "${pkgs.stdenv.cc.cc.lib}/lib" "${pkgs.zlib}/lib"
+        "${pkgs.libxrender}/lib" "${pkgs.libxext}/lib" "${pkgs.libx11}/lib" "${pkgs.expat}/lib" ];
+      rfaa_config = "/var/lib/bio-library-runtime/rfaa.json";
+    };
     "bio-tools/cluster.sh".text = ''
       export RFAA_DB_VOLUME=${lib.escapeShellArg rfaaStorage.volumeId}
       export RFAA_DB_NFS=${lib.escapeShellArg rfaaStorage.nfs}
@@ -183,6 +199,7 @@ in
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
     unitConfig.ConditionPathExists = "/var/lib/dc/msa-build-queue.json";
+    environment.BIO_MSA_QUEUE_TOOLS_PIN = "/var/lib/bio-runs/msa-recent-public-inference-20260906/frozen-bio-tools/pin.json";
     serviceConfig = {
       Type = "oneshot";
       ExecStart = "/run/current-system/sw/bin/bio-msa-build-queue tick";
@@ -224,6 +241,8 @@ in
   };
 
   systemd.tmpfiles.rules = [
+    "d /var/lib/bio-library 0700 root root - -"
+    "d /var/lib/bio-library-runtime 0700 root root - -"
     "d /var/lib/dc            0700 root root - -"
     "d /var/lib/dc/rfaa-validation-trigger 0700 root root - -"
     "d /root/.config         0700 root root - -"
@@ -231,6 +250,17 @@ in
     "d /root/.ssh            0700 root root - -"
     "d /var/lib/bio-runs     0755 root root - -"   # bio-submit pulls results here
   ];
+
+  systemd.services.bio-library-init = {
+    description = "Initialize the authoritative construct library";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-tmpfiles-setup.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/bio-library init";
+      UMask = "0077";
+    };
+  };
 
   # Tailscale daemon (join the tailnet later with `tailscale up --auth-key=...`).
   services.tailscale.enable = true;

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "kind": "monomer",
+  "id": "example-custom-residue",
+  "name": "Unresolved custom oligo residue",
+  "tags": ["example"],
+  "status": "draft",
+  "identity": {
+    "description": "Replace this draft with the exact incorporated structure and attachment sites before modeling."
+  },
+  "provenance": {
+    "source": "Illustrative schema example",
+    "supplier_notation": "Retain the actual vendor modification code here",
+    "interpretation": "No chemical identity has been inferred from a reagent name."
+  }
+}

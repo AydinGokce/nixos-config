@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "kind": "construct",
+  "id": "example-peptide",
+  "name": "Example peptide (illustrative input)",
+  "tags": ["example"],
+  "status": "defined",
+  "identity": {"molecule_type": "protein", "sequence": "ACDEFGHIK"},
+  "provenance": {"source": "Synthetic schema example, not an experimental construct"}
+}

@@ -9,6 +9,10 @@ The workstation's `bio-fold` submits a job, downloads its results and optionally
 renders a structure with PyMOL. This is temporary VM compute, not a serverless
 HTTP endpoint or a SLURM cluster.
 
+The [construct library](library/README.md) stores immutable molecular records on
+the head and supplies model-specific inputs through `--construct` and `--assembly`.
+Workstation backups retain and restore-check the complete library hourly.
+
 ## Run from the workstation
 
 ```bash
@@ -163,6 +167,9 @@ spending, imports the previous GPU ledger, reserves each job's maximum duration,
 and requires a healthy watchdog before launching. The watchdog runs every minute
 and deletes expired managed workers. Worker OS disks are included in confirmed
 cleanup; shared databases and the head are protected.
+The head waits three minutes after confirmed managed cleanup before another
+launch, across submission controllers. `DC_LAUNCH_COOLDOWN_SECONDS` overrides
+this delay; removal and watchdog actions never wait on it.
 
 This is an estimated guard, not a provider-enforced billing cap. Protected
 persistent storage continues billing after GPU work stops, so expensive databases

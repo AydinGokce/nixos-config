@@ -2,7 +2,7 @@
 # result, and optionally view/render it locally in PyMOL. Thin orchestrator over
 # the head node's `bio-submit` + a local `bio-viz`.
 #
-#   bio-fold [model] (--seq SEQ | --fasta F | --pdb F | --json F | --contigs 'STR') [flags]
+#   bio-fold [model] (--construct REF | --assembly REF | --seq SEQ | --fasta F | --pdb F | --contigs 'STR') [flags]
 #     models: boltz2 (default) | protenix | openfold3 | rfaa | rfdiffusion | mpnn | esm | evolvepro
 #     --view          open the predicted structure in PyMOL (GUI)
 #     --render        save a ray-traced PNG next to the result
@@ -14,6 +14,8 @@
 #   examples:
 #     bio-fold boltz2 --seq MKTAYIAKQR... --view
 #     bio-fold --fasta prot.fasta --render
+#     bio-fold boltz2 --construct target-enzyme --render
+#     bio-fold protenix --assembly enzyme-oligo --render
 #     bio-fold rfdiffusion --contigs '[100-100]' --num 4 --render
 
 # shellcheck source=/dev/null
@@ -23,8 +25,10 @@ HEAD="${BIO_CLUSTER_HEAD:-}"; RUSER="${BIO_CLUSTER_USER:-root}"
 KEY="${BIO_CLUSTER_SSHKEY:-$HOME/.ssh/datacrunch_ed25519}"
 
 usage() { cat <<'USAGE'
-bio-fold [MODEL] (--seq SEQUENCE | --fasta FILE | --pdb FILE | --contigs STRING)
+bio-fold [MODEL] (--construct REF | --assembly REF | --seq SEQUENCE | --fasta FILE | --pdb FILE | --contigs STRING)
   Models: boltz2 (default), openfold3, protenix, rfaa, rfdiffusion, mpnn, esm, evolvepro
+  --construct REF        use a construct stored on the head (alias or pinned reference)
+  --assembly REF         use an assembly stored on the head
   --render / --view       render PNG / open PyMOL after fetching a structure
   --out DIRECTORY        local results (default ~/bio-runs/JOB)
   --labels FILE          EVOLVEpro measured activity CSV
@@ -32,6 +36,7 @@ bio-fold [MODEL] (--seq SEQUENCE | --fasta FILE | --pdb FILE | --contigs STRING)
   --model NAME           model variant (ESM/EVOLVEpro/MPNN)
   --msa-backend BACKEND   public|private for Boltz2, OpenFold3 or Protenix
   --num N --gpu TYPE --spot --timeout SECONDS -- MODEL_ARGUMENTS
+  Import construct/assembly JSON with bio-library import --json FILE, then use its reference.
 USAGE
 }
 
@@ -42,15 +47,23 @@ SSHO=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 model=boltz2
 case "${1:-}" in -h|--help) usage; exit 0 ;; ""|-*) ;; *) model="$1"; shift ;; esac
 
-seq=""; infile=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; msa_backend=""; view=0; render=0; extra=()
+seq=""; infile=""; input_option=""; library_ref=""; seq_tmp=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; msa_backend=""; view=0; render=0; extra=()
+trap '[ -z "$seq_tmp" ] || rm -f -- "$seq_tmp"' EXIT
 while [ $# -gt 0 ]; do
   case "$1" in
-    --seq|--fasta|--pdb|--json|--in|--input-pdb|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out|--msa-backend)
+    --seq|--fasta|--pdb|--json|--in|--input-pdb|--construct|--assembly|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out|--msa-backend)
       [ $# -ge 2 ] || { echo "bio-fold: $1 needs a value" >&2; exit 2; } ;;
+  esac
+  case "$1" in
+    --seq|--fasta|--pdb|--json|--in|--input-pdb|--construct|--assembly)
+      [ -z "$input_option" ] || { echo "bio-fold: choose exactly one sequence, file, construct or assembly input ($input_option conflicts with $1)" >&2; exit 2; }
+      [ -n "$2" ] || { echo "bio-fold: $1 needs a nonempty value" >&2; exit 2; }
+      input_option="$1" ;;
   esac
   case "$1" in
     --seq)                          seq="$2"; shift ;;
     --fasta|--pdb|--json|--in|--input-pdb) infile="$2"; shift ;;
+    --construct|--assembly)          library_ref="$2"; shift ;;
     --labels)                       labels="$2"; shift ;;
     --model)                        variant="$2"; shift ;;
     --timeout)                      seconds="$2"; shift ;;
@@ -70,6 +83,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ -n "$library_ref" ] && [ -n "$contigs" ]; then
+  echo 'bio-fold: --construct/--assembly cannot be combined with --contigs' >&2; exit 2
+fi
+if [ -n "$contigs" ] && [ "$model" != rfdiffusion ]; then
+  echo 'bio-fold: --contigs is only supported for rfdiffusion' >&2; exit 2
+fi
 if [ -n "$msa_backend" ]; then
   case "$msa_backend" in public|private) ;; *) echo 'bio-fold: --msa-backend must be public or private' >&2; exit 2 ;; esac
   case "$model" in boltz2|openfold3|protenix) ;; *) echo "bio-fold: --msa-backend is unsupported for $model" >&2; exit 2 ;; esac
@@ -84,20 +103,36 @@ stage() { # localfile remoteflag  -> scp to head, append flag+remote-path
   rargs+=("$flag" "$rp")
 }
 
+if [ -n "$library_ref" ]; then
+  case "$model" in
+    boltz2|protenix|openfold3|rfaa|esm|evolvepro) rargs+=("$input_option" "$library_ref") ;;
+    *) echo "bio-fold: $model needs a structure input; construct/assembly references are unsupported" >&2; exit 2 ;;
+  esac
+else
 case "$model" in
   boltz2|protenix|openfold3|rfaa|esm|evolvepro)
-    if [ -n "$seq" ]; then infile="$(mktemp --suffix=.fasta)"; printf '>query\n%s\n' "$seq" > "$infile"; fi
-    [ -n "$infile" ] || { echo "bio-fold: $model needs --seq or --fasta" >&2; exit 2; }
-    stage "$infile" --fasta ;;
+    if [ -n "$seq" ]; then seq_tmp="$(mktemp --suffix=.fasta)"; infile="$seq_tmp"; printf '>query\n%s\n' "$seq" > "$infile"; fi
+    [ -n "$infile" ] || { echo "bio-fold: $model needs --construct, --assembly, --seq or a supported input file" >&2; exit 2; }
+    case "$input_option" in
+      --json)
+        case "$model" in boltz2|protenix|openfold3|rfaa) stage "$infile" --json ;;
+          *) echo "bio-fold: $model requires a protein sequence input, not --json" >&2; exit 2 ;;
+        esac ;;
+      --pdb|--input-pdb) echo "bio-fold: $model requires a sequence or native JSON input, not $input_option" >&2; exit 2 ;;
+      *) stage "$infile" --fasta ;;
+    esac ;;
   mpnn)
     [ -n "$infile" ] || { echo "bio-fold: mpnn needs --pdb" >&2; exit 2; }
+    case "$input_option" in --pdb|--input-pdb|--in) ;; *) echo 'bio-fold: mpnn needs --pdb or --in' >&2; exit 2 ;; esac
     stage "$infile" --pdb ;;
   rfdiffusion)
     [ -n "$contigs" ] || { echo "bio-fold: rfdiffusion needs --contigs" >&2; exit 2; }
+    case "$input_option" in ""|--pdb|--input-pdb|--in) ;; *) echo 'bio-fold: rfdiffusion accepts --pdb/--input-pdb with --contigs' >&2; exit 2 ;; esac
     rargs+=(--contigs "$contigs")
     [ -n "$infile" ] && stage "$infile" --input-pdb ;;
   *) echo "bio-fold: unknown model '$model'" >&2; usage; exit 2 ;;
 esac
+fi
 [ -z "$labels" ] || stage "$labels" --labels
 [ -z "$sub" ] || rargs+=(--sub "$sub")
 [ -z "$variant" ] || rargs+=(--model "$variant")
