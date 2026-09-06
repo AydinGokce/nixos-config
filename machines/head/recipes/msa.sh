@@ -15,6 +15,14 @@ if available_kib < required_gib * 1024 * 1024:
 print(f'MSA reference worker: {available_kib / 1024**2:.1f} GiB available host RAM', flush=True)
 PY
   source "$TOOLS/msa/tools.sh"
+  if [ "$SUB" = session ]; then
+    [ -n "${BIO_MSA_SESSION_ID:-}" ] || { echo 'msa: session ID is missing' >&2; exit 2; }
+    exec python3 "$TOOLS/msa/session.py" serve \
+      --session-id "$BIO_MSA_SESSION_ID" --state "/tmp/bio-msa-session-$BIO_MSA_SESSION_ID" \
+      --out "$OUT" --database "$MSA_DB_ROOT" --tools "$TOOLS" --tools-root "$MSA_TOOLS_ROOT" \
+      --results "$SHARED/cache/msa-api" --deadline "$BIO_JOB_DEADLINE_EPOCH" \
+      --idle-seconds "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" --warm "${BIO_MSA_SESSION_WARM:-prefetch}"
+  fi
   threads=$(nproc)
   if [ "$SUB" = convert ]; then
     [ "$threads" -le 8 ] || threads=8

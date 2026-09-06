@@ -17,7 +17,10 @@ Library: --construct REF | --assembly REF (pinned and checked before GPU rental)
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
          --gpu TYPE, --spot, --timeout SECONDS (default 7200), -- EXTRA_ARGS
 MSA: --msa-backend public|private, or --msa-bundle DIRECTORY for a prepared input.
-Database jobs: bio-submit msa --sub install|convert|panel|prepare|serve [--model MODEL --fasta FILE]
+RF3: --refresh-preparation captures a new search while preserving earlier cache entries.
+Execution: --execution auto|resident|ephemeral (default auto; audited native defaults).
+Boltz resident: explicitly request the audited seed with -- --seed 42.
+Database jobs: bio-submit msa --sub install|convert|panel|prepare|serve|session [--model MODEL --fasta FILE]
 Panel preparation: bio-submit msa --sub panel --json MANIFEST.json [--worker TYPE]
 Install then prepare: bio-submit msa --sub install --json MANIFEST.json [--worker TYPE]
 RFAA: --sub full (default) or --sub single-seq; full needs bio-rfaa-databases.
@@ -45,17 +48,19 @@ gpu=""; spot=""; infile=""; labels=""; model=""; sub=""; contigs=""; num=""; tem
 msa_backend="${BIO_MSA_DEFAULT_BACKEND:-public}"; msa_bundle=""; bundle_result=""
 library_ref=""; library_kind=""; library_bundle=""; library_sha=""; library_format=""; library_has_protein=""; input_flag=""
 panel_manifest_sha=""
+execution=auto; rf3_refresh_preparation=0; rf3_preparation_receipt=""
 case "$recipe" in openfold3|boltz2|protenix|rf3) ;; *) msa_backend=public;; esac
 if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
   case "${1:-}" in ""|-*) ;; *) sub="$1"; shift ;; esac
 fi
 while [ $# -gt 0 ]; do
   case "$1" in
-    --gpu|--worker|--model|--fasta|--pdb|--json|--in|--input-pdb|--labels|--sub|--contigs|--num-designs|--num|--num-seqs|--temp|--name|--timeout|--msa-backend|--msa-bundle|--bundle-result|--construct|--assembly)
+    --gpu|--worker|--model|--fasta|--pdb|--json|--in|--input-pdb|--labels|--sub|--contigs|--num-designs|--num|--num-seqs|--temp|--name|--timeout|--msa-backend|--msa-bundle|--bundle-result|--construct|--assembly|--execution)
       [ $# -ge 2 ] || { echo "bio-submit: $1 needs a value" >&2; exit 2; }
       case "$1" in
         --gpu|--worker) gpu="$2";; --model) model="$2";; --labels) labels="$2";;
         --msa-backend) msa_backend="$2";; --msa-bundle) msa_bundle="$2";; --bundle-result) bundle_result="$2";;
+        --execution) execution="$2";;
         --construct|--assembly)
           [ -z "$library_ref" ] || { echo 'bio-submit: choose one library reference' >&2; exit 2; }
           library_ref="$2"; library_kind="${1#--}" ;;
@@ -66,12 +71,17 @@ while [ $# -gt 0 ]; do
           infile="$2"; input_flag="$1" ;;
       esac; shift ;;
     --spot) spot=--spot ;;
+    --refresh-preparation) rf3_refresh_preparation=1 ;;
     --) shift; extra+=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) echo "bio-submit: unknown option $1 (put model-specific arguments after --)" >&2; exit 2 ;;
   esac
   shift
 done
+case "$execution" in auto|resident|ephemeral) ;; *) echo 'bio-submit: --execution must be auto, resident or ephemeral' >&2; exit 2;; esac
+if [ "$rf3_refresh_preparation" = 1 ]; then
+  [ "$recipe" = rf3 ] && [ -z "$msa_bundle" ] || { echo 'bio-submit: --refresh-preparation requires RF3 without an explicit --msa-bundle' >&2; exit 2; }
+fi
 [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 60 && seconds <= 85500 )) || { echo 'bio-submit: timeout must be 60..85500 seconds' >&2; exit 2; }
 [ -z "$infile" ] || [ -f "$infile" ] || { echo "bio-submit: input not found: $infile" >&2; exit 2; }
 [ -z "$labels" ] || [ -f "$labels" ] || { echo "bio-submit: labels not found: $labels" >&2; exit 2; }
@@ -104,7 +114,29 @@ PY
   mkdir -p "$RESULTS_DIR/library-inputs"
   library_bundle="$RESULTS_DIR/library-inputs/$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   compile_args=(--root "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" --ref "$library_ref" --model "$recipe" --out "$library_bundle" --msa-backend "$msa_backend")
-  if [ "$msa_backend" = private ] && [ "$recipe" != rf3 ]; then compile_args+=(--plain-fasta); fi
+  prefer_plain=0
+  if [ "$execution" != ephemeral ] && [ "$msa_backend" = public ] && \
+     [[ "$recipe" = protenix || "$recipe" = openfold3 || "$recipe" = boltz2 ]] && \
+     [ -f "${BIO_INFERENCE_STATE:-/var/lib/bio-inference}/profiles/$recipe.json" ]; then
+    prefer_plain=$(python3 - "$TOOLS_SRC/library" "${BIO_LIBRARY_ROOT:-/var/lib/bio-library}" "$library_ref" <<'PLAININPUT'
+import pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from adapters import Registry, fasta, verify_snapshot
+snapshot = Registry(sys.argv[2]).snapshot(sys.argv[3])
+verify_snapshot(snapshot)
+try:
+    with tempfile.TemporaryDirectory() as folder:
+        fasta(snapshot, pathlib.Path(folder))
+except ValueError:
+    print(0)
+else:
+    print(1)
+PLAININPUT
+    )
+  fi
+  if { [ "$msa_backend" = private ] && [ "$recipe" != rf3 ]; } || [ "$prefer_plain" = 1 ]; then
+    compile_args+=(--plain-fasta)
+  fi
   python3 "$TOOLS_SRC/library/runtime.py" "${compile_args[@]}"
   library_sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$library_bundle/bundle.json")
   library_format=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["format"])' "$library_bundle/bundle.json")
@@ -134,7 +166,7 @@ fi
 if [ "$recipe" = msa ]; then
   sub="${sub:-prepare}"
   case "$sub" in
-    install|convert|serve)
+    install|convert|serve|session)
       [ -z "$bundle_result" ] || { echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2; } ;;
     prepare)
       [ -n "$infile" ] || { echo 'bio-submit: MSA preparation needs --fasta' >&2; exit 2; }
@@ -143,7 +175,7 @@ if [ "$recipe" = msa ]; then
         *) echo 'bio-submit: MSA preparation needs --model openfold3|boltz2|protenix|rf3' >&2; exit 2;; esac ;;
     panel)
       [ -n "$infile" ] || { echo 'bio-submit: MSA panel needs --json MANIFEST.json' >&2; exit 2; } ;;
-    *) echo 'bio-submit: MSA --sub must be install, convert, panel, prepare or serve' >&2; exit 2;;
+    *) echo 'bio-submit: MSA --sub must be install, convert, panel, prepare, serve or session' >&2; exit 2;;
   esac
   if [ "$sub" = panel ] || { [ "$sub" = install ] && [ -n "$infile" ]; }; then
     [ -z "$model$labels$contigs$num$temp$bundle_result" ] && [ "${#extra[@]}" -eq 0 ] \
@@ -222,9 +254,22 @@ RF3SETTINGS
   else
     rf3_input_args=(--fasta "$infile")
   fi
+  if [ -n "$msa_bundle" ]; then
+    rf3_source_format=$(python3 - "$TOOLS_SRC/rf3" "$msa_bundle/input.json" <<'RF3SOURCEFORMAT'
+import sys
+sys.path.insert(0,sys.argv[1])
+from prepare import validate
+print(validate(sys.argv[2])['source_format'])
+RF3SOURCEFORMAT
+    )
+    case "$rf3_source_format" in
+      rf3-json) rf3_input_args=(--native-json "$infile") ;;
+      fasta) rf3_input_args=(--fasta "$infile") ;;
+      *) echo 'bio-submit: unsupported RF3 prepared source format' >&2; exit 2 ;;
+    esac
+  fi
   python3 "$TOOLS_SRC/rf3/msa.py" queries "${rf3_input_args[@]}" > "$rf3_root/queries.json"
   if [ -n "$msa_bundle" ]; then
-    python3 "$TOOLS_SRC/rf3/prepare.py" validate --input "$msa_bundle/input.json" >/dev/null
     python3 - "$TOOLS_SRC/rf3" "$msa_bundle/msa-manifest.json" "$infile" <<'RF3CHECK'
 import sys
 sys.path.insert(0,sys.argv[1])
@@ -233,16 +278,17 @@ if read_json(sys.argv[2])['source_sha256'] != file_hash(sys.argv[3]):
     raise SystemExit('bio-submit: RF3 prepared input differs from supplied input file')
 RF3CHECK
   else
-    rf3_search_args=(--server-url "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}" --source public)
-    if [ "$msa_backend" = private ] && [ "$(cat "$rf3_root/queries.json")" != '{}' ]; then
-      bio-msa prepare --model rf3 --json "$rf3_root/queries.json" --timeout "$seconds" \
-        --bundle-result "$rf3_root/search-result.json"
-      rf3_search=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle"])' "$rf3_root/search-result.json")
-      rf3_search_args=(--search-bundle "$rf3_search")
-    fi
-    timeout --signal=TERM --kill-after=20 "$seconds" python3 "$TOOLS_SRC/rf3/msa.py" prepare \
-      "${rf3_input_args[@]}" "${rf3_search_args[@]}" --out "$rf3_root/prepared" --name "${name:-rf3_job}"
+    rf3_cache_args=(--rf3-prepare-only --model rf3 --shared "$SHARED_MNT" \
+      --backend "$msa_backend" --endpoint "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}" \
+      --timeout "$seconds" --rf3-out "$rf3_root/prepared" --rf3-name "${name:-rf3_job}")
+    [ -z "${MSA_DB_ROOT:-}" ] || rf3_cache_args+=(--rf3-database-root "$MSA_DB_ROOT")
+    [ -z "$library_sha" ] || rf3_cache_args+=(--chemistry-sha "$library_sha")
+    [ -z "$library_ref" ] || rf3_cache_args+=(--library-reference "$library_ref")
+    [ "$rf3_refresh_preparation" = 0 ] || rf3_cache_args+=(--refresh-preparation)
+    timeout --signal=TERM --kill-after=20 "$seconds" python3 "$TOOLS_SRC/inference/frontend.py" \
+      "${rf3_input_args[@]}" "${rf3_cache_args[@]}" > "$rf3_root/preparation-result.json"
     msa_bundle="$rf3_root/prepared"
+    rf3_preparation_receipt="$rf3_root/prepared.preparation-cache.json"
   fi
 fi
 # Prepare and validate complete native inputs before renting an inference GPU.
@@ -260,7 +306,46 @@ if [ "$recipe" != msa ] && [ "$recipe" != rf3 ] && { [ "$msa_backend" = private 
   fi
   python3 "$TOOLS_SRC/msa/prepared.py" validate --bundle "$msa_bundle" --model "$recipe" --fasta "$infile"
 fi
-# Serialize jobs while environments and provider volume attachment are shared.
+# Reuse an audited resident default configuration when the request matches it.
+# All optional model arguments remain on the existing fully configurable route.
+resident_eligible=0; resident_native_seed=""
+case "$recipe" in
+  protenix|openfold3)
+    if [ -z "$gpu$spot$model$sub$contigs$num$temp$labels$name" ] && [ "${#extra[@]}" -eq 0 ] && \
+       { [ -z "$library_bundle" ] || [ "$library_format" = protein-fasta ]; }; then resident_eligible=1; fi ;;
+  boltz2)
+    if [ -z "$gpu$spot$model$sub$contigs$num$temp$labels$name" ] && \
+       { [ -z "$library_bundle" ] || [ "$library_format" = protein-fasta ]; }; then
+      if [ "${#extra[@]}" -eq 0 ]; then
+        resident_eligible=1
+      elif { [ "${#extra[@]}" -eq 2 ] && [ "${extra[0]}" = --seed ] && [ "${extra[1]}" = 42 ]; } || \
+           { [ "${#extra[@]}" -eq 1 ] && [ "${extra[0]}" = --seed=42 ]; }; then
+        resident_eligible=1; resident_native_seed=42
+      fi
+    fi ;;
+  rf3)
+    if [ -z "$gpu$spot$model$sub$contigs$num$temp$labels" ] && [ "${#extra[@]}" -eq 0 ]; then resident_eligible=1; fi ;;
+esac
+if [ "$execution" != ephemeral ] && [ "$resident_eligible" = 1 ]; then
+  resident_args=(--state "${BIO_INFERENCE_STATE:-/var/lib/bio-inference}" --model "$recipe" \
+    --shared "$SHARED_MNT" --results "$RESULTS_DIR" --fasta "$infile" --backend "$msa_backend" \
+    --timeout "$seconds" --endpoint "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}")
+  [ -z "$msa_bundle" ] || resident_args+=(--bundle "$msa_bundle")
+  [ -z "$library_ref" ] || resident_args+=(--library-reference "$library_ref" --chemistry-sha "$library_sha")
+  [ -z "$rf3_preparation_receipt" ] || resident_args+=(--rf3-preparation-receipt "$rf3_preparation_receipt")
+  [ -z "$resident_native_seed" ] || resident_args+=(--native-seed "$resident_native_seed")
+  resident_status=0
+  python3 "$TOOLS_SRC/inference/frontend.py" "${resident_args[@]}" --probe || resident_status=$?
+  if [ "$resident_status" = 0 ]; then
+    exec python3 "$TOOLS_SRC/inference/frontend.py" "${resident_args[@]}"
+  elif [ "$resident_status" != 78 ] || [ "$execution" = resident ]; then
+    exit "$resident_status"
+  fi
+elif [ "$execution" = resident ]; then
+  echo 'bio-submit: resident execution requires a compatible native-default input; use bio-inference for an explicit prepared configuration' >&2
+  exit 2
+fi
+# Serialize ephemeral jobs while legacy environments and provider attachment are shared.
 # The lock is independent of dc's accounting lock.
 mkdir -p "$STATE_DIR" "$RESULTS_DIR"
 lock_name=bio-submit
@@ -295,6 +380,7 @@ if [ -n "$panel_manifest_sha" ]; then
   cp "$RIN" "$LOCALOUT/panel-manifest.json"
 fi
 if [ -n "$labels" ]; then cp "$labels" "$run/in/labels.csv"; RLABELS="$run/in/labels.csv"; fi
+if [ -n "$rf3_preparation_receipt" ]; then cp "$rf3_preparation_receipt" "$LOCALOUT/rf3-preparation-cache.json"; fi
 if [ -n "$msa_bundle" ]; then
   RPREP="$run/in/prepared"; mkdir -p "$RPREP"
   cp -a "$msa_bundle/." "$RPREP/"
@@ -337,6 +423,8 @@ remote_msa_bundle="$RPREP"
   printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$remote_msa_bundle"
   if [ "$recipe" = rf3 ]; then printf 'export BIO_RF3_INPUT=%q\n' "$RPREP/input.json"; fi
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
+  printf 'export BIO_MSA_SESSION_ID=%q BIO_MSA_SESSION_IDLE_SECONDS=%q BIO_MSA_SESSION_WARM=%q\n' \
+    "${BIO_MSA_SESSION_ID:-}" "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" "${BIO_MSA_SESSION_WARM:-report}"
   printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
   printf 'export RFAA_CPU=%q RFAA_MEM_GB=%q\n' "${RFAA_CPU:-4}" "${RFAA_MEM_GB:-64}"
@@ -535,6 +623,18 @@ if library:
     source = {k: native[k] for k in ('source_ref', 'source_snapshot_sha256', 'sha256', 'format', 'msa_backend')}
 with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,library_input=source,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
 PY
+if [ -n "$rf3_preparation_receipt" ]; then
+  python3 - "$LOCALOUT/job.json" "$LOCALOUT/rf3-preparation-cache.json" <<'RF3CACHEJOB'
+import hashlib,json,pathlib,sys
+job,receipt=map(pathlib.Path,sys.argv[1:]);value=json.loads(job.read_text())
+value['rf3_preparation']={'path':receipt.name,'sha256':hashlib.sha256(receipt.read_bytes()).hexdigest()}
+job.write_text(json.dumps(value,indent=2)+'\n')
+RF3CACHEJOB
+fi
+if [ "$recipe" = msa ] && [ "$sub" = session ]; then
+  python3 "$TOOLS_SRC/msa/session_client.py" register-launch --state "$BIO_MSA_SESSION_STATE" \
+    --job "$LOCALOUT/job.json" --remote-out "$ROUT"
+fi
 echo "bio-submit: running $recipe on $id ($ip), timeout ${seconds}s"
 status=0
 timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "root@$ip" bash -s < "$remote_file" || status=$?

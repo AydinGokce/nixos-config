@@ -35,6 +35,8 @@ bio-fold [MODEL] (--construct REF | --assembly REF | --seq SEQUENCE | --fasta FI
   --sub COMMAND          ESM command, EVOLVEpro embed|rank, RFAA full|single-seq
   --model NAME           model variant (ESM/EVOLVEpro/MPNN)
   --msa-backend BACKEND   public|private for Boltz2, OpenFold3, Protenix or RF3
+  --refresh-preparation  capture a new RF3 search; retain earlier cached evidence
+  --execution MODE       auto|resident|ephemeral (default auto)
   --num N --gpu TYPE --spot --timeout SECONDS -- MODEL_ARGUMENTS
   Import construct/assembly JSON with bio-library import --json FILE, then use its reference.
 USAGE
@@ -47,11 +49,11 @@ SSHO=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 model=boltz2
 case "${1:-}" in -h|--help) usage; exit 0 ;; ""|-*) ;; *) model="$1"; shift ;; esac
 
-seq=""; infile=""; input_option=""; library_ref=""; seq_tmp=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; msa_backend=""; view=0; render=0; extra=()
+seq=""; infile=""; input_option=""; library_ref=""; seq_tmp=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; msa_backend=""; execution=""; refresh_preparation=0; view=0; render=0; extra=()
 trap '[ -z "$seq_tmp" ] || rm -f -- "$seq_tmp"' EXIT
 while [ $# -gt 0 ]; do
   case "$1" in
-    --seq|--fasta|--pdb|--json|--in|--input-pdb|--construct|--assembly|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out|--msa-backend)
+    --seq|--fasta|--pdb|--json|--in|--input-pdb|--construct|--assembly|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out|--msa-backend|--execution)
       [ $# -ge 2 ] || { echo "bio-fold: $1 needs a value" >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -72,6 +74,8 @@ while [ $# -gt 0 ]; do
     --sub)                          sub="$2"; shift ;;
     --gpu)                          gpu="$2"; shift ;;
     --msa-backend)                   msa_backend="$2"; shift ;;
+    --execution)                     execution="$2"; shift ;;
+    --refresh-preparation)            refresh_preparation=1 ;;
     --spot)                         spot="--spot" ;;
     --out)                          outdir="$2"; shift ;;
     --view|--open)                  view=1 ;;
@@ -83,6 +87,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ "$refresh_preparation" = 1 ] && [ "$model" != rf3 ]; then
+  echo 'bio-fold: --refresh-preparation is supported only for RF3' >&2; exit 2
+fi
 if [ -n "$library_ref" ] && [ -n "$contigs" ]; then
   echo 'bio-fold: --construct/--assembly cannot be combined with --contigs' >&2; exit 2
 fi
@@ -138,6 +145,8 @@ fi
 [ -z "$variant" ] || rargs+=(--model "$variant")
 [ -z "$seconds" ] || rargs+=(--timeout "$seconds")
 [ -z "$msa_backend" ] || rargs+=(--msa-backend "$msa_backend")
+[ -z "$execution" ] || rargs+=(--execution "$execution")
+[ "$refresh_preparation" = 0 ] || rargs+=(--refresh-preparation)
 [ -n "$num" ]  && rargs+=(--num "$num")
 [ -n "$gpu" ]  && rargs+=(--gpu "$gpu")
 [ -n "$spot" ] && rargs+=("$spot")

@@ -1,9 +1,11 @@
 # Cloud bio toolkit
 
-`bio-head` is a NixOS CPU server on DataCrunch/Verda. It provisions an Ubuntu/CUDA
-GPU worker for each job, reuses model environments and weights on managed shared
-storage, retrieves results, and deletes the worker. Jobs are currently serialized
-so shared environment installation and volume attachment cannot race.
+`bio-head` is a NixOS CPU server on DataCrunch/Verda. Compatible folding jobs can
+use resident GPU workers that load a pinned model once and process multiple
+requests. The head keeps a durable queue, prepares inputs and validates outputs
+on CPUs. Other jobs use the existing temporary Ubuntu/CUDA worker path, which
+reuses model environments and weights on managed shared storage and removes the
+worker after retrieval. Temporary-worker provisioning remains serialized.
 
 The workstation's `bio-fold` submits a job, downloads its results and optionally
 renders a structure with PyMOL. This is temporary VM compute, not a serverless
@@ -29,6 +31,12 @@ bio-fold evolvepro --fasta variants.fasta --labels measured.csv --num 4
 
 `--view` opens PyMOL; `--render` writes `render.png`. Results default to
 `~/bio-runs/JOB/`; use `--out DIR` to override. Model arguments follow `--`.
+`--execution auto` uses an active, validated resident profile when compatible;
+`--execution resident` requires one, and `--execution ephemeral` selects a
+temporary worker. Auto also uses the temporary path when no compatible live
+worker exists. Once queued, a failed resident request needs an explicit retry.
+See [resident execution and operator commands](inference/README.md).
+
 `--timeout SECONDS` limits a run (default two hours). `--gpu TYPE` requests a
 specific instance; omit it for compatibility-aware capacity fallback. The suffix
 in `1A100.22V` denotes CPU allocation: that instance has an **80 GB A100**.
@@ -65,7 +73,8 @@ rejected before renting a worker.
 Boltz, Protenix, OpenFold3 and RF3 use the remote ColabFold MSA server by default.
 That server searches large sequence databases and returns alignments;
 we keep the model weights and query results locally. The private path described
-below remains subject to full installation and quality comparison. RF3 shares
+below has its full databases installed; quality comparisons determine whether
+it is suitable for the intended workload. RF3 shares
 this ColabFold path. The separate RFAA database installation is parked; its
 verified archives and completed data are retained for a later decision.
 This is a difference in preprocessing and hosting, not evidence that OpenFold3
@@ -86,7 +95,8 @@ complete classic CPU sequence databases, pairing taxonomy and template data.
 installation is explicit and must finish before preparation can succeed.
 
 ```bash
-# On the head, after complete database installation:
+# On the head, reuse one bounded search session across requests:
+bio-msa session start --timeout 14400
 bio-msa prepare --model openfold3 --fasta protein.fasta --timeout 14400
 bio-submit openfold3 --fasta protein.fasta --msa-backend private
 # From the updated workstation wrapper:
@@ -100,8 +110,12 @@ instance price of at most $13/hour, including spot offers. Searches still use th
 pinned CPU pipeline when the available host also has GPUs. `--worker TYPE`
 overrides selection, and `--spot` restricts it to spot offers. The fresh launch
 quote and total project budget are checked separately before allocation.
-Submissions retain and validate the input bundle,
-remove the preparation worker, then rent the prediction GPU. An explicit private
+An active managed MSA session serves successive preparation requests without
+reloading the database indexes. Without a session, the existing per-request
+preparation path still applies. Submissions retain and validate their input
+bundle, then use compatible resident prediction workers or temporary GPUs.
+See [managed MSA sessions](msa/SESSIONS.md) for idle shutdown, index residency and
+explicit stop commands. An explicit private
 request fails if preparation is unavailable; it never switches to the public
 server. Retained bundles bind their exact sequences, native inputs and database
 provenance. The full RFAA HHsuite pipeline stays separate.
@@ -112,8 +126,10 @@ documented as pairing identifiers, not biological taxonomy annotations.
 
 Public remains the default until comparisons establish suitable alignment,
 pairing, template-feature and prediction quality. Miniature API tests and native
-bundle replay tests establish compatibility only. Full database installation
-and scientific comparisons are still pending. See [the implementation guide](msa/README.md)
+bundle replay tests establish compatibility only. The current matched quality
+panel has 12 single chains of 88–502 residues. It does not qualify large base
+editors or protein–RNA–DNA and CRISPR–anti-CRISPR assemblies; those need separate
+reference and interaction benchmarks. See [the implementation guide](msa/README.md)
 and [storage contract](msa/STORAGE_CONTRACT.md).
 
 Each submission sends a snapshot of the deployed recipes, helpers and

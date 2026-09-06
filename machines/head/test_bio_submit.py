@@ -198,6 +198,8 @@ PY
                         ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copytree(SCRIPT.parent / "msa", self.root / "tools" / "msa",
                         ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(SCRIPT.parent / "inference", self.root / "tools" / "inference",
+                        ignore=shutil.ignore_patterns("__pycache__"))
         # Native formats are covered by msa/test_prepared.py. This boundary
         # validator ensures orchestration cannot ignore a rejected bundle.
         (self.root / "tools" / "msa" / "prepared.py").write_text('''import argparse, json, os
@@ -450,9 +452,58 @@ mkdir -p "$LOCALOUT"
                 self.assertIn("export MMSEQS_SERVICE_HOST_URL=" + expected + "\n",
                               (self.root / "transmitted.sh").read_text())
 
+    def boltz_resident_boundary(self):
+        (self.root/'tools/inference/frontend.py').write_text('''import json,os,pathlib,sys
+args=sys.argv[1:];root=pathlib.Path(os.environ['AUDIT'])
+with (root/'resident-calls.jsonl').open('a') as f:f.write(json.dumps(args)+'\\n')
+if '--native-seed' not in args:sys.exit(78)
+assert args[args.index('--native-seed')+1]=='42'
+print('resident boundary accepted')
+''')
+
+    def test_boltz_resident_accepts_only_exact_explicit_seed42_forms(self):
+        self.boltz_resident_boundary()
+        for extras in (['--seed','42'],['--seed=42']):
+            with self.subTest(extras=extras):
+                result=subprocess.run(['bash',str(SCRIPT),'boltz2','--fasta',str(self.input),
+                    '--execution','resident','--',*extras],env=self.env,capture_output=True,text=True,timeout=20)
+                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                calls=[json.loads(line) for line in (self.root/'resident-calls.jsonl').read_text().splitlines()]
+                self.assertEqual(calls[-1][calls[-1].index('--native-seed')+1],'42')
+                self.assertNotIn('--seed',calls[-1])
+                self.assertNotIn('--probe',calls[-1])
+                self.assertFalse((self.root/'launches').exists())
+
+    def test_boltz_other_seed_or_additional_native_option_cannot_use_resident_defaults(self):
+        self.boltz_resident_boundary()
+        for extras in (['--seed','43'],['--seed=43'],['--seed','42','--sampling_steps','50'],
+                       ['--seed','42','--seed','42']):
+            with self.subTest(extras=extras):
+                result=subprocess.run(['bash',str(SCRIPT),'boltz2','--fasta',str(self.input),
+                    '--execution','resident','--',*extras],env=self.env,capture_output=True,text=True,timeout=20)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertFalse((self.root/'resident-calls.jsonl').exists())
+                self.assertFalse((self.root/'launches').exists())
+
+    def test_boltz_unset_seed_auto_falls_back_and_explicit_resident_stops_at_unavailable(self):
+        self.boltz_resident_boundary()
+        result=subprocess.run(['bash',str(SCRIPT),'boltz2','--fasta',str(self.input),
+            '--execution','resident'],env=self.env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(result.returncode,78,result.stdout+result.stderr)
+        self.assertFalse((self.root/'launches').exists())
+        result=subprocess.run(['bash',str(SCRIPT),'boltz2','--fasta',str(self.input)],
+            env=self.env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertTrue((self.root/'launches').exists())
+        calls=[json.loads(line) for line in (self.root/'resident-calls.jsonl').read_text().splitlines()]
+        self.assertTrue(all('--native-seed' not in args and '--probe' in args for args in calls))
+
     def rf3_fixture(self):
         shutil.copytree(SCRIPT.parent / "rf3", self.root / "tools" / "rf3",
                         ignore=shutil.ignore_patterns("__pycache__"))
+        if not (self.root / "tools/library").exists():
+            shutil.copytree(SCRIPT.parent / "library", self.root / "tools/library",
+                            ignore=shutil.ignore_patterns("__pycache__"))
         sequence = "".join(self.input.read_text().splitlines()[1:])
         alignment = self.root / "query.a3m"
         alignment.write_text(f">query\n{sequence}\n>homolog TaxID=42\n{sequence}\n")
@@ -488,6 +539,63 @@ mkdir -p "$LOCALOUT"
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('differs from supplied input', result.stderr)
         self.assertFalse((self.root / "launches").exists())
+
+    def test_rf3_explicit_json_bundle_uses_its_verified_native_source_format(self):
+        self.rf3_fixture()
+        native = self.root / 'original native.json'
+        native.write_text(json.dumps([{'name': 'native-case', 'components': [
+            {'chain_id': 'A', 'seq': 'NLYIQWLKDGGPSSGRPPPS', 'chain_type': 'polypeptide(L)', 'is_polymer': True},
+            {'chain_id': 'L', 'smiles': 'C[C@H](O)F', 'res_name': 'LIG'}]}]))
+        bundle = self.root / 'native prepared'
+        subprocess.run([sys.executable, str(SCRIPT.parent / 'rf3/prepare.py'), 'prepare',
+            '--native-json', str(native), '--msa-map', str(self.root/'mapping.json'), '--out', str(bundle)],
+            check=True, capture_output=True, text=True)
+        result = subprocess.run(['bash', str(SCRIPT), 'rf3', '--in', str(native), '--msa-bundle', str(bundle),
+            '--execution', 'ephemeral'], env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertFalse((self.root/'preparation-calls').exists())
+        transmitted=(self.root/'transmitted.sh').read_text()
+        self.assertIn('export BIO_RF3_INPUT=',transmitted)
+        run=next((self.root/'shared/runs').iterdir())
+        self.assertEqual((run/'in/prepared/input.json').read_bytes(),(bundle/'input.json').read_bytes())
+
+    def test_rf3_refresh_conflicts_with_explicit_bundle_before_any_launch(self):
+        bundle=self.rf3_fixture()
+        result=subprocess.run(['bash',str(SCRIPT),'rf3','--fasta',str(self.input),
+            '--msa-bundle',str(bundle),'--refresh-preparation'],env=self.env,capture_output=True,text=True,timeout=20)
+        self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+        self.assertIn('without an explicit --msa-bundle',result.stderr)
+        self.assertFalse((self.root/'launches').exists())
+
+    def test_rf3_search_cache_boundary_forwards_request_before_launch_and_retains_receipt(self):
+        bundle=self.rf3_fixture()
+        # The actual RF3 parser/cache/API boundary is exercised by test_rf3_preparation_cache.
+        # Here a deterministic CPU boundary isolates shell routing and evidence transfer.
+        (self.root/'tools/inference/frontend.py').write_text('''import json,os,pathlib,shutil,sys
+args=sys.argv[1:]
+def value(flag):return args[args.index(flag)+1]
+root=pathlib.Path(os.environ['AUDIT']);out=pathlib.Path(value('--rf3-out'))
+with (root/'events').open('a') as f:f.write('rf3-cache-prepare\\n')
+(root/'rf3-cache-argv.json').write_text(json.dumps(args))
+shutil.copytree(os.environ['RF3_FAKE_CAPTURED_BUNDLE'],out)
+receipt={'kind':'rf3-preparation-cache-request','bundle':str(out),'reused_preparation':False,'refreshed':'--refresh-preparation' in args}
+out.with_name(out.name+'.preparation-cache.json').write_text(json.dumps(receipt))
+print(json.dumps(receipt))
+''')
+        result=subprocess.run(['bash',str(SCRIPT),'rf3','--fasta',str(self.input),
+            '--refresh-preparation','--execution','ephemeral','--name','retained-name'],
+            env=dict(self.env,RF3_FAKE_CAPTURED_BUNDLE=str(bundle)),capture_output=True,text=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        args=json.loads((self.root/'rf3-cache-argv.json').read_text())
+        self.assertIn('--rf3-prepare-only',args);self.assertIn('--refresh-preparation',args)
+        self.assertEqual(args[args.index('--fasta')+1],str(self.input))
+        self.assertEqual(args[args.index('--rf3-name')+1],'retained-name')
+        self.assertEqual(args[args.index('--shared')+1],str(self.root/'shared'))
+        events=(self.root/'events').read_text().splitlines()
+        self.assertLess(events.index('rf3-cache-prepare'),next(i for i,e in enumerate(events) if e.startswith('launch:')))
+        job=next((self.root/'results').glob('rf3-*/job.json'))
+        data=json.loads(job.read_text());receipt=job.parent/'rf3-preparation-cache.json'
+        self.assertEqual(data['rf3_preparation']['sha256'],hashlib.sha256(receipt.read_bytes()).hexdigest())
 
     def test_rf3_failed_search_does_not_fall_back_or_rent(self):
         self.rf3_fixture()

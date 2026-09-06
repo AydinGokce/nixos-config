@@ -118,6 +118,13 @@ class BioFoldTests(unittest.TestCase):
         self.assertEqual(self.commands("bio-viz"), [])
         self.assertEqual(len(self.commands("rsync")), 1)
 
+    def test_resident_execution_option_reaches_head_as_launcher_option(self):
+        result = self.run_fold('--execution', 'resident')
+        self.assert_success(result)
+        command = self.commands('ssh')[0][-1]
+        self.assertIn('--execution resident', command)
+        self.assertNotIn('-- --execution', command)
+
     def test_rf3_library_private_input_dispatch(self):
         result = self.run_arguments("rf3", "--assembly", "target-complex", "--msa-backend", "private", BIO_TEST_RF3='passed')
         self.assert_success(result)
@@ -125,6 +132,25 @@ class BioFoldTests(unittest.TestCase):
         self.assertIn("bio-submit rf3 --assembly target-complex", remote)
         self.assertIn("--msa-backend private", remote)
         self.assertEqual(self.commands("scp"), [])
+
+    def test_rf3_refresh_preparation_is_head_option_and_keeps_native_extras(self):
+        result=subprocess.run(['bash',str(SCRIPT),'rf3','--assembly','assembly:mixed@3','--refresh-preparation',
+            '--msa-backend','private','--out',str(self.out),'--','seed=101'],
+            env=dict(self.env,BIO_TEST_RF3='passed'),capture_output=True,text=True,timeout=15)
+        self.assert_success(result)
+        remote=shlex.split(self.commands('ssh')[0][-1])
+        self.assertEqual(remote,['bio-submit','rf3','--assembly','assembly:mixed@3',
+            '--msa-backend','private','--refresh-preparation','--','seed=101'])
+        self.assertEqual(self.commands('scp'),[])
+
+    def test_refresh_preparation_rejects_other_models_before_upload(self):
+        for model in ('boltz2','protenix','openfold3','rfaa'):
+            with self.subTest(model=model):
+                result=self.run_arguments(model,'--fasta',str(self.fasta),'--refresh-preparation')
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertIn('only for RF3',result.stderr)
+                self.assertEqual(self.commands('scp'),[])
+                self.assertEqual(self.commands('ssh'),[])
 
     def test_rf3_renders_only_audited_selected_sample(self):
         result = self.run_arguments('rf3', '--assembly', 'target-complex', '--render', BIO_TEST_RF3='passed')

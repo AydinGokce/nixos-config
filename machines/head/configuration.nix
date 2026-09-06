@@ -56,6 +56,19 @@ in
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/library/cli.py "$@"
     '')
+    (pkgs.writeShellScriptBin "bio-inference" ''
+      set -euo pipefail
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export BIO_INFERENCE_CONTROL_SOURCE=nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH/inference-control
+      for inference_arg in "$@"; do
+        if [ "$inference_arg" = worker-start ]; then
+          source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+          export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+          break
+        fi
+      done
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/inference/cli.py "$@"
+    '')
     (pkgs.writeShellScriptBin "bio-rfaa-databases" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 curl gnutar gzip coreutils util-linux ])}''${PATH:+:$PATH}
       exec python3 /etc/bio-tools/rfaa/databases.py "$@"
@@ -120,6 +133,7 @@ in
     "bio-tools/rf3".source = ./rf3;
     "bio-tools/msa".source = ./msa;
     "bio-tools/library".source = ./library;
+    "bio-tools/inference".source = ./inference;
     "bio-tools/library-runtime.json".text = builtins.toJSON {
       python = "${pkgs.python312}/bin/python3.12";
       path = lib.makeBinPath [ pkgs.git pkgs.coreutils ];
@@ -251,6 +265,7 @@ in
   };
 
   systemd.tmpfiles.rules = [
+    "d /var/lib/bio-inference 0700 root root - -"
     "d /var/lib/bio-library 0700 root root - -"
     "d /var/lib/bio-library-runtime 0700 root root - -"
     "d /var/lib/dc            0700 root root - -"
@@ -260,6 +275,23 @@ in
     "d /root/.ssh            0700 root root - -"
     "d /var/lib/bio-runs     0755 root root - -"   # bio-submit pulls results here
   ];
+
+  systemd.services.bio-inference = {
+    description = "Dispatch durable model requests and CPU postprocessing";
+    restartTriggers = [ ./inference ];
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network-online.target" "systemd-tmpfiles-setup.service" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "/run/current-system/sw/bin/bio-inference serve";
+      Restart = "on-failure";
+      RestartSec = 5;
+      KillMode = "control-group";
+      TimeoutStopSec = 30;
+      UMask = "0077";
+    };
+  };
 
   systemd.services.bio-library-init = {
     description = "Initialize the authoritative construct library";
@@ -286,6 +318,14 @@ in
     # This head/provider pair returned zero-filled reads over NFS 4.2. The
     # identical files read correctly over 4.1; pin it for every shared mount.
     options = [ "vers=4.1" "nconnect=16" "x-systemd.automount" "noauto" "x-systemd.idle-timeout=600" ];
+  };
+  # Only queue/control artifacts use this subtree, through this mount on every
+  # client. Its separate metadata cache avoids NFS's 30-second negative lookups.
+  fileSystems."/mnt/bio-inference-control" = {
+    device = "nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH/inference-control";
+    fsType = "nfs";
+    options = [ "vers=4.1" "nconnect=16" "hard" "nosharecache" "lookupcache=none" "actimeo=0"
+      "nofail" "_netdev" ];
   };
   fileSystems."/mnt/bio-databases" = lib.mkIf (rfaaStorage.nfs != "") {
     device = rfaaStorage.nfs;

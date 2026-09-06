@@ -3,6 +3,56 @@
 These are functional checks with small protein inputs. Production RFAA database
 installation is tracked separately from tests with miniature databases.
 
+## Resident execution and completed private comparison
+
+The full private ColabFold database snapshot is downloaded, extracted and
+indexed, including all five required components. All 42 private native
+preparations finished. A managed session then completed an additional real
+request and closed after its idle timeout while preserving the borrowed API.
+Index residency was measured, not guaranteed: the recorded `mincore` observation
+showed 49.1% of the approximately 700 GB of index pages resident. Full prefetch
+and locking modes have implementation tests but were not exercised on this
+production session.
+
+The matched H100 comparison finished at 21:36:01 UTC: **72/72 runs, 264/264
+structures and 36/36 public/private pairs**. The 70 resumed runs completed in
+about 13 minutes, all on their first queue attempt. Two earlier completed runs
+remain in the cohort; the original failed OpenFold3 attempt is retained
+separately. Independent audits verified every expected sample, file hash,
+worker/GPU/configuration binding and CPU score. This elapsed time describes the
+three parallel resident workers, not a controlled speedup experiment.
+
+| Model | Public CA RMSD (Å) | Private CA RMSD (Å) | Public lDDT-CA | Private lDDT-CA |
+|---|---:|---:|---:|---:|
+| Boltz2 | 1.239559 | 1.237539 | 0.957496 | 0.957494 |
+| OpenFold3 | 1.100616 | 1.123167 | 0.958774 | 0.958295 |
+| Protenix | 1.223770 | 1.207792 | 0.955765 | 0.956680 |
+
+These are descriptive means across all configured samples of 12 single chains,
+88–502 residues. Small average differences do not establish equivalence for
+large engineered editors, complexes or binding/inhibition. Public preparation
+remains the default. The complete case/sample tables and preserved failures are
+under `~/bio-runs/msa-resident-resume-20260906/v1/report-support/`; the independent
+retention audit is under `audit-support/` in the same run directory.
+
+Actual native A→B→A qualification preserved feature inputs, random-number state,
+model parameters and buffers. Boltz matched coordinates and confidence exactly.
+Protenix, OpenFold3 and RF3 showed small native CUDA numerical variability;
+earlier strict coordinate-equality failures remain recorded. They were not
+reclassified as passes by increasing the tolerance. RF3's final qualification
+also verified all 15 sample chemistry audits, and its normal resident frontend
+completed five more chemically valid samples with CPU validation before
+publication. This establishes execution isolation and chemistry handling,
+not general predictive or functional accuracy.
+
+Two real queue requests reused one loaded model and survived a head coordinator
+restart without changing attempt identity. A dedicated NFS control mount
+reduced the observed worker-to-head result collection delay from 8–25 seconds
+to 0.7–1.3 seconds. Cached artifacts separately passed actual NFS publication,
+concurrent publication, writable-copy isolation and interrupted-publication
+checks. GPU runtimes are sealed worker-local copies; no package installation is
+performed per prediction. See [the execution contract](inference/README.md).
+
 ## Project briefs and construct descriptions
 
 An actual workstation-to-head integration test created an isolated protein and
@@ -235,15 +285,16 @@ Both head and workstation NixOS configurations build successfully. Head changes
 are deployed. Workstation activation still requires the user's sudo
 authentication. AF3 was excluded from changes and validation.
 
-## Production databases and quality comparisons
+## Production databases and quality comparisons — earlier setup record
+
+The following milestones precede the completed resident comparison above.
 
 The 3300 GB RFAA volume `00537aea-2184-434a-84c1-1074bd1ebd58` and separate 3000 GB
 ColabFold volume `3ccef50a-59fe-4a5f-b7d3-ec669fe7ccef` are allocated, registered
-with persistent retention, and mounted on the head. Both full archive downloads
-are in progress. RFAA installation runs on the head; ColabFold's current head
-stage downloads archives only, leaving conversion, full CPU indexes and mmCIF
-mirroring for a sufficiently large worker. Full production installation and
-inference against those databases are still pending. The miniature-database
+with persistent retention, and mounted on the head. Initially both archive
+downloads ran on the head, with ColabFold conversion, full CPU indexes and mmCIF
+mirroring reserved for a sufficiently large worker. RFAA was subsequently
+parked with its data retained; ColabFold completed as recorded above. The miniature-database
 results above do not establish production corpus completeness or scientific
 parity. Persistent storage remains billable after the $500 launch/compute guard
 halts new paid work; it is not a hard storage spending cap.
@@ -258,7 +309,7 @@ outputs now score, and prior Protenix scores remain exactly unchanged.
 Six classical and twelve recent experimental references retain full construct
 FASTA sequences, observed-residue mappings and source hashes. The recent panel
 has a frozen selection/exclusion audit under
-`~/bio-runs/msa-recent-panel-20260906`; no predictions have been run for that panel.
+`~/bio-runs/msa-recent-panel-20260906`; this selection preceded its predictions.
 Its engineered, truncated and fusion constructs are explicitly labeled.
 See [the quality comparison protocol](msa/QUALITY.md). Public preparation remains
 the default until appropriate comparisons support a change.
@@ -284,7 +335,7 @@ renting another GPU or running inference.
 All 42 public native preparation bundles for the frozen 14-case, three-model
 panel are validated. One recent Boltz target had a transient HTTP 404; the
 original failure and a successful explicitly recorded identical-input retry are
-both retained. The 12 recent cases have no GPU predictions yet. Their frozen
+both retained. The 12 recent cases were then ready for GPU prediction. Their frozen
 private panel is `~/bio-runs/msa-private-panel-20260906/panel-input.json`, canonical
 SHA256 `8bb1eb328c2bd0258b3e868be3f0c496e456f31c6e646e3428e8812d882334f0`.
 
@@ -293,6 +344,6 @@ isolation and retained official paired-job archive evidence. The resumable build
 queue passes 35 tests for download prerequisites, promoted-component resumption,
 capacity/price limits, uncertain starts, exact cleanup and panel-only retries.
 A head-only systemd probe confirmed retained process/invocation metadata used
-for reconciliation. These checks establish orchestration behavior, not a
-completed full corpus or prediction-quality parity. See
+for reconciliation. Those implementation checks established orchestration
+behavior; corpus completion and the limited comparison are recorded above. See
 [the panel interface](msa/PANEL.md) and [the build queue](msa/BUILD_QUEUE.md).
