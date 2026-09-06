@@ -5,7 +5,7 @@ Subcommands:
   list-models                        show ESM-2 checkpoints + sizes/VRAM hints
   embed   [-i FASTA|-s SEQ] -o OUT   per-sequence or per-residue embeddings -> .npz
   logits  [-i FASTA|-s SEQ] -o OUT   per-position amino-acid logits -> .npz
-  score   [-i FASTA|-s SEQ] [-o CSV] per-sequence pseudo-log-likelihood ("naturalness")
+  score   [-i FASTA|-s SEQ] [-o CSV] sum/mean of unmasked per-residue model log probabilities
   mutate  -s WTSEQ -m A24G,... [-o CSV]
                                      masked-marginal effect score per mutation
 

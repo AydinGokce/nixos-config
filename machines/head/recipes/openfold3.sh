@@ -1,13 +1,21 @@
 # OpenFold3 (AF3-class open reimpl; Apache-2.0 code+weights, commercial OK). Weights
 # fetched by setup_openfold from public S3 (not gated). No local DBs via
 # --use_msa_server=True (remote ColabFold API; rate-limited). IN = query FASTA.
-VENV="$SHARED/envs/openfold3"; export OPENFOLD_CACHE="$SHARED/openfold3/cache"; mkdir -p "$OPENFOLD_CACHE"
+VENV="$SHARED/envs/openfold3"
+# setup_openfold writes weights under $HOME/.openfold3 while run_openfold reads
+# $OPENFOLD_CACHE — so point BOTH at one dir on the share, else run_openfold
+# never finds the checkpoint (and the weights would die with the node anyway).
+OF3_HOME="$SHARED/openfold3/home"; export OPENFOLD_CACHE="$OF3_HOME/.openfold3"
+mkdir -p "$OPENFOLD_CACHE"
 sys_venv "$VENV"; P="$VENV/bin/python"
-"$P" -c 'import torch' >/dev/null 2>&1 || uv pip install --python "$P" torch --index-url https://download.pytorch.org/whl/cu124
-uv pip install --python "$P" openfold3
+uv pip install --python "$P" torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python "$P" openfold3==0.5.0 torch==2.7.1
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
-# one-time weights fetch (cached on the shared FS via OPENFOLD_CACHE)
-"$VENV/bin/setup_openfold" --non-interactive || true
+# Setup checks the release's exact checkpoint and CCD cache. A failed download
+# must abort instead of surfacing later as an opaque missing-checkpoint error.
+CFG="$OPENFOLD_CACHE/setup_config.json"
+printf '{"openfold_cache":"%s","param_directory":"%s"}\n' "$OPENFOLD_CACHE" "$OPENFOLD_CACHE" > "$CFG"
+HOME="$OF3_HOME" "$VENV/bin/setup_openfold" --config "$CFG"
 SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-of3_job}"
 J="$OUT/query.json"
 cat > "$J" <<JSON
@@ -15,4 +23,4 @@ cat > "$J" <<JSON
 JSON
 have_gpu
 # shellcheck disable=SC2086
-"$VENV/bin/run_openfold" predict --query_json="$J" --use_msa_server=True --output_dir="$OUT" $EXTRA
+"$VENV/bin/run_openfold" predict --query_json="$J" --use_msa_server=True --output_dir="$OUT" "${EXTRA_ARGS[@]}"

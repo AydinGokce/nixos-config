@@ -52,6 +52,8 @@ def cmd_embed(args):
     import torch
     from transformers import AutoTokenizer, AutoModelForMaskedLM
     repo = args.model if "/" in args.model else "facebook/" + args.model
+    if args.device == "cuda" and not torch.cuda.is_available():
+        sys.exit("bio-evolvepro: CUDA requested but unavailable")
     device = "cuda" if (torch.cuda.is_available() and args.device != "cpu") else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
     tok = AutoTokenizer.from_pretrained(repo)
@@ -75,13 +77,14 @@ def cmd_embed(args):
 def cmd_evolve(args):
     import numpy as np
     import pandas as pd
-    emb = pd.read_csv(args.embeddings, index_col=0)
+    # Numeric-looking identifiers and names like NA are still literal strings.
+    emb = pd.read_csv(args.embeddings, dtype={"variant": str}, keep_default_na=False).set_index("variant")
     X_all = emb.values
     idx = list(emb.index)
 
     measured = {}
     if args.labels:
-        lab = pd.read_csv(args.labels)
+        lab = pd.read_csv(args.labels, dtype=str, keep_default_na=False)
         cols = {c.lower(): c for c in lab.columns}
         vcol = cols.get("variant") or lab.columns[0]
         acol = cols.get("activity") or cols.get("fitness") or lab.columns[1]
@@ -94,7 +97,9 @@ def cmd_evolve(args):
     if not train_i:
         # First round: no measurements yet — propose a diverse spread by k-means.
         from sklearn.cluster import KMeans
-        k = min(args.n, len(idx))
+        # Identical embeddings cannot form separate clusters. Avoid empty
+        # clusters and select one representative for each distinct point.
+        k = min(args.n, len(np.unique(X_all, axis=0)))
         km = KMeans(n_clusters=k, n_init=10, random_state=args.seed).fit(X_all)
         chosen = []
         for c in range(k):
@@ -105,6 +110,8 @@ def cmd_evolve(args):
         out = pd.DataFrame({"variant": [idx[i] for i in chosen],
                             "strategy": "first_round_kmeans_diverse"})
         out.to_csv(args.out, index=False)
+        if args.full:
+            out.to_csv(args.full, index=False)
         print(f"bio-evolvepro: no labels given -> proposed {len(chosen)} diverse variants "
               f"(first round) -> {args.out}")
         return

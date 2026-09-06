@@ -57,6 +57,8 @@ let
     [
       (mkBioCmd { name = "bio-doctor"; })
       (mkBioCmd { name = "bio-setup"; })
+      # laptop-side: run a cluster model, fetch the result, view/render locally
+      (mkBioCmd { name = "bio-fold"; runtimeInputs = [ pkgs.openssh pkgs.rsync ]; })
     ]
     # Per-tool run wrappers, gated on their enable flag.
     ++ lib.optional cfg.tools.esm.enable (mkBioCmd { name = "bio-esm"; })
@@ -77,6 +79,11 @@ let
     export BIO_GPU_VRAM_GB=${toString cfg.gpu.vramGB}
     export BIO_ESM_DEFAULT_MODEL=${lib.escapeShellArg cfg.esm.defaultModel}
     export BIO_TORCH_CUDA=${lib.escapeShellArg cfg.torchCudaWheel}
+
+    # Cluster head used by the laptop-side `bio-fold` to run models remotely.
+    export BIO_CLUSTER_HEAD=${lib.escapeShellArg cfg.cluster.head}
+    export BIO_CLUSTER_USER=${lib.escapeShellArg cfg.cluster.user}
+    export BIO_CLUSTER_SSHKEY=${lib.escapeShellArg cfg.cluster.sshKey}
 
     # NVIDIA userspace driver (libcuda.so.1) lives here on NixOS; CUDA wheels
     # dlopen it at runtime, so every wrapper prepends this to LD_LIBRARY_PATH.
@@ -168,6 +175,24 @@ in
         Default ESM-2 checkpoint for `bio-esm` when --model is not given.
         650M fits comfortably in 8GB; bump to 3B/15B on a big-VRAM machine.
       '';
+    };
+
+    cluster = {
+      head = lib.mkOption {
+        type = lib.types.str;
+        default = "31.56.109.100";
+        description = "DataCrunch head node (IP or tailnet name) that `bio-fold` runs `bio-submit` on.";
+      };
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "root";
+        description = "SSH user on the cluster head.";
+      };
+      sshKey = lib.mkOption {
+        type = lib.types.str;
+        default = "/home/${cfg.user}/.ssh/datacrunch_ed25519";
+        description = "SSH private key `bio-fold` uses to reach the head + fetch results.";
+      };
     };
 
     tools = lib.mapAttrs

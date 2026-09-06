@@ -17,4 +17,4 @@ YAML
 have_gpu
 # shellcheck disable=SC2086
 "$VENV/bin/boltz" predict "$YAML" --use_msa_server --accelerator gpu --devices 1 \
-  --out_dir "$OUT" --output_format pdb --cache "$BOLTZ_CACHE" $EXTRA
+  --out_dir "$OUT" --output_format pdb --cache "$BOLTZ_CACHE" "${EXTRA_ARGS[@]}"

@@ -3,6 +3,12 @@
 A reusable NixOS module that installs a suite of protein-design and protein-ML
 tools behind uniform `bio-*` command-line wrappers, plus PyMOL for visualization.
 
+For cloud runs, `bio-fold MODEL --fasta input.fasta --render` submits to the
+configured head, downloads results to `~/bio-runs/JOB`, and renders locally.
+`--view` opens PyMOL interactively. Folding models include Boltz-2, OpenFold3,
+Protenix and RFAA; the same interface also supports RFdiffusion, ProteinMPNN,
+ESM-2 and EVOLVEpro. See [cloud setup and usage](../../machines/head/README.md).
+
 | Tool | Wrapper | What it does | On the 8GB 3070 |
 |------|---------|--------------|-----------------|
 | **ProteinMPNN** | `bio-mpnn` | fixed-backbone sequence design | ✅ runs great |
@@ -64,7 +70,7 @@ bio-esm list-models
 bio-esm embed  -i seqs.fasta -o emb.npz            # per-seq mean embeddings
 bio-esm embed  -i seqs.fasta -o emb.npz --pooling per_tok
 bio-esm logits -s MKTAYIAKQR -o logits.npz         # per-position AA logits
-bio-esm score  -i seqs.fasta -o scores.csv         # pseudo-log-likelihood ("naturalness")
+bio-esm score  -i seqs.fasta -o scores.csv         # unmasked per-residue log probabilities
 bio-esm mutate -s MKTAYIAKQR -m A2G,K9R -o eff.csv # masked-marginal mutation effect
 ```
 Model defaults to `bio.esm.defaultModel` (650M here). Override with `--model esm2_t36_3B_UR50D`.

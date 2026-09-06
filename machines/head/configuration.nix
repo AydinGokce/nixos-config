@@ -1,8 +1,10 @@
-# bio-head — always-on DataCrunch CPU node: SLURM controller / orchestrator that
+# bio-head — always-on DataCrunch CPU node: orchestrator that
 # launches ephemeral GPU instances per job. Lean, headless server (deliberately
 # NOT built through the desktop `mkSystem` path). Installed via nixos-anywhere.
 { config, lib, pkgs, modulesPath, ... }:
-
+let
+  rfaaStorage = import ./rfaa-storage.nix;
+in
 {
   imports = [ (modulesPath + "/profiles/qemu-guest.nix") ]; # virtio drivers for KVM
 
@@ -39,21 +41,53 @@
     git curl wget jq tmux vim htop rsync openssh uv python3 tailscale util-linux
   ]) ++ [
     (pkgs.writeShellScriptBin "dc" ''
-      export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused ])}''${PATH:+:$PATH}
+      export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused python3 ])}''${PATH:+:$PATH}
       ${builtins.readFile ./dc.sh}
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
-      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused ])}''${PATH:+:$PATH}
+      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-submit.sh}
+    '')
+    (pkgs.writeShellScriptBin "bio-rfaa-databases" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 curl gnutar gzip coreutils util-linux ])}''${PATH:+:$PATH}
+      exec python3 /etc/bio-tools/rfaa/databases.py "$@"
     '')
   ];
 
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
   # to the head; bio-submit rsyncs these onto the shared FS for the GPU nodes.
   environment.etc = {
+    "bio-tools/dc-budget.py".source = ./dc-budget.py;
     "bio-tools/py".source = ../../modules/bio/py;                # esm_cli, rfaa patch, etc.
     "bio-tools/requirements".source = ../../modules/bio/requirements;
     "bio-tools/recipes".source = ./recipes;                     # per-tool bio-submit recipes
+    "bio-tools/rfaa".source = ./rfaa;
+    "bio-tools/cluster.sh".text = ''
+      export RFAA_DB_VOLUME=${lib.escapeShellArg rfaaStorage.volumeId}
+      export RFAA_DB_NFS=${lib.escapeShellArg rfaaStorage.nfs}
+      export RFAA_DB_DIR=/mnt/bio-databases/rfaa
+    '';
+  };
+
+  # The launcher refuses new jobs if this monitor stops running. It reconciles
+  # provider inventory/cost estimates and removes expired managed GPU workers.
+  systemd.services.dc-budget-watchdog = {
+    description = "Reconcile cloud spending and expire temporary compute";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/dc watchdog";
+      TimeoutStartSec = 240;
+    };
+  };
+  systemd.timers.dc-budget-watchdog = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "30s";
+      OnUnitActiveSec = "60s";
+      AccuracySec = "5s";
+    };
   };
 
   systemd.tmpfiles.rules = [
@@ -76,6 +110,11 @@
     device = "nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH";
     fsType = "nfs";
     options = [ "nconnect=16" "x-systemd.automount" "noauto" "x-systemd.idle-timeout=600" ];
+  };
+  fileSystems."/mnt/bio-databases" = lib.mkIf (rfaaStorage.nfs != "") {
+    device = rfaaStorage.nfs;
+    fsType = "nfs";
+    options = [ "nconnect=16" "x-systemd.automount" "noauto" ];
   };
 
   time.timeZone = "UTC";

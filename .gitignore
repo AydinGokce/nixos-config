@@ -71,3 +71,7 @@ node_modules/
 # nix build artifacts
 result
 result-*
+
+# Python validation artifacts
+__pycache__/
+*.py[cod]

@@ -1,31 +1,71 @@
-# RoseTTAFold-All-Atom — single-sequence, template-free (no MSA/template DBs).
-# py3.10 + torch 2.0.1+cu118 + dgl 1.1.2 + pyg. IN = query FASTA. Reduced accuracy
-# vs a real MSA, but needs zero databases. NAME optional.
+# RoseTTAFold-All-Atom. Full MSA/template preparation is the default; select
+# SUB=single-seq explicitly for a database-free smoke test. IN = one-chain FASTA.
+MODE="${SUB:-full}"
+case "$MODE" in full|single-seq) ;; *) echo 'rfaa: --sub must be full or single-seq' >&2; exit 2 ;; esac
+RFAA_SCRIPTS="$SHARED/tools/rfaa"
+export RFAA_DB_DIR="${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
+python3 "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --validate-only
+if [ "$MODE" = full ]; then
+  python3 "$RFAA_SCRIPTS/databases.py" validate --root "$RFAA_DB_DIR"
+fi
 PY=$(nfs_py310)
 VENV="$SHARED/envs/rfaa"; SRC="$SHARED/src/rfaa"; NAME="${NAME:-rfaa}"
 "$VENV/bin/python" -c '' >/dev/null 2>&1 || { rm -rf "$VENV"; uv venv --python "$PY" "$VENV"; }
 P="$VENV/bin/python"
 [ -d "$SRC/.git" ] || git clone https://github.com/baker-laboratory/RoseTTAFold-All-Atom "$SRC"
-git -C "$SRC" checkout -q d69ab3a73f8ede31a4cc005fbc076a341d848469 || true
-git -C "$SRC" submodule update --init --recursive -q || true
+git -C "$SRC" checkout -q d69ab3a73f8ede31a4cc005fbc076a341d848469
+git -C "$SRC" submodule update --init --recursive -q
 uv pip install --python "$P" -r "$SHARED/tools/requirements/rfaa.txt"
-"$P" -c 'import dgl' >/dev/null 2>&1 || uv pip install --python "$P" dgl==1.1.2 -f https://data.dgl.ai/wheels/cu118/repo.html
-uv pip install --python "$P" torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.1+cu118.html || true
-uv pip install --python "$P" torch-geometric==2.5.0 || true
-uv pip install --python "$P" "git+https://github.com/NVIDIA/dllogger.git@0540a43971f4a8a16693a9de9de73c1072020769" || true
-[ -d "$SRC/rf2aa/SE3Transformer" ] && uv pip install --python "$P" --no-deps "$SRC/rf2aa/SE3Transformer" || true
-# template-free enablement: empty pdb100 FFindex stub + patch load_protein
-mkdir -p "$SRC/pdb100_2021Mar03"
-: > "$SRC/pdb100_2021Mar03/pdb100_2021Mar03_pdb.ffindex"; printf '\0' > "$SRC/pdb100_2021Mar03/pdb100_2021Mar03_pdb.ffdata"
-"$P" "$SHARED/tools/py/rfaa_singleseq_patch.py" "$SRC/rf2aa/data/protein.py" || true
-[ -s "$SRC/RFAA_paper_weights.pt" ] || dl "http://files.ipd.uw.edu/pub/RF-All-Atom/weights/RFAA_paper_weights.pt" "$SRC/RFAA_paper_weights.pt"
-# query-only a3m so make_msa skips its DB search
-CH="$OUT/$NAME/A"; mkdir -p "$CH"
-{ echo '>query'; grep -v '^>' "$IN" | tr -d '\n\r \t'; echo; } > "$CH/t000_.msa0.a3m"; : > "$CH/t000_.atab"; : > "$CH/t000_.hhr"
+# PyTorch's cu118 wheel does not provide DGL's unversioned cu11 library names.
+# The Ubuntu image has CUDA 12, so these libraries must travel with the venv.
+uv pip install --python "$P" nvidia-cuda-runtime-cu11==11.8.89 \
+  nvidia-cusparse-cu11==11.7.5.86 nvidia-curand-cu11==10.3.0.86
+uv pip install --python "$P" 'dgl==1.1.2+cu118' --only-binary=dgl \
+  -f https://data.dgl.ai/wheels/cu118/repo.html
+uv pip install --python "$P" 'torch-scatter==2.1.2+pt20cu118' \
+  'torch-sparse==0.6.18+pt20cu118' 'torch-cluster==1.6.3+pt20cu118' \
+  --only-binary=torch-scatter,torch-sparse,torch-cluster \
+  -f https://data.pyg.org/whl/torch-2.0.1+cu118.html
+uv pip install --python "$P" torch-geometric==2.5.0
+uv pip install --python "$P" "git+https://github.com/NVIDIA/dllogger.git@0540a43971f4a8a16693a9de9de73c1072020769"
+uv pip install --python "$P" --no-deps "$SRC/rf2aa/SE3Transformer"
+# Empty results from a completed HHsearch are valid; support that case as well
+# as the explicitly selected single-seq mode. Never alter a real template DB.
+"$P" "$SHARED/tools/py/rfaa_singleseq_patch.py" "$SRC/rf2aa/data/protein.py"
+"$P" "$RFAA_SCRIPTS/patch_templates.py" "$SRC/rf2aa/data/parsers.py"
+WEIGHTS="$SRC/RFAA_paper_weights.pt"
+if [ "$(stat -c %s "$WEIGHTS" 2>/dev/null || echo 0)" != 1336673865 ]; then
+  dl "https://files.ipd.uw.edu/pub/RF-All-Atom/weights/RFAA_paper_weights.pt" "$WEIGHTS.part"
+  [ "$(stat -c %s "$WEIGHTS.part")" = 1336673865 ] || { echo 'rfaa: incomplete model weights' >&2; exit 1; }
+  mv "$WEIGHTS.part" "$WEIGHTS"
+fi
+CH="$OUT/$NAME/A"
+if [ "$MODE" = full ]; then
+  source "$RFAA_SCRIPTS/tools.sh"
+  HHDB="$RFAA_DB_DIR/pdb100_2021Mar03/pdb100_2021Mar03"
+  "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --out "$CH" --root "$RFAA_DB_DIR" \
+    --mode full --cpu "${RFAA_CPU:-4}" --mem "${RFAA_MEM_GB:-64}"
+else
+  HHDB="$SHARED/cache/rfaa/blank-template/pdb100"
+  mkdir -p "$(dirname "$HHDB")"
+  : > "${HHDB}_pdb.ffindex"; printf '\0' > "${HHDB}_pdb.ffdata"
+  "$P" "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --out "$CH" --mode single-seq
+fi
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 WANDB_MODE=disabled
+sp=$(echo "$VENV"/lib/python*/site-packages)
+"$P" "$SHARED/tools/py/clear_execstack.py" "$sp"/torch/lib/*.so* "$sp"/dgl/*.so*
+"$P" - <<'PY'
+import torch, dgl
+assert torch.cuda.is_available(), "RFAA needs a CUDA GPU"
+graph = dgl.graph(([0], [1]), num_nodes=2).to("cuda")
+graph.ndata["x"] = torch.ones((2, 1), device="cuda")
+graph.update_all(dgl.function.copy_u("x", "m"), dgl.function.sum("m", "y"))
+assert graph.ndata["y"].sum().item() == 1
+print("RFAA CUDA graph check passed", torch.__version__, dgl.__version__)
+PY
 have_gpu
 cd "$SRC"
-# shellcheck disable=SC2086
 "$P" -m rf2aa.run_inference --config-name protein job_name="$NAME" output_path="$OUT" \
-  checkpoint_path="$SRC/RFAA_paper_weights.pt" protein_inputs.A.fasta_file="$IN" $EXTRA
+  checkpoint_path="$WEIGHTS" protein_inputs.A.fasta_file="$IN" \
+  database_params.hhdb="$HHDB" database_params.sequencedb="$HHDB" "${EXTRA_ARGS[@]}"
