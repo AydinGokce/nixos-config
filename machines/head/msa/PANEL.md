@@ -33,8 +33,12 @@ bio-msa panel --json frozen-panel.json --worker TYPE --spot --timeout 21600
 bio-msa install --json frozen-panel.json --worker TYPE --spot --timeout 21600
 ```
 
-The default is `CPU.360V.1440G`; the existing full-search guard requires at least
-768 GiB available RAM. The full `.msa-databases.json` receipt and configured active
+Automatic selection chooses available FIN-02 x86 compute with at least 768 GiB
+RAM and an instance-price ceiling of $13/hour, including spot offers. `--spot`
+restricts selection to spot offers; `--worker TYPE` selects a specific host type.
+The launch rechecks the price and project budget, and the full-search guard
+requires at least 768 GiB available RAM on the worker. The full
+`.msa-databases.json` receipt and configured active
 storage are required before rental. Pinned model environments must already exist
 on shared storage. No sequence database, index, search setting or target is reduced
 to fit a smaller worker. Panel jobs use the existing independent MSA submission
