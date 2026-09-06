@@ -199,8 +199,33 @@ in
     };
   };
 
+  # One explicitly registered full-database validation. Its private artifact
+  # records durable intent before submission and never automatically retries.
+  systemd.services.bio-rfaa-validation-trigger = {
+    description = "Observe or submit the registered full RFAA validation once";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    path = [ pkgs.systemd pkgs.util-linux pkgs.coreutils ];
+    unitConfig.ConditionPathExists = "/var/lib/dc/rfaa-validation-trigger/config.json";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "${pkgs.python3}/bin/python3 /var/lib/dc/rfaa-validation-trigger/trigger.py tick --config /var/lib/dc/rfaa-validation-trigger/config.json";
+      TimeoutStartSec = 300;
+      UMask = "0077";
+    };
+  };
+  systemd.timers.bio-rfaa-validation-trigger = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*-*-* *:00/15:00";
+      Persistent = true;
+      AccuracySec = "1min";
+    };
+  };
+
   systemd.tmpfiles.rules = [
     "d /var/lib/dc            0700 root root - -"
+    "d /var/lib/dc/rfaa-validation-trigger 0700 root root - -"
     "d /root/.config         0700 root root - -"
     "d /root/.config/datacrunch 0700 root root - -"
     "d /root/.ssh            0700 root root - -"
