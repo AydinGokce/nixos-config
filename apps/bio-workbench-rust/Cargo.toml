@@ -1,0 +1,13 @@
+[package]
+name = "bio-workbench-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Offline native design prototype for Bio Workbench"
+
+[dependencies]
+eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "__screenshot"] }
+
+[profile.release]
+opt-level = 2
+debug = false
