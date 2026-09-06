@@ -72,6 +72,13 @@ allowlist, not arbitrary command execution. Native per-model defaults are
 preserved. Public MSA remains the default; private MSA is selectable and its
 native support is checked before launch.
 
+**Check compatibility** includes the text or library reference currently in the
+editor; an extra **Add input** click is optional. Use **Add input/component** to
+keep that entry and paste another. Unfinished drafts, names, modalities and
+formats are saved locally across views and restarts. Paste and library drafts
+are separate; a notice identifies saved drafts on inactive input tabs, which
+are included only when you return to that tab or add them to the input list.
+
 The comparison view bundles 3Dmol locally: rotate, zoom, change representations,
 pick residues, add labels and notes, and save annotations to the head. Multiple
 native samples remain available. Linked rotation shares the camera; it is not

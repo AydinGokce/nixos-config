@@ -28,6 +28,11 @@ import { RunsPanel } from "./components/RunsPanel";
 import { ComparePanel } from "./components/ComparePanel";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { inputCount, terminal, validateDraft } from "./domain";
+import {
+  clearActiveDraft,
+  inputFromDraft,
+  restoreInputDraft,
+} from "./inputDraft";
 import { exampleCatalog, exampleRun } from "./fixtures";
 import type {
   Artifact,
@@ -43,6 +48,7 @@ function getDraft(): {
   inputs?: MolecularInput[];
   name?: string;
   mode?: "batch" | "assembly";
+  editor?: unknown;
 } {
   try {
     const raw = readLocal(draftKey);
@@ -91,6 +97,11 @@ export default function App() {
   const [inputs, setInputs] = useState<MolecularInput[]>(
     initial.current.inputs ?? [],
   );
+  const [editor, setEditor] = useState(() =>
+    restoreInputDraft(initial.current.editor),
+  );
+  const pendingInput = inputFromDraft(editor, inputs);
+  const effectiveInputs = pendingInput ? [...inputs, pendingInput] : inputs;
   const [name, setName] = useState(initial.current.name ?? "");
   const [mode, setMode] = useState<"batch" | "assembly">(
     initial.current.mode === "assembly" ? "assembly" : "batch",
@@ -152,12 +163,12 @@ export default function App() {
   }, [refresh]);
   useEffect(() => {
     try {
-      writeLocal(draftKey, JSON.stringify({ inputs, name, mode }));
+      writeLocal(draftKey, JSON.stringify({ inputs, name, mode, editor }));
       setDraftSaved(true);
     } catch {
       setDraftSaved(false);
     }
-  }, [inputs, name, mode]);
+  }, [inputs, name, mode, editor]);
   useEffect(() => {
     if (!connected || demo) return;
     let disposed = false;
@@ -218,16 +229,27 @@ export default function App() {
   );
   async function preview() {
     setError("");
-    const problems = validateDraft(inputs, mode, models, catalog.models);
+    const problems = validateDraft(
+      effectiveInputs,
+      mode,
+      models,
+      catalog.models,
+    );
     if (problems.length) {
       setError(problems.join("\n"));
       return;
+    }
+    // Commit the visible editor once before networking. A failed preview keeps
+    // the exact row IDs and request signature available for an idempotent retry.
+    if (pendingInput) {
+      setInputs(effectiveInputs);
+      setEditor(clearActiveDraft(editor));
     }
     const payload = {
       name:
         name.trim() || `Untitled ${mode === "assembly" ? "assembly" : "batch"}`,
       mode,
-      inputs,
+      inputs: effectiveInputs,
       models,
       msa_backend: backend,
       execution,
@@ -313,7 +335,8 @@ export default function App() {
   const predictedCount =
     (mode === "assembly"
       ? 1
-      : inputs.reduce((n, input) => n + inputCount(input), 0)) * models.length;
+      : effectiveInputs.reduce((n, input) => n + inputCount(input), 0)) *
+    models.length;
   return (
     <div className="app-shell">
       <aside className="app-rail">
@@ -492,7 +515,7 @@ export default function App() {
                 </label>
                 <span>
                   {draftSaved
-                    ? "Added inputs saved on this device"
+                    ? "Draft saved on this device"
                     : "Local draft could not be saved"}
                 </span>
               </div>
@@ -500,6 +523,8 @@ export default function App() {
                 <InputBuilder
                   inputs={inputs}
                   setInputs={setInputs}
+                  draft={editor}
+                  setDraft={setEditor}
                   mode={mode}
                   setMode={setMode}
                   upload={(file, progress) => api.upload(file, progress)}
@@ -509,7 +534,7 @@ export default function App() {
                 />
                 <ModelPicker
                   catalog={catalog}
-                  inputs={inputs}
+                  inputs={effectiveInputs}
                   mode={mode}
                   selected={models}
                   setSelected={setModels}
@@ -525,7 +550,7 @@ export default function App() {
               <div className="launch-bar">
                 <div>
                   <strong>
-                    {inputs.length}{" "}
+                    {effectiveInputs.length}{" "}
                     {mode === "assembly" ? "components" : "inputs"}{" "}
                     <span>×</span> {models.length} models
                   </strong>

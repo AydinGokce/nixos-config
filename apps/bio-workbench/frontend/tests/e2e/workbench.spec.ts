@@ -154,7 +154,7 @@ test("native preview preserves batch input and all rejected pairs; only selected
   await page
     .getByLabel("Molecular input", { exact: true })
     .fill(">target\nACDEFGHIK\n");
-  await page.getByRole("button", { name: "Add input", exact: true }).click();
+  await expect(page.locator(".launch-bar strong")).toContainText("1 inputs");
   await page.getByRole("checkbox", { name: /RoseTTAFold3/ }).check();
   await page.getByRole("checkbox", { name: /^Protenix/ }).check();
   await page.getByRole("button", { name: "Check compatibility" }).click();
@@ -248,10 +248,12 @@ test("failed preview retry reuses its request key without silently launching", a
   page,
 }) => {
   const keys: string[] = [];
+  const requests: any[] = [];
   await mockApi(page, (method, params) => {
     if (method === "batch.list") return { batches: [] };
     if (method === "batch.validate") {
       keys.push(params.request_key);
+      requests.push(params);
       throw new Error("Connection interrupted after request");
     }
     throw new Error(`Unexpected ${method}`);
@@ -259,12 +261,181 @@ test("failed preview retry reuses its request key without silently launching", a
   await page.goto("/");
   await page.getByLabel("Molecular input", { exact: true }).fill("ACDE");
   await page.getByRole("button", { name: "Add input", exact: true }).click();
+  await page.getByLabel("Molecular input", { exact: true }).fill("  FGHI\n");
+  await expect(page.locator(".launch-bar strong")).toContainText("2 inputs");
   await page.getByRole("checkbox", { name: /RoseTTAFold3/ }).check();
   await page.getByRole("button", { name: "Check compatibility" }).click();
   await expect(page.getByRole("alert")).toContainText("Connection interrupted");
   await page.getByRole("button", { name: "Check compatibility" }).click();
   await expect.poll(() => keys.length).toBe(2);
   expect(keys[0]).toBe(keys[1]);
+  expect(requests[0].inputs.map((input: any) => input.source.text)).toEqual([
+    "ACDE",
+    "  FGHI\n",
+  ]);
+  expect(requests[1]).toEqual(requests[0]);
+  await expect(page.getByLabel("Molecular input", { exact: true })).toHaveValue(
+    "",
+  );
+  await expect(page.locator(".input-row")).toHaveCount(2);
+});
+
+test("unfinished paste survives navigation and reload and controls model compatibility", async ({
+  page,
+}) => {
+  await mockApi(page, (method) => {
+    if (method === "batch.list") return { batches: [] };
+    throw new Error(`Unexpected ${method}`);
+  });
+  await page.goto("/");
+  await page.getByLabel("Molecule type").selectOption("dna");
+  await page.getByLabel("Molecular input", { exact: true }).fill("ACGTACGT");
+  await expect(
+    page.getByRole("checkbox", { name: /^EVOLVEpro/ }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("checkbox", { name: /RoseTTAFold3/ }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Run history", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Prepare inputs", exact: true })
+    .click();
+  await expect(page.getByLabel("Molecular input", { exact: true })).toHaveValue(
+    "ACGTACGT",
+  );
+  await page.reload();
+  await expect(page.getByLabel("Molecular input", { exact: true })).toHaveValue(
+    "ACGTACGT",
+  );
+  await expect(page.getByLabel("Molecule type")).toHaveValue("dna");
+  await page.getByRole("button", { name: "Check compatibility" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Select at least one model.",
+  );
+  await expect(page.getByRole("alert")).not.toContainText("Add at least one");
+  await expect(page.getByLabel("Molecular input", { exact: true })).toHaveValue(
+    "ACGTACGT",
+  );
+});
+
+test("pending assembly component participates in compatibility and keeps unique chains", async ({
+  page,
+}) => {
+  let request: any;
+  await mockApi(page, (method, params) => {
+    if (method === "batch.list") return { batches: [] };
+    if (method === "batch.validate") {
+      request = params;
+      throw new Error("Preview test receipt");
+    }
+    throw new Error(`Unexpected ${method}`);
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /One assembly/ }).click();
+  await page.getByLabel("Molecular input", { exact: true }).fill("ACDEFGHIK");
+  await page
+    .getByRole("button", { name: "Add component", exact: true })
+    .click();
+  await page.getByLabel("Chain for Input 1").fill("B");
+  await page.getByLabel("Molecule type").selectOption("rna");
+  await page.getByLabel("Molecular input", { exact: true }).fill("ACGU");
+  await expect(
+    page.getByRole("checkbox", { name: /^EVOLVEpro/ }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: /Separate predictions/ }).click();
+  await expect(
+    page.getByRole("checkbox", { name: /^EVOLVEpro/ }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: /One assembly/ }).click();
+  await page.getByRole("checkbox", { name: /RoseTTAFold3/ }).check();
+  await page.getByRole("button", { name: "Check compatibility" }).click();
+  await expect.poll(() => request).toBeTruthy();
+  expect(
+    request.inputs.map((input: any) => [input.molecule_type, input.chain_id]),
+  ).toEqual([
+    ["protein", "B"],
+    ["rna", "A"],
+  ]);
+});
+
+test("paste and library drafts remain separate and hidden drafts are not submitted", async ({
+  page,
+}) => {
+  let request: any;
+  await mockApi(page, (method, params) => {
+    if (method === "batch.list") return { batches: [] };
+    if (method === "batch.validate") {
+      request = params;
+      throw new Error("Preview test receipt");
+    }
+    throw new Error(`Unexpected ${method}`);
+  });
+  await page.goto("/");
+  await page.getByLabel("Molecular input", { exact: true }).fill("ACDEFGHIK");
+  await page
+    .getByRole("tab", { name: "Library reference", exact: true })
+    .click();
+  await expect(
+    page.getByLabel("Library reference", { exact: true }),
+  ).toHaveValue("");
+  await page
+    .getByLabel("Library reference", { exact: true })
+    .fill("construct:example@2");
+  await page.getByRole("tab", { name: "Upload files", exact: true }).click();
+  await page.getByLabel("Molecule type").selectOption("dna");
+  await expect(page.locator(".launch-bar strong")).toContainText("0 inputs");
+  await expect(
+    page.getByText(/Your pasted input draft is saved/),
+  ).toBeVisible();
+  await page
+    .getByRole("tab", { name: "Library reference", exact: true })
+    .click();
+  await page.getByRole("checkbox", { name: /RoseTTAFold3/ }).check();
+  await page.getByRole("button", { name: "Check compatibility" }).click();
+  await expect.poll(() => request).toBeTruthy();
+  expect(request.inputs).toHaveLength(1);
+  expect(request.inputs[0].source).toEqual({
+    kind: "library",
+    ref: "construct:example@2",
+  });
+  await page.getByRole("tab", { name: "Paste input", exact: true }).click();
+  await expect(page.getByLabel("Molecular input", { exact: true })).toHaveValue(
+    "ACDEFGHIK",
+  );
+  await expect(page.getByLabel("Molecule type")).toHaveValue("protein");
+  await expect(page.getByLabel("Input format")).toHaveValue("sequence");
+});
+
+test("whitespace remains empty and local validation leaves pasted text editable", async ({
+  page,
+}) => {
+  const methods: string[] = [];
+  await mockApi(page, (method) => {
+    methods.push(method);
+    if (method === "batch.list") return { batches: [] };
+    throw new Error(`Unexpected ${method}`);
+  });
+  await page.goto("/");
+  await page.getByLabel("Molecular input", { exact: true }).fill(" \n\t");
+  await page.getByRole("checkbox", { name: /RoseTTAFold3/ }).check();
+  await page.getByRole("button", { name: "Check compatibility" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Add at least one molecular input.",
+  );
+  await page
+    .getByRole("tab", { name: "Library reference", exact: true })
+    .click();
+  await page
+    .getByLabel("Library reference", { exact: true })
+    .fill("invalid-reference");
+  await page.getByRole("button", { name: "Check compatibility" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "use a construct: or assembly: library reference",
+  );
+  await expect(
+    page.getByLabel("Library reference", { exact: true }),
+  ).toHaveValue("invalid-reference");
+  expect(methods).not.toContain("batch.validate");
 });
 test("resetting an enum to Native default removes the scientific override", async ({
   page,

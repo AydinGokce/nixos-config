@@ -15,6 +15,12 @@ import {
   inputCount,
   moleculeLabels,
 } from "../domain";
+import {
+  clearActiveDraft,
+  inputFromDraft,
+  nextChain,
+  type InputDraft,
+} from "../inputDraft";
 import type {
   InputFormat,
   MolecularInput,
@@ -25,6 +31,8 @@ import type {
 interface Props {
   inputs: MolecularInput[];
   setInputs: (inputs: MolecularInput[]) => void;
+  draft: InputDraft;
+  setDraft: (draft: InputDraft) => void;
   mode: "batch" | "assembly";
   setMode: (mode: "batch" | "assembly") => void;
   upload: (
@@ -38,6 +46,8 @@ interface Props {
 export function InputBuilder({
   inputs,
   setInputs,
+  draft,
+  setDraft,
   mode,
   setMode,
   upload,
@@ -45,11 +55,18 @@ export function InputBuilder({
   importRequest,
   onImportConsumed,
 }: Props) {
-  const [tab, setTab] = useState<"paste" | "upload" | "library">("paste");
-  const [type, setType] = useState<MoleculeType>("protein");
-  const [format, setFormat] = useState<InputFormat>("sequence");
-  const [text, setText] = useState("");
-  const [name, setName] = useState("");
+  const { tab } = draft;
+  const active = tab === "library" ? "library" : "paste";
+  const { text, name, format } = draft[active];
+  const type =
+    tab === "upload" ? draft.upload_type : draft[active].molecule_type;
+  const setTab = (tab: InputDraft["tab"]) => setDraft({ ...draft, tab });
+  const setFormat = (format: InputFormat) =>
+    setDraft({ ...draft, [active]: { ...draft[active], format } });
+  const setText = (text: string) =>
+    setDraft({ ...draft, [active]: { ...draft[active], text } });
+  const setName = (name: string) =>
+    setDraft({ ...draft, [active]: { ...draft[active], name } });
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
@@ -75,8 +92,6 @@ export function InputBuilder({
   }, [importRequest, tab]);
   const currentInputs = useRef(inputs);
   currentInputs.current = inputs;
-  const nextChain = (index: number) =>
-    index < 26 ? String.fromCharCode(65 + index) : `C${index + 1}`;
   const formats: InputFormat[] =
     type === "ligand"
       ? ["smiles", "ccd", "sdf"]
@@ -86,20 +101,30 @@ export function InputBuilder({
           ? ["library-json"]
           : ["sequence", "fasta"];
   function changeType(next: MoleculeType) {
-    setType(next);
-    setFormat(
-      next === "ligand"
-        ? "smiles"
-        : next === "structure"
-          ? "pdb"
-          : next === "assembly"
-            ? "library-json"
-            : "sequence",
-    );
+    if (tab === "upload") {
+      setDraft({ ...draft, upload_type: next });
+      return;
+    }
+    setDraft({
+      ...draft,
+      [active]: {
+        ...draft[active],
+        molecule_type: next,
+        format:
+          next === "ligand"
+            ? "smiles"
+            : next === "structure"
+              ? "pdb"
+              : next === "assembly"
+                ? "library-json"
+                : "sequence",
+      },
+    });
   }
   function addText() {
     setError("");
-    if (!text.trim()) {
+    const row = inputFromDraft(draft, currentInputs.current);
+    if (!row) {
       setError(
         tab === "library"
           ? "Enter a library reference."
@@ -107,26 +132,8 @@ export function InputBuilder({
       );
       return;
     }
-    const actualFormat =
-      format === "sequence" && text.trimStart().startsWith(">")
-        ? "fasta"
-        : format;
-    // Preserve the source exactly. The server owns sequence validation and chemistry interpretation.
-    const row: MolecularInput = {
-      id: crypto.randomUUID(),
-      name:
-        name.trim() ||
-        (tab === "library" ? text.trim() : `Input ${inputs.length + 1}`),
-      molecule_type: type,
-      chain_id: nextChain(inputs.length),
-      source:
-        tab === "library"
-          ? { kind: "library", ref: text.trim() }
-          : { kind: "text", text, format: actualFormat },
-    };
-    setInputs([...inputs, row]);
-    setText("");
-    setName("");
+    setInputs([...currentInputs.current, row]);
+    setDraft(clearActiveDraft(draft));
   }
   async function addFiles(files: FileList | File[]) {
     setError("");
@@ -156,7 +163,7 @@ export function InputBuilder({
             : ["sdf", "smiles"].includes(detected)
               ? "ligand"
               : type,
-          chain_id: nextChain(inputs.length + added.length),
+          chain_id: nextChain([...currentInputs.current, ...added]),
           source: {
             kind: "upload",
             upload_id: receipt.upload_id,
@@ -171,13 +178,10 @@ export function InputBuilder({
         );
       }
     }
-    setInputs([
-      ...currentInputs.current,
-      ...added.map((input, i) => ({
-        ...input,
-        chain_id: nextChain(currentInputs.current.length + i),
-      })),
-    ]);
+    const merged = [...currentInputs.current];
+    for (const input of added)
+      merged.push({ ...input, chain_id: nextChain(merged) });
+    setInputs(merged);
     setUploading(null);
     setError(problems.join("\n"));
     if (fileRef.current) fileRef.current.value = "";
@@ -373,6 +377,23 @@ export function InputBuilder({
             {error}
           </div>
         )}
+        {tab !== "upload" && text.trim() && (
+          <p className="launch-note">
+            This {tab === "library" ? "reference" : "input"} is included when
+            you check compatibility. Use Add{" "}
+            {mode === "assembly" ? "component" : "input"} to enter another.
+          </p>
+        )}
+        {(["paste", "library"] as const)
+          .filter((method) => method !== tab && draft[method].text.trim())
+          .map((method) => (
+            <p className="launch-note" key={method}>
+              Your {method === "paste" ? "pasted input" : "library reference"}{" "}
+              draft is saved. Return to{" "}
+              {method === "paste" ? "Paste input" : "Library reference"} to
+              include it.
+            </p>
+          ))}
       </div>
       {inputs.length > 0 && (
         <div className="input-inventory">
