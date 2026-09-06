@@ -3,6 +3,63 @@
 These are functional checks with small protein inputs. Production RFAA database
 installation is tracked separately from tests with miniature databases.
 
+## Project briefs and construct descriptions
+
+An actual workstation-to-head integration test created an isolated protein and
+project, retained the original CRLF Markdown bytes, revised the purpose without
+changing chemistry, and confirmed that project membership stayed pinned until
+explicitly revised. Both project contexts were exported and verified locally.
+Editing analysis notes remained valid; changing a frozen brief was rejected.
+The same project-containing library passed backup and isolated restore. A real
+RF3 CPU parser compiled its member and bound exactly the molecular snapshot
+recorded in the exported context. No model inference or real research records
+were created by this test.
+
+Evidence: `~/bio-runs/project-context-validation-20260906/run-b2e44dc1ce/proof.json`.
+Local tests cover safe archives, immutable dependency closure, concurrent
+publication, missing descriptions, wrong-project transfers, both file-option
+spellings and backward-compatible backup restore. Templates and an introduction
+are installed at `~/bio-projects/`; the authoritative production library remains
+on the head.
+
+## RF3 and default language-model validation
+
+RF3's pinned Foundry runtime and 3.04 GB checkpoint are installed. Real H100
+predictions at 10 recycles, 50 diffusion steps, five samples and seed 101 passed
+for ubiquitin, paired insulin A/B, and a six-chain assembly containing an
+MSE-modified protein, modified DNA/RNA, charged/chiral ligands and zinc.
+All five six-chain samples retained 777 finite atoms, exact named atom/element/
+charge/bond inventories and 339 native tetrahedral constraints. The selected
+sample's protein CA RMSD to 1UBQ was 1.0364 Å across 76 residues. This mixed input
+is an installation fixture, not a demonstrated functional complex.
+
+The earlier seven-chain fixture also requested an E-configured alkene; all five
+predicted samples flipped it to Z. That original run and its native execution
+status remain intact, with a separate failed chemistry audit. Mandatory output
+QA now preserves all raw predictions and original rankings, publishes only the
+highest native-ranked passing sample, and returns failure if none passes. Ten
+retained ubiquitin/insulin samples passed the same audit. The desktop wrapper
+verifies and renders only the audited selection.
+
+Evidence is under `~/bio-runs/rf3-runtime-20260906/`,
+`~/bio-runs/rf3-output-qa-20260906/` and
+`~/bio-runs/rf3-validation-20260906/`; the latter includes the final deployment
+proof, local render, exact cleanup proof for the normal submission, and wrapper
+installation proof. Positive validation reused the existing MSA builder's GPU;
+its lifecycle remains owned by that separate managed job. RF3 code is committed
+in `268b13c`.
+
+ESM and EVOLVEpro's default 650M checkpoint was downloaded with verified file
+hashes and tested with networking disabled on an existing H100. Six sequence
+scores and a finite 6 × 1280 embedding array passed; ranking selected two of
+three unmeasured candidates. Evidence: `~/bio-runs/default-models-20260906/`.
+Optional 3B/15B checkpoints remain downloads on demand.
+
+These checks establish execution and the stated integrity properties. They do
+not establish public/private database prediction-quality parity, binding,
+biochemical activity or project-level success. RFAA's full database installation
+is paused and its existing data retained.
+
 ## Cloud runs
 
 Results are retained under `~/bio-runs/` on the workstation and

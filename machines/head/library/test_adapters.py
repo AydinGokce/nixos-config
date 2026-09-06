@@ -56,7 +56,10 @@ class AdapterBundleTests(unittest.TestCase):
         manifest = adapters.validate_bundle(bundle, "boltz2", result["sha256"])
         self.assertEqual(manifest["msa_backend"], "private")
         self.assertEqual(manifest["source_ref"], "construct:enzyme@1")
-        self.assertEqual(set(manifest["files"]), {"input.fasta", "source.json", "preflight.json"})
+        self.assertEqual(set(manifest["files"]), {"input.fasta", "source.json", "preflight.json",
+                         "assets/construct/enzyme/1/attachments/description.md"})
+        self.assertEqual((bundle/"assets/construct/enzyme/1/attachments/description.md").read_bytes(),
+                         self.registry.attachment_path("enzyme", "attachments/description.md").read_bytes())
         self.assertEqual(manifest["files"], adapters.manifest_files(bundle))
         self.assertEqual(json.loads((bundle / "source.json").read_text()), self.registry.snapshot("enzyme"))
         self.assertTrue(result["preflight"]["canonical_single_protein"])
@@ -255,9 +258,11 @@ class AdapterBundleTests(unittest.TestCase):
     def test_changed_copy_fails_revalidation_before_materialize_publication(self):
         result = self.compile()
         original_copy = shutil.copytree
-        def corrupt_copy(source, destination, **kwargs):
-            value = original_copy(source, destination, **kwargs)
-            (Path(destination) / "input.fasta").write_text(">copy changed\nACD\n")
+        def corrupt_copy(source, destination, *args, **kwargs):
+            value = original_copy(source, destination, *args, **kwargs)
+            # copytree recursively calls itself for the bound purpose assets.
+            if (Path(destination)/"input.fasta").exists():
+                (Path(destination) / "input.fasta").write_text(">copy changed\nACD\n")
             return value
         runtime = self.base / "runtime"
         with patch.object(adapters.shutil, "copytree", side_effect=corrupt_copy):

@@ -131,6 +131,103 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(options["check"])
         self.assertNotIn("shell", options)
 
+    def test_purpose_and_project_briefs_roundtrip_with_pinned_revisions(self):
+        fasta = self.base/'input protein.fa'
+        fasta.write_text('>target\nACDEFGHIK\n')
+        purpose = self.base/"purpose ' doc.md"
+        purpose.write_bytes(b'# Intended function\r\nMeasure an explicit assay criterion.\r\n')
+        brief = self.base/'project brief.md'
+        brief.write_text('# Project objective\nCompare the target to a negative control.\n')
+        self.quiet_forward(['import', '--fasta', str(fasta), '--type', 'protein', '--id', 'enzyme',
+                            '--description', str(purpose)])
+        record = self.transport.library.show('enzyme')
+        stored = self.transport.library.attachment_path('enzyme', 'attachments/description.md')
+        self.assertEqual(stored.read_bytes(), purpose.read_bytes())
+        self.quiet_forward(['project', '--id', 'study', '--brief', str(brief), '--member', 'enzyme'])
+        purpose.write_text('# Revised purpose\nSeparate prediction evidence from measured function.\n')
+        self.quiet_forward(['describe', 'enzyme', '--markdown', str(purpose)])
+        self.assertEqual(self.transport.library.show('enzyme')['revision'], 2)
+        project = self.transport.library.show('study')
+        self.assertEqual(project['identity']['members'][0]['source_ref'], 'construct:enzyme@1')
+        self.assertEqual(self.transport.library.show('construct:enzyme@1')['sha256'], record['sha256'])
+        self.assertEqual(list(self.transport.remote.iterdir()), [])
+
+    def test_equals_form_files_are_staged_and_snapshot_output_is_local(self):
+        fasta = self.base/'input with spaces.fa'
+        fasta.write_text('>target\nACDEFGHIK\n')
+        markdown = self.base/'intent.md'
+        markdown.write_text('# Intended function\nEvaluate a stated criterion.\n')
+        self.quiet_forward(['import', '--fasta='+str(fasta), '--type', 'protein', '--id', 'enzyme',
+                            '--description='+str(markdown)])
+        self.quiet_forward(['project', '--id', 'study', '--brief='+str(markdown), '--member', 'enzyme'])
+        self.quiet_forward(['describe', 'enzyme', '--markdown='+str(markdown)])
+        output = self.base/'snapshot.json'
+        self.quiet_forward(['snapshot', 'enzyme', '--out='+str(output)])
+        self.assertEqual(json.loads(output.read_text())['source_ref'], 'construct:enzyme@2')
+        self.assertEqual(len([call for call, _ in self.transport.calls if call[0] == 'scp']), 4)
+        for call, _ in self.transport.calls:
+            if call[0] == 'ssh' and 'bio-library' in call[-1]:
+                command = shlex.split(call[-1])
+                self.assertNotIn(str(fasta), command)
+                self.assertNotIn(str(markdown), command)
+                self.assertNotIn(str(output), command)
+
+    def test_project_workspace_is_verified_and_local_analysis_remains_writable(self):
+        self.create_protein()
+        brief = self.base/'project.md'
+        brief.write_text('# Research objective\nA defined comparison with a control.\n')
+        self.quiet_forward(['project', '--id', 'study', '--brief', str(brief), '--member', 'target'])
+        out = self.base/'analysis workspace'
+        self.quiet_forward(['context', 'study', '--out', str(out)])
+        self.assertEqual((out/'project.md').read_bytes(), brief.read_bytes())
+        self.assertTrue((out/'AGENTS.md').is_file())
+        (out/'analysis'/'notes.md').write_text('No model result has been obtained yet.\n')
+        manifest = client_module.context_module().verify_directory(out)
+        self.assertEqual(manifest['project_ref'], 'project:study@1')
+        origin = json.loads((out/'analysis'/'origin.json').read_text())
+        self.assertEqual(origin['origin'], self.client.origin)
+        exports = [shlex.split(call[-1]) for call, _ in self.transport.calls
+                   if call[0] == 'ssh' and ' --archive ' in call[-1]]
+        self.assertEqual(exports[0][exports[0].index('context')+1], 'project:study@1')
+        self.assertEqual(list(self.transport.remote.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            self.quiet_forward(['context', 'study', '--out', str(out)])
+
+    def test_corrupt_project_transfer_never_publishes_a_workspace(self):
+        self.create_protein()
+        brief = self.base/'project.md'
+        brief.write_text('# Research objective\nRetain input integrity.\n')
+        self.quiet_forward(['project', '--id', 'study', '--brief', str(brief), '--member', 'target'])
+        def damage_archive():
+            paths = list(self.transport.remote.rglob('context.tar.gz'))
+            self.assertEqual(len(paths), 1)
+            paths[0].write_bytes(b'corrupt archive')
+        self.transport.before_copy_from = damage_archive
+        out = self.base/'corrupt workspace'
+        with self.assertRaises((ValueError, OSError)):
+            self.quiet_forward(['context', 'study', '--out', str(out)])
+        self.assertFalse(out.exists())
+        self.assertEqual(list(self.transport.remote.iterdir()), [])
+
+    def test_valid_context_for_another_project_is_not_published(self):
+        self.create_protein()
+        brief = self.base/'project.md'
+        brief.write_text('# Research objective\nBind this exact request.\n')
+        for name in ('study', 'different'):
+            self.quiet_forward(['project', '--id', name, '--brief', str(brief), '--member', 'target'])
+        def substitute_archive():
+            paths = list(self.transport.remote.rglob('context.tar.gz'))
+            self.assertEqual(len(paths), 1)
+            replacement = paths[0].with_name('different.tar.gz')
+            client_module.context_module().export_archive(self.transport.library, 'different', replacement)
+            replacement.replace(paths[0])
+        self.transport.before_copy_from = substitute_archive
+        out = self.base/'wrong project'
+        with self.assertRaisesRegex(ValueError, 'requested project revision'):
+            self.quiet_forward(['context', 'study', '--out', str(out)])
+        self.assertFalse(out.exists())
+        self.assertEqual(list(self.transport.remote.iterdir()), [])
+
     def test_import_stages_local_files_and_cleans_remote_directory(self):
         source = self.base / "a sequence ' with spaces.fa"
         source.write_bytes(b">example\r\nACDEFGHIK\r\n")

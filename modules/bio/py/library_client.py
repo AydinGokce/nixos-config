@@ -55,6 +55,16 @@ def registry_module():
     return module
 
 
+def context_module():
+    registry_path = Path(os.environ.get('BIO_LIBRARY_REGISTRY', '/etc/bio/library/registry.py'))
+    path = registry_path.with_name('context.py')
+    spec = importlib.util.spec_from_file_location('bio_library_context', path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def normalize_origin(value):
     require(isinstance(value, dict) and set(value) == {'head', 'library_root'}, 'Invalid backup origin')
     head, root = value['head'], value['library_root']
@@ -163,7 +173,27 @@ class Client:
 
     def forward(self, arguments):
         require(arguments, 'Expected a library command; use --help')
+        # Argparse accepts both --file PATH and --file=PATH. Normalize before
+        # deciding which paths belong to this workstation rather than the head.
+        normalized = []
+        file_options = {'--json', '--fasta', '--sdf', '--attachment', '--description', '--brief', '--markdown', '--out'}
+        options = True
+        for value in arguments:
+            option, separator, payload = value.partition('=')
+            if options and separator and option in file_options:
+                normalized.extend((option, payload))
+            else:
+                normalized.append(value)
+            if value == '--':
+                options = False
+        arguments = normalized
         command = arguments[0]
+        if command == 'context':
+            parser = argparse.ArgumentParser(prog='bio-library context', description='Export exact project goals and constructs for agent analysis; runs no models.')
+            parser.add_argument('ref')
+            parser.add_argument('--out', type=Path, required=True)
+            args = parser.parse_args(arguments[1:])
+            print(json.dumps(self.context(args.ref, args.out), indent=2)); return
         if command == 'export-snapshot':
             parser = argparse.ArgumentParser(prog='bio-library export-snapshot')
             parser.add_argument('--out', type=Path, required=True)
@@ -176,7 +206,7 @@ class Client:
             position = 0
             while position < len(arguments):
                 value = arguments[position]
-                if value in ('--json', '--fasta', '--sdf', '--attachment'):
+                if value in ('--json', '--fasta', '--sdf', '--attachment', '--description', '--brief', '--markdown'):
                     require(position+1 < len(arguments), f'{value} needs a value')
                     raw = arguments[position+1]
                     name = None
@@ -213,6 +243,36 @@ class Client:
         finally:
             if staged is not None:
                 self.remove_temporary(staged)
+
+    def context(self, ref, output):
+        output = Path(output).expanduser().absolute()
+        no_symlinks(output)
+        require(not output.exists(), f'Workspace already exists: {output}')
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shown = self.ssh([*self.library_command, 'show', ref], capture_output=True, text=True)
+        record = registry_module().verify_document(json.loads(shown.stdout))
+        require(record.get('kind') == 'project', 'Context requires a project reference')
+        pinned_ref = registry_module().reference(record)
+        remote = self.temporary()
+        try:
+            self.ssh([*self.library_command, 'context', pinned_ref, '--archive', remote + '/context.tar.gz'],
+                     stdout=subprocess.DEVNULL)
+            with tempfile.TemporaryDirectory(prefix='.bio-context-', dir=output.parent) as local:
+                archive = Path(local)/'context.tar.gz'
+                self.copy_from(remote + '/context.tar.gz', archive)
+                module = context_module()
+                verified = module.verify_archive(archive)
+                require(verified.get('project_ref') == pinned_ref
+                        and verified.get('records', {}).get(pinned_ref, {}).get('sha256') == record['sha256'],
+                        'Transferred context differs from the requested project revision')
+                manifest = module.extract_archive(archive, output)
+            # Working notes are outside the immutable, checksummed input set.
+            atomic_json(output/'analysis'/'origin.json', dict(schema=1, origin=dict(self.origin),
+                        exported_at=dt.datetime.now(dt.timezone.utc).isoformat()), overwrite=False)
+            return dict(directory=str(output), project_ref=manifest.get('project_ref'),
+                        manifest_sha256=manifest.get('sha256'), origin=dict(self.origin), verified=True)
+        finally:
+            self.remove_temporary(remote)
 
 
 def retained_receipts(receipts, now):
@@ -292,8 +352,12 @@ def main():
 Store and reuse molecular constructs on the configured cloud head.
   import           Import --fasta FILE --type protein|dna|rna --id NAME,
                    --sdf FILE --id NAME, --smiles TEXT --id NAME, or --json FILE
-  list / show REF  Find constructs, monomers and assemblies
+  list / show REF  Find constructs, monomers, assemblies and projects
   revise REF       Create an immutable revision with --json PATCH
+  describe REF     Read its purpose; revise with --markdown FILE
+  project          Create --id NAME --brief FILE [--member REF ...]
+  context REF      Export a Codex project workspace with --out DIRECTORY
+  context-verify   Verify frozen project inputs locally: DIRECTORY
   snapshot REF     Resolve all pinned components; --out FILE saves locally
   check REF        Check model input compatibility with --model MODEL
   verify / reindex Check stored records or rebuild the searchable index
@@ -302,10 +366,17 @@ Store and reuse molecular constructs on the configured cloud head.
   restore-local    Restore --from LOCAL.tar.gz --to EMPTY_DIRECTORY
 
 Prediction: bio-fold MODEL --construct REF | --assembly REF
-Models: boltz2, protenix, openfold3, rfaa; canonical proteins: esm, evolvepro
-Compatibility checks use the CPU parser for native folding inputs and canonical
-FASTA checks for ESM/EVOLVEpro or private MSA inputs; no prediction or MSA queries.
+Models: boltz2, protenix, openfold3, rf3, rfaa; canonical proteins: esm, evolvepro
+Import accepts --description FILE for intended function and success criteria.
+Compatibility checks use the CPU parser for native folding inputs including
+private RF3; other private MSA inputs and ESM/EVOLVEpro use canonical FASTA checks.
+Project exports run no models. Predictions alone do not establish function.
 Use bio-library COMMAND --help for command-specific options.''')
+    elif arguments[0] == 'context-verify':
+        parser = argparse.ArgumentParser(prog='bio-library context-verify')
+        parser.add_argument('directory', type=Path)
+        args = parser.parse_args(arguments[1:])
+        print(json.dumps(context_module().verify_directory(args.directory), indent=2))
     elif arguments[0] == 'backup':
         parser = argparse.ArgumentParser(prog='bio-library backup')
         parser.add_argument('--destination', default=str(Path.home()/'bio-library-backups'))

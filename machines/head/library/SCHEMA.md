@@ -14,17 +14,18 @@ bio-library/
   constructs/<id>/<revision>/attachments/<attachment-name>
   monomers/<id>/<revision>/record.json
   assemblies/<id>/<revision>/record.json
+  projects/<id>/<revision>/record.json
   index.sqlite3
   .registry.lock
   .staging/
 ```
 
-All three record kinds can have attachments. IDs start with a lowercase letter,
+All four record kinds can have attachments. IDs start with a lowercase letter,
 use lowercase letters, digits, hyphens or underscores, and are at most 64
 characters. IDs and aliases share one case-sensitive namespace. Historical
 aliases remain reserved for their original entity, and resolve to its latest
 revision. The complete immutable reference is `construct:enzyme@3`,
-`monomer:modified-a@1`, or `assembly:enzyme-oligo@2`.
+`monomer:modified-a@1`, `assembly:enzyme-oligo@2`, or `project:binding-study@1`.
 The importers retain original bytes under reserved names such as `source.fasta`,
 `source.sdf` and `source.json`; custom attachments use their supplied names.
 
@@ -82,6 +83,68 @@ and default to `defined`. Ambiguous or noncanonical FASTA symbols default to
 `draft`. Generic JSON, SMILES and SDF imports default to `draft`, preserving
 unresolved chemistry. Only a model adapter can establish which fields its
 specific version supports.
+
+## Project briefs and purpose documents
+
+Projects use the same immutable revisions, alias rules, lock, index and backup
+format as molecular records. Their membership provides research context; it
+does not create a molecular assembly or authorize a model run.
+
+```json
+{
+  "kind": "project",
+  "id": "binding-study",
+  "name": "Binding study",
+  "identity": {
+    "objectives_file": "attachments/project.md",
+    "members": [
+      {"source_ref": "construct:enzyme@2", "role": "Evaluate substrate binding."},
+      {"source_ref": "assembly:enzyme-complex@1", "role": "Assess the proposed interface."}
+    ]
+  }
+}
+```
+
+Every project publication requires an attached `project.md` containing nonempty
+UTF-8 Markdown, at most 1 MiB. Original bytes and newlines are preserved.
+Membership aliases are resolved under the publication lock and stored as exact
+construct or assembly revisions. Monomers and other projects cannot be members;
+an empty member list is allowed while a project is being defined. Multiple
+revisions of one construct can be compared in one project, but an exact member
+revision cannot be repeated. Each member's `role` belongs to that project
+revision. There are no mutable backlinks in construct records.
+
+New construct and assembly publications automatically include
+`attachments/description.md` when no description was supplied or inherited. The
+scaffold asks for intended function, hypotheses, testable success criteria and
+evidence limitations. Its explicit marker
+`<!-- bio-library:purpose-scaffold:v1 incomplete -->` means it is unfinished.
+A user-written document is unassessed, never automatically considered complete
+or evidence of function. Criteria should specify an observation or metric,
+threshold, test conditions, method and required evidence. Prediction confidence
+and chemical output validation do not demonstrate biological function.
+
+`Registry.describe(ref, markdown_path)` publishes a new immutable revision with
+replacement `description.md` (construct/assembly) or `project.md` (project),
+preserving the molecular identity and all other attachments. It rejects an
+explicit stale revision. Chemical revisions inherit the previous purpose bytes;
+their applicability must be assessed, not silently assumed. Existing records
+without descriptions remain readable and unchanged. New revisions of such
+legacy records receive an explicitly incomplete scaffold.
+
+`Registry.project_snapshot(ref)` resolves a consistent project under one shared
+lock. Its `resolved-project` document includes `project_ref`, the exact
+`project_record`, and `members`, each with `source_ref`, `role`, a complete pinned
+molecular `snapshot`, and a `description` receipt (`present: false` for a legacy
+missing document). Assembly snapshots also bind the individual component
+records and their description attachment receipts. The project's top-level
+SHA-256 binds all nested records, molecular snapshots and document checksums.
+Later project, molecule or purpose revisions do not change an older snapshot.
+Assessment records should retain this exact project snapshot digest and the
+source references they evaluated.
+
+The additive `project` kind keeps schema version 1. Libraries and backups made
+before the `projects/` collection existed remain readable and restorable.
 
 ## Molecular identity
 

@@ -48,7 +48,7 @@ let
       export PATH=${lib.makeBinPath (commonRuntime ++ runtimeInputs)}''${PATH:+:$PATH}
       ${lib.optionalString (builtins.elem name [ "bio-library" "bio-library-backup" ]) ''
         export BIO_LIBRARY_CLIENT=''${BIO_LIBRARY_CLIENT:-${./py/library_client.py}}
-        export BIO_LIBRARY_REGISTRY=''${BIO_LIBRARY_REGISTRY:-${../../machines/head/library/registry.py}}
+        export BIO_LIBRARY_REGISTRY=''${BIO_LIBRARY_REGISTRY:-${../../machines/head/library}/registry.py}
       ''}
       set -o pipefail
       ${builtins.readFile (./scripts + "/${name}.sh")}
@@ -301,7 +301,7 @@ in
       "bio/py/clear_execstack.py".source = ./py/clear_execstack.py;
       "bio/py/rfaa_singleseq_patch.py".source = ./py/rfaa_singleseq_patch.py;
       "bio/py/library_client.py".source = ./py/library_client.py;
-      "bio/library/registry.py".source = ../../machines/head/library/registry.py;
+      "bio/library".source = ../../machines/head/library;
     };
 
     systemd.user.services.bio-library-backup = lib.mkIf cfg.library.backup.enable {

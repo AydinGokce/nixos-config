@@ -60,6 +60,62 @@ Keep supplier annotations in `provenance`, `notes` and attachments. RFAA rejects
 all residue modifications. Storing a complete custom monomer makes it reusable
 and exportable even when these models cannot predict it.
 
+## Research objectives and construct purpose
+
+Each newly published construct or assembly carries `attachments/description.md`.
+Supply your own Markdown with `--description` at import, or use `describe` to
+publish a new immutable revision. Otherwise, the library creates an explicitly
+unfinished template. Existing records remain readable; missing descriptions are
+reported when exporting a project context.
+After filling a template, remove its opening `incomplete` comment. Supplied
+descriptions remain unassessed until their claims are checked against evidence.
+
+Describe the intended function, mechanism or hypothesis, relevant domains and
+residues, experimental conditions, testable success criteria, controls and known
+limitations. Identify which conclusions a structural model could support and
+which require biochemical or cellular measurements. Do not use confidence alone
+as a proxy for activity, affinity, specificity or project success.
+
+```bash
+bio-library import --fasta enzyme.fasta --type protein --id enzyme --description enzyme.md
+bio-library describe enzyme --markdown revised-purpose.md
+bio-library describe enzyme
+bio-library project --id enzyme-study --brief PROJECT.md --member enzyme
+bio-library context enzyme-study --out ~/bio-projects/enzyme-study-v1
+bio-library context-verify ~/bio-projects/enzyme-study-v1
+```
+
+A project brief belongs to a versioned `project` record. It should define the
+research objectives, measurable criteria, priorities, operating conditions,
+available assays, controls and resource limits. Project members bind exact
+construct or assembly revisions. A member can also have a project-specific
+`role` in an imported project JSON record. Describing or revising a construct
+does not silently change an existing project: revise its complete `identity`
+with the intended member references. `describe PROJECT --markdown FILE` revises
+the brief while retaining the project's pinned members.
+
+The exported workspace includes the project brief, descriptions, exact source
+records, resolved assemblies, original attachments, an input manifest, an
+`AGENTS.md` workflow and assessment templates. It runs no models. A future Codex
+session can read the workspace, map the stated criteria to suitable tests, run
+supported models through `bio-fold`, and record evidence and limitations under
+`analysis/`. Preserve the exported input files; export a new workspace after
+changing a project or construct. `context-verify` checks the frozen input files
+while allowing ongoing analysis notes.
+
+Assessment should distinguish a supported prediction, a contradictory result,
+an inconclusive test and an unresolved need for experiment. Record the exact
+project/construct revisions, model and checkpoint, MSA source, parameters,
+seed, outputs, metrics and comparison controls for each conclusion. A completed
+run or a well-folded prediction does not establish that a construct meets its
+functional goals. Unfinished descriptions are a request for missing intent,
+not permission to invent an objective.
+
+Project briefs and all description revisions remain on the head and are
+included in the existing verified local backups. An exported workspace is a
+working copy; its later `analysis/` notes are local until explicitly saved back
+as record attachments or backed up separately.
+
 ## Current adapters
 
 | Input | Boltz 2.2.1 | Protenix 2.0.0 | OpenFold3 0.5.0 | RFAA pinned source | RF3 pinned source |

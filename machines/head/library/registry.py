@@ -13,6 +13,7 @@ import datetime
 import fcntl
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -24,13 +25,17 @@ import sys
 import tarfile
 import tempfile
 
+_projects_spec = importlib.util.spec_from_file_location('_bio_library_projects', Path(__file__).with_name('projects.py'))
+projects = importlib.util.module_from_spec(_projects_spec)
+_projects_spec.loader.exec_module(projects)
+
 SCHEMA = 1
 DEFAULT_ROOT = "/var/lib/bio-library"
-COLLECTIONS = {"construct": "constructs", "monomer": "monomers", "assembly": "assemblies"}
+COLLECTIONS = {"construct": "constructs", "monomer": "monomers", "assembly": "assemblies", "project": "projects"}
 ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 ALIAS = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z")
 CHAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]{0,31}\Z")
-REF = re.compile(r"(construct|monomer|assembly):([a-z][a-z0-9_-]{0,63})@([1-9][0-9]*)\Z")
+REF = re.compile(r"(construct|monomer|assembly|project):([a-z][a-z0-9_-]{0,63})@([1-9][0-9]*)\Z")
 MOLECULE_TYPES = {"protein", "dna", "rna", "small_molecule", "mixed_polymer"}
 ALPHABETS = {"protein": set("ACDEFGHIKLMNPQRSTVWYXBZUOJ"),
              "dna": set("ACGTRYSWKMBDHVN"), "rna": set("ACGURYSWKMBDHVN")}
@@ -199,6 +204,9 @@ def validate_identity(record):
     identity = record.get("identity")
     require(isinstance(identity, dict), "identity must be a JSON object")
     kind = record["kind"]
+    if kind == "project":
+        projects.validate_identity(identity, require=require)
+        return  # Project membership is research context, not molecular composition.
     if kind == "construct":
         molecule = identity.get("molecule_type")
         require(molecule in MOLECULE_TYPES, f"Unsupported molecule_type: {molecule!r}")
@@ -351,6 +359,12 @@ class Registry:
         require(len(names) == len(set(names)), "Duplicate attachment path")
         if document["identity"].get("structure_file"):
             require(document["identity"]["structure_file"] in names, "structure_file is missing its attachment")
+        if document['kind'] == 'project':
+            relative = document['identity']['objectives_file']
+            require(relative in names, 'Project objectives are missing their Markdown attachment')
+            require((path.parent/relative).stat().st_size <= projects.MAX_MARKDOWN_BYTES,
+                    'Project Markdown is larger than 1 MiB')
+            projects.markdown_bytes((path.parent/relative).read_bytes(), require=require)
         return document
 
     def _records_locked(self):
@@ -358,6 +372,8 @@ class Registry:
         for kind, collection in COLLECTIONS.items():
             folder = self.root / collection
             no_symlinks(folder)
+            if kind == 'project' and not folder.exists():
+                continue  # Existing schema-1 libraries need no write-time migration to be read.
             require(folder.is_dir(), f"Missing registry collection: {collection}")
             for entity in sorted(folder.iterdir()):
                 no_symlinks(entity)
@@ -440,7 +456,7 @@ class Registry:
         require(type(document.get("schema", SCHEMA)) is int and document.get("schema", SCHEMA) == SCHEMA,
                 "Unsupported schema")
         kind, ident = document.get("kind"), document.get("id")
-        require(kind in COLLECTIONS, "kind must be construct, monomer or assembly")
+        require(kind in COLLECTIONS, "kind must be construct, monomer, assembly or project")
         require(isinstance(ident, str) and ID.fullmatch(ident), "id must be lowercase letters/digits/_/- and start with a letter")
         output = copy.deepcopy(document)
         output.update(schema=SCHEMA, kind=kind, id=ident, revision=revision, created_at=now())
@@ -461,7 +477,11 @@ class Registry:
             elif isinstance(value, list):
                 for item in value:
                     pin(item)
-        pin(output.get("identity"))
+        if kind == 'project':
+            output['identity'] = projects.pin_identity(output.get('identity'),
+                lambda ref: self._resolve(ref, records), require=require)
+        else:
+            pin(output.get("identity"))
         self._validate_metadata(output)
         validate_identity(output)
         self._validate_references(output, records)
@@ -476,6 +496,11 @@ class Registry:
             require(parent in records, f"Missing parent revision: {parent}")
         for _, ref in reference_values(record["identity"]):
             require(ref in records, f"Missing referenced revision: {ref}")
+        if record['kind'] == 'project':
+            for member in record['identity']['members']:
+                ref = member['source_ref']
+                require(ref in records and records[ref]['kind'] in {'construct', 'assembly'},
+                        f'Missing project member construct/assembly revision: {ref}')
         if record["kind"] == "assembly":
             chains = {item["chain_id"]: records[item["construct_ref"]]
                       for item in record["identity"]["components"]}
@@ -515,8 +540,27 @@ class Registry:
                 relative = safe_relative(name)
                 require(len(relative.parts) == 1, "Attachment names must be plain filenames")
                 require(name != "record.json", "Reserved attachment name")
+                if name == projects.filename(output['kind']):
+                    no_symlinks(source, regular=True)
+                    require(Path(source).stat().st_size <= projects.MAX_MARKDOWN_BYTES,
+                            'Purpose Markdown is larger than 1 MiB')
                 receipt = self._copy_attachment(Path(source), temporary / "attachments" / name)
                 output["attachments"].append(receipt)
+            purpose_name = projects.filename(output['kind'])
+            if purpose_name:
+                purpose_path = temporary/'attachments'/purpose_name
+                if not purpose_path.exists():
+                    require(output['kind'] != 'project', 'New project revisions require nonempty UTF-8 project.md')
+                    raw = projects.scaffold(output['kind'], output['name'])
+                    with purpose_path.open('xb') as handle:
+                        os.chmod(purpose_path, 0o600)
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    output['attachments'].append({'path': 'attachments/'+purpose_name,
+                        'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
+                projects.markdown_bytes(purpose_path.read_bytes(), require=require)
+                output['attachments'].sort(key=lambda item: item['path'])
             if output["identity"].get("structure_file"):
                 require(output["identity"]["structure_file"] in [x["path"] for x in output["attachments"]],
                         "structure_file is missing its attachment")
@@ -524,6 +568,8 @@ class Registry:
             write_json(temporary / "record.json", output)
             fsync_directory(temporary / "attachments")
             fsync_directory(temporary)
+            destination.parent.parent.mkdir(mode=0o700, exist_ok=True)
+            fsync_directory(self.root)
             destination.parent.mkdir(mode=0o700, exist_ok=True)
             fsync_directory(destination.parent.parent)
             os.rename(temporary, destination)
@@ -584,44 +630,74 @@ class Registry:
                     (molecule_type is None or r["identity"].get("molecule_type") == molecule_type) and
                     (tag is None or tag in r["tags"])]
 
+    def describe(self, ref, markdown_path):
+        """Publish purpose text as a new revision while keeping chemical identity."""
+        source = no_symlinks(markdown_path, regular=True)
+        require(source.stat().st_size <= projects.MAX_MARKDOWN_BYTES, 'Purpose Markdown is larger than 1 MiB')
+        projects.markdown_bytes(source.read_bytes(), require=require)
+        record = self.show(ref)
+        name = projects.filename(record['kind'])
+        require(name is not None, 'Purpose documents apply to constructs, assemblies or projects')
+        # Pin the source revision; concurrent edits must fail as stale, not be replaced.
+        return self.revise(reference(record), {}, {name: source})
+
     def snapshot(self, ref):
         with self._lock():
             records = self._records_locked()
-            source_ref = self._resolve(ref, records)
-            source = records[source_ref]
-            require(source["kind"] in {"construct", "assembly"}, "Snapshot requires a construct or assembly")
-            self._validate_references(source, records)
-            if source["kind"] == "construct":
-                components = [{"chain_id": "A", "construct_ref": source_ref}]
-                bonds = []
-            else:
-                components = source["identity"]["components"]
-                bonds = source["identity"].get("bonds", [])
-            monomers, visiting = {}, set()
-            def visit(record):
-                ref = reference(record)
-                if ref in visiting:
-                    return
-                visiting.add(ref)
-                self._validate_references(record, records)
-                for kind, child_ref in reference_values(record["identity"]):
-                    if kind == "monomer_ref":
-                        monomers[child_ref] = copy.deepcopy(records[child_ref])
-                        visit(records[child_ref])
-            resolved = []
-            for component in components:
-                record = records[component["construct_ref"]]
-                visit(record)
-                resolved.append({**copy.deepcopy(component), "record": copy.deepcopy(record)})
-            visit(source)
-            output = {"schema": SCHEMA, "kind": "resolved-assembly", "name": source["name"],
-                      "source_ref": source_ref, "components": resolved, "bonds": copy.deepcopy(bonds),
-                      "monomers": dict(sorted(monomers.items())),
-                      "provenance": {"registry_source_ref": source_ref, "source_record_sha256": source["sha256"]}}
-            if source["kind"] == "assembly":
-                output["assembly_record"] = copy.deepcopy(source)
-            output["sha256"] = digest_json(output)
-            return output
+            return self._snapshot_locked(self._resolve(ref, records), records)
+
+    def _snapshot_locked(self, source_ref, records):
+        source = records[source_ref]
+        require(source["kind"] in {"construct", "assembly"}, "Snapshot requires a construct or assembly")
+        self._validate_references(source, records)
+        if source["kind"] == "construct":
+            components = [{"chain_id": "A", "construct_ref": source_ref}]
+            bonds = []
+        else:
+            components = source["identity"]["components"]
+            bonds = source["identity"].get("bonds", [])
+        monomers, visiting = {}, set()
+        def visit(record):
+            ref = reference(record)
+            if ref in visiting:
+                return
+            visiting.add(ref)
+            self._validate_references(record, records)
+            for kind, child_ref in reference_values(record["identity"]):
+                if kind == "monomer_ref":
+                    monomers[child_ref] = copy.deepcopy(records[child_ref])
+                    visit(records[child_ref])
+        resolved = []
+        for component in components:
+            record = records[component["construct_ref"]]
+            visit(record)
+            resolved.append({**copy.deepcopy(component), "record": copy.deepcopy(record)})
+        visit(source)
+        output = {"schema": SCHEMA, "kind": "resolved-assembly", "name": source["name"],
+                  "source_ref": source_ref, "components": resolved, "bonds": copy.deepcopy(bonds),
+                  "monomers": dict(sorted(monomers.items())),
+                  "provenance": {"registry_source_ref": source_ref, "source_record_sha256": source["sha256"]}}
+        if source["kind"] == "assembly":
+            output["assembly_record"] = copy.deepcopy(source)
+        output["sha256"] = digest_json(output)
+        return output
+
+    def project_snapshot(self, ref):
+        """Resolve an entire pinned project under one consistent shared lock."""
+        with self._lock():
+            records = self._records_locked()
+            project_ref = self._resolve(ref, records, 'project')
+            record = records[project_ref]
+            members = []
+            for member in record['identity']['members']:
+                source_ref = member['source_ref']
+                members.append({**copy.deepcopy(member),
+                    'snapshot': self._snapshot_locked(source_ref, records),
+                    'description': projects.description_receipt(records[source_ref])})
+            result = {'schema': SCHEMA, 'kind': 'resolved-project', 'project_ref': project_ref,
+                      'project_record': copy.deepcopy(record), 'members': members}
+            result['sha256'] = digest_json(result)
+            return result
 
     def verify(self, ref=None):
         with self._lock():
@@ -861,10 +937,27 @@ def main(argv=None):
         command.add_argument("--notes")
         command.add_argument("--status", choices=["draft", "defined"])
     imp.add_argument("--attachment", action="append", default=[], metavar="NAME=FILE")
+    imp.add_argument("--description", type=Path, help="Markdown describing intended function and success criteria")
     rev = commands.add_parser("revise")
     rev.add_argument("ref")
     rev.add_argument("--json", required=True, type=Path)
     rev.add_argument("--attachment", action="append", default=[], metavar="NAME=FILE")
+    rev.add_argument("--description", type=Path, help="Replace description.md in the new revision")
+    project = commands.add_parser("project", help="Create a project with a Markdown research brief and pinned members")
+    project.add_argument("--id", required=True)
+    project.add_argument("--name")
+    project.add_argument("--brief", required=True, type=Path)
+    project.add_argument("--member", action="append", default=[], metavar="REF")
+    describe = commands.add_parser("describe", help="Read a purpose document, or revise it without changing chemical identity")
+    describe.add_argument("ref")
+    describe.add_argument("--markdown", type=Path, help="Publish this Markdown as a new immutable revision")
+    context = commands.add_parser("context", help="Export a project workspace for evidence-based agent analysis; runs no models")
+    context.add_argument("ref")
+    context_output = context.add_mutually_exclusive_group(required=True)
+    context_output.add_argument("--out", type=Path)
+    context_output.add_argument("--archive", type=Path, help=argparse.SUPPRESS)
+    context_verify = commands.add_parser("context-verify", help="Verify the frozen inputs of an exported project workspace")
+    context_verify.add_argument("directory", type=Path)
     listing = commands.add_parser("list")
     listing.add_argument("--kind", choices=list(COLLECTIONS))
     listing.add_argument("--type", choices=sorted(MOLECULE_TYPES))
@@ -892,7 +985,13 @@ def main(argv=None):
             name, path = item.split("=", 1)
             require(name not in attachments, "Duplicate attachment name")
             attachments[name] = Path(path)
+        if args.description:
+            require('description.md' not in attachments, '--description conflicts with description.md attachment')
+            attachments['description.md'] = args.description
         if args.command == "revise":
+            if args.description:
+                require(registry.show(args.ref)['kind'] in {'construct', 'assembly'},
+                        '--description applies to constructs or assemblies; use describe for a project brief')
             no_symlinks(args.json, regular=True)
             attachments.setdefault("revision-source.json", args.json)
             result = registry.revise(args.ref, load_json(args.json), attachments)
@@ -930,7 +1029,39 @@ def main(argv=None):
                 document["aliases"] = args.alias
             if args.tag:
                 document["tags"] = args.tag
+            if args.description:
+                require(document.get('kind') in {'construct', 'assembly'},
+                        '--description applies to constructs or assemblies; project briefs use project.md')
             result = registry.import_record(document, attachments)
+    elif args.command == "project":
+        document = {'kind': 'project', 'id': args.id, 'identity': {
+            'objectives_file': 'attachments/project.md',
+            'members': [{'source_ref': ref, 'role': ''} for ref in args.member]}}
+        if args.name:
+            document['name'] = args.name
+        result = registry.import_record(document, {'project.md': args.brief})
+    elif args.command == "describe":
+        if args.markdown:
+            result = registry.describe(args.ref, args.markdown)
+        else:
+            record = registry.show(args.ref)
+            name = projects.filename(record['kind'])
+            require(name is not None, 'Purpose documents apply to constructs, assemblies or projects')
+            path = registry.attachment_path(reference(record), 'attachments/'+name)
+            sys.stdout.write(projects.markdown_bytes(path.read_bytes(), require=require).decode('utf-8'))
+            return
+    elif args.command in {'context', 'context-verify'}:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bio_library_context', Path(__file__).with_name('context.py'))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        if args.command == 'context-verify':
+            result = module.verify_directory(args.directory)
+        elif args.archive:
+            result = module.export_archive(registry, args.ref, args.archive)
+        else:
+            result = module.export_directory(registry, args.ref, args.out)
     elif args.command == "list":
         result = registry.list(kind=args.kind, molecule_type=args.type, tag=args.tag, all_revisions=args.all_revisions)
     elif args.command == "show":
