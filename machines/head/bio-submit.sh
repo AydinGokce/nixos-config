@@ -15,7 +15,7 @@ Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
          --gpu TYPE, --spot, --timeout SECONDS (default 7200), -- EXTRA_ARGS
 MSA: --msa-backend public|private, or --msa-bundle DIRECTORY for a prepared input.
-Database jobs: bio-submit msa --sub install|prepare|serve [--model MODEL --fasta FILE]
+Database jobs: bio-submit msa --sub install|convert|prepare|serve [--model MODEL --fasta FILE]
 RFAA: --sub full (default) or --sub single-seq; full needs bio-rfaa-databases.
 EVOLVEpro: --sub rank (default) or --sub embed; --labels measured.csv for ranking.
 Results: /var/lib/bio-runs/JOB on the head, including run.log and job.json.
@@ -75,13 +75,14 @@ case "$msa_backend" in public|private) ;; *) echo 'bio-submit: --msa-backend mus
 if [ "$recipe" = msa ]; then
   sub="${sub:-prepare}"
   case "$sub" in
-    install|serve)
+    install|convert|serve)
       [ -z "$bundle_result" ] || { echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2; } ;;
     prepare)
       [ -n "$infile" ] || { echo 'bio-submit: MSA preparation needs --fasta' >&2; exit 2; }
       case "$model" in openfold3|boltz2|protenix) ;; *) echo 'bio-submit: MSA preparation needs --model openfold3|boltz2|protenix' >&2; exit 2;; esac ;;
-    *) echo 'bio-submit: MSA --sub must be install, prepare or serve' >&2; exit 2;;
+    *) echo 'bio-submit: MSA --sub must be install, convert, prepare or serve' >&2; exit 2;;
   esac
+  [ "$sub" != convert ] || tier=msa_convert
   [ -z "$msa_bundle" ] || { echo 'bio-submit: a database job cannot consume an inference bundle' >&2; exit 2; }
 elif [ -n "$bundle_result" ]; then
   echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2
@@ -154,7 +155,7 @@ if [ "$recipe" = rfaa ] && [ -n "$db_nfs" ]; then
     echo 'bio-submit: full RFAA databases are not ready on the head; finish installation and validation before launching' >&2
     exit 2
   }
-elif [ "$recipe" = msa ] && [ "$sub" != install ]; then
+elif [ "$recipe" = msa ] && [ "$sub" != install ] && [ "$sub" != convert ]; then
   msa_receipt="${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}/.msa-databases.json"
   [ -f "$msa_receipt" ] && [ -s "$msa_receipt" ] || {
     echo 'bio-submit: private MSA databases are not ready on the head; a nonempty final .msa-databases.json receipt is required' >&2
@@ -257,7 +258,7 @@ fi
 if [ -n "$MSA_DB_NFS" ]; then
   sudo mkdir -p /mnt/bio-msa-databases
   msa_mount_options=vers=4.1,nconnect=16,nolock,ro
-  [ "$SUB" != install ] || msa_mount_options=vers=4.1,nconnect=16,nolock
+  case "$SUB" in install|convert) msa_mount_options=vers=4.1,nconnect=16,nolock ;; esac
   for i in 1 2 3 4 5 6 7 8; do
     mountpoint -q /mnt/bio-msa-databases && break
     sudo mount -t nfs -o "$msa_mount_options" "$MSA_DB_NFS" /mnt/bio-msa-databases && break
@@ -319,6 +320,7 @@ else
     modern) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V 1A6000.10V) ;;
     latest) candidates=(1A100.22V 1L40S.20V 1RTXPRO6000.30V 1H100.80S.32V) ;;
     msa) candidates=(CPU.360V.1440G) ;;
+    msa_convert) candidates=(CPU.16V.64G) ;;
   esac
 fi
 for g in "${candidates[@]}"; do
@@ -326,6 +328,7 @@ for g in "${candidates[@]}"; do
   max_hours=$(python3 -c 'import sys; print((int(sys.argv[1])+900)/3600)' "$seconds")
   image_args=()
   [ "$g" != 1A6000.10V ] || image_args=(--image ubuntu-24.04-cuda-12.6-docker)
+  if [ "$recipe" = msa ] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
   if out=$(dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --max-hours "$max_hours" 2>&1); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)
     ip=$(printf '%s\n' "$out" | sed -n 's/.*READY.*ip=\([^ ]*\).*/\1/p' | tail -1)

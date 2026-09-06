@@ -166,6 +166,8 @@ receipt and these files beneath `/mnt/bio-msa-databases/colabfold`:
 - `.msa-databases.json` and `manifest.json`;
 - `.components/uniref30.json`, `environmental.json`, `pdb100.json`,
   `templates.json` and `mmcif.json`;
+- `.conversions.json` and `.conversions/uniref30.json`, `environmental.json`
+  and `pdb100.json`, retained as `conversions.json` and `conversion-NAME.json`;
 - `mmcif/mmcif-content.jsonl.gz`, the compressed per-structure content hash manifest.
 
 Copy failures remain recorded as warnings; model outputs on the original share

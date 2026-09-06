@@ -434,8 +434,8 @@ sleep() { :; }
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         return (self.root / "mounts").read_text().splitlines()[-1]
 
-    def test_msa_install_and_serve_need_no_input_and_only_install_mounts_database_writable(self):
-        for sub in ("install", "serve", "prepare"):
+    def test_msa_database_modes_require_only_prepare_input_and_mount_only_writers_writable(self):
+        for sub in ("install", "convert", "serve", "prepare"):
             with self.subTest(sub=sub):
                 arguments = [] if sub != "prepare" else ["--model", "boltz2", "--fasta", self.input]
                 result = self.submit("msa", "--sub", sub, *arguments,
@@ -443,10 +443,13 @@ sleep() { :; }
                 self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
                 mount = self.execute_msa_mount_block(sub)
                 self.assertEqual(mount, "mount -t nfs -o vers=4.1,nconnect=16,nolock" +
-                                 ("" if sub == "install" else ",ro") +
+                                 ("" if sub in ("install", "convert") else ",ro") +
                                  " msa-server:/colabfold /mnt/bio-msa-databases")
-        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"]*3)
+        self.assertEqual((self.root / "launches").read_text().splitlines(),
+                         ["CPU.360V.1440G", "CPU.16V.64G", "CPU.360V.1440G", "CPU.360V.1440G"])
         self.assertTrue(all("--volume msa-database-volume" in line
+                            for line in (self.root / "launch-args").read_text().splitlines()))
+        self.assertTrue(all("--image ubuntu-24.04 --max-hours" in line
                             for line in (self.root / "launch-args").read_text().splitlines()))
 
     def test_msa_prepare_requires_model_fasta_and_configured_storage_before_rental(self):
@@ -480,11 +483,49 @@ sleep() { :; }
             if condition == "directory":
                 receipt.rmdir()
 
-    def test_msa_install_can_run_without_a_final_database_receipt(self):
+    def test_msa_install_and_convert_can_run_without_a_final_database_receipt(self):
         (self.msa_root / ".msa-databases.json").unlink()
-        result = self.submit("msa", "--sub", "install", **self.msa_settings())
+        for sub in ("install", "convert"):
+            with self.subTest(sub=sub):
+                result = self.submit("msa", "--sub", sub, **self.msa_settings())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "launches").read_text().splitlines(),
+                         ["CPU.360V.1440G", "CPU.16V.64G"])
+
+    def test_msa_convert_worker_failure_preserves_status_and_cleans_exact_worker(self):
+        (self.msa_root / ".msa-databases.json").unlink()
+        result = self.submit("msa", "--sub", "convert", **self.msa_settings(MODEL_EXIT="17"))
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertNotIn("DONE", result.stdout)
+        self.assertEqual((self.root / "removals").read_text().splitlines(),
+                         ["rm 12345678-1234-1234-1234-123456789012"])
+        metadata = json.loads(next((self.root / "results").glob("*/job.json")).read_text())
+        self.assertEqual(metadata["exit_status"], 17)
+        self.assertEqual(metadata["database_volume"], "msa-database-volume")
+        self.assertEqual((self.root / "msa-storage-checks").read_text().count("check --volume"), 2)
+        self.assertEqual((self.root / "msa-storage-checks").read_text().count("track --volume"), 2)
+        self.assertFalse((self.root / "prepared-checks").exists())
+
+    def test_msa_convert_cli_forwards_options_and_documents_incomplete_indexing(self):
+        wrapper = SCRIPT.with_name("bio-msa.sh")
+        forwarded = self.root / "bin" / "bio-submit"
+        forwarded.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        forwarded.chmod(0o700)
+        result = subprocess.run(["bash", str(wrapper), "convert", "--timeout", "3600",
+                                 "--name", "conversion with spaces"], env=self.env,
+                                text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"])
+        self.assertEqual(json.loads(result.stdout),
+                         ["msa", "--sub", "convert", "--timeout", "3600", "--name", "conversion with spaces"])
+        help_result = subprocess.run(["bash", str(wrapper), "--help"], env=self.env,
+                                     text=True, capture_output=True, timeout=5)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("bio-msa convert", help_result.stdout)
+        self.assertIn("CPU.16V.64G", help_result.stdout)
+        self.assertIn("without full search indexes", help_result.stdout)
+        submit_help = self.submit("msa", "--help")
+        self.assertEqual(submit_help.returncode, 0, submit_help.stderr)
+        self.assertIn("install|convert|prepare|serve", submit_help.stdout)
 
     def test_nested_private_preparation_with_uninstalled_databases_rents_no_worker(self):
         (self.msa_root / ".msa-databases.json").unlink()
@@ -549,7 +590,7 @@ sleep() { :; }
         state.mkdir()
         with (state / "bio-submit.lock").open("w") as locked:
             fcntl.flock(locked.fileno(), fcntl.LOCK_EX)
-            result = self.submit("msa", "--sub", "install", **self.msa_settings())
+            result = self.submit("msa", "--sub", "convert", **self.msa_settings())
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertTrue((state / "msa-submit.lock").exists())
 
@@ -617,7 +658,7 @@ sleep() { :; }
 
     def test_bundle_result_is_preparation_only_and_published_after_success(self):
         receipt = self.root / "bundle-result.json"
-        for sub in ("install", "serve"):
+        for sub in ("install", "convert", "serve"):
             with self.subTest(sub=sub):
                 result = self.submit("msa", "--sub", sub, "--bundle-result", receipt, **self.msa_settings())
                 self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
@@ -642,6 +683,102 @@ sleep() { :; }
                 self.assertFalse(receipt.exists())
                 metadata, = set((self.root / "results").glob("*/job.json")) - before
                 self.assertNotEqual(json.loads(metadata.read_text())["exit_status"], 0)
+
+
+class MsaRecipeTests(unittest.TestCase):
+    """Execute the actual recipe with synthetic host RAM and inert database tools."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        commands = self.root / "bin"
+        commands.mkdir()
+        # Only /proc/meminfo is replaced. The actual recipe's Python preflight
+        # and shell control flow execute, including errexit and early return.
+        python = commands / "python3"
+        python.write_text(f'#!{sys.executable}\n' + '''import os, sys
+from pathlib import Path
+from unittest.mock import patch
+if sys.argv[1] == '-':
+    code = sys.stdin.read()
+    sys.argv = sys.argv[1:]
+    read_text = Path.read_text
+    def synthetic_memory(path, *args, **kwargs):
+        if str(path) == '/proc/meminfo':
+            return 'MemAvailable: ' + str(int(os.environ['AVAILABLE_GIB']) * 1024**2) + ' kB\\n'
+        return read_text(path, *args, **kwargs)
+    with patch.object(Path, 'read_text', synthetic_memory):
+        exec(compile(code, '<recipe stdin>', 'exec'), {'__name__': '__main__'})
+else:
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+''')
+        python.chmod(0o700)
+        nproc = commands / "nproc"
+        nproc.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "${TEST_CORES:-64}"\n')
+        nproc.chmod(0o700)
+        tools = self.root / "tools with spaces"
+        (tools / "msa").mkdir(parents=True)
+        (tools / "msa" / "tools.sh").write_text(
+            'echo bootstrap >> "$AUDIT/events"\nexport MSA_TOOLS_ROOT="$AUDIT/pinned tools"\n')
+        stub = '''import json, os, sys
+from pathlib import Path
+with (Path(os.environ['AUDIT']) / 'calls.jsonl').open('a') as output:
+    output.write(json.dumps([Path(__file__).name, *sys.argv[1:]]) + '\\n')
+if Path(__file__).name != 'databases.py' or sys.argv[1] != 'convert':
+    raise SystemExit('conversion must not start the server, install, validate or prepare')
+if int(os.environ.get('DATABASE_EXIT', '0')):
+    raise SystemExit(int(os.environ['DATABASE_EXIT']))
+print(json.dumps({'stage': 'databases-converted', 'production_ready': False}))
+'''
+        for name in ("databases.py", "server.py", "prepared.py"):
+            (tools / "msa" / name).write_text(stub)
+        out = self.root / "output with spaces"
+        out.mkdir()
+        self.env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
+                        AUDIT=str(self.root), TOOLS=str(tools), OUT=str(out),
+                        MSA_DB_ROOT=str(self.root / "database with spaces"))
+
+    def recipe(self, sub, available_gib, **settings):
+        return subprocess.run(["bash", "-c", 'EXTRA_ARGS=(); source "$1"', "recipe-test",
+                               str(SCRIPT.parent / "recipes" / "msa.sh")],
+                              env=dict(self.env, SUB=sub, AVAILABLE_GIB=str(available_gib), **settings),
+                              text=True, capture_output=True, timeout=5)
+
+    def test_conversion_accepts_56_gib_caps_threads_and_exits_before_indexing_or_serving(self):
+        result = self.recipe("convert", 56)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["bootstrap"])
+        calls = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+        self.assertEqual(calls, [["databases.py", "convert", "--root", self.env["MSA_DB_ROOT"],
+                                 "--tools-root", str(self.root / "pinned tools"), "--threads", "8"]])
+        artifact = Path(self.env["OUT"]) / "database-conversion.json"
+        self.assertEqual(json.loads(artifact.read_text()),
+                         dict(stage="databases-converted", production_ready=False))
+        self.assertEqual(list(Path(self.env["OUT"]).iterdir()), [artifact])
+
+    def test_conversion_uses_fewer_available_threads_and_propagates_failure(self):
+        result = self.recipe("convert", 56, TEST_CORES="4", DATABASE_EXIT="23")
+        self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
+        call, = [json.loads(line) for line in (self.root / "calls.jsonl").read_text().splitlines()]
+        self.assertEqual(call[-2:], ["--threads", "4"])
+        self.assertEqual(call[0:2], ["databases.py", "convert"])
+
+    def test_conversion_rejects_insufficient_ram_before_tools_bootstrap(self):
+        result = self.recipe("convert", 55)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("database conversion requires at least 56 GiB", result.stderr)
+        self.assertFalse((self.root / "events").exists())
+        self.assertFalse((self.root / "calls.jsonl").exists())
+
+    def test_full_install_prepare_and_serve_still_require_768_gib(self):
+        for sub in ("install", "prepare", "serve"):
+            with self.subTest(sub=sub):
+                result = self.recipe(sub, 767)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("full indexed CPU reference requires at least 768 GiB", result.stderr)
+                self.assertFalse((self.root / "events").exists())
+                self.assertFalse((self.root / "calls.jsonl").exists())
 
 
 if __name__ == "__main__":

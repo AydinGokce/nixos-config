@@ -99,10 +99,10 @@ def fingerprint(path):
     return dict(bytes=size, edge_sha256=hashlib.sha256(first + last).hexdigest())
 
 
-def inventory(directory):
+def inventory(directory, exclude_prefix=None):
     result = {}
     for path in sorted(directory.rglob("*")):
-        if path.name.startswith(".") or path.is_dir():
+        if path.name.startswith(".") or path.is_dir() or (exclude_prefix and path.name.startswith(exclude_prefix)):
             continue
         if not path.resolve().is_relative_to(directory.resolve()):
             fail(f"Database symlink escapes its component: {path}")
@@ -202,8 +202,11 @@ def relocate_links(directory):
             path.symlink_to(relative)
 
 
-def validate_db(prefix, expanded=False):
-    for suffix in (["", "_h", "_seq", "_seq_h", "_aln", ".idx"] if expanded else ["", "_h", ".idx"]):
+def validate_db(prefix, expanded=False, require_index=True):
+    suffixes = ["", "_h", "_seq", "_seq_h", "_aln"] if expanded else ["", "_h"]
+    if require_index:
+        suffixes.append(".idx")
+    for suffix in suffixes:
         p = Path(str(prefix) + suffix)
         for tail in ("", ".index", ".dbtype"):
             file = Path(str(p) + tail)
@@ -289,7 +292,7 @@ def run_mmseqs(tool, args, stage, commands):
     write_json(stage / "commands.json", commands)
     env = dict(os.environ, MMSEQS_FORCE_MERGE="1")
     # Runtime GPU flags or shortened indexes cannot leak in from the caller.
-    for name in ("GPU", "MMSEQS_NO_INDEX", "MMSEQS_IGNORE_INDEX"):
+    for name in ("GPU", "MMSEQS_FORCE_GPU", "MMSEQS_FORCE_GPUSERVER", "MMSEQS_NO_INDEX", "MMSEQS_IGNORE_INDEX"):
         env.pop(name, None)
     subprocess.run(command, check=True, env=env, stdout=sys.stderr)
 
@@ -305,7 +308,59 @@ def cleanup_sources(root, name, receipt):
                 path.unlink()
 
 
-def install_component(root, name, tool, threads, mirror, port):
+def sequence_statistics(prefix):
+    """Match release18 DBReader::getAminoAcidDBSize without loading sequence data."""
+    dtype = int.from_bytes(Path(str(prefix) + ".dbtype").read_bytes(), "little")
+    if dtype & 0xFFFF != 0 or (dtype >> 16) & 8:  # DBTYPE_EXTENDED_GPU
+        fail(f"Statistics require the unpadded amino-acid database: {prefix}")
+    index = Path(str(prefix) + ".index")
+    # awk streams the multi-GB numeric index in C. Double precision exactly
+    # represents these integer counts/totals (<2**53); no Python list of rows.
+    script = '''NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/ || $3 < 2 { exit 1 }
+{ n++; residues += $3 - 2; if ($3 - 2 > longest) longest = $3 - 2 }
+END { if (n == 0) exit 1; printf "%.0f %.0f %.0f\\n", n, residues, longest }'''
+    counts = subprocess.check_output(["awk", script, str(index)], text=True,
+                                     env=dict(os.environ, LC_ALL="C")).split()
+    entries, residues, longest = map(int, counts)
+    if residues >= 2**53 or residues <= 0:
+        fail(f"Invalid or inexact sequence residue total: {prefix}")
+    return dict(entries=entries, residues=residues, max_length=longest,
+                encoded_bytes=prefix.stat().st_size, index_bytes=index.stat().st_size)
+
+
+def conversion_inventory(built, name):
+    return inventory(built, exclude_prefix=PREFIXES[name] + ".idx")
+
+
+def conversion_receipt(root, name, built, source_receipts, commands):
+    prefix = built / PREFIXES[name]
+    validate_db(prefix, name != "pdb100", require_index=False)
+    if name == "uniref30":
+        for suffix in ("_mapping", "_taxonomy"):
+            if not Path(str(prefix) + suffix).is_file():
+                fail(f"Missing converted representative taxonomy: {prefix}{suffix}")
+    files = conversion_inventory(built, name)
+    marker = built / ".conversion.json"
+    if marker.exists():
+        receipt = load(marker)
+        if receipt.get("manifest_sha256") != MANIFEST_SHA256 or receipt.get("sources") != source_receipts or receipt.get("files") != files:
+            fail(f"Converted component differs from its receipt: {name}")
+    else:
+        statistics = dict(representatives=sequence_statistics(prefix))
+        if name != "pdb100":
+            statistics["members"] = sequence_statistics(Path(str(prefix) + "_seq"))
+        receipt = dict(stage="component-converted", production_ready=False,
+                       manifest_sha256=MANIFEST_SHA256, component=name,
+                       sources=source_receipts, files=files, statistics=statistics,
+                       commands=list(commands), completed_utc=time.time())
+        write_json(marker, receipt)
+    write_json(root / ".conversions" / (name + ".json"), receipt)
+    return receipt
+
+
+def install_component(root, name, tool, threads, mirror, port, convert_only=False):
+    if convert_only and name not in PREFIXES:
+        fail(f"Conversion-only is not applicable to {name}")
     final = root / name
     external_receipt = root / ".components" / (name + ".json")
     if final.exists():
@@ -314,6 +369,8 @@ def install_component(root, name, tool, threads, mirror, port):
             fail(f"Installed component differs from its receipt: {name}")
         write_json(external_receipt, receipt)
         cleanup_sources(root, name, receipt)
+        if convert_only:
+            return conversion_receipt(root, name, final, receipt["sources"], receipt.get("commands", []))
         return
     stage = root / ".staging" / name
     stage.mkdir(parents=True, exist_ok=True)
@@ -342,17 +399,12 @@ def install_component(root, name, tool, threads, mirror, port):
                 source_prefix = sources / SOURCES[name]["archive"].removesuffix(".tar.gz")
                 run_mmseqs(tool, ["tsv2exprofiledb", source_prefix, prefix, "--threads", threads], stage, commands)
             write_json(built / ".converted.json", dict(source=source_receipts[name]))
-        if not (built / ".indexed.json").exists():
-            for file in built.glob(PREFIXES[name] + ".idx*"):
-                if file.is_file() or file.is_symlink():
-                    file.unlink()
-            scratch = stage / "index-tmp"
-            if scratch.exists():
-                shutil.rmtree(scratch)
-            run_mmseqs(tool, ["createindex", prefix, scratch, "--remove-tmp-files", "1", "--threads", threads], stage, commands)
-            validate_db(prefix, name != "pdb100")
-            write_json(built / ".indexed.json", dict(mmseqs=MMSEQS_COMMIT))
+        elif load(built / ".converted.json").get("source") != source_receipts[name]:
+            fail(f"Converted source changed: {name}")
         if name == "uniref30":
+            # Release18 indexdb packs sequences/headers/alignments, not taxonomy;
+            # pairaln opens the base _mapping separately. Apply it before the
+            # conversion checkpoint without changing index or pairing inputs.
             tax_archive, source_receipts["taxonomy"] = download(root, SOURCES["taxonomy"])
             taxdir = stage / "taxonomy"
             extract(tax_archive, taxdir)
@@ -370,6 +422,23 @@ def install_component(root, name, tool, threads, mirror, port):
                 link = Path(str(prefix) + ".idx_" + suffix)
                 link.unlink(missing_ok=True)
                 link.symlink_to(prefix.name + "_" + suffix)
+        converted = conversion_receipt(root, name, built, source_receipts, commands)
+        if convert_only:
+            log(f"Converted complete {name}; indexing remains pending")
+            return converted
+        if not (built / ".indexed.json").exists():
+            for file in built.glob(PREFIXES[name] + ".idx*"):
+                # Taxonomy aliases are part of the completed conversion.
+                if file.name in (prefix.name + ".idx_mapping", prefix.name + ".idx_taxonomy"):
+                    continue
+                if file.is_file() or file.is_symlink():
+                    file.unlink()
+            scratch = stage / "index-tmp"
+            if scratch.exists():
+                shutil.rmtree(scratch)
+            run_mmseqs(tool, ["createindex", prefix, scratch, "--remove-tmp-files", "1", "--threads", threads], stage, commands)
+            validate_db(prefix, name != "pdb100")
+            write_json(built / ".indexed.json", dict(mmseqs=MMSEQS_COMMIT))
     elif name == "templates":
         extract(archive, built, {"pdb100_a3m.ffdata", "pdb100_a3m.ffindex"})
     else:
@@ -401,6 +470,8 @@ def install_component(root, name, tool, threads, mirror, port):
     files = validate_component(built, name)
     receipt = dict(manifest_sha256=MANIFEST_SHA256, component=name, sources=source_receipts,
                    commands=commands, files=files, completed_utc=time.time())
+    if name in PREFIXES:
+        receipt["statistics"] = converted["statistics"]
     write_json(built / ".component.json", receipt)
     built.rename(final)
     write_json(external_receipt, receipt)
@@ -456,7 +527,7 @@ def download_sources(root):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("plan", "download", "install", "validate"))
+    p.add_argument("action", choices=("plan", "download", "convert", "install", "validate"))
     p.add_argument("--root", type=Path, default=Path(os.environ.get("MSA_DB_ROOT", DEFAULT_ROOT)))
     p.add_argument("--tools-root", type=Path, default=Path(os.environ.get("MSA_TOOLS_ROOT", DEFAULT_TOOLS)))
     p.add_argument("--threads", type=int, default=8)
@@ -473,10 +544,11 @@ def main(argv=None):
         return
     if args.threads < 1 or not 1 <= args.pdb_port <= 65535 or "::" not in args.pdb_mirror:
         fail("Invalid thread count or rsync mirror")
-    if args.action == "install":
+    if args.action in ("install", "convert"):
         available = next(int(line.split()[1])*1024 for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))
-        if available < 120*GIB:
-            fail("Full CPU database indexing needs at least 120 GiB available RAM; use a preparation worker, not the 16 GB head")
+        minimum = 56 if args.action == "convert" else 120
+        if available < minimum*GIB:
+            fail(f"Full CPU database {args.action} needs at least {minimum} GiB available RAM; use a preparation worker, not the 16 GB head")
         provenance = tools(args.tools_root)
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".install.lock").open("a") as lock:
@@ -491,6 +563,16 @@ def main(argv=None):
             write_json(manifest, MANIFEST)
         if args.action == "download":
             print(json.dumps(download_sources(root), indent=2))
+            return
+        if args.action == "convert":
+            converted = {}
+            for name in PREFIXES:
+                converted[name] = install_component(root, name, provenance["mmseqs"], args.threads,
+                                                    args.pdb_mirror, args.pdb_port, convert_only=True)
+            result = dict(stage="databases-converted", production_ready=False, tools=provenance,
+                          manifest_sha256=MANIFEST_SHA256, components=converted, completed_utc=time.time())
+            write_json(root / ".conversions.json", result)
+            print(json.dumps(result, indent=2))
             return
         for name in COMPONENTS:
             install_component(root, name, provenance["mmseqs"], args.threads, args.pdb_mirror, args.pdb_port)

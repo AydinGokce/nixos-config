@@ -242,13 +242,14 @@ class InstallerTests(unittest.TestCase):
             db.validate(self.root)
 
     def test_gpu_environment_cannot_change_install(self):
-        with patch.dict(db.os.environ, {'GPU':'1','MMSEQS_NO_INDEX':'1','MMSEQS_IGNORE_INDEX':'1'}), \
+        flags = {'GPU':'1','MMSEQS_FORCE_GPU':'1','MMSEQS_FORCE_GPUSERVER':'1',
+                 'MMSEQS_NO_INDEX':'1','MMSEQS_IGNORE_INDEX':'1'}
+        with patch.dict(db.os.environ, flags), \
                 patch.object(db.subprocess, 'run') as run:
             db.run_mmseqs('mmseqs', ['createdb','input','out'], self.root, [])
         env = run.call_args.kwargs['env']
-        self.assertNotIn('GPU', env)
-        self.assertNotIn('MMSEQS_NO_INDEX', env)
-        self.assertNotIn('MMSEQS_IGNORE_INDEX', env)
+        for name in flags:
+            self.assertNotIn(name, env)
         self.assertEqual(env['MMSEQS_FORCE_MERGE'], '1')
 
     def test_low_space_fails_clearly(self):
@@ -304,6 +305,118 @@ class InstallerTests(unittest.TestCase):
                 patch.object(db,'free_space') as space:
             db.download_sources(self.root)
         space.assert_called_once_with(self.root, 2*len(content)-3+16*db.GIB)
+
+    def test_conversion_stops_before_index_and_full_install_reuses_it(self):
+        path = self.root/'.archives'/db.SOURCES['pdb100']['archive']
+        path.parent.mkdir()
+        path.write_bytes(gzip.compress(b'>x\nACDE\n'))
+        source = {'sha256': db.digest(path)[0]}
+        db.write_json(path.with_suffix('.gz.json'), source)
+        calls = []
+        def run(tool, args, stage, commands):
+            calls.append(args[0])
+            commands.append([tool, *map(str, args)])
+            db.write_json(stage/'commands.json', commands)
+            fake_database(Path(args[2] if args[0] == 'createdb' else args[1]),
+                          index=args[0] == 'createindex')
+        with patch.object(db, 'download', return_value=(path, source)), \
+                patch.object(db, 'run_mmseqs', side_effect=run):
+            first = db.install_component(self.root, 'pdb100', 'mmseqs', 2, 'unused::mirror', 873, convert_only=True)
+            prefix = self.root/'.staging/pdb100/built'/db.PREFIXES['pdb100']
+            self.assertEqual(calls, ['createdb'])
+            self.assertFalse(Path(str(prefix)+'.idx').exists())
+            self.assertFalse((self.root/'.components').exists())
+            self.assertFalse((self.root/'.msa-databases.json').exists())
+            self.assertTrue(path.exists())
+            self.assertFalse(first['production_ready'])
+            self.assertEqual(first['statistics']['representatives']['residues'], 4)
+            repeated = db.install_component(self.root, 'pdb100', 'mmseqs', 2, 'unused::mirror', 873, convert_only=True)
+            self.assertEqual(first, repeated)
+            self.assertEqual(calls, ['createdb'])
+            # An interrupted index must not poison the reusable conversion.
+            Path(str(prefix)+'.idx').touch()
+            db.install_component(self.root, 'pdb100', 'mmseqs', 2, 'unused::mirror', 873)
+        self.assertEqual(calls, ['createdb', 'createindex'])
+        self.assertFalse(path.exists())
+        self.assertFalse((self.root/'.staging/pdb100').exists())
+        installed = db.load(self.root/'.components/pdb100.json')
+        self.assertEqual(first['statistics'], installed['statistics'])
+        self.assertEqual([command[1] for command in installed['commands']], ['createdb', 'createindex'])
+        self.assertEqual(first, db.load(self.root/'.conversions/pdb100.json'))
+
+    def test_changed_converted_output_fails_before_indexing(self):
+        path = self.root/'source.gz'; path.write_bytes(b'fake')
+        def run(tool, args, stage, commands):
+            fake_database(Path(args[2]), index=False)
+        with patch.object(db, 'download', return_value=(path, {})), \
+                patch.object(db, 'run_mmseqs', side_effect=run) as mmseqs:
+            db.install_component(self.root, 'pdb100', 'mmseqs', 2, 'unused::mirror', 873, convert_only=True)
+            prefix = self.root/'.staging/pdb100/built'/db.PREFIXES['pdb100']
+            prefix.write_bytes(b'AAAA\n\0')
+            with self.assertRaisesRegex(RuntimeError, 'differs from its receipt'):
+                db.install_component(self.root, 'pdb100', 'mmseqs', 2, 'unused::mirror', 873)
+            self.assertEqual(mmseqs.call_count, 1)
+        self.assertFalse((self.root/'.components').exists())
+
+    def test_conversion_has_latest_taxonomy_before_any_index(self):
+        path = self.root/'source.tar.gz'; path.write_bytes(b'fake')
+        def extract(source, target):
+            target.mkdir(parents=True, exist_ok=True)
+            if target.name == 'taxonomy':
+                (target/(db.PREFIXES['uniref30']+'_mapping')).write_bytes(bytes.fromhex('1300170c')+b'mapping')
+                (target/(db.PREFIXES['uniref30']+'_taxonomy')).write_bytes(b'latest taxonomy')
+        def run(tool, args, stage, commands):
+            self.assertEqual(args[0], 'tsv2exprofiledb')
+            fake_database(Path(args[2]), expanded=True, index=False)
+        with patch.object(db, 'download', return_value=(path, {})), \
+                patch.object(db, 'extract', side_effect=extract), \
+                patch.object(db, 'run_mmseqs', side_effect=run) as mmseqs:
+            receipt = db.install_component(self.root, 'uniref30', 'mmseqs', 2, 'unused::mirror', 873, convert_only=True)
+        prefix = self.root/'.staging/uniref30/built'/db.PREFIXES['uniref30']
+        self.assertEqual(Path(str(prefix)+'.idx_taxonomy').read_bytes(), b'latest taxonomy')
+        self.assertFalse(Path(str(prefix)+'.idx').exists())
+        self.assertEqual(mmseqs.call_count, 1)
+        self.assertEqual(set(receipt['sources']), {'uniref30', 'taxonomy'})
+        self.assertEqual(set(receipt['statistics']), {'representatives', 'members'})
+
+    def test_statistics_use_decoded_lengths_and_reject_invalid_or_padded_rows(self):
+        prefix = self.root/'compressed'
+        prefix.write_bytes(b'compressed data')
+        Path(str(prefix)+'.dbtype').write_bytes((0x80000000).to_bytes(4, 'little'))
+        index = Path(str(prefix)+'.index')
+        index.write_text('0\t0\t78\n1\t8\t80\n')
+        stats = db.sequence_statistics(prefix)
+        self.assertEqual((stats['entries'], stats['residues'], stats['max_length']), (2, 154, 78))
+        index.write_text('0\t0\t78\n1\t8\tbroken\n')
+        with self.assertRaises(subprocess.CalledProcessError):
+            db.sequence_statistics(prefix)
+        Path(str(prefix)+'.dbtype').write_bytes((8 << 16).to_bytes(4, 'little'))
+        with self.assertRaisesRegex(RuntimeError, 'unpadded amino-acid'):
+            db.sequence_statistics(prefix)
+
+    def test_conversion_rejects_head_ram_before_loading_tools_or_creating_root(self):
+        root = self.root/'not-created'
+        with patch.object(Path, 'read_text', return_value='MemAvailable: 16000000 kB\n'), \
+                patch.object(db, 'tools') as tools:
+            with self.assertRaisesRegex(RuntimeError, 'at least 56 GiB available RAM'):
+                db.main(['convert', '--root', str(root)])
+        tools.assert_not_called()
+        self.assertFalse(root.exists())
+
+    def test_convert_main_writes_only_partial_receipt(self):
+        converted = dict(stage='component-converted', production_ready=False)
+        with patch.object(Path, 'read_text', return_value='MemAvailable: 64000000 kB\n'), \
+                patch.object(db, 'tools', return_value={'mmseqs':'pinned-mmseqs'}), \
+                patch.object(db, 'install_component', return_value=converted) as install, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            db.main(['convert', '--root', str(self.root)])
+        self.assertEqual([call.args[1] for call in install.call_args_list], list(db.PREFIXES))
+        self.assertTrue(all(call.kwargs['convert_only'] for call in install.call_args_list))
+        result = db.load(self.root/'.conversions.json')
+        self.assertEqual(result, json.loads(output.getvalue()))
+        self.assertFalse(result['production_ready'])
+        self.assertFalse((self.root/'.msa-databases.json').exists())
+        self.assertFalse((self.root/'.components').exists())
 
 
 class ServerTests(unittest.TestCase):

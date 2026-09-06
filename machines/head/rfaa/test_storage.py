@@ -603,7 +603,7 @@ class ProcessTests(unittest.TestCase):
             target = root / ("colabfold-database-receipts-" + MSA_DB)
             self.assertEqual(json.loads((target / "allocation.json").read_text()), receipt)
             sources = [call.args[0][-2] for call in run.call_args_list]
-            self.assertEqual(len(sources), 8)
+            self.assertEqual(len(sources), 12)
             self.assertTrue(all(path.startswith("/mnt/bio-msa-databases/colabfold/")
                                 and path.endswith((".json", "/mmcif-content.jsonl.gz")) for path in sources))
             self.assertIn("/mnt/bio-msa-databases/colabfold/.msa-databases.json", sources)
@@ -612,6 +612,15 @@ class ProcessTests(unittest.TestCase):
             self.assertIn(manifest, sources)
             copy = next(call.args[0] for call in run.call_args_list if call.args[0][-2] == manifest)
             self.assertEqual(copy[-1], str(target / "mmcif-content.jsonl.gz"))
+            conversions = {".conversions.json": "conversions.json", **{
+                ".conversions/" + name + ".json": "conversion-" + name + ".json"
+                for name in ("uniref30", "environmental", "pdb100")}}
+            for relative, retained in conversions.items():
+                source = "/mnt/bio-msa-databases/colabfold/" + relative
+                self.assertIn(source, sources)
+                copy = next(call.args[0] for call in run.call_args_list if call.args[0][-2] == source)
+                self.assertEqual(copy[-1], str(target / retained))
+            self.assertFalse(any(".staging/" in source for source in sources))
 
     def test_reused_pid_or_previous_boot_is_never_signalled(self):
         job = dict(pid=424242, start_ticks="123", boot_id=BOOT)

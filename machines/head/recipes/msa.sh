@@ -3,16 +3,25 @@
 msa_run() (
   set -euo pipefail
   [ "${#EXTRA_ARGS[@]}" -eq 0 ] || { echo 'msa: unexpected extra arguments' >&2; exit 2; }
-  python3 - <<'PY'
+  python3 - "$SUB" <<'PY'
+import sys
 from pathlib import Path
 memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
 available_kib = int(memory['MemAvailable'].split()[0])
-if available_kib < 768 * 1024 * 1024:
-    raise SystemExit('msa: full indexed CPU reference requires at least 768 GiB available RAM')
+required_gib = 56 if sys.argv[1] == 'convert' else 768
+if available_kib < required_gib * 1024 * 1024:
+    stage = 'database conversion' if sys.argv[1] == 'convert' else 'full indexed CPU reference'
+    raise SystemExit(f'msa: {stage} requires at least {required_gib} GiB available RAM')
 print(f'MSA reference worker: {available_kib / 1024**2:.1f} GiB available host RAM', flush=True)
 PY
   source "$TOOLS/msa/tools.sh"
   threads=$(nproc)
+  if [ "$SUB" = convert ]; then
+    [ "$threads" -le 8 ] || threads=8
+    python3 "$TOOLS/msa/databases.py" convert --root "$MSA_DB_ROOT" \
+      --tools-root "$MSA_TOOLS_ROOT" --threads "$threads" > "$OUT/database-conversion.json"
+    exit 0
+  fi
   [ "$threads" -le 64 ] || threads=64
   if [ "$SUB" = install ]; then
     python3 "$TOOLS/msa/databases.py" install --root "$MSA_DB_ROOT" \

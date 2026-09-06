@@ -53,6 +53,9 @@ PROFILES = {
             ("databases.json", "colabfold/.msa-databases.json"),
             ("manifest.json", "colabfold/manifest.json"),
             ("mmcif-content.jsonl.gz", "colabfold/mmcif/mmcif-content.jsonl.gz"),
+            ("conversions.json", "colabfold/.conversions.json"),
+            *(("conversion-" + name + ".json", "colabfold/.conversions/" + name + ".json")
+              for name in ("uniref30", "environmental", "pdb100")),
             *((name + ".json", "colabfold/.components/" + name + ".json")
               for name in ("uniref30", "environmental", "pdb100", "templates", "mmcif")),
         ),
