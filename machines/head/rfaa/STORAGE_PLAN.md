@@ -1,17 +1,29 @@
 # RFAA production database storage plan
 
-Prepared from read-only provider inventory and official documentation on
-2026-09-06 UTC. **No production database volume has been allocated or registered.**
-The repository supplies the lifecycle helper and head timer described below.
-The user has selected persistent retention for the upcoming private database
-deployment. The existing $500 project ceiling still applies. The helper and
-examples below currently implement a fixed expiry; support for persistent
-receipts belongs to that deployment phase. No further retention approval is
-needed.
+Updated 2026-09-06 UTC after production allocation and registration. The user
+selected **persistent retention**. RFAA volume
+`00537aea-2184-434a-84c1-1074bd1ebd58` was created at
+`2026-09-06T02:52:27.347Z`, registered with `expires_at: null`, and mounted on the
+head. Its name is `bio-rfaa-db-9942ea95f1bc45ee9b30434f1110d815`; its verified export is
+`nfs.fin-02.datacrunch.io:/bio-rfaa-db-9942ea95f1bc45ee9b30434f1110d815-W4BWHZ3V6HHG`.
+
+The `rfaa-database-install.service` started at **02:54:21 UTC** with a two-day
+runtime limit, initial invocation `0e3ba600e859465f88a0960475c5694c`. It resumed
+at 03:04:57 UTC after clean NFS 4.1 remounts, using invocation
+`6fe5d072c79848589b8ccf1f72baec2a`. Read-only inspection confirmed it running and
+the UniRef30 archive growing. Full installation and a
+production database-backed prediction remain pending; a running service is not
+an installation success receipt.
+
+The separate 3000 GB ColabFold volume
+`3ccef50a-59fe-4a5f-b7d3-ec669fe7ccef` is also allocated and registered persistent.
+The [two-profile storage contract](../msa/STORAGE_CONTRACT.md) describes the
+implemented allocator, persistent receipts, and explicit retirement. The $500
+project ceiling remains a launch/compute guard, not a hard storage billing cap.
 
 ## Capacity, cost, and protected resources
 
-Provision one **3300 GB `NVMe_Shared` volume in `FIN-02`**. Keep all downloaded
+The RFAA allocation is **3300 GB `NVMe_Shared` in `FIN-02`**. Keep all downloaded
 databases beneath `/mnt/bio-databases/rfaa`; keep environments, input sequences,
 predictions, alignments, and logs on the existing share and head results directory.
 The [database installer](README.md) downloads and extracts serially, removing
@@ -29,18 +41,21 @@ Multiplying the second-based rate gives:
 | Seven days | $151.89 |
 | Provider monthly equivalent | $660.00 |
 
-These exclude compute, existing storage, taxes, and deletion delays. The existing
-head and its storage add approximately $14.97 over seven days at the previously
-observed $0.0891/hour. Record a fresh `dc spend` before provisioning and include
-all existing job reservations, the full chosen retention, and the $10 safety
-cushion. Account top-ups do not reset spending. A volume created directly through
-the API bypasses `dc launch`'s reservation check.
+These exclude compute, existing storage, taxes, and deletion delays. The two new
+database volumes together cost approximately $41.42/day; with the existing head
+and original storage at $0.0891/hour, background costs are approximately
+**$43.56/day**. A fresh $500 allowance would cover at most 11.48 days before
+previous spending, safety margin, or additional compute. Account top-ups do not
+reset project spending.
 
-For a seven-day allocation, configure exported
-`DC_PERSISTENT_RESERVE_HOURS=168` consistently for `dc` and its watchdog before
-use; this conservatively reserves another seven days of observed persistent
-costs on each subsequent launch. Restore the previous value after removal.
-This setting does not create an expiry timer; see [the budget guard](../BUDGET.md).
+`bio-database-volume` checks current spending, existing job reservations, at least
+24 hours of background/new-storage cost, and at least $10 margin before creating
+a volume. Subsequent launches reserve ongoing background costs too. This rolling
+allowance does not expire persistent storage: it continues charging after the
+compute guard halts workers. Read `dc spend` regularly and update the ceiling only
+with the user's authorization. `DC_PERSISTENT_RESERVE_HOURS` can increase the
+look-ahead consistently for `dc` and its watchdog, but does not schedule deletion;
+see [the budget guard](../BUDGET.md).
 
 Every teardown must exclude these verified resources, regardless of names:
 
@@ -55,21 +70,22 @@ The original share is `NVMe_Shared`, `PAY_AS_YOU_GO`, in `FIN-02`, with export
 hold the full databases. Do not use bulk volume deletion or `dc rm all` for this
 storage operation.
 
-## API requests after retention is selected
+## Allocation and registration procedure
 
 Use the existing credentials on the head; no new API key is required. All
-requests below are **specifications for the later operation**, not commands that
-have been executed. The [public API schema](https://api.verda.com/v1/openapi.json)
+requests below document the implemented operation. Both current database
+allocations have already completed this step; do not create replacements or
+rerun registration over their receipts. The [public API schema](https://api.verda.com/v1/openapi.json)
 defines these request fields and endpoints. Authenticate with the existing
 OAuth client-credentials flow without printing tokens or secrets.
 
-Before creation, record a unique name, the exact UTC expiry, and the selected
-delete policy in a separate root-owned allocation intent outside the new volume,
-for example `/var/lib/dc/rfaa-storage-intent.json`. Do not create the operational
-`rfaa-storage.json` receipt yourself: `register` creates it after verifying the
-actual allocation and refuses an existing receipt. Check `GET /volumes` and
-`GET /volumes/trash` for an earlier allocation with that name before retrying an
-interrupted operation.
+`bio-database-volume plan rfaa`, `create rfaa`, and `reconcile rfaa` manage the
+unique name/token and root-owned `/var/lib/dc/rfaa-storage-intent.json` outside the
+new volume. They serialize allocation and budget checks and reconcile active and
+trashed inventory before any retry. An ambiguous accepted request is never
+blindly repeated. Do not create the operational `rfaa-storage.json` yourself:
+`register` creates it after verifying the actual allocation and refuses an
+existing receipt.
 
 `POST /v1/volumes`:
 
@@ -78,11 +94,12 @@ interrupted operation.
   "type": "NVMe_Shared",
   "location_code": "FIN-02",
   "size": 3300,
-  "name": "bio-rfaa-db-<UNIQUE_TIMESTAMP>",
+  "name": "bio-rfaa-db-<UNIQUE_TOKEN>",
   "instance_ids": ["340a396b-19a1-4969-833e-2ddc80d5729b"],
   "tags": [
     {"key": "purpose", "value": "rfaa-databases"},
-    {"key": "expires-at", "value": "<EXACT_UTC_EXPIRY>"}
+    {"key": "allocation-token", "value": "<UNIQUE_TOKEN>"},
+    {"key": "retention", "value": "persistent"}
   ]
 }
 ```
@@ -90,8 +107,8 @@ interrupted operation.
 The response is HTTP 202 with the new UUID. The official
 [Python SDK](https://github.com/verda-cloud/sdk-python/blob/1d26dc83d9b26f51d2ecd87a28ffd42f73a059a3/verda/volumes/_volumes.py)
 reads this response as plain text. Parse a valid UUID from either plain text or a
-JSON string. The current budget helper's plain-UUID response exception applies
-only to `/instances`; do not reuse its unchanged response parser for this POST.
+JSON string. The budget API helper accepts this strict UUID shape at both
+`/instances` and `/volumes` create endpoints.
 If the response is ambiguous, reconcile inventory using the unique allocation
 name/tag before another POST; otherwise a retry could create a second paid volume.
 
@@ -120,10 +137,10 @@ The [SFS sharing guide](https://docs.verda.com/storage/shared-filesystems-sfs/ed
 requires matching locations and warns that sharing to long-term instances can
 incur an upfront contract payment. Use pay-as-you-go instances here. The SFS
 guide supports sharing to running instances; generic block-volume API/SDK notes
-mention shutdown requirements. Shared attach/detach runtime behavior has **not**
-been mutation-tested in this review. Check empty-volume sharing and teardown
-before starting the large download; do not shut down the head automatically if
-a generic action is rejected.
+mention shutdown requirements. Creation-time sharing and head NFS access are now
+verified on the allocated volumes. Shared detach/deletion has not been exercised
+on these persistent production volumes. Do not shut down the head automatically
+if a generic action is rejected.
 
 Read the NFS source token from `mount_command` and compare it with `pseudo_path`;
 do not execute a provider-returned shell command with `eval`. Use its actual host
@@ -142,15 +159,16 @@ Register the actual allocation and verify the timer **before starting downloads*
 
 ```bash
 bio-rfaa-storage register --volume NEW_VOLUME_UUID --name ACTUAL_VOLUME_NAME \
-  --expires-at 'YYYY-MM-DDTHH:MM:SS+00:00'
+  --persistent
 systemctl is-active rfaa-storage-expiry.timer
 bio-rfaa-storage check --volume NEW_VOLUME_UUID
 ```
 
 Registration only reads provider identity and writes the root-owned local
-receipt; it never creates a volume. Compute the selected maximum lifetime from
-the provider's `created_at`, including download time. Use an actual UTC date
-in the command above. Registration refuses protected IDs, wrong volume identity,
+receipt; it never creates a volume. The alternative
+`--expires-at 'YYYY-MM-DDTHH:MM:SS+00:00'` selects a timed allocation with an actual
+future UTC deadline, including download time; it is mutually exclusive with
+`--persistent`. Registration refuses protected IDs, wrong volume identity,
 and an existing receipt; preserve an earlier allocation's audit record before
 registering another one.
 
@@ -163,24 +181,23 @@ journalctl -u rfaa-database-install -f
 ```
 
 Confirm its exit status and run `bio-rfaa-databases validate`. Download runtime
-is uncertain; a two-day installer timeout does not extend storage retention.
+is uncertain; the two-day installer timeout stops the writer, not storage billing.
 Use one writer. Read-only worker mounts and a separate database-volume lifetime
 avoid deleting model environments or results during database teardown.
 
 Account NVMe and storage-item quotas include both block storage and SFS;
 deleted storage still consumes quota until permanently removed. The documented
 [quota view](https://docs.verda.com/welcome-to-verda/quotas/) is in the console.
-No quota-read endpoint appears in the checked public OpenAPI, so capacity is not
-proven by this read-only review. Subsequent live validation launches were
+No quota-read endpoint appears in the checked public OpenAPI. Earlier live validation launches were
 rejected with `Storage limit exceeded`. At the quota audit, active storage was
 150 GB and trash contained 28 OS volumes totaling 1400 GB. Seven of those disks
 (350 GB) matched closed new managed jobs and were subsequently confirmed
 permanently removed by the narrow `dc gc` operation; the 21 older unmatched disks
 were preserved. The exact account quota
-limit is still unknown. Freeing those 350 GB for small validation workers does
-not establish capacity for an additional 3300 GB database volume. Check quota
-and request an increase if needed before production allocation; a quota error
-is not a reason to delete unrelated old volumes.
+limit is still unknown. Both production allocations subsequently succeeded,
+establishing capacity for the new 6300 GB at that time. This does not establish
+remaining headroom for worker OS disks. A later quota error is a reason to inspect
+the account quota, not to delete unrelated old volumes.
 
 ## Full-mode worker and validation
 
@@ -223,11 +240,12 @@ ownership and private permissions; symlinks and insecure state are rejected.
 can select a different receipt consistently across submission and budget tools.
 
 `rfaa-storage-expiry.timer` invokes the helper at each minute boundary with
-`Persistent=true`. It does nothing before expiry or without a receipt. Detection
-can take up to one minute after the recorded UTC deadline; teardown and outages
+`Persistent=true`. It does nothing without a receipt or for an active persistent
+allocation. For a timed receipt, detection can take up to one minute after the
+recorded UTC deadline; teardown and outages
 can add delay. A separate operation lock prevents concurrent timer/manual
-retirements while allowing receipt checks. An `expires-at` provider tag is
-descriptive; it does not activate provider-enforced expiry.
+retirements while allowing receipt checks. Retiring persistent allocations are
+retried too. Provider tags describe retention; they do not enforce it.
 
 Full submissions check the receipt before and after the submission lock and
 record their PID, kernel boot ID, and process start ticks. The launcher checks
@@ -270,15 +288,17 @@ The head and original shared volume are never deletion targets. Clear retired
 values from `rfaa-storage.nix` in a later normal deployment; expiry itself does
 not depend on the workstation being online.
 
-After validation and result verification, the selected delete-after-validation
-policy can retire early without editing the receipt:
+Persistent retention is the selected policy. If the operator later chooses to
+retire this allocation after verifying retained results, the explicit command is:
 
 ```bash
 bio-rfaa-storage expire --now --volume EXACT_REGISTERED_UUID
 ```
 
 This command requires the exact registered UUID and applies the same identity,
-job, mount, and confirmation checks. Ordinary `expire` remains deadline-only.
+job, mount, and confirmation checks. Ordinary `expire` starts timed retirement
+only at the deadline and retries any already-retiring allocation; it never starts
+retirement of an active persistent receipt.
 
 The default is soft deletion: provider documentation gives a 96-hour
 recovery window, then permanent removal. Restoring incurs the pay-as-you-go
@@ -291,8 +311,11 @@ Inspect `systemctl status rfaa-storage-expiry.timer`,
 `journalctl -u rfaa-storage-expiry.service`, and the receipt for current state.
 The offline lifecycle tests cover identity/permission failures, exact scope,
 launcher/expiry races, concurrent retirement, PID/boot identity, output retrieval
-ordering, and retry/confirmation behavior. Production volume allocation and a
-real storage expiry remain untested pending the retention decision. A head-local
-timer cannot guarantee a hard billing cutoff during outages; the existing GPU
-watchdog only accounts for storage. The $500 estimate is still not a provider
+ordering, persistence/profile isolation, and retry/confirmation behavior.
+Production allocation, registration and mounting are verified; a real production
+storage retirement remains untested because these databases are being retained.
+A head-local timer cannot guarantee a hard billing cutoff during outages. The
+existing compute watchdog accounts for storage and fences new paid work after an
+unexplained allocation inventory omission, while preserving its estimated costs.
+It does not delete persistent volumes at $500. The estimate is not a provider
 billing cap.

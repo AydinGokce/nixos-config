@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One explicitly registered RFAA database volume and its storage deadline.
+"""Exact-volume lifecycle controls for the RFAA and ColabFold databases.
 
 This does not create volumes. check/track use only the local receipt. register
 reads provider identity; expire retires exactly that receipt's volume, while
@@ -30,10 +30,55 @@ HEAD_ID = "340a396b-19a1-4969-833e-2ddc80d5729b"
 PROTECTED_IDS = {HEAD_ID, "d48e5cae-cbbc-4d76-af0d-6faa275b5959",
                  "b8b3b446-e464-44dd-9e01-6402489f8c5a"}
 MOUNT = "/mnt/bio-databases"
+PROFILES = {
+    "rfaa": {
+        "size_gb": 3300, "name_prefix": "bio-rfaa-db-", "purpose": "rfaa-databases",
+        "mount": MOUNT, "automount": r"mnt-bio\x2ddatabases.automount",
+        "receipt": "rfaa-storage.json", "override": "RFAA_STORAGE_RECEIPT",
+        "job_pattern": r"rfaa-[A-Za-z0-9-]+",
+        "units": ("rfaa-database-install.service",),
+        "installation_receipts": (
+            ("uniref30.json", "rfaa/UniRef30_2020_06/.rfaa-database.json"),
+            ("bfd.json", "rfaa/bfd/.rfaa-database.json"),
+            ("pdb100.json", "rfaa/pdb100_2021Mar03/.rfaa-database.json"),
+        ),
+    },
+    "colabfold": {
+        "size_gb": 3000, "name_prefix": "bio-colabfold-db-", "purpose": "colabfold-databases",
+        "mount": "/mnt/bio-msa-databases", "automount": r"mnt-bio\x2dmsa\x2ddatabases.automount",
+        "receipt": "msa-storage.json", "override": "MSA_STORAGE_RECEIPT",
+        "job_pattern": r"(?:msa|openfold3|boltz2|protenix)-[A-Za-z0-9-]+",
+        "units": ("msa-database-install.service", "msa-server.service"),
+        "installation_receipts": (
+            ("databases.json", "colabfold/.msa-databases.json"),
+            ("manifest.json", "colabfold/manifest.json"),
+            ("mmcif-content.jsonl.gz", "colabfold/mmcif/mmcif-content.jsonl.gz"),
+            *((name + ".json", "colabfold/.components/" + name + ".json")
+              for name in ("uniref30", "environmental", "pdb100", "templates", "mmcif")),
+        ),
+    },
+}
 
 
 class Error(RuntimeError):
     pass
+
+
+def profile_config(profile):
+    try:
+        return PROFILES[profile]
+    except (KeyError, TypeError):
+        raise Error("Unknown database storage profile") from None
+
+
+def receipt_path(profile="rfaa", state_root=None):
+    config = profile_config(profile)
+    root = Path(state_root or os.environ.get("DC_STATE_DIR", "/var/lib/dc"))
+    return Path(os.environ.get(config["override"], str(root / config["receipt"])))
+
+
+def matches(pattern, value):
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
 
 def utc(value):
@@ -139,7 +184,7 @@ class Store:
         return value
 
     def save(self, value):
-        fd, name = tempfile.mkstemp(prefix=".rfaa-storage-", dir=self.path.parent)
+        fd, name = tempfile.mkstemp(prefix=".database-storage-", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w") as stream:
                 json.dump(value, stream, indent=2, allow_nan=False)
@@ -157,23 +202,32 @@ class Store:
                 os.unlink(name)
 
 
-def validate_receipt(receipt):
-    if not receipt or receipt.get("version") != 1:
-        raise Error("Full RFAA requires a registered database storage receipt")
+def validate_receipt(receipt, profile="rfaa"):
+    config = profile_config(profile)
+    if not isinstance(receipt, dict) or type(receipt.get("version")) is not int or receipt["version"] != 1:
+        raise Error("A registered database storage receipt is required")
     volume_id(receipt.get("volume_id"))
-    if (receipt.get("status") not in {"active", "retiring", "complete"}
-            or not re.fullmatch(r"bio-rfaa-db-[A-Za-z0-9-]{8,64}", receipt.get("name", ""))
-            or receipt.get("location") != "FIN-02" or receipt.get("size_gb") != 3300
+    if (receipt.get("profile", "rfaa") != profile
+            or receipt.get("status") not in {"active", "retiring", "complete"}
+            or not matches(re.escape(config["name_prefix"]) + r"[A-Za-z0-9-]{8,64}", receipt.get("name"))
+            or receipt.get("location") != "FIN-02" or receipt.get("size_gb") != config["size_gb"]
             or not isinstance(receipt.get("permanent"), bool)
             or not isinstance(receipt.get("jobs"), dict)
-            or not re.fullmatch(r"nfs\.fin-02\.(?:datacrunch\.io|verda\.com):/[A-Za-z0-9/_-]+", receipt.get("nfs", ""))):
+            or not matches(r"nfs\.fin-02\.(?:datacrunch\.io|verda\.com):/[A-Za-z0-9/_-]+", receipt.get("nfs"))):
         raise Error("Invalid database storage receipt; refusing lifecycle operations")
-    utc(receipt.get("expires_at"))
+    retention = receipt.get("retention", "timed")
+    if retention == "persistent":
+        if "expires_at" not in receipt or receipt["expires_at"] is not None:
+            raise Error("Persistent storage requires an explicit null expiry")
+    elif retention == "timed":
+        utc(receipt.get("expires_at"))
+    else:
+        raise Error("Unknown database retention policy")
     utc(receipt.get("created_at"))
     for name, job in receipt["jobs"].items():
-        if (not re.fullmatch(r"rfaa-[A-Za-z0-9-]+", name) or not isinstance(job, dict)
+        if (not matches(config["job_pattern"], name) or not isinstance(job, dict)
                 or job.get("job") != name or not isinstance(job.get("pid"), int) or job["pid"] <= 1
-                or not re.fullmatch(r"[0-9]+", job.get("start_ticks", ""))):
+                or not matches(r"[0-9]+", job.get("start_ticks"))):
             raise Error("Invalid tracked submission identity")
         try:
             uuid.UUID(job.get("boot_id", ""))
@@ -183,19 +237,36 @@ def validate_receipt(receipt):
             volume_id(job["instance_id"])
 
 
-def check_identity(receipt, row):
+def deadline_passed(receipt, now):
+    """Receipt must have passed validate_receipt before checking its deadline."""
+    return receipt.get("retention", "timed") != "persistent" and utc(receipt["expires_at"]) <= now
+
+
+def check_active(receipt, ident, now, profile="rfaa"):
+    """Pure launch fence shared with the controller; performs no I/O or locking."""
+    validate_receipt(receipt, profile)
+    if receipt["volume_id"] != ident or receipt["status"] != "active" or deadline_passed(receipt, now):
+        raise Error("Database allocation is expired, retiring, or does not match; launch is disabled")
+
+
+def check_identity(receipt, row, profile="rfaa"):
+    config = profile_config(profile)
     volume_id(receipt["volume_id"])
     if (row.get("id") != receipt["volume_id"] or row.get("name") != receipt["name"]
             or row.get("type") != "NVMe_Shared" or row.get("is_os_volume") is not False
             or row.get("size") != receipt["size_gb"] or row.get("location") != receipt["location"]
             or row.get("contract") != "PAY_AS_YOU_GO" or row.get("currency") != "usd"
             or utc(row.get("created_at")) != utc(receipt["created_at"])
-            or not any(tag.get("key") == "purpose" and tag.get("value") == "rfaa-databases"
+            or not any(tag.get("key") == "purpose" and tag.get("value") == config["purpose"]
                        for tag in row.get("tags", []))):
         raise Error("Database volume identity differs from the registered allocation")
 
 
 class Operations:
+    def __init__(self, profile="rfaa"):
+        self.profile = profile
+        self.config = profile_config(profile)
+
     def run(self, command, timeout=60, *, check=True):
         try:
             result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
@@ -207,11 +278,11 @@ class Operations:
         return result
 
     def stop_installer(self):
-        unit = "rfaa-database-install.service"
-        loaded = self.run(["systemctl", "show", "--property=LoadState", "--value", unit], check=False)
-        if loaded.returncode == 0 and loaded.stdout.strip() == "not-found":
-            return
-        self.run(["systemctl", "stop", unit])
+        for unit in self.config["units"]:
+            loaded = self.run(["systemctl", "show", "--property=LoadState", "--value", unit], check=False)
+            if loaded.returncode == 0 and loaded.stdout.strip() == "not-found":
+                continue
+            self.run(["systemctl", "stop", unit])
 
     def stop_process(self, job):
         pid, expected = job["pid"], job["start_ticks"]
@@ -258,22 +329,23 @@ class Operations:
         self.run(["dc", "rm", ident], timeout=180)
 
     def collect_database_receipts(self, receipt, results_root):
-        target = results_root / ("rfaa-database-receipts-" + receipt["volume_id"])
+        target = results_root / (self.profile + "-database-receipts-" + receipt["volume_id"])
         target.mkdir(mode=0o700, exist_ok=True)
         (target / "allocation.json").write_text(json.dumps(receipt, indent=2) + "\n")
         failed = False
-        for label, directory in (("uniref30", "UniRef30_2020_06"), ("bfd", "bfd"), ("pdb100", "pdb100_2021Mar03")):
+        for filename, relative in self.config["installation_receipts"]:
             try:
-                self.run(["rsync", "-a", "--timeout=15", f"{MOUNT}/rfaa/{directory}/.rfaa-database.json",
-                          str(target / (label + ".json"))], timeout=20)
+                self.run(["rsync", "-a", "--timeout=15", str(Path(self.config["mount"]) / relative),
+                          str(target / filename)], timeout=20)
             except Error:
                 failed = True
         if failed:
             raise Error("Some database installation receipts could not be copied; allocation receipt was retained")
 
     def unmount(self, expected_source):
+        mount = self.config["mount"]
         def mounted():
-            result = self.run(["findmnt", "--json", "--mountpoint", MOUNT, "-o", "SOURCE,FSTYPE"], check=False)
+            result = self.run(["findmnt", "--json", "--mountpoint", mount, "-o", "SOURCE,FSTYPE"], check=False)
             if result.returncode == 1:
                 return None
             if result.returncode:
@@ -288,25 +360,24 @@ class Operations:
                 raise Error("Database mount belongs to another filesystem; refusing to unmount")
             return item
         mounted()
-        unit = r"mnt-bio\x2ddatabases.automount"
+        unit = self.config["automount"]
         loaded = self.run(["systemctl", "show", "--property=LoadState", "--value", unit], check=False)
         if not (loaded.returncode == 0 and loaded.stdout.strip() == "not-found"):
             self.run(["systemctl", "stop", unit])
         if mounted():
-            self.run(["umount", MOUNT])
+            self.run(["umount", mount])
 
 
 class Controller:
     def __init__(self, store, budget, api, *, operations=None, clock=time.time,
-                 start=process_start, boot=boot_id, results_root="/var/lib/bio-runs"):
+                 start=process_start, boot=boot_id, results_root="/var/lib/bio-runs", profile="rfaa"):
         self.store, self.budget, self.api = store, budget, api
-        self.ops, self.clock, self.start, self.boot = operations or Operations(), clock, start, boot
+        self.profile, self.config = profile, profile_config(profile)
+        self.ops, self.clock, self.start, self.boot = operations or Operations(profile), clock, start, boot
         self.results_root = Path(results_root)
 
     def active(self, receipt, ident):
-        validate_receipt(receipt)
-        if receipt["volume_id"] != ident or receipt["status"] != "active" or utc(receipt["expires_at"]) <= self.clock():
-            raise Error("Database allocation is expired, retiring, or does not match; full RFAA is disabled")
+        check_active(receipt, ident, self.clock(), self.profile)
 
     def check(self, ident):
         with self.store.locked() as receipt:
@@ -315,8 +386,8 @@ class Controller:
     def track(self, ident, job_dir, pid, instance=None):
         directory = Path(job_dir)
         if (directory.parent.resolve() != self.results_root.resolve() or directory.is_symlink()
-                or not re.fullmatch(r"rfaa-[A-Za-z0-9-]+", directory.name)):
-            raise Error("RFAA job directory must be a direct result directory for this model")
+                or not re.fullmatch(self.config["job_pattern"], directory.name)):
+            raise Error("Job directory must be a direct result directory allowed by this database profile")
         ticks = self.start(pid)
         if ticks is None:
             raise Error("Submission process exited before it could be tracked")
@@ -336,21 +407,24 @@ class Controller:
                                                    instance_id=instance or (existing or {}).get("instance_id"))
             self.store.save(receipt)
 
-    def register(self, ident, name, expires_at, permanent=False):
+    def register(self, ident, name, expires_at=None, permanent=False, *, persistent=False):
         volume_id(ident)
-        if utc(expires_at) <= self.clock():
+        if persistent and expires_at is not None:
+            raise Error("Persistent registration cannot also specify an expiry")
+        if not persistent and utc(expires_at) <= self.clock():
             raise Error("Database storage expiry must be in the future")
         row = self.api.request("GET", "/volumes/" + ident)
-        receipt = dict(version=1, volume_id=ident, name=name, location="FIN-02", size_gb=3300,
+        receipt = dict(version=1, profile=self.profile, volume_id=ident, name=name,
+                       location="FIN-02", size_gb=self.config["size_gb"],
                        status="active", created_at=row.get("created_at"), expires_at=expires_at,
-                       permanent=permanent, jobs={})
+                       retention="persistent" if persistent else "timed", permanent=permanent, jobs={})
         sources = [part for part in shlex.split(row.get("mount_command") or "")
                    if re.fullmatch(r"nfs\.fin-02\.(?:datacrunch\.io|verda\.com):/[A-Za-z0-9/_-]+", part)]
         if len(sources) != 1 or sources[0].split(":", 1)[1] != row.get("pseudo_path"):
             raise Error("Cannot verify the database NFS export")
         receipt["nfs"] = sources[0]
-        validate_receipt(receipt)
-        check_identity(receipt, row)
+        validate_receipt(receipt, self.profile)
+        check_identity(receipt, row, self.profile)
         if row.get("status") in {"deleted", "deleting", "canceled"}:
             raise Error("Cannot register deleted database storage")
         with self.store.locked() as old:
@@ -383,11 +457,11 @@ class Controller:
 
     def expire_locked(self, *, now=False, volume=None):
         with self.store.locked() as receipt:
-            validate_receipt(receipt)
+            validate_receipt(receipt, self.profile)
             if volume is not None and volume != receipt["volume_id"]:
                 raise Error("Early retirement volume does not match the registered allocation")
             if receipt["status"] == "complete" or (receipt["status"] == "active" and not now
-                                                       and utc(receipt["expires_at"]) > self.clock()):
+                                                       and not deadline_passed(receipt, self.clock())):
                 return False
             receipt.update(status="retiring", last_attempt=stamp(self.clock()))
             self.store.save(receipt)
@@ -404,11 +478,11 @@ class Controller:
         ident = receipt["volume_id"]
         row = self.get_volume(ident)
         if row:
-            check_identity(receipt, row)
+            check_identity(receipt, row, self.profile)
         inventory = self.api.inventory()
         for observed in inventory[1] + inventory[2]:
             if observed.get("id") == ident:
-                check_identity(receipt, observed)
+                check_identity(receipt, observed, self.profile)
         jobs = self.managed_jobs(ident)
         for job in jobs:
             if job.get("id"):
@@ -461,7 +535,7 @@ class Controller:
             raise Error("Database volume has unresolved managed reservations; next timer run will retry")
         row = self.get_volume(ident)
         if row:
-            check_identity(receipt, row)
+            check_identity(receipt, row, self.profile)
         inventory = self.api.inventory()
         if self.deleted(receipt, row, inventory):
             self.complete(warnings)
@@ -483,7 +557,7 @@ class Controller:
             self.api.request("DELETE", "/volumes/" + ident, {"is_permanent": True})
         row = self.get_volume(ident)
         if row:
-            check_identity(receipt, row)
+            check_identity(receipt, row, self.profile)
         inventory = self.api.inventory()
         if not self.deleted(receipt, row, inventory):
             raise Error("Database deletion unconfirmed; next timer run will retry")
@@ -522,8 +596,7 @@ class Controller:
                 return None
             raise
 
-    @staticmethod
-    def deleted(receipt, row, inventory):
+    def deleted(self, receipt, row, inventory):
         ident = receipt["volume_id"]
         if any(item.get("id") == ident for item in inventory[1]):
             return False
@@ -534,7 +607,7 @@ class Controller:
             if len(matches) != 1:
                 return False
             row = matches[0]
-            check_identity(receipt, row)
+            check_identity(receipt, row, self.profile)
         return (row.get("status") == "deleted" and bool(row.get("deleted_at"))
                 and (not receipt["permanent"] or row.get("is_permanently_deleted") is True))
 
@@ -566,28 +639,32 @@ def main(argv=None):
     register = commands.add_parser("register")
     register.add_argument("--volume", required=True)
     register.add_argument("--name", required=True)
-    register.add_argument("--expires-at", required=True)
-    register.add_argument("--permanent", action="store_true")
+    retention = register.add_mutually_exclusive_group(required=True)
+    retention.add_argument("--expires-at", help="UTC deadline for timed storage")
+    retention.add_argument("--persistent", action="store_true", help="retain storage until exact-ID manual retirement")
+    register.add_argument("--permanent", action="store_true", help="permanently delete, rather than trash, when retired")
     expire = commands.add_parser("expire")
     expire.add_argument("--now", action="store_true", help="retire early after validation/results retrieval")
     expire.add_argument("--volume", help="exact registered UUID, required with --now")
+    for command in (check, track, register, expire):
+        command.add_argument("--profile", choices=tuple(PROFILES), default="rfaa")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         raise Error("Storage lifecycle commands must run as root on the head")
     budget_path = Path(os.environ.get("DC_STATE_DIR", "/var/lib/dc")) / "budget.json"
-    path = Path(os.environ.get("RFAA_STORAGE_RECEIPT", str(budget_path.with_name("rfaa-storage.json"))))
+    path = receipt_path(args.profile, budget_path.parent)
     api = None
     if args.command in {"register", "expire"}:
         api = runpy.run_path(os.environ.get("DC_HELPER", "/etc/bio-tools/dc-budget.py"))["API"]()
     controller = Controller(Store(path), Store(budget_path, lock=budget_path.with_name("budget.lock")), api,
-                            results_root=os.environ.get("BIO_RESULTS_DIR", "/var/lib/bio-runs"))
+                            results_root=os.environ.get("BIO_RESULTS_DIR", "/var/lib/bio-runs"), profile=args.profile)
     if args.command == "check":
         controller.check(args.volume)
     elif args.command == "track":
         controller.track(args.volume, args.job_dir, args.pid, args.instance)
     elif args.command == "register":
-        controller.register(args.volume, args.name, args.expires_at, args.permanent)
-        print("Registered database storage identity and UTC expiry; no volume was created")
+        controller.register(args.volume, args.name, args.expires_at, args.permanent, persistent=args.persistent)
+        print("Registered database storage identity and retention; no volume was created")
     else:
         if controller.expire(now=args.now, volume=args.volume):
             print("Database storage retirement completed; head and original shared storage retained")
@@ -598,5 +675,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(f"bio-rfaa-storage: {exc}", file=__import__("sys").stderr)
+        print(f"bio-storage: {exc}", file=__import__("sys").stderr)
         raise SystemExit(1)

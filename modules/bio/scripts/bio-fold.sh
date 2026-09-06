@@ -30,6 +30,7 @@ bio-fold [MODEL] (--seq SEQUENCE | --fasta FILE | --pdb FILE | --contigs STRING)
   --labels FILE          EVOLVEpro measured activity CSV
   --sub COMMAND          ESM command, EVOLVEpro embed|rank, RFAA full|single-seq
   --model NAME           model variant (ESM/EVOLVEpro/MPNN)
+  --msa-backend BACKEND   public|private for Boltz2, OpenFold3 or Protenix
   --num N --gpu TYPE --spot --timeout SECONDS -- MODEL_ARGUMENTS
 USAGE
 }
@@ -41,10 +42,10 @@ SSHO=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 model=boltz2
 case "${1:-}" in -h|--help) usage; exit 0 ;; ""|-*) ;; *) model="$1"; shift ;; esac
 
-seq=""; infile=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; view=0; render=0; extra=()
+seq=""; infile=""; labels=""; variant=""; seconds=""; contigs=""; num=""; sub=""; gpu=""; spot=""; outdir=""; msa_backend=""; view=0; render=0; extra=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --seq|--fasta|--pdb|--json|--in|--input-pdb|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out)
+    --seq|--fasta|--pdb|--json|--in|--input-pdb|--labels|--model|--timeout|--contigs|--num|--num-designs|--num-seqs|--sub|--gpu|--out|--msa-backend)
       [ $# -ge 2 ] || { echo "bio-fold: $1 needs a value" >&2; exit 2; } ;;
   esac
   case "$1" in
@@ -57,6 +58,7 @@ while [ $# -gt 0 ]; do
     --num|--num-designs|--num-seqs) num="$2"; shift ;;
     --sub)                          sub="$2"; shift ;;
     --gpu)                          gpu="$2"; shift ;;
+    --msa-backend)                   msa_backend="$2"; shift ;;
     --spot)                         spot="--spot" ;;
     --out)                          outdir="$2"; shift ;;
     --view|--open)                  view=1 ;;
@@ -67,6 +69,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+if [ -n "$msa_backend" ]; then
+  case "$msa_backend" in public|private) ;; *) echo 'bio-fold: --msa-backend must be public or private' >&2; exit 2 ;; esac
+  case "$model" in boltz2|openfold3|protenix) ;; *) echo "bio-fold: --msa-backend is unsupported for $model" >&2; exit 2 ;; esac
+fi
 
 rand="$$-$(date +%s)"
 rargs=("$model")
@@ -95,6 +102,7 @@ esac
 [ -z "$sub" ] || rargs+=(--sub "$sub")
 [ -z "$variant" ] || rargs+=(--model "$variant")
 [ -z "$seconds" ] || rargs+=(--timeout "$seconds")
+[ -z "$msa_backend" ] || rargs+=(--msa-backend "$msa_backend")
 [ -n "$num" ]  && rargs+=(--num "$num")
 [ -n "$gpu" ]  && rargs+=(--gpu "$gpu")
 [ -n "$spot" ] && rargs+=("$spot")
@@ -114,7 +122,16 @@ outdir="${outdir:-$HOME/bio-runs/$(basename "$rpath")}"; mkdir -p "$outdir"
 echo "bio-fold: fetching -> $outdir"
 rsync -a -e "ssh ${SSHO[*]}" "$RUSER@$HEAD:$rpath/" "$outdir/" || { echo "bio-fold: rsync fetch failed" >&2; exit 1; }
 
-struct="$(find "$outdir" \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)"
+# Retained input bundles contain template structures. Prefer model predictions
+# and exclude preparation directories from the fallback used by other models.
+struct=""
+case "$model" in
+  openfold3) struct="$(find "$outdir" -type f -name '*_model.cif' -print -quit 2>/dev/null)" ;;
+  boltz2|protenix) struct="$(find "$outdir" -type f -path '*/predictions/*' \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)" ;;
+esac
+if [ -z "$struct" ]; then
+  struct="$(find "$outdir" -type d \( -name prepared -o -name prepared-bundle -o -name prepared-native -o -name template_data -o -name api-jobs -o -name api-audit \) -prune -o -type f \( -name '*.pdb' -o -name '*.cif' \) -print -quit 2>/dev/null)"
+fi
 echo "bio-fold: results in $outdir${struct:+  (structure: $struct)}"
 if [ -n "$struct" ]; then
   if [ "$render" = 1 ]; then bio-viz --render "$struct" -o "$outdir/render.png" || exit $?; fi

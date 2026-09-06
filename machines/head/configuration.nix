@@ -4,6 +4,7 @@
 { config, lib, pkgs, modulesPath, ... }:
 let
   rfaaStorage = import ./rfaa-storage.nix;
+  msaStorage = import ./msa-storage.nix;
 in
 {
   imports = [ (modulesPath + "/profiles/qemu-guest.nix") ]; # virtio drivers for KVM
@@ -64,20 +65,41 @@ in
       esac
       exec python3 /etc/bio-tools/rfaa/storage.py "$@"
     '')
+    (pkgs.writeShellScriptBin "bio-msa-storage" ''
+      exec /run/current-system/sw/bin/bio-rfaa-storage "$@" --profile colabfold
+    '')
+    (pkgs.writeShellScriptBin "bio-database-volume" ''
+      set -euo pipefail
+      source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+      export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+      export DC_HELPER=/etc/bio-tools/dc-budget.py
+      export DATABASE_STORAGE_HELPER=/etc/bio-tools/rfaa/storage.py
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/database-volume.py "$@"
+    '')
+    (pkgs.writeShellScriptBin "bio-msa" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      ${builtins.readFile ./bio-msa.sh}
+    '')
   ];
 
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
   # to the head; bio-submit sends a verified snapshot to each GPU over SSH.
   environment.etc = {
     "bio-tools/dc-budget.py".source = ./dc-budget.py;
+    "bio-tools/database-volume.py".source = ./database-volume.py;
     "bio-tools/py".source = ../../modules/bio/py;                # esm_cli, rfaa patch, etc.
     "bio-tools/requirements".source = ../../modules/bio/requirements;
     "bio-tools/recipes".source = ./recipes;                     # per-tool bio-submit recipes
     "bio-tools/rfaa".source = ./rfaa;
+    "bio-tools/msa".source = ./msa;
     "bio-tools/cluster.sh".text = ''
       export RFAA_DB_VOLUME=${lib.escapeShellArg rfaaStorage.volumeId}
       export RFAA_DB_NFS=${lib.escapeShellArg rfaaStorage.nfs}
       export RFAA_DB_DIR=/mnt/bio-databases/rfaa
+      export MSA_DB_VOLUME=${lib.escapeShellArg msaStorage.volumeId}
+      export MSA_DB_NFS=${lib.escapeShellArg msaStorage.nfs}
+      export MSA_DB_ROOT=/mnt/bio-msa-databases/colabfold
+      export BIO_MSA_DEFAULT_BACKEND=public
     '';
   };
 
@@ -122,6 +144,24 @@ in
       AccuracySec = "1s";
     };
   };
+  systemd.services.msa-storage-expiry = {
+    description = "Reconcile explicit retirement of ColabFold database storage";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/bio-msa-storage expire";
+      TimeoutStartSec = 240;
+    };
+  };
+  systemd.timers.msa-storage-expiry = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*-*-* *:*:00";
+      Persistent = true;
+      AccuracySec = "1s";
+    };
+  };
 
   systemd.tmpfiles.rules = [
     "d /var/lib/dc            0700 root root - -"
@@ -142,12 +182,19 @@ in
   fileSystems."/mnt/bio-shared" = {
     device = "nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH";
     fsType = "nfs";
-    options = [ "nconnect=16" "x-systemd.automount" "noauto" "x-systemd.idle-timeout=600" ];
+    # This head/provider pair returned zero-filled reads over NFS 4.2. The
+    # identical files read correctly over 4.1; pin it for every shared mount.
+    options = [ "vers=4.1" "nconnect=16" "x-systemd.automount" "noauto" "x-systemd.idle-timeout=600" ];
   };
   fileSystems."/mnt/bio-databases" = lib.mkIf (rfaaStorage.nfs != "") {
     device = rfaaStorage.nfs;
     fsType = "nfs";
-    options = [ "nconnect=16" "x-systemd.automount" "noauto" ];
+    options = [ "vers=4.1" "nconnect=16" "x-systemd.automount" "noauto" ];
+  };
+  fileSystems."/mnt/bio-msa-databases" = lib.mkIf (msaStorage.nfs != "") {
+    device = msaStorage.nfs;
+    fsType = "nfs";
+    options = [ "vers=4.1" "nconnect=16" "x-systemd.automount" "noauto" ];
   };
 
   time.timeZone = "UTC";

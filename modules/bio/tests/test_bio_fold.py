@@ -6,6 +6,7 @@ SSH, upload, download, and visualization are replaced with temporary commands.
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,16 @@ if command == "rsync":
     if not status:
         out = Path(sys.argv[-1])
         out.mkdir(parents=True, exist_ok=True)
+        if os.environ.get("BIO_TEST_TEMPLATES"):
+            for directory in ("prepared-bundle", "prepared-native", "template_data"):
+                template = out / directory / "template.cif"
+                template.parent.mkdir()
+                template.write_text("template, not a prediction\n")
         (out / "prediction.pdb").write_text("END\n")
+        if os.environ.get("BIO_TEST_NESTED_PREDICTION"):
+            predicted = out / "boltz_results_input" / "predictions" / "input" / "input_model_0.cif"
+            predicted.parent.mkdir(parents=True)
+            predicted.write_text("prediction\n")
     sys.exit(status)
 if command == "bio-viz":
     status = int(os.environ.get("BIO_TEST_RENDER_STATUS", "0")) if "--render" in sys.argv else 0
@@ -115,6 +125,30 @@ class BioFoldTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.commands("bio-viz"), [])
         self.assertIn("rsync fetch failed", result.stderr)
+
+    def test_private_backend_is_forwarded_as_submission_option(self):
+        result = self.run_fold("--msa-backend", "private", "--", "--seed", "5")
+        self.assert_success(result)
+        remote = shlex.split(self.commands("ssh")[0][-1])
+        self.assertEqual(remote[remote.index("--msa-backend") + 1], "private")
+        self.assertLess(remote.index("--msa-backend"), remote.index("--"))
+
+    def test_invalid_backend_fails_before_upload(self):
+        result = self.run_fold("--msa-backend", "unknown")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.commands("scp"), [])
+        self.assertEqual(self.commands("ssh"), [])
+
+    def test_prepared_templates_are_excluded_from_render_fallback(self):
+        result = self.run_fold("--render", BIO_TEST_TEMPLATES="1")
+        self.assert_success(result)
+        self.assertEqual(self.commands("bio-viz")[0][1], str(self.out / "prediction.pdb"))
+
+    def test_model_prediction_is_preferred_to_other_structures(self):
+        result = self.run_fold("--render", BIO_TEST_TEMPLATES="1", BIO_TEST_NESTED_PREDICTION="1")
+        self.assert_success(result)
+        self.assertEqual(self.commands("bio-viz")[0][1], str(
+            self.out / "boltz_results_input" / "predictions" / "input" / "input_model_0.cif"))
 
 
 if __name__ == "__main__":

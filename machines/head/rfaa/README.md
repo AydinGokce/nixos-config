@@ -33,14 +33,26 @@ another 399 GiB. Provision the volume only with the intended storage retention
 and budget accounted for; it continues to incur storage charges without a GPU.
 
 The [storage lifecycle guide](STORAGE_PLAN.md) contains the verified provider
-payloads, current cost estimate, and allocation/expiry procedure. Once retention
-is chosen, `bio-rfaa-storage register` verifies the new volume and records its
-exact UTC expiry. Full submissions require an active root-owned receipt; the
-head's minute timer retires expired storage while retaining the original share
-and results. No production database volume has been allocated or registered yet.
+payloads, cost estimate, and allocation/retirement procedure. The 3300 GB production
+volume `00537aea-2184-434a-84c1-1074bd1ebd58` was allocated and registered with
+persistent retention on 2026-09-06 UTC. Its head NFS mount is verified. The named
+installer started at 02:54:21 UTC and resumed at 03:04:57 UTC after the head shares
+were cleanly remounted with NFS 4.1. It is downloading the full original databases;
+installation and production inference validation are still pending.
 
-After registration, inspect the manifest and run the production installer under
-the named head service that the expiry helper can stop:
+Full submissions require an active root-owned receipt. Persistent receipts have
+no expiry; the minute timer leaves them active until exact-ID retirement is
+explicitly requested. Timed receipts remain supported. The $500 budget guard
+limits new paid launches and temporary compute; it does not delete persistent
+storage or impose a hard storage spending cap. See the
+[shared storage contract](../msa/STORAGE_CONTRACT.md) for both database profiles.
+The fast database validator also runs on the head before rental, then again on
+the worker to verify that client's filesystem view.
+
+After registration and verification of the exact NFS mount, inspect the manifest
+and run the production installer under the named head service that the retirement
+helper can stop. The current installation already uses this service; monitor it
+instead of starting a second writer:
 
 ```bash
 bio-rfaa-databases plan

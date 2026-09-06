@@ -91,21 +91,53 @@ IDs and names matched closed managed jobs. The 21 older unmatched trash disks,
 head OS and original shared volume were preserved. New managed worker cleanup
 now confirms permanent OS removal; the ESM run exercised this path successfully.
 
+## NFS read compatibility
+
+The same persisted 1739-byte ColabFold `manifest.json` read as all NUL bytes on
+the head over NFS 4.2, with SHA256
+`0c7c4f620e26e38293d8c519ada2701da93058ff12089cd1dfba33d25e9af8b7`.
+After explicitly unmounting all three shares and deploying generation
+`6yksd26rbahkzchk7xhf98dl1zbma39q`, actual `findmnt` options on the head showed
+`vers=4.1` for the original share and both database volumes. The manifest then
+parsed as JSON equal to the pinned installer manifest, with SHA256
+`c41c662d09ba43e090e64301410a15185f7a2b1a516ad533166ede805c55694e`.
+The existing 7605-byte Boltz `mols/ALA.pkl` also read as nonzero content, with
+SHA256 `00c247b6c8e5e3c2d248ab59560219bb35fe801ba8a8b52a5d76dc198a8d984b`.
+
+Independent read-only confirmation at 2026-09-06 03:08:52 UTC is retained in
+`~/bio-runs/nfs41-validation-20260906/evidence.json`, including actual mounts,
+file hashes, generation and service invocation IDs. RFAA and MSA download
+services resumed at 03:04:57 UTC; their growing partial archives had gzip
+headers. These observations do not establish completed downloads, index creation
+or whole-corpus integrity.
+
+Both head configuration and fresh-worker mount commands now explicitly request
+NFS 4.1. An already-mounted worker is not changed merely by deploying a new
+script. This is an observed read-compatibility workaround on this head/provider
+pair, not proof of a particular kernel/server fault or validation of every
+worker's filesystem view. Verified code transmission, worker-direct output
+retrieval and database validation on each worker remain necessary.
+
 ## Local and simulated checks
 
-- Budget controller: 41 tests for accounting, reservations, uncertain creates,
-  deadlines, storage lifetime checks and protected-resource cleanup.
-- Submission orchestration: 17 tests cover retrieval/failure propagation, budget
+- Budget controller: 54 tests for accounting, reservations, uncertain creates,
+  deadlines, storage lifetime checks, protected-resource cleanup and retaining
+  persistent-volume accounting during unexplained inventory omissions.
+- Persistent database allocator: 18 tests cover serialized creation, durable
+  intents, conservative quotes, uncertain-request reconciliation and retirement.
+- Submission orchestration: 37 tests cover retrieval/failure propagation, budget
   denial, RFAA storage/memory requirements and expiry races, Protenix GPU and
   endpoint configuration, verified code delivery despite stale shared files or
   corrupted transfer, and cleanup after the log pipe closes during failures or
-  termination. Workstation wrapper: six tests.
-- Database storage lifecycle: 24 offline tests for exact-volume identity,
+  termination. They also cover private preparation before inference rental,
+  explicit NFS 4.1 mount arguments, and head-side database readiness checks
+  before any paid launch. Workstation wrapper: six tests.
+- Database storage lifecycle: 36 offline tests for exact-volume identity,
   concurrent expiry/launches, process identity across reboots, preserving
-  completed outputs, and confirmed cleanup/retry behavior. The head's deployed
-  expiry timer is active; without a receipt its service exits successfully and
-  the full-mode receipt check refuses submission. No production volume was
-  created for these checks.
+  completed outputs, confirmed cleanup/retry behavior, persistent retention and
+  profile isolation. Both deployed receipts are now active and persistent;
+  ordinary expiry timers leave them retained. No production retirement was
+  performed for these tests.
 - EVOLVEpro: seven numerical/input tests; actual CPU ESM-2 embeddings and
   regression ranked three candidates and selected two from six variants.
 - RFAA: nine preparation/database tests and three installed-parser regression
@@ -131,11 +163,26 @@ Both head and workstation NixOS configurations build successfully. Head changes
 are deployed. Workstation activation still requires the user's sudo
 authentication. AF3 was excluded from changes and validation.
 
-## Production RFAA databases
+## Production databases and quality comparisons
 
-Full database download and full production-database cloud inference remain
-pending the database deployment phase. The user has authorized persistent
-retention and a private MSA backend, with prediction quality as the acceptance
-criterion before switching. No 3300 GB database volume has been allocated. The
-miniature-database results above do not establish a successful production
-download or exhaustive database integrity.
+The 3300 GB RFAA volume `00537aea-2184-434a-84c1-1074bd1ebd58` and separate 3000 GB
+ColabFold volume `3ccef50a-59fe-4a5f-b7d3-ec669fe7ccef` are allocated, registered
+with persistent retention, and mounted on the head. Both full archive downloads
+are in progress. RFAA installation runs on the head; ColabFold's current head
+stage downloads archives only, leaving conversion, full CPU indexes and mmCIF
+mirroring for a sufficiently large worker. Full production installation and
+inference against those databases are still pending. The miniature-database
+results above do not establish production corpus completeness or scientific
+parity. Persistent storage remains billable after the $500 launch/compute guard
+halts new paid work; it is not a hard storage spending cap.
+
+Five numerical scoring tests pass, covering proper rotation, mirror exclusion
+from RMSD, local distortion, invalid coordinates and strict complete-sequence
+prediction parsing, including rejection of multiple models and duplicate atoms.
+Six classical and twelve recent experimental references retain full construct
+FASTA sequences, observed-residue mappings and source hashes. The recent panel
+has a frozen selection/exclusion audit under
+`~/bio-runs/msa-recent-panel-20260906`; no predictions have been run for that panel.
+Its engineered, truncated and fusion constructs are explicitly labeled.
+See [the quality comparison protocol](msa/QUALITY.md). Public preparation remains
+the default until appropriate comparisons support a change.

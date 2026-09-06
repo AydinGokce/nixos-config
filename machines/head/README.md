@@ -52,9 +52,10 @@ Torch/Triton kernels do not support Blackwell, and its compiled LayerNorm needs
 the matching CUDA toolkit and Ninja. Unsupported explicit GPU choices are
 rejected before renting a worker.
 
-Boltz, Protenix and OpenFold3 use the remote ColabFold MSA server in these
-recipes. That server searches large sequence databases and returns alignments;
-we keep the model weights and query results locally. Full RFAA instead runs its
+Boltz, Protenix and OpenFold3 use the remote ColabFold MSA server by default.
+That server searches large sequence databases and returns alignments;
+we keep the model weights and query results locally. The private path described
+below is being installed and remains subject to quality comparison. Full RFAA runs its
 sequence and template searches against the dedicated databases described below.
 This is a difference in preprocessing and hosting, not evidence that OpenFold3
 does not use databases. Reusing externally prepared RFAA alignments and template
@@ -66,16 +67,49 @@ ColabFold's MIT software license is separate from hosted-service terms. A
 commercial production deployment should establish its MSA service arrangements
 and confidentiality requirements explicitly.
 
+## Private MSA preparation
+
+The separate 3000 GB ColabFold volume has persistent retention. It holds the
+complete classic CPU sequence databases, pairing taxonomy and template data.
+`bio-msa install` provisions that snapshot on a transient high-memory worker;
+installation is explicit and must finish before preparation can succeed.
+
+```bash
+# On the head, after complete database installation:
+bio-msa prepare --model openfold3 --fasta protein.fasta --timeout 14400
+bio-submit openfold3 --fasta protein.fasta --msa-backend private
+# From the updated workstation wrapper:
+bio-fold boltz2 --fasta protein.fasta --msa-backend private --render
+```
+
+Private submissions first run the native model's preparation against a
+localhost-only MSA API on a CPU worker. They retain and validate the input bundle,
+remove the preparation worker, then rent the prediction GPU. An explicit private
+request fails if preparation is unavailable; it never switches to the public
+server. Retained bundles bind their exact sequences, native inputs and database
+provenance. The full RFAA HHsuite pipeline stays separate.
+
+Public remains the default until comparisons establish suitable alignment,
+pairing, template-feature and prediction quality. Miniature API tests and native
+bundle replay tests establish compatibility only. Full database installation
+and scientific comparisons are still pending. See [the implementation guide](msa/README.md)
+and [storage contract](msa/STORAGE_CONTRACT.md).
+
 Each submission sends a snapshot of the deployed recipes, helpers and
 requirements over SSH into worker-local storage. The worker verifies its SHA-256
 before executing it; `job.json` records the hash and the head retains the bundle.
 This also avoids stale recipe content observed on the mutable shared filesystem.
 
 Results are copied directly from each worker to head-local
-`/var/lib/bio-runs/JOB/` before teardown. This avoids an observed NFS issue where
-the NixOS head reads worker-written files as zero-filled. `run.log` and `job.json`
-record logs, instance identity, timeout and exit status. Failed jobs preserve
-partial outputs when available and return a nonzero status.
+`/var/lib/bio-runs/JOB/` before teardown. On this head/provider combination, a
+persisted MSA manifest read as all NUL bytes over NFS 4.2 and read correctly after
+a clean NFS 4.1 remount. All three head shares now use 4.1, and fresh worker mount
+commands explicitly request it. This establishes the observed workaround for
+those reads, not the server/kernel root cause or integrity of every database
+file. Worker-direct result copying and worker-side database validation remain
+in place; see [the retained evidence](VALIDATION.md#nfs-read-compatibility).
+`run.log` and `job.json` record logs, instance identity, timeout and exit status.
+Failed jobs preserve partial outputs when available and return a nonzero status.
 
 ## Full RoseTTAFold All-Atom databases
 
@@ -91,9 +125,14 @@ volume** with at least 3 TiB capacity plus appropriate temporary-download
 headroom, not the 100 GB model cache. Provisioning and retention are separate
 from merely installing the model. Configure its ID and NFS export in
 [`rfaa-storage.nix`](rfaa-storage.nix), then deploy. An empty configuration rejects
-full RFAA submissions before renting a GPU. Register the exact allocation and
-agreed UTC expiry with `bio-rfaa-storage`; full-mode submissions also require an
-active, unexpired receipt. See [the storage plan](rfaa/STORAGE_PLAN.md) for capacity,
+full RFAA submissions before renting a GPU. The 3300 GB allocation is now
+registered with persistent retention, and its full download is in progress.
+Full-mode submission runs the fast database validator on the head before renting
+a worker; the worker repeats validation against its own mount. Private MSA
+preparation and serving also require a nonempty final installation receipt on the
+head before rental. Merely downloading archives does not create that receipt.
+Full-mode submissions require an active receipt and validated installed data.
+See [the storage plan](rfaa/STORAGE_PLAN.md) for capacity,
 retention costs, registration, and the allocation-specific cleanup procedure.
 
 ```bash
@@ -110,9 +149,9 @@ for sources, integrity checks, external database adoption and licensing notes.
 SignalP trimming is optional and omitted; core MSA/template inference does not
 require a SignalP credential.
 
-`rfaa-storage-expiry.timer` checks the registered lifetime every minute, catches
-missed deadlines after reboot, and retries unfinished cleanup. No registered
-allocation means no cleanup action. Expiry blocks queued full-mode jobs, stops
+`rfaa-storage-expiry.timer` checks the registered policy every minute, catches
+missed deadlines for timed receipts, and retries unfinished cleanup. Active
+persistent receipts have no automatic expiry. Explicit retirement blocks queued full-mode jobs, stops
 only recorded users of that allocation, and retires that volume while preserving
 results on the original share and head. Provider or network failures can delay
 teardown; the timer is not an absolute billing cutoff.
@@ -127,7 +166,9 @@ cleanup; shared databases and the head are protected.
 
 This is an estimated guard, not a provider-enforced billing cap. Protected
 persistent storage continues billing after GPU work stops, so expensive databases
-need an explicit retention policy. See [BUDGET.md](BUDGET.md) for formulas,
+have an explicit retention policy. Both databases are retained persistently at
+approximately $41.42/day combined; head and original storage bring the current
+background to about $43.56/day before temporary compute. See [BUDGET.md](BUDGET.md) for formulas,
 limitations and recovery commands. Automatic account top-ups do not reset spending.
 
 ```bash

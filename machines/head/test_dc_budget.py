@@ -143,6 +143,20 @@ class BudgetTests(unittest.TestCase):
     def init(self):
         self.c.watchdog()
 
+    def allocated_database(self, profile="rfaa"):
+        ident = "11234567-89ab-4cde-8fab-0123456789ab"
+        name = ("bio-rfaa-db-" if profile == "rfaa" else "bio-colabfold-db-") + "a" * 32
+        row = volume(ident, self.clock(), .9, name=name)
+        row.update(type="NVMe_Shared", is_os_volume=False)
+        self.api.volumes.append(row)
+        intent = dict(version=1, profile=profile, status="allocated", volume_id=ident, name=name,
+                      verified=dict(id=ident, name=name, created_at=row["created_at"], base_hourly_cost=.9))
+        filename = "rfaa-storage-intent.json" if profile == "rfaa" else "msa-storage-intent.json"
+        path = self.store.root / filename
+        path.write_text(json.dumps(intent))
+        path.chmod(0o600)
+        return row, intent
+
     def closed_trash(self):
         """A previous-version managed job whose OS disk remains in trash."""
         self.init()
@@ -460,6 +474,190 @@ class BudgetTests(unittest.TestCase):
                 self.c.launch(args)
         self.assertFalse(self.state()["jobs"])
 
+    def test_persistent_colabfold_retirement_fences_launch_under_budget_lock(self):
+        self.init()
+        receipt = self.store.root / "msa-storage.json"
+        data = dict(profile="colabfold", volume_id="database", status="retiring",
+                    retention="persistent", expires_at=None)
+        receipt.write_text(json.dumps(data))
+        receipt.chmod(0o600)
+        args = self.args()
+        args.volume = ["shared", "database"]
+        with self.assertRaisesRegex(dc.LaunchBlocked, "ColabFold.*retiring"):
+            self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+        data["status"] = "active"
+        receipt.write_text(json.dumps(data))
+        self.c.launch(args)
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["volumes"], args.volume)
+
+    def test_uncertain_database_allocation_blocks_unrelated_compute_until_reconciled(self):
+        self.init()
+        intent = self.store.root / "msa-storage-intent.json"
+        data = dict(version=1, profile="colabfold", status="creating")
+        for status in ("creating", "uncertain"):
+            data["status"] = status
+            intent.write_text(json.dumps(data))
+            intent.chmod(0o600)
+            with self.assertRaisesRegex(dc.LaunchBlocked, "Unresolved colabfold database allocation"):
+                self.c.launch(self.args())
+            self.assertFalse(self.state()["jobs"])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+        self.allocated_database("colabfold")
+        self.c.launch(self.args())
+
+    def test_allocated_database_omission_keeps_cost_and_blocks_compute_until_reappearance(self):
+        row, intent = self.allocated_database()
+        self.init()
+        self.api.volumes.remove(row)
+        self.clock.sleep(3600)
+        self.c.watchdog()
+        state = self.state()
+        resource = state["resources"]["volume:" + row["id"]]
+        self.assertTrue(resource["active"])
+        self.assertAlmostEqual(resource["cost"], 1.8)
+        self.assertAlmostEqual(dc.summary(state, self.clock())["background_hourly"], 1.06)
+        self.assertEqual(state["unresolved_database_volumes"], [row["id"]])
+        with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
+            self.c.launch(self.args())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+        self.api.volumes.append(row)
+        self.c.launch(self.args())
+        self.assertEqual(self.state()["unresolved_database_volumes"], [])
+        self.assertAlmostEqual(self.state()["resources"]["volume:" + row["id"]]["cost"], 1.8)
+
+    def test_allocated_intent_recovers_storage_cost_if_budget_save_was_interrupted(self):
+        row, _ = self.allocated_database()
+        self.api.volumes.remove(row)
+        self.init()
+        resource = self.state()["resources"]["volume:" + row["id"]]
+        self.assertTrue(resource["active"])
+        self.assertAlmostEqual(resource["cost"], .9)
+        with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
+            self.c.launch(self.args())
+
+    def test_storage_omission_does_not_prevent_existing_worker_cleanup(self):
+        row, _ = self.allocated_database()
+        self.init()
+        ident = self.c.launch(self.args())
+        self.api.volumes.remove(row)
+        self.c.remove(ident)
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+        self.assertTrue(self.state()["resources"]["volume:" + row["id"]]["active"])
+        self.assertFalse(any(item["id"] == ident for item in self.api.instances))
+
+    def test_only_exact_completed_retirement_releases_missing_database_fence(self):
+        row, intent = self.allocated_database("colabfold")
+        self.init()
+        self.api.volumes.remove(row)
+        receipt = self.store.root / "msa-storage.json"
+        data = dict(version=1, profile="colabfold", volume_id=row["id"], name=row["name"],
+                    created_at=row["created_at"], status="retiring", retention="persistent", expires_at=None)
+        for changes in ({}, {"status": "complete", "completed_at": stamp(self.clock()), "name": "other"},
+                        {"status": "complete", "completed_at": stamp(self.clock()), "profile": "rfaa"}):
+            receipt.write_text(json.dumps(data | changes))
+            receipt.chmod(0o600)
+            with self.assertRaises(dc.LaunchBlocked):
+                self.c.launch(self.args())
+            self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+        data.update(status="complete", completed_at=stamp(self.clock()))
+        receipt.write_text(json.dumps(data))
+        self.c.launch(self.args())
+        self.assertFalse(self.state()["resources"]["volume:" + row["id"]]["active"])
+        self.assertEqual(self.state()["unresolved_database_volumes"], [])
+
+    def test_observed_deleted_database_can_disappear_after_purge_without_false_fence(self):
+        row, _ = self.allocated_database()
+        self.init()
+        self.api.volumes.remove(row)
+        row.update(status="deleted", deleted_at=stamp(self.clock()))
+        self.api.trash.append(row)
+        self.c.watchdog()
+        self.api.trash.clear()
+        self.c.launch(self.args())
+        self.assertFalse(self.state()["resources"]["volume:" + row["id"]]["active"])
+        self.assertEqual(self.state()["unresolved_database_volumes"], [])
+
+    def test_completed_retirement_recovers_historical_cost_without_prior_budget_snapshot(self):
+        row, _ = self.allocated_database()
+        self.api.volumes.remove(row)
+        receipt = self.store.root / "rfaa-storage.json"
+        receipt.write_text(json.dumps(dict(version=1, profile="rfaa", volume_id=row["id"], name=row["name"],
+            created_at=row["created_at"], status="complete", completed_at=stamp(self.clock()),
+            retention="persistent", expires_at=None)))
+        receipt.chmod(0o600)
+        self.init()
+        resource = self.state()["resources"]["volume:" + row["id"]]
+        self.assertFalse(resource["active"])
+        self.assertAlmostEqual(resource["cost"], .9)
+        self.c.launch(self.args())
+
+    def test_allocated_intent_without_verified_identity_never_allows_compute(self):
+        row, intent = self.allocated_database()
+        del intent["verified"]
+        path = self.store.root / "rfaa-storage-intent.json"
+        path.write_text(json.dumps(intent))
+        self.init()
+        with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
+            self.c.launch(self.args())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_corrupt_or_unsafe_allocation_intent_blocks_compute(self):
+        self.init()
+        intent = self.store.root / "rfaa-storage-intent.json"
+        for contents, mode in (("{}", 0o600),
+                               (json.dumps(dict(version=1, profile="rfaa", status="planned")), 0o666)):
+            intent.write_text(contents)
+            intent.chmod(mode)
+            with self.assertRaisesRegex(dc.LaunchBlocked, "Invalid database allocation intent"):
+                self.c.launch(self.args())
+            self.assertFalse(self.state()["jobs"])
+
+    def test_persistent_rfaa_and_timed_colabfold_are_independent(self):
+        self.init()
+        for filename, data in (
+            ("rfaa-storage.json", dict(profile="rfaa", volume_id="rfaa-db", status="active",
+                                       retention="persistent", expires_at=None)),
+            ("msa-storage.json", dict(profile="colabfold", volume_id="msa-db", status="active",
+                                      retention="timed", expires_at=stamp(self.clock()))),
+        ):
+            receipt = self.store.root / filename
+            receipt.write_text(json.dumps(data))
+            receipt.chmod(0o600)
+        dc.check_storage_lifetime(self.store.root, ["rfaa-db"], self.clock())
+        with self.assertRaisesRegex(dc.LaunchBlocked, "ColabFold.*expired"):
+            dc.check_storage_lifetime(self.store.root, ["msa-db"], self.clock())
+
+    def test_unknown_retention_or_conflicting_persistent_expiry_blocks_launch(self):
+        self.init()
+        receipt = self.store.root / "msa-storage.json"
+        for extra in (dict(retention="forever", expires_at=None),
+                      dict(retention="persistent", expires_at=stamp(self.clock() + 3600)),
+                      dict(retention="persistent", expires_at=None, profile="rfaa")):
+            with self.subTest(extra=extra):
+                data = dict(profile="colabfold", volume_id="database", status="active")
+                data.update(extra)
+                receipt.write_text(json.dumps(data))
+                receipt.chmod(0o600)
+                with self.assertRaisesRegex(dc.LaunchBlocked, "Invalid ColabFold storage receipt"):
+                    self.c.launch(self.args())
+                self.assertFalse(self.state()["jobs"])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_colabfold_receipt_override_cannot_bypass_retirement_gate(self):
+        self.init()
+        receipt = self.store.root / "custom-msa-storage.json"
+        receipt.write_text(json.dumps(dict(profile="colabfold", volume_id="database",
+                                           status="retiring", retention="persistent", expires_at=None)))
+        receipt.chmod(0o600)
+        args = self.args()
+        args.volume = ["database"]
+        with patch.dict(os.environ, MSA_STORAGE_RECEIPT=str(receipt)):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "ColabFold.*retiring"):
+                self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+
     def test_gc_purges_matching_closed_job_and_preserves_legacy_unmanaged_and_shared(self):
         token, disk = self.closed_trash()
         for ident, name, is_os, kind in (("old-os", "OS-NVMe-old", True, "NVMe"),
@@ -613,12 +811,15 @@ class BudgetTests(unittest.TestCase):
 class APIErrorTests(unittest.TestCase):
     def test_create_accepts_only_json_or_strict_plain_uuid(self):
         ident = FakeAPI.ID
-        for body in (ident.encode(), ("\n" + ident + "\n").encode(), json.dumps(ident).encode()):
-            with self.subTest(body=body):
-                self.assertEqual(dc.response_value(body, "POST", "/instances", 202), ident)
+        for path in ("/instances", "/volumes"):
+            for body in (ident.encode(), ("\n" + ident + "\n").encode(), json.dumps(ident).encode()):
+                with self.subTest(body=body, path=path):
+                    self.assertEqual(dc.response_value(body, "POST", path, 202), ident)
         for body, method, path in ((b"not-a-uuid", "POST", "/instances"),
                                    (b"\xff" + ident.encode(), "POST", "/instances"),
                                    (ident.encode(), "GET", "/instances"),
+                                   (ident.encode(), "GET", "/volumes"),
+                                   (b"not-a-uuid", "POST", "/volumes"),
                                    (ident.encode(), "POST", "/oauth2/token")):
             with self.subTest(body=body, method=method, path=path):
                 with self.assertRaisesRegex(dc.APIError, "HTTP 202.*not valid JSON"):

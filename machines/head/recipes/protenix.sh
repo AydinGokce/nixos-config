@@ -2,6 +2,15 @@
 # auto-download. Uses the remote ColabFold MSA server. IN = query FASTA.
 # Uses torch 2.7.1+cu128 and the default cuEquivariance kernels. Importing its
 # fused LayerNorm also requires nvcc and Ninja. Weights download can be slow.
+if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+  python3 "$TOOLS/msa/prepared.py" validate --bundle "$BIO_MSA_BUNDLE" --model protenix --fasta "$IN"
+  for arg in "${EXTRA_ARGS[@]}"; do
+    case "$arg" in
+      -i|--input*|--use_msa*|--msa_*|--use_template*|--use_rna_msa*|--use_default_params*)
+        echo "protenix: prepared input conflicts with $arg" >&2; exit 2 ;;
+    esac
+  done
+fi
 VENV="$SHARED/envs/protenix"
 # protenix 2.0.0 reads PROTENIX_ROOT_DIR (NOT ..._DATA_...) and keeps checkpoints
 # in $PROTENIX_ROOT_DIR/checkpoint; unset it and weights re-download from the slow
@@ -75,12 +84,34 @@ print("Protenix fused CUDA LayerNorm check passed", flush=True)
 PY
 SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-protenix_job}"
 J="$OUT/input.json"
+if [ -n "${BIO_MSA_BUNDLE:-}" ]; then
+  J=$("$P" "$TOOLS/msa/prepared.py" materialize --bundle "$BIO_MSA_BUNDLE" \
+      --model protenix --fasta "$IN" --out "$OUT/prepared-native")
+  # Prepared inference must never fall back to a public search. Keep MSA
+  # featurization enabled and verify the native search predicate before CLI.
+  export MMSEQS_SERVICE_HOST_URL=http://127.0.0.1:9
+  "$P" - "$J" <<'PY'
+import json
+import sys
+from runner.msa_search import need_msa_search
+with open(sys.argv[1]) as handle:
+    queries = json.load(handle)
+assert queries and not any(need_msa_search(query) for query in queries), (
+    "protenix: prepared input unexpectedly requires an MSA search"
+)
+print("Protenix prepared MSA paths verified; remote generation disabled", flush=True)
+PY
+else
+cp "$IN" "$OUT/reference_input.fasta"
 cat > "$J" <<JSON
 [ { "name": "$JOB", "sequences": [ { "proteinChain": { "sequence": "$SEQ", "count": 1 } } ] } ]
 JSON
+fi
 have_gpu
 # shellcheck disable=SC2086
 # The function is named predict upstream, but 2.0.0 registers it as `pred`.
+# Keep use_msa true for prepared input: false also disables MSA featurization.
+# Existing validated paired/unpaired paths make the native search unnecessary.
 "$VENV/bin/protenix" pred --input "$J" --out_dir "$OUT" --seeds 101 \
   --model_name "${MODEL:-protenix_base_default_v1.0.0}" \
   --use_msa true --msa_server_mode colabfold --use_template false "${EXTRA_ARGS[@]}"
@@ -90,3 +121,7 @@ have_gpu
   echo 'protenix: no predicted CIF produced; inspect the inference/MSA errors above' >&2
   exit 1
 }
+if [ -z "${BIO_MSA_BUNDLE:-}" ]; then
+  "$P" "$TOOLS/msa/prepared.py" capture --model protenix --run-dir "$OUT" \
+    --out "$OUT/prepared-bundle" --source public --endpoint "$MMSEQS_SERVICE_HOST_URL"
+fi

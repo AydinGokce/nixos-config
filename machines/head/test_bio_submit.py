@@ -1,16 +1,20 @@
 """Exercise orchestration failures with a fake cloud, never real credentials."""
 import json
 import hashlib
+import fcntl
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 
 
 SCRIPT = Path(__file__).with_name("bio-submit.sh")
+RFAA_DATABASES = runpy.run_path(str(SCRIPT.parent / "rfaa" / "databases.py"))
 
 
 class SubmissionTests(unittest.TestCase):
@@ -25,13 +29,20 @@ class SubmissionTests(unittest.TestCase):
             "bio-rfaa-storage": '''#!/usr/bin/env bash
 set -eu
 echo "$*" >> "$AUDIT/storage-checks"
+echo "storage:${0##*/}:$*" >> "$AUDIT/events"
 case "$1" in
   check)
     count=$(grep -c '^check ' "$AUDIT/storage-checks")
     if [ "${EXPIRE_ON_CHECK:-0}" = "$count" ]; then
       echo 'RFAA storage expired or retiring' >&2; exit 2
+    fi
+    if [ "${REMOVE_DATABASE_RECEIPT_ON_CHECK:-0}" = "$count" ]; then
+      rm -f -- "$DATABASE_RECEIPT_TO_REMOVE"
     fi ;;
   track)
+    if [[ "$*" != *--instance* ]] && [ "${EXPIRE_BEFORE_LAUNCH:-0}" = 1 ]; then
+      echo 'RFAA storage expired or retiring' >&2; exit 2
+    fi
     if [[ "$*" = *--instance* ]] && [ "${EXPIRE_AFTER_LAUNCH:-0}" = 1 ]; then
       echo 'RFAA storage expired or retiring' >&2; exit 2
     fi ;;
@@ -40,12 +51,15 @@ esac
             "dc": '''#!/usr/bin/env bash
 set -eu
 if [ "$1" = launch ]; then
+  echo "launch:$2" >> "$AUDIT/events"
+  echo "$*" >> "$AUDIT/launch-args"
   if [ "${DENY_BUDGET:-0}" = 1 ]; then echo 'BUDGET HALT'; exit 4; fi
   echo "$2" >> "$AUDIT/launches"
   if [ "${NO_GPU_CAPACITY:-0}" = 1 ]; then exit 1; fi
   if [ "${NO_LARGE_A100:-0}" = 1 ] && [ "$2" = 1A100.22V ]; then exit 1; fi
   echo 'READY id=12345678-1234-1234-1234-123456789012 ip=127.0.0.1'
 else
+  echo "cleanup:$*" >> "$AUDIT/events"
   echo "$*" >> "$AUDIT/removals"
   if [ "${DELETE_FAIL:-0}" = 1 ]; then echo 'fake deletion failed' >&2; exit 1; fi
   echo "removed $2 (confirmed; managed OS permanently removed; shared volumes retained)"
@@ -54,6 +68,7 @@ fi
             "ssh": '''#!/usr/bin/env bash
 set -eu
 if [ "${!#}" = true ]; then exit 0; fi
+echo 'worker' >> "$AUDIT/events"
 cat > "$AUDIT/transmitted.sh"
 bash -n "$AUDIT/transmitted.sh"
 if [ "${EXECUTE_BUNDLE:-0}" = 1 ]; then
@@ -76,26 +91,104 @@ exit "${MODEL_EXIT:-0}"
 set -eu
 case "$*" in
   *root@*)
+    echo 'fetch' >> "$AUDIT/events"
     [ "${FETCH_FAIL:-0}" != 1 ] || exit 23
-    echo 'ATOM validated-result' > "${!#}/result.pdb" ;;
+    echo 'ATOM validated-result' > "${!#}/result.pdb"
+    if [ "${FETCH_PREPARED:-0}" = 1 ]; then
+      python3 - "${!#}" <<'PY'
+import json, os, sys
+from pathlib import Path
+target = Path(sys.argv[1]) / 'prepared'
+target.mkdir(exist_ok=True)
+(target / 'complete.json').write_text(json.dumps({'model': os.environ.get('PREPARED_MODEL', 'boltz2'),
+    'ready': os.environ.get('FETCH_BAD_PREPARED') != '1'}))
+(target / 'native-input.bin').write_bytes(b'opaque native model input')
+PY
+    fi ;;
 esac
 ''',
+            "bio-msa": '''#!/usr/bin/env bash
+set -eu
+echo "prepare:$*" >> "$AUDIT/events"
+echo "$*" >> "$AUDIT/preparation-calls"
+if [ "${NESTED_PREPARATION:-0}" = 1 ]; then
+  shift
+  exec bash "$BIO_SUBMIT_SCRIPT" msa --sub prepare "$@"
+fi
+[ "${PREPARATION_EXIT:-0}" = 0 ] || exit "$PREPARATION_EXIT"
+python3 - "$@" <<'PY'
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+model = args[args.index('--model')+1]
+receipt = Path(args[args.index('--bundle-result')+1])
+bundle = Path(os.environ['AUDIT']) / "prepared bundle with 'quote"
+if os.environ.get('PREPARATION_MISSING') != '1':
+    bundle.mkdir(exist_ok=True)
+    (bundle / 'complete.json').write_text(json.dumps({'model': model,
+        'ready': os.environ.get('PREPARATION_BAD') != '1'}))
+    (bundle / 'native-input.bin').write_bytes(b'opaque native model input')
+receipt.write_text('invalid json' if os.environ.get('PREPARATION_BAD_RECEIPT') == '1'
+                   else json.dumps({'bundle': str(bundle)}))
+PY
+''',
         }
+        stubs["bio-msa-storage"] = stubs["bio-rfaa-storage"].replace("storage-checks", "msa-storage-checks").replace("RFAA", "MSA")
         for name, body in stubs.items():
             path = commands / name
             path.write_text(body)
             path.chmod(0o700)
         self.input = self.root / "query with 'quote.fasta"
         self.input.write_text(">query\nNLYIQWLKDGGPSSGRPPPS\n")
+        self.rfaa_root = self.root / "rfaa databases with 'quote"
+        self.rfaa_root.mkdir()
+        # Exercise the real fast validator with complete miniature FFindex/data
+        # pairs and matching receipts. Actual HHsuite search fixtures live in rfaa/.
+        for dataset in RFAA_DATABASES["DATASETS"].values():
+            directory = self.rfaa_root / dataset["directory"]
+            directory.mkdir()
+            for component in dataset["components"]:
+                stem = directory / (dataset["prefix"] + "_" + component)
+                Path(str(stem) + ".ffdata").write_bytes(b"X" * 2048)
+                Path(str(stem) + ".ffindex").write_text("first\t0\t1024\nlast\t1024\t1024\n")
+            files = RFAA_DATABASES["validate_directory"](directory, dataset)
+            RFAA_DATABASES["receipt"](directory, dataset, files)
+        self.msa_root = self.root / "msa databases with 'quote"
+        self.msa_root.mkdir()
+        (self.msa_root / ".msa-databases.json").write_text('{"fixture": "completed installation"}\n')
         self.env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
                         AUDIT=str(self.root), BIO_SHARED_MNT=str(self.root / "shared"),
                         BIO_TOOLS_SRC=str(self.root / "tools"),
                         BIO_CLUSTER_CONFIG=str(self.root / "cluster.sh"),
                         BIO_STATE_DIR=str(self.root / "state"),
-                        BIO_RESULTS_DIR=str(self.root / "results"))
+                        BIO_RESULTS_DIR=str(self.root / "results"),
+                        RFAA_DB_DIR=str(self.rfaa_root), MSA_DB_ROOT=str(self.msa_root),
+                        BIO_SUBMIT_SCRIPT=str(SCRIPT))
         (self.root / "tools").mkdir()
         shutil.copytree(SCRIPT.parent / "rfaa", self.root / "tools" / "rfaa",
                         ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(SCRIPT.parent / "msa", self.root / "tools" / "msa",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        # Native formats are covered by msa/test_prepared.py. This boundary
+        # validator ensures orchestration cannot ignore a rejected bundle.
+        (self.root / "tools" / "msa" / "prepared.py").write_text('''import argparse, json, os
+from pathlib import Path
+p=argparse.ArgumentParser()
+p.add_argument('command', choices=['validate'])
+p.add_argument('--bundle', required=True)
+p.add_argument('--model', required=True)
+p.add_argument('--fasta', required=True)
+a=p.parse_args()
+with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('validate:'+a.model+'\\n')
+with (Path(os.environ['AUDIT'])/'prepared-checks').open('a') as f: f.write(json.dumps(vars(a))+'\\n')
+try:
+    data=json.loads((Path(a.bundle)/'complete.json').read_text())
+    assert data['ready'] and data['model']==a.model
+    assert (Path(a.bundle)/'native-input.bin').is_file()
+    assert Path(a.fasta).is_file()
+except (OSError, ValueError, KeyError, AssertionError):
+    raise SystemExit(64)
+''')
         (self.root / "tools" / "recipes").mkdir()
         (self.root / "tools" / "recipes" / "boltz2.sh").write_text("# authoritative deployed recipe\n")
         (self.root / "tools" / "py").mkdir()
@@ -106,6 +199,20 @@ esac
         return subprocess.run(["bash", str(SCRIPT), "boltz2", "--fasta", str(self.input),
                                "--", "--example", "a quoted value"], env=env,
                               text=True, capture_output=True, timeout=20)
+
+    def submit(self, model, *arguments, **settings):
+        return subprocess.run(["bash", str(SCRIPT), model, *map(str, arguments)],
+                              env=dict(self.env, **settings), text=True, capture_output=True, timeout=20)
+
+    def msa_settings(self, **settings):
+        return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
+
+    def valid_bundle(self, model="boltz2"):
+        path = self.root / "existing prepared bundle"
+        path.mkdir(exist_ok=True)
+        (path / "complete.json").write_text(json.dumps(dict(model=model, ready=True)))
+        (path / "native-input.bin").write_bytes(b"opaque native model input")
+        return path
 
     def test_success_fetches_before_reporting_completion(self):
         result = self.run_job()
@@ -236,6 +343,41 @@ mkdir -p "$LOCALOUT"
         self.assertIn("database volume configured", result.stderr)
         self.assertFalse((self.root / "launches").exists())
 
+    def test_full_rfaa_missing_installation_or_receipt_never_rents_a_gpu(self):
+        settings = dict(RFAA_DB_VOLUME="database-volume", RFAA_DB_NFS="database-server:/rfaa")
+        receipt = self.rfaa_root / "bfd" / ".rfaa-database.json"
+        result = self.submit("rfaa", "--fasta", self.input, RFAA_DB_DIR=str(self.root / "not-installed"), **settings)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("full RFAA databases are not ready", result.stderr)
+        receipt.unlink()
+        result = self.submit("rfaa", "--fasta", self.input, **settings)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Missing installation receipt", result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "launch-args").exists())
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_full_rfaa_zero_filled_or_truncated_data_fails_before_paid_launch(self):
+        dataset = RFAA_DATABASES["DATASETS"]["bfd"]
+        path = self.rfaa_root / dataset["directory"] / (dataset["prefix"] + "_a3m.ffdata")
+        for data, diagnostic in ((bytes(2048), "Zero-filled database"), (b"X"*1024, "Truncated data file")):
+            with self.subTest(diagnostic=diagnostic):
+                path.write_bytes(data)
+                result = self.submit("rfaa", "--fasta", self.input,
+                                     RFAA_DB_VOLUME="database-volume", RFAA_DB_NFS="database-server:/rfaa")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+                self.assertFalse((self.root / "launch-args").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_rfaa_single_sequence_does_not_require_installed_databases(self):
+        shutil.rmtree(self.rfaa_root)
+        result = self.submit("rfaa", "--fasta", self.input, "--sub", "single-seq",
+                             RFAA_DB_VOLUME="database-volume", RFAA_DB_NFS="database-server:/rfaa")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / "storage-checks").exists())
+        self.assertNotIn("--volume database-volume", (self.root / "launch-args").read_text())
+
     def test_full_rfaa_fallback_keeps_sufficient_ram_and_mounts_database_read_only(self):
         result = subprocess.run(["bash", str(SCRIPT), "rfaa", "--fasta", str(self.input)],
                                 env=dict(self.env, RFAA_DB_VOLUME="database-volume",
@@ -246,7 +388,7 @@ mkdir -p "$LOCALOUT"
                          ["1A100.22V", "1A100.40S.22V"])
         transmitted = (self.root / "transmitted.sh").read_text()
         self.assertIn("RFAA_DB_NFS=database-server:/rfaa", transmitted)
-        self.assertIn("nconnect=16,nolock,ro", transmitted)
+        self.assertIn("vers=4.1,nconnect=16,nolock,ro", transmitted)
         metadata = next((self.root / "results").glob("*/job.json"))
         self.assertEqual(json.loads(metadata.read_text())["database_volume"], "database-volume")
         self.assertEqual((self.root / "storage-checks").read_text().count("check --volume"), 2)
@@ -271,6 +413,235 @@ mkdir -p "$LOCALOUT"
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
         self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def execute_msa_mount_block(self, sub):
+        """Run the generated mount branch against shell functions, not sudo/NFS."""
+        source = (self.root / "transmitted.sh").read_text()
+        block = source[source.index('if [ -n "$MSA_DB_NFS" ]; then'):source.index('command -v uv')]
+        (self.root / "mounted").unlink(missing_ok=True)
+        script = '''set -eu
+sudo() {
+  if [ "$1" = mount ]; then
+    echo "$*" >> "$AUDIT/mounts"
+    touch "$AUDIT/mounted"
+  fi
+}
+mountpoint() { test -f "$AUDIT/mounted"; }
+sleep() { :; }
+''' + block
+        result = subprocess.run(["bash", "-c", script], env=dict(self.env, SUB=sub, MSA_DB_NFS="msa-server:/colabfold"),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        return (self.root / "mounts").read_text().splitlines()[-1]
+
+    def test_msa_install_and_serve_need_no_input_and_only_install_mounts_database_writable(self):
+        for sub in ("install", "serve", "prepare"):
+            with self.subTest(sub=sub):
+                arguments = [] if sub != "prepare" else ["--model", "boltz2", "--fasta", self.input]
+                result = self.submit("msa", "--sub", sub, *arguments,
+                                     **self.msa_settings(FETCH_PREPARED="1"))
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                mount = self.execute_msa_mount_block(sub)
+                self.assertEqual(mount, "mount -t nfs -o vers=4.1,nconnect=16,nolock" +
+                                 ("" if sub == "install" else ",ro") +
+                                 " msa-server:/colabfold /mnt/bio-msa-databases")
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"]*3)
+        self.assertTrue(all("--volume msa-database-volume" in line
+                            for line in (self.root / "launch-args").read_text().splitlines()))
+
+    def test_msa_prepare_requires_model_fasta_and_configured_storage_before_rental(self):
+        cases = [([], self.msa_settings()), (["--model", "boltz2"], self.msa_settings()),
+                 (["--fasta", self.input], self.msa_settings()),
+                 (["--model", "rfaa", "--fasta", self.input], self.msa_settings()),
+                 (["--model", "boltz2", "--fasta", self.input], dict(MSA_DB_VOLUME="", MSA_DB_NFS=""))]
+        for arguments, settings in cases:
+            with self.subTest(arguments=arguments, settings=settings):
+                result = self.submit("msa", "--sub", "prepare", *arguments, **settings)
+                self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+                self.assertFalse((self.root / "launches").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_msa_prepare_and_serve_require_a_nonempty_regular_final_receipt_before_rental(self):
+        receipt = self.msa_root / ".msa-databases.json"
+        for condition in ("missing", "empty", "directory"):
+            receipt.unlink(missing_ok=True)
+            if condition == "empty":
+                receipt.touch()
+            elif condition == "directory":
+                receipt.mkdir()
+            for sub in ("prepare", "serve"):
+                with self.subTest(condition=condition, sub=sub):
+                    arguments = ["--model", "boltz2", "--fasta", self.input] if sub == "prepare" else []
+                    result = self.submit("msa", "--sub", sub, *arguments, **self.msa_settings())
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("nonempty final .msa-databases.json", result.stderr)
+                    self.assertFalse((self.root / "launch-args").exists())
+                    self.assertFalse((self.root / "transmitted.sh").exists())
+            if condition == "directory":
+                receipt.rmdir()
+
+    def test_msa_install_can_run_without_a_final_database_receipt(self):
+        (self.msa_root / ".msa-databases.json").unlink()
+        result = self.submit("msa", "--sub", "install", **self.msa_settings())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"])
+
+    def test_nested_private_preparation_with_uninstalled_databases_rents_no_worker(self):
+        (self.msa_root / ".msa-databases.json").unlink()
+        result = self.submit("boltz2", "--fasta", self.input, "--msa-backend", "private",
+                             **self.msa_settings(NESTED_PREPARATION="1"))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("private MSA databases are not ready", result.stderr)
+        self.assertFalse((self.root / "launch-args").exists())
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_database_readiness_is_checked_after_the_queued_storage_recheck(self):
+        for model, receipt, settings, arguments in (
+            ("rfaa", self.rfaa_root / "bfd" / ".rfaa-database.json",
+             dict(RFAA_DB_VOLUME="database-volume", RFAA_DB_NFS="database-server:/rfaa"),
+             ["--fasta", self.input]),
+            ("msa", self.msa_root / ".msa-databases.json", self.msa_settings(),
+             ["--sub", "prepare", "--model", "boltz2", "--fasta", self.input]),
+        ):
+            with self.subTest(model=model):
+                result = self.submit(model, *arguments, REMOVE_DATABASE_RECEIPT_ON_CHECK="2",
+                                     DATABASE_RECEIPT_TO_REMOVE=str(receipt), **settings)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(receipt.exists())
+                self.assertFalse((self.root / "launch-args").exists())
+
+    def test_msa_storage_checks_and_tracking_surround_the_exact_worker_launch(self):
+        result = self.submit("msa", "--sub", "serve", **self.msa_settings())
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        events = (self.root / "events").read_text().splitlines()
+        checks = [i for i, event in enumerate(events) if event.startswith("storage:bio-msa-storage:check ")]
+        tracks = [i for i, event in enumerate(events) if event.startswith("storage:bio-msa-storage:track ")]
+        launch = events.index("launch:CPU.360V.1440G")
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(tracks), 2)
+        self.assertLess(checks[0], checks[1])
+        self.assertLess(checks[1], tracks[0])
+        self.assertLess(tracks[0], launch)
+        self.assertLess(launch, tracks[1])
+        self.assertLess(tracks[1], events.index("worker"))
+        self.assertNotIn("--instance", events[tracks[0]])
+        self.assertIn("--instance 12345678-1234-1234-1234-123456789012", events[tracks[1]])
+        metadata = json.loads(next((self.root / "results").glob("*/job.json")).read_text())
+        self.assertEqual(metadata["database_volume"], "msa-database-volume")
+
+    def test_msa_storage_retirement_before_or_during_queue_and_prelaunch_track_prevents_rental(self):
+        for settings in ({"EXPIRE_ON_CHECK": "1"}, {"EXPIRE_ON_CHECK": "2"}, {"EXPIRE_BEFORE_LAUNCH": "1"}):
+            with self.subTest(settings=settings):
+                (self.root / "msa-storage-checks").unlink(missing_ok=True)
+                result = self.submit("msa", "--sub", "install", **self.msa_settings(**settings))
+                self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+                self.assertFalse((self.root / "launches").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_msa_retirement_after_launch_cleans_worker_without_running_search(self):
+        result = self.submit("msa", "--sub", "serve", **self.msa_settings(EXPIRE_AFTER_LAUNCH="1"))
+        self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_msa_uses_its_own_lock_while_inference_lock_is_held(self):
+        state = self.root / "state"
+        state.mkdir()
+        with (state / "bio-submit.lock").open("w") as locked:
+            fcntl.flock(locked.fileno(), fcntl.LOCK_EX)
+            result = self.submit("msa", "--sub", "install", **self.msa_settings())
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertTrue((state / "msa-submit.lock").exists())
+
+    def test_private_preparation_validates_canonical_model_bundle_before_inference_rental(self):
+        for alias, model in (("of3", "openfold3"), ("boltz", "boltz2"), ("protenix", "protenix")):
+            with self.subTest(alias=alias):
+                (self.root / "events").unlink(missing_ok=True)
+                result = self.submit(alias, "--fasta", self.input, "--msa-backend", "private")
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                events = (self.root / "events").read_text().splitlines()
+                self.assertIn("--model "+model, events[0])
+                self.assertLess(events.index("validate:"+model), events.index("launch:1A100.22V"))
+                self.assertNotIn("--volume msa-database-volume", (self.root / "launch-args").read_text())
+                staged = list((self.root / "shared" / "runs").glob(model+"-*/in/prepared/native-input.bin"))
+                self.assertEqual(len(staged), 1)
+                self.assertEqual(staged[0].read_bytes(), b"opaque native model input")
+        self.assertFalse(list((self.root / "state").glob("msa-result.*.json")))
+
+    def test_failed_missing_or_invalid_private_preparation_never_falls_back_or_rents_inference_gpu(self):
+        cases = ({"PREPARATION_EXIT": "29"}, {"PREPARATION_MISSING": "1"},
+                 {"PREPARATION_BAD": "1"}, {"PREPARATION_BAD_RECEIPT": "1"})
+        for settings in cases:
+            with self.subTest(settings=settings):
+                shutil.rmtree(self.root / "prepared bundle with 'quote", ignore_errors=True)
+                result = self.submit("boltz2", "--fasta", self.input, "--msa-backend", "private", **settings)
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                if "PREPARATION_EXIT" in settings:
+                    self.assertEqual(result.returncode, 29)
+                self.assertNotIn("DONE", result.stdout)
+                self.assertFalse((self.root / "launches").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_explicit_prepared_bundle_is_validated_staged_and_includes_verified_msa_code(self):
+        bundle = self.valid_bundle()
+        result = self.submit("boltz2", "--fasta", self.input, "--msa-bundle", bundle, EXECUTE_BUNDLE="1")
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertFalse((self.root / "preparation-calls").exists())
+        event = (self.root / "events").read_text().splitlines()
+        self.assertLess(event.index("validate:boltz2"), event.index("launch:1A100.22V"))
+        staged = next((self.root / "shared" / "runs").glob("*/in/prepared/native-input.bin"))
+        self.assertEqual(staged.read_bytes(), (bundle / "native-input.bin").read_bytes())
+        archive = next((self.root / "results").glob("*/tools.tar.gz"))
+        with tarfile.open(archive) as packed:
+            self.assertEqual(packed.extractfile("msa/prepared.py").read(),
+                             (self.root / "tools" / "msa" / "prepared.py").read_bytes())
+            self.assertIn("msa/databases.py", packed.getnames())
+        self.assertIn("BIO_MSA_BUNDLE=", (self.root / "transmitted.sh").read_text())
+
+    def test_invalid_explicit_bundle_stops_before_gpu_without_calling_preparation(self):
+        bundle = self.valid_bundle("openfold3")
+        result = self.submit("boltz2", "--fasta", self.input, "--msa-bundle", bundle)
+        self.assertEqual(result.returncode, 64, result.stdout+result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "preparation-calls").exists())
+
+    def test_nested_private_preparation_finishes_its_worker_before_inference_launch(self):
+        result = self.submit("boltz2", "--fasta", self.input, "--msa-backend", "private",
+                             **self.msa_settings(NESTED_PREPARATION="1", FETCH_PREPARED="1"))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G", "1A100.22V"])
+        events = (self.root / "events").read_text().splitlines()
+        cleanup = next(i for i, event in enumerate(events) if event.startswith("cleanup:"))
+        self.assertLess(cleanup, events.index("launch:1A100.22V"))
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 2)
+
+    def test_bundle_result_is_preparation_only_and_published_after_success(self):
+        receipt = self.root / "bundle-result.json"
+        for sub in ("install", "serve"):
+            with self.subTest(sub=sub):
+                result = self.submit("msa", "--sub", sub, "--bundle-result", receipt, **self.msa_settings())
+                self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+                self.assertFalse((self.root / "launches").exists())
+        result = self.submit("msa", "--sub", "prepare", "--model", "boltz2", "--fasta", self.input,
+                             "--bundle-result", receipt, **self.msa_settings(FETCH_PREPARED="1"))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        bundle = Path(json.loads(receipt.read_text())["bundle"])
+        self.assertTrue((bundle / "complete.json").is_file())
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
+
+    def test_worker_fetch_validation_and_cleanup_failures_never_publish_bundle_success(self):
+        cases = ({"MODEL_EXIT": "17"}, {"FETCH_FAIL": "1"}, {"FETCH_BAD_PREPARED": "1"}, {"DELETE_FAIL": "1"})
+        for number, settings in enumerate(cases):
+            with self.subTest(settings=settings):
+                receipt = self.root / ("bundle-result-"+str(number)+".json")
+                before = set((self.root / "results").glob("*/job.json"))
+                result = self.submit("msa", "--sub", "prepare", "--model", "boltz2", "--fasta", self.input,
+                                     "--bundle-result", receipt, **self.msa_settings(FETCH_PREPARED="1", **settings))
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertNotIn("DONE", result.stdout)
+                self.assertFalse(receipt.exists())
+                metadata, = set((self.root / "results").glob("*/job.json")) - before
+                self.assertNotEqual(json.loads(metadata.read_text())["exit_status"], 0)
 
 
 if __name__ == "__main__":

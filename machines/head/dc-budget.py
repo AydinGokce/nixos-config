@@ -87,14 +87,14 @@ def response_value(raw, method, path, status):
     try:
         return json.loads(raw)
     except (ValueError, UnicodeDecodeError):
-        # Verda's instance-create endpoint can return its UUID as plain text,
+        # Verda's instance/volume create endpoints can return UUIDs as plain text,
         # despite the OpenAPI JSON content declaration. Accept only that exact
         # shape at this endpoint; other malformed responses stay uncertain.
-        if method == "POST" and path == "/instances":
+        if method == "POST" and path in {"/instances", "/volumes"}:
             candidate = raw.strip()
             if re.fullmatch(rb"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", candidate):
                 return str(uuid.UUID(candidate.decode("ascii")))
-        raise APIError(method, path, status, "response was not valid JSON or an expected instance UUID") from None
+        raise APIError(method, path, status, "response was not valid JSON or an expected resource UUID") from None
 
 
 def number(value, label):
@@ -276,9 +276,41 @@ def reconcile(state, inventory, now):
                     "name": row.get("hostname", row.get("name", ident)),
                 }
             seen.add(key)
+    missing_databases = []
+    expected = state.get("expected_database_volumes", {})
+    for ident, allocation in expected.items():
+        key = "volume:" + ident
+        previous = state["resources"].get(key)
+        retired = allocation.get("retired_at")
+        if key not in seen and previous is None and retired is not None:
+            state["resources"][key] = dict(rate=allocation["rate"],
+                cost=allocation["rate"] * max(0, retired - allocation["created"]) / 3600,
+                last=now, active=False, created=allocation["created"], kind="volume",
+                deleted=retired, name=allocation["name"])
+            continue
+        if (key in seen or allocation.get("retired_at") is not None
+                or (previous and previous.get("deleted") is not None)):
+            continue
+        # A missing inventory row is not proof that persistent storage stopped
+        # billing. The durable allocation intent survives a crash before budget.save.
+        if previous:
+            previous["cost"] += previous["rate"] * max(0, now - previous["last"]) / 3600
+            previous.update(active=True, last=now)
+        else:
+            state["resources"][key] = dict(rate=allocation["rate"],
+                cost=allocation["rate"] * max(0, now - allocation["created"]) / 3600,
+                last=now, active=True, created=allocation["created"], kind="volume",
+                deleted=None, name=allocation["name"])
+        missing_databases.append(ident)
+    state["unresolved_database_volumes"] = missing_databases
     for key, resource in state["resources"].items():
         if key not in seen and resource["active"]:
-            resource["cost"] += resource["rate"] * max(0, now - resource["last"]) / 3600
+            ident = key.removeprefix("volume:")
+            if key.startswith("volume:") and ident in missing_databases:
+                continue
+            retired = expected.get(ident, {}).get("retired_at") if key.startswith("volume:") else None
+            until = min(now, retired) if retired is not None else now
+            resource["cost"] += resource["rate"] * max(0, until - resource["last"]) / 3600
             resource.update(active=False, last=now)
     current = {row["id"]: row for row in instances}
     for token, job in state["jobs"].items():
@@ -332,13 +364,17 @@ def summary(state, now, persistent_hours=24):
                           if row["active"] and key not in managed)
     return {"spent": spent, "hourly": active_rate, "reserved": reserved,
             "background_reserve": background_rate * horizon / 3600,
-            "background_hourly": background_rate, "uncertain": uncertain}
+            "background_hourly": background_rate, "uncertain": uncertain,
+            "storage_uncertain": bool(state.get("unresolved_database_volumes") or
+                                      state.get("database_allocation_errors"))}
 
 
 def reserve(state, token, rate, os_rate, hours, now, ceiling, margin, persistent_hours):
     report = summary(state, now, max(persistent_hours, hours))
     if now - state["last_watchdog"] > 180:
         raise LaunchBlocked("Budget watchdog is stale/not running; refusing a paid launch")
+    if report["storage_uncertain"]:
+        raise LaunchBlocked("Database storage accounting is unresolved; reconcile the exact allocation before a paid launch")
     if report["uncertain"]:
         raise LaunchBlocked("Unresolved launch or cleanup; reconcile it before another paid launch")
     projected = report["spent"] + report["reserved"] + report["background_reserve"] + (rate + os_rate) * hours + margin
@@ -368,30 +404,125 @@ def purgeable_os(state, token, job, disk, inventory):
                     for row in instances) or any(row.get("id") == ident for row in volumes))
 
 
+def private_json(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise ValueError("state must be private and owned by the controller user")
+    return json.loads(path.read_text())
+
+
+def allocation_intents(root):
+    intents = {}
+    for profile, filename, override in (
+        ("rfaa", "rfaa-storage-intent.json", "RFAA_STORAGE_INTENT"),
+        ("colabfold", "msa-storage-intent.json", "MSA_STORAGE_INTENT"),
+    ):
+        path = Path(os.environ.get(override, str(Path(root) / filename)))
+        try:
+            intent = private_json(path)
+            if intent is None:
+                continue
+            status = intent["status"]
+            if intent.get("version") != 1 or intent.get("profile") != profile or status not in {
+                    "planned", "creating", "uncertain", "allocated", "rejected"}:
+                raise ValueError("invalid allocation profile or status")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise LaunchBlocked(f"Invalid database allocation intent: {exc}") from None
+        intents[profile] = intent
+    return intents
+
+
+def remember_database_allocations(state, root, now):
+    """Keep proven allocation costs through inventory gaps without blocking cleanup."""
+    expected = state.setdefault("expected_database_volumes", {})
+    errors = []
+    try:
+        for profile, intent in allocation_intents(root).items():
+            if intent["status"] != "allocated":
+                continue
+            ident = str(uuid.UUID(intent["volume_id"]))
+            verified = intent["verified"]
+            rate = number(verified["base_hourly_cost"], "allocated storage rate")
+            created = epoch(verified["created_at"])
+            if (ident != intent["volume_id"] or verified["id"] != ident or rate <= 0
+                    or not isinstance(intent["name"], str) or not intent["name"]
+                    or verified["name"] != intent["name"] or created > now):
+                raise ValueError("allocated storage identity/rate does not match its receipt")
+            previous = expected.get(ident)
+            value = dict(profile=profile, name=intent["name"], created=created, rate=rate)
+            if previous and any(previous[key] != value[key] for key in ("profile", "name", "created")):
+                raise ValueError("allocated storage identity changed")
+            expected[ident] = {**(previous or {}), **value}
+    except (Error, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        errors.append(str(exc))
+    for ident, allocation in expected.items():
+        profile = allocation["profile"]
+        filename, override = (("rfaa-storage.json", "RFAA_STORAGE_RECEIPT") if profile == "rfaa"
+                              else ("msa-storage.json", "MSA_STORAGE_RECEIPT"))
+        try:
+            receipt = private_json(Path(os.environ.get(override, str(Path(root) / filename))))
+            if receipt and receipt.get("status") == "complete":
+                completed = epoch(receipt["completed_at"])
+                if (receipt.get("version") != 1 or receipt.get("profile", "rfaa") != profile
+                        or receipt.get("volume_id") != ident or receipt.get("name") != allocation["name"]
+                        or epoch(receipt["created_at"]) != allocation["created"]
+                        or not allocation["created"] <= completed <= now):
+                    raise ValueError("completed storage receipt does not match the exact allocation")
+                allocation["retired_at"] = completed
+        except (Error, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            errors.append(str(exc))
+    state["database_allocation_errors"] = errors
+
+
 def check_storage_lifetime(root, volumes, now):
     """Gate new reservations after database expiry, while holding budget.lock.
 
     Expiry marks its receipt retiring before taking this same accounting lock.
     It therefore sees every older reservation, and later ones cannot launch.
     """
-    path = Path(os.environ.get("RFAA_STORAGE_RECEIPT", str(Path(root) / "rfaa-storage.json")))
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    try:
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) & 0o077):
-            raise ValueError("receipt must be private and owned by the controller user")
-        receipt = json.loads(path.read_text())
-        volume = receipt["volume_id"]
-        if not isinstance(volume, str) or not volume:
-            raise ValueError("invalid volume identity")
-        expired = volume in volumes and (receipt["status"] != "active" or epoch(receipt["expires_at"]) <= now)
-    except (OSError, ValueError, KeyError, TypeError, Error) as exc:
-        raise LaunchBlocked(f"Invalid RFAA storage receipt: {exc}") from None
-    if expired:
-        raise LaunchBlocked("RFAA database storage is expired or retiring; launch refused")
+    # An accepted storage create can be temporarily absent from inventory.
+    # Fence compute until its durable allocation intent has been reconciled.
+    for profile, intent in allocation_intents(root).items():
+        status = intent["status"]
+        if status in {"creating", "uncertain"}:
+            raise LaunchBlocked(f"Unresolved {profile} database allocation; reconcile storage before launching compute")
+    for profile, label, filename, override in (
+        ("rfaa", "RFAA", "rfaa-storage.json", "RFAA_STORAGE_RECEIPT"),
+        ("colabfold", "ColabFold", "msa-storage.json", "MSA_STORAGE_RECEIPT"),
+    ):
+        path = Path(os.environ.get(override, str(Path(root) / filename)))
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        try:
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise ValueError("receipt must be private and owned by the controller user")
+            receipt = json.loads(path.read_text())
+            volume = receipt["volume_id"]
+            if not isinstance(volume, str) or not volume:
+                raise ValueError("invalid volume identity")
+            if receipt.get("profile", "rfaa") != profile:
+                raise ValueError("receipt belongs to a different storage profile")
+            retention, expiry = receipt.get("retention", "timed"), receipt["expires_at"]
+            if retention == "persistent":
+                if expiry is not None:
+                    raise ValueError("persistent retention requires a null expiry")
+                expired = False
+            elif retention == "timed":
+                expired = epoch(expiry) <= now
+            else:
+                raise ValueError("unknown retention policy")
+            blocked = volume in volumes and (receipt["status"] != "active" or expired)
+        except (OSError, ValueError, KeyError, TypeError, Error) as exc:
+            raise LaunchBlocked(f"Invalid {label} storage receipt: {exc}") from None
+        if blocked:
+            raise LaunchBlocked(f"{label} database storage is expired or retiring; launch refused")
 
 
 class Controller:
@@ -403,6 +534,7 @@ class Controller:
 
     def refresh(self, state):
         inventory = self.api.inventory()
+        remember_database_allocations(state, self.store.root, self.clock())
         reconcile(state, inventory, self.clock())
         return inventory
 
@@ -617,6 +749,9 @@ class Controller:
                 self.print_spend(report)
                 if halt:
                     print("dc: BUDGET HALT; managed GPUs terminating. Head/storage remain billable.", file=sys.stderr)
+                if report["storage_uncertain"]:
+                    print("dc: database storage accounting unresolved; new paid launches blocked; "
+                          "unconfirmed storage remains billable in the estimate.", file=sys.stderr)
         except Error:
             # Storage API trouble must not suppress deadline cleanup attempts.
             with self.store.locked(self.clock()) as state:
@@ -643,6 +778,11 @@ class Controller:
               f"background reserve ${report['background_reserve']:.2f}; safety margin ${self.margin:.2f}")
         print("Estimate includes observed head/OS/shared storage and imported GPU history; "
               "not provider billing. Head/storage continue after GPU cutoff.")
+        if report["background_hourly"]:
+            daily = report["background_hourly"] * 24
+            remaining = max(0, self.ceiling - report["spent"] - report["reserved"] - self.margin)
+            print(f"Persistent background: ${daily:.2f}/day; remaining allowance covers at most "
+                  f"{remaining / daily:.2f} days at that rate before additional jobs.")
 
 
 def parser():

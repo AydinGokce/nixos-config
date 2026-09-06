@@ -1,6 +1,7 @@
 """Offline lifecycle tests: no network, provider mutations, signals or mounts."""
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ s = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(s)
 
 DB = "01234567-89ab-4cde-8fab-0123456789ab"
+MSA_DB = "31234567-89ab-4cde-8fab-0123456789ab"
 WORKER = "11234567-89ab-4cde-8fab-0123456789ab"
 BOOT = "21234567-89ab-4cde-8fab-0123456789ab"
 SHARED = "b8b3b446-e464-44dd-9e01-6402489f8c5a"
@@ -26,22 +28,26 @@ class APIError(s.Error):
 
 
 class API:
-    def __init__(self, clock, events):
+    def __init__(self, clock, events, ident=DB, profile="rfaa"):
         self.clock, self.events = clock, events
-        self.row = dict(id=DB, name="bio-rfaa-db-20260906-test", type="NVMe_Shared", size=3300,
+        self.ident = ident
+        config = s.profile_config(profile)
+        export = config["name_prefix"] + "test"
+        self.row = dict(id=ident, name=config["name_prefix"] + "20260906-test", type="NVMe_Shared", size=config["size_gb"],
                         location="FIN-02", is_os_volume=False, contract="PAY_AS_YOU_GO", currency="usd",
                         created_at=s.stamp(clock() - 60), status="exported", instance_id=s.HEAD_ID,
-                        instances=[dict(id=s.HEAD_ID)], tags=[dict(key="purpose", value="rfaa-databases")],
-                        pseudo_path="/bio-rfaa-db-test", mount_command=
-                        "sudo mount -t nfs -o nconnect=16 nfs.fin-02.datacrunch.io:/bio-rfaa-db-test /mnt/example")
-        self.instances = [dict(id=s.HEAD_ID, volume_ids=[SHARED, DB])]
+                        instances=[dict(id=s.HEAD_ID)], tags=[dict(key="purpose", value=config["purpose"])],
+                        pseudo_path="/" + export, mount_command=
+                        f"sudo mount -t nfs -o nconnect=16 nfs.fin-02.datacrunch.io:/{export} /mnt/example")
+        self.instances = [dict(id=s.HEAD_ID, volume_ids=[SHARED, ident])]
+        self.other_volumes = []
         self.deleted = False
         self.get404 = False
         self.delete_lands = True
         self.calls = []
 
     def inventory(self):
-        current = [dict(id=SHARED, name="bio-shared")]
+        current = [dict(id=SHARED, name="bio-shared"), *self.other_volumes]
         trash = []
         if self.deleted:
             trash.append(self.row)
@@ -51,19 +57,19 @@ class API:
 
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
-        if method == "GET" and path == "/volumes/" + DB:
+        if method == "GET" and path == "/volumes/" + self.ident:
             if self.get404:
                 raise APIError(404)
             return copy.deepcopy(self.row)
         if method == "PUT" and path == "/volumes":
             self.events.append("detach")
-            assert body == dict(id=DB, action="detach", instance_id=s.HEAD_ID)
+            assert body == dict(id=self.ident, action="detach", instance_id=s.HEAD_ID)
             self.row.update(instance_id=None, instances=[])
             for instance in self.instances:
                 if instance["id"] == s.HEAD_ID:
-                    instance["volume_ids"] = [ident for ident in instance["volume_ids"] if ident != DB]
+                    instance["volume_ids"] = [ident for ident in instance["volume_ids"] if ident != self.ident]
             return None
-        if method == "DELETE" and path == "/volumes/" + DB:
+        if method == "DELETE" and path == "/volumes/" + self.ident:
             self.events.append("delete")
             if self.delete_lands:
                 self.deleted = True
@@ -105,7 +111,7 @@ class Ops:
         self.api.row["instances"] = [row for row in self.api.row["instances"] if row["id"] != ident]
 
     def unmount(self, source):
-        assert source == "nfs.fin-02.datacrunch.io:/bio-rfaa-db-test"
+        assert source == "nfs.fin-02.datacrunch.io:" + self.api.row["pseudo_path"]
         self.events.append("unmount")
         if self.busy_mount:
             raise s.Error("busy mount")
@@ -415,7 +421,198 @@ class StorageTests(unittest.TestCase):
         self.no_api_mutations()
 
 
+class PersistentProfileTests(unittest.TestCase):
+    setUp = StorageTests.setUp
+
+    def persistent_rfaa(self, permanent=False):
+        self.store.path.unlink()
+        return self.controller.register(DB, self.api.row["name"], persistent=True, permanent=permanent)
+
+    def colabfold(self):
+        store = s.Store(self.root / "msa-storage.json", owner=os.getuid())
+        api = API(self.clock, self.events, MSA_DB, "colabfold")
+        api.other_volumes = [copy.deepcopy(self.api.row)]
+        api.instances[0]["volume_ids"].append(DB)
+        ops = Ops(self.events, api, self.budget)
+        controller = s.Controller(store, self.budget, api, operations=ops, clock=self.clock,
+                                  start=lambda pid: "123", boot=lambda: BOOT,
+                                  results_root=self.results, profile="colabfold")
+        controller.register(MSA_DB, api.row["name"], persistent=True)
+        return controller, store, api
+
+    def test_persistent_registration_check_track_and_timer_do_not_create_an_expiry(self):
+        receipt = self.persistent_rfaa()
+        self.assertEqual(receipt["retention"], "persistent")
+        self.assertIsNone(receipt["expires_at"])
+        self.assertFalse(receipt["permanent"])
+        self.clock_value += 10 * 365 * 86400
+        self.controller.check(DB)
+        self.controller.track(DB, self.results / "rfaa-persistent-job", 424242)
+        calls = list(self.api.calls)
+        self.assertFalse(self.controller.expire())
+        self.assertEqual(self.api.calls, calls)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.store.read()["status"], "active")
+
+    def test_persistent_manual_retirement_retries_and_keeps_permanent_delete_meaning(self):
+        self.persistent_rfaa(permanent=True)
+        self.assertFalse(self.controller.expire())
+        with self.assertRaisesRegex(s.Error, "exact registered UUID"):
+            self.controller.expire(now=True)
+        with self.assertRaisesRegex(s.Error, "does not match"):
+            self.controller.expire(now=True, volume=MSA_DB)
+        with self.assertRaisesRegex(s.Error, "unshare requested"):
+            self.controller.expire(now=True, volume=DB)
+        for action in (lambda: self.controller.check(DB),
+                       lambda: self.controller.track(DB, self.results / "rfaa-too-late", 424242)):
+            with self.assertRaisesRegex(s.Error, "retiring"):
+                action()
+        self.assertTrue(self.controller.expire())  # Timer retries an explicit retirement.
+        self.assertEqual(self.store.read()["status"], "complete")
+        deletes = [body for method, path, body in self.api.calls if method == "DELETE"]
+        self.assertEqual(deletes, [{"is_permanent": True}])
+
+    def test_legacy_timed_receipt_and_permanent_delete_do_not_become_persistent(self):
+        with self.store.locked() as receipt:
+            receipt.pop("profile")
+            receipt.pop("retention")
+            receipt["permanent"] = True
+            self.store.save(receipt)
+        self.controller.check(DB)
+        self.assertFalse(self.controller.expire())
+        self.clock_value += 3601
+        with self.assertRaisesRegex(s.Error, "unshare requested"):
+            self.controller.expire()
+        self.assertTrue(self.controller.expire())
+        self.assertEqual([body for method, _, body in self.api.calls if method == "DELETE"],
+                         [{"is_permanent": True}])
+
+    def test_inconsistent_retention_is_rejected_before_cleanup(self):
+        original = self.persistent_rfaa()
+        for changes in ({"expires_at": s.stamp(self.clock() + 60)}, {"retention": "timed"},
+                        {"retention": "forever"}):
+            with self.subTest(changes=changes):
+                self.store.save(dict(original, **changes))
+                with self.assertRaises(s.Error):
+                    self.controller.expire(now=True, volume=DB)
+                self.assertEqual(self.events, [])
+        missing = dict(original)
+        missing.pop("expires_at")
+        with self.assertRaisesRegex(s.Error, "explicit null"):
+            s.check_active(missing, DB, self.clock())
+        with self.assertRaisesRegex(s.Error, "cannot also specify"):
+            self.controller.register(DB, self.api.row["name"], s.stamp(self.clock()+60), persistent=True)
+        for field in ("name", "nfs", "jobs", "version"):
+            with self.subTest(field=field), self.assertRaises(s.Error):
+                s.check_active(dict(original, **{field: None}), DB, self.clock())
+
+    def test_colabfold_retirement_does_not_touch_rfaa_volume_receipt_or_jobs(self):
+        controller, store, api = self.colabfold()
+        original = self.store.path.read_bytes()
+        with self.budget.locked() as state:
+            state["jobs"]["rfaa-pending"] = dict(id=None, status="pending", volumes=[DB])
+            state["jobs"]["msa-worker"] = dict(id=WORKER, status="running", volumes=[MSA_DB])
+            self.budget.save(state)
+        api.instances.append(dict(id=WORKER, volume_ids=[MSA_DB]))
+        api.row["instances"].append(dict(id=WORKER))
+        controller.track(MSA_DB, self.results / "msa-build-test", 424242, WORKER)
+        with self.assertRaisesRegex(s.Error, "unshare requested"):
+            controller.expire(now=True, volume=MSA_DB)
+        self.assertTrue(controller.expire())
+        self.assertEqual(store.read()["status"], "complete")
+        self.assertEqual(self.store.path.read_bytes(), original)
+        self.assertEqual(self.budget.read()["jobs"]["rfaa-pending"]["status"], "pending")
+        self.assertIn(DB, [row["id"] for row in api.inventory()[1]])
+        self.assertEqual([path for method, path, _ in api.calls if method == "DELETE"],
+                         ["/volumes/" + MSA_DB])
+        self.controller.check(DB)
+
+    def test_wrong_profile_receipt_and_provider_tags_block_before_any_teardown(self):
+        controller, store, api = self.colabfold()
+        with self.assertRaisesRegex(s.Error, "Invalid database storage receipt"):
+            s.check_active(store.read(), MSA_DB, self.clock(), "rfaa")
+        with self.assertRaisesRegex(s.Error, "Invalid database storage receipt"):
+            s.check_active(self.store.read(), DB, self.clock(), "colabfold")
+        api.row["tags"] = [{"key": "purpose", "value": "rfaa-databases"}]
+        with self.assertRaisesRegex(s.Error, "identity differs"):
+            controller.expire(now=True, volume=MSA_DB)
+        self.assertEqual(self.events, [])
+        self.assertTrue(all(method == "GET" for method, _, _ in api.calls))
+
+    def test_colabfold_tracks_only_named_users_and_waits_for_uncertain_backend(self):
+        controller, store, api = self.colabfold()
+        for prefix in ("msa", "openfold3", "boltz2", "protenix"):
+            controller.track(MSA_DB, self.results / (prefix + "-tracked"), 424242)
+        for name in ("rfaa-other", "esmfold-other", "msa/../outside"):
+            with self.assertRaisesRegex(s.Error, "Job directory"):
+                controller.track(MSA_DB, self.results / name, 424242)
+        with self.budget.locked() as state:
+            state["jobs"]["uncertain"] = dict(id=None, status="uncertain", volumes=[MSA_DB])
+            self.budget.save(state)
+        with self.assertRaisesRegex(s.Error, "unresolved managed"):
+            controller.expire(now=True, volume=MSA_DB)
+        self.assertNotIn("unmount", self.events)
+        self.assertTrue(all(method == "GET" for method, _, _ in api.calls))
+
+    def test_receipt_paths_respect_each_profiles_override_without_global_state(self):
+        with patch.dict(os.environ, {"DC_STATE_DIR": str(self.root)}, clear=True):
+            self.assertEqual(s.receipt_path(), self.root / "rfaa-storage.json")
+            self.assertEqual(s.receipt_path("colabfold"), self.root / "msa-storage.json")
+            with patch.dict(os.environ, {"MSA_STORAGE_RECEIPT": "/private/custom-msa.json"}):
+                self.assertEqual(s.receipt_path("colabfold"), Path("/private/custom-msa.json"))
+                self.assertEqual(s.receipt_path(), self.root / "rfaa-storage.json")
+
+    def test_cli_retention_modes_are_mutually_exclusive_before_api_access(self):
+        with patch.object(s.runpy, "run_path") as api, patch("sys.stderr", new_callable=io.StringIO):
+            for flags in ([], ["--persistent", "--expires-at", s.stamp(self.clock()+60)]):
+                with self.assertRaises(SystemExit) as error:
+                    s.main(["register", "--profile", "colabfold", "--volume", MSA_DB,
+                            "--name", "bio-colabfold-db-test-test", *flags])
+                self.assertEqual(error.exception.code, 2)
+            api.assert_not_called()
+
+
 class ProcessTests(unittest.TestCase):
+    def test_colabfold_stops_only_its_installer_and_optional_server(self):
+        loaded = s.subprocess.CompletedProcess([], 0, "loaded\n")
+        with patch.object(s.Operations, "run", return_value=loaded) as run:
+            s.Operations("colabfold").stop_installer()
+        stopped = [call.args[0] for call in run.call_args_list if call.args[0][1] == "stop"]
+        self.assertEqual(stopped, [["systemctl", "stop", "msa-database-install.service"],
+                                   ["systemctl", "stop", "msa-server.service"]])
+
+    def test_colabfold_unmount_uses_its_exact_mount_and_automount(self):
+        source = "nfs.fin-02.datacrunch.io:/bio-colabfold-db-test"
+        mounted = s.subprocess.CompletedProcess([], 0, json.dumps(dict(filesystems=[dict(source=source, fstype="nfs4")])))
+        loaded = s.subprocess.CompletedProcess([], 0, "loaded\n")
+        done = s.subprocess.CompletedProcess([], 0, "")
+        with patch.object(s.Operations, "run", side_effect=[mounted, loaded, done, mounted, done]) as run:
+            s.Operations("colabfold").unmount(source)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[0][3], "/mnt/bio-msa-databases")
+        self.assertEqual(commands[2], ["systemctl", "stop", r"mnt-bio\x2dmsa\x2ddatabases.automount"])
+        self.assertEqual(commands[-1], ["umount", "/mnt/bio-msa-databases"])
+        self.assertNotIn(s.MOUNT, [arg for command in commands for arg in command])
+
+    def test_colabfold_retains_small_receipts_without_copying_database_blobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt = dict(volume_id=MSA_DB, profile="colabfold")
+            with patch.object(s.Operations, "run") as run:
+                s.Operations("colabfold").collect_database_receipts(receipt, root)
+            target = root / ("colabfold-database-receipts-" + MSA_DB)
+            self.assertEqual(json.loads((target / "allocation.json").read_text()), receipt)
+            sources = [call.args[0][-2] for call in run.call_args_list]
+            self.assertEqual(len(sources), 8)
+            self.assertTrue(all(path.startswith("/mnt/bio-msa-databases/colabfold/")
+                                and path.endswith((".json", "/mmcif-content.jsonl.gz")) for path in sources))
+            self.assertIn("/mnt/bio-msa-databases/colabfold/.msa-databases.json", sources)
+            self.assertIn("/mnt/bio-msa-databases/colabfold/.components/mmcif.json", sources)
+            manifest = "/mnt/bio-msa-databases/colabfold/mmcif/mmcif-content.jsonl.gz"
+            self.assertIn(manifest, sources)
+            copy = next(call.args[0] for call in run.call_args_list if call.args[0][-2] == manifest)
+            self.assertEqual(copy[-1], str(target / "mmcif-content.jsonl.gz"))
+
     def test_reused_pid_or_previous_boot_is_never_signalled(self):
         job = dict(pid=424242, start_ticks="123", boot_id=BOOT)
         for current_boot, ticks in ((DB, "123"), (BOOT, "456")):

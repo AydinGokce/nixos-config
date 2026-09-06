@@ -1,0 +1,105 @@
+# Full private ColabFold preparation on transient CPU compute. The database
+# snapshot persists; this worker's localhost API is never exposed publicly.
+msa_run() (
+  set -euo pipefail
+  [ "${#EXTRA_ARGS[@]}" -eq 0 ] || { echo 'msa: unexpected extra arguments' >&2; exit 2; }
+  python3 - <<'PY'
+from pathlib import Path
+memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+available_kib = int(memory['MemAvailable'].split()[0])
+if available_kib < 768 * 1024 * 1024:
+    raise SystemExit('msa: full indexed CPU reference requires at least 768 GiB available RAM')
+print(f'MSA reference worker: {available_kib / 1024**2:.1f} GiB available host RAM', flush=True)
+PY
+  source "$TOOLS/msa/tools.sh"
+  threads=$(nproc)
+  [ "$threads" -le 64 ] || threads=64
+  if [ "$SUB" = install ]; then
+    python3 "$TOOLS/msa/databases.py" install --root "$MSA_DB_ROOT" \
+      --tools-root "$MSA_TOOLS_ROOT" --threads "$threads" > "$OUT/database-install.json"
+    python3 "$TOOLS/msa/databases.py" validate --root "$MSA_DB_ROOT" \
+      --tools-root "$MSA_TOOLS_ROOT" > "$OUT/database-validation.json"
+    exit 0
+  fi
+  # MMseqs otherwise inherits every core on large hosts, multiplying its
+  # per-thread prefilter memory. This bounds concurrency, not search depth.
+  search_threads="$threads"
+  [ "$search_threads" -le 16 ] || search_threads=16
+  export MMSEQS_NUM_THREADS="$search_threads"
+  python3 "$TOOLS/msa/server.py" config --root "$MSA_DB_ROOT" \
+    --tools-root "$MSA_TOOLS_ROOT" --results "$SHARED/cache/msa-api" \
+    --output "$OUT/msa-server.json" > "$OUT/server-command.json"
+  "$MMSEQS_SERVER" -local -config "$OUT/msa-server.json" > "$OUT/msa-server.log" 2>&1 &
+  server_pid=$!
+  proxy_pid=""
+  msa_stop() {
+    local status=$?
+    trap - EXIT
+    if [ -n "$proxy_pid" ]; then
+      kill "$proxy_pid" 2>/dev/null || true
+      wait "$proxy_pid" 2>/dev/null || true
+      python3 "$TOOLS/msa/server.py" export --audit "$OUT/api-audit" \
+        --config "$OUT/msa-server.json" --output "$OUT/api-jobs" || { [ "$status" -ne 0 ] || status=1; }
+    fi
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    exit "$status"
+  }
+  trap msa_stop EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  python3 - "$server_pid" <<'PY'
+import os, socket, sys, time
+pid = int(sys.argv[1])
+for attempt in range(120):
+    os.kill(pid, 0)
+    try:
+        with socket.create_connection(('127.0.0.1', 8080), timeout=1):
+            break
+    except OSError:
+        time.sleep(1)
+else:
+    raise SystemExit('msa: private API did not become ready')
+PY
+  if [ "$SUB" = serve ]; then
+    echo 'msa: private API listening only on worker localhost:8080'
+    wait "$server_pid"
+    exit 0
+  fi
+  python3 "$TOOLS/msa/server.py" proxy --audit "$OUT/api-audit" > "$OUT/api-audit.log" 2>&1 &
+  proxy_pid=$!
+  python3 - "$proxy_pid" <<'PY'
+import os, socket, sys, time
+for attempt in range(30):
+    os.kill(int(sys.argv[1]), 0)
+    try:
+        with socket.create_connection(('127.0.0.1', 8081), timeout=1):
+            break
+    except OSError:
+        time.sleep(1)
+else:
+    raise SystemExit('msa: API audit proxy did not become ready')
+PY
+  case "$MODEL" in
+    openfold3)
+      venv="$SHARED/envs/openfold3"
+      export OPENFOLD_CACHE="$SHARED/openfold3/home/.openfold3" ;;
+    boltz2)
+      venv="$SHARED/envs/boltz"
+      export BOLTZ_CACHE="$SHARED/cache/boltz" ;;
+    protenix)
+      venv="$SHARED/envs/protenix"
+      export PROTENIX_ROOT_DIR="$SHARED/protenix/release_data" ;;
+    *) echo 'msa: invalid model for native preparation' >&2; exit 2 ;;
+  esac
+  [ -x "$venv/bin/python" ] || { echo "msa: missing pinned $MODEL environment at $venv" >&2; exit 2; }
+  export PATH="$venv/bin:/usr/local/cuda/bin:$PATH"
+  export LD_LIBRARY_PATH="$(venv_ld "$venv")${LD_LIBRARY_PATH:-}"
+  "$venv/bin/python" "$TOOLS/msa/prepared.py" prepare --model "$MODEL" \
+    --fasta "$IN" --out "$OUT/prepared" --server-url http://127.0.0.1:8081 --source private \
+    --database-provenance "$OUT/msa-server.provenance.json"
+  # Keep the server configuration and database identity alongside native inputs.
+  cp "$OUT/msa-server.provenance.json" "$OUT/preparation-provenance.json"
+)
+msa_run
