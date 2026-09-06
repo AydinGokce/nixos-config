@@ -80,6 +80,19 @@ in
       export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-msa.sh}
     '')
+    (pkgs.writeShellScriptBin "bio-msa-build-queue" ''
+      set -euo pipefail
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd util-linux coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      # Only ticks consult provider availability and reconcile cloud inventory.
+      for queue_arg in "$@"; do
+        if [ "$queue_arg" = tick ]; then
+          source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+          export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+          break
+        fi
+      done
+      exec python3 /etc/bio-tools/msa/build-queue.py "$@"
+    '')
   ];
 
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
@@ -160,6 +173,29 @@ in
       OnCalendar = "*-*-* *:*:00";
       Persistent = true;
       AccuracySec = "1s";
+    };
+  };
+
+  # Explicit queue initialization freezes the requested panel and volume. Until
+  # then the timer is inert; downloads, capacity and cleanup gate every rental.
+  systemd.services.bio-msa-build-queue = {
+    description = "Advance the registered private MSA database build and panel";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    unitConfig.ConditionPathExists = "/var/lib/dc/msa-build-queue.json";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/bio-msa-build-queue tick";
+      TimeoutStartSec = 600;
+      UMask = "0077";
+    };
+  };
+  systemd.timers.bio-msa-build-queue = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*-*-* *:00/15:00";
+      Persistent = true;
+      AccuracySec = "1min";
     };
   };
 

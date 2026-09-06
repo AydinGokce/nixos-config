@@ -15,7 +15,9 @@ Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
          --gpu TYPE, --spot, --timeout SECONDS (default 7200), -- EXTRA_ARGS
 MSA: --msa-backend public|private, or --msa-bundle DIRECTORY for a prepared input.
-Database jobs: bio-submit msa --sub install|convert|prepare|serve [--model MODEL --fasta FILE]
+Database jobs: bio-submit msa --sub install|convert|panel|prepare|serve [--model MODEL --fasta FILE]
+Panel preparation: bio-submit msa --sub panel --json MANIFEST.json [--worker TYPE]
+Install then prepare: bio-submit msa --sub install --json MANIFEST.json [--worker TYPE]
 RFAA: --sub full (default) or --sub single-seq; full needs bio-rfaa-databases.
 EVOLVEpro: --sub rank (default) or --sub embed; --labels measured.csv for ranking.
 Results: /var/lib/bio-runs/JOB on the head, including run.log and job.json.
@@ -38,6 +40,7 @@ case "$tool" in
 esac
 gpu=""; spot=""; infile=""; labels=""; model=""; sub=""; contigs=""; num=""; temp=""; name=""; seconds=7200; extra=()
 msa_backend="${BIO_MSA_DEFAULT_BACKEND:-public}"; msa_bundle=""; bundle_result=""
+panel_manifest_sha=""
 case "$recipe" in openfold3|boltz2|protenix) ;; *) msa_backend=public;; esac
 if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
   case "${1:-}" in ""|-*) ;; *) sub="$1"; shift ;; esac
@@ -80,8 +83,15 @@ if [ "$recipe" = msa ]; then
     prepare)
       [ -n "$infile" ] || { echo 'bio-submit: MSA preparation needs --fasta' >&2; exit 2; }
       case "$model" in openfold3|boltz2|protenix) ;; *) echo 'bio-submit: MSA preparation needs --model openfold3|boltz2|protenix' >&2; exit 2;; esac ;;
-    *) echo 'bio-submit: MSA --sub must be install, convert, prepare or serve' >&2; exit 2;;
+    panel)
+      [ -n "$infile" ] || { echo 'bio-submit: MSA panel needs --json MANIFEST.json' >&2; exit 2; } ;;
+    *) echo 'bio-submit: MSA --sub must be install, convert, panel, prepare or serve' >&2; exit 2;;
   esac
+  if [ "$sub" = panel ] || { [ "$sub" = install ] && [ -n "$infile" ]; }; then
+    [ -z "$model$labels$contigs$num$temp$bundle_result" ] && [ "${#extra[@]}" -eq 0 ] \
+      || { echo 'bio-submit: panel targets/settings belong in the manifest; model overrides and --bundle-result are unsupported' >&2; exit 2; }
+    panel_manifest_sha=$(python3 "$TOOLS_SRC/msa/panel.py" validate --manifest "$infile" --hash-only)
+  fi
   [ "$sub" != convert ] || tier=msa_convert
   [ -z "$msa_bundle" ] || { echo 'bio-submit: a database job cannot consume an inference bundle' >&2; exit 2; }
 elif [ -n "$bundle_result" ]; then
@@ -168,6 +178,10 @@ exec > >(tee -a "$LOCALOUT/run.log") 2>&1
 run="$SHARED_MNT/runs/$jobid"; mkdir -p "$run/in" "$run/out"
 RIN=""; RLABELS=""; RPREP=""
 if [ -n "$infile" ]; then cp "$infile" "$run/in/input.${infile##*.}"; RIN="$run/in/input.${infile##*.}"; fi
+if [ -n "$panel_manifest_sha" ]; then
+  python3 "$TOOLS_SRC/msa/panel.py" validate --manifest "$RIN" --expected-sha256 "$panel_manifest_sha"
+  cp "$RIN" "$LOCALOUT/panel-manifest.json"
+fi
 if [ -n "$labels" ]; then cp "$labels" "$run/in/labels.csv"; RLABELS="$run/in/labels.csv"; fi
 if [ -n "$msa_bundle" ]; then
   RPREP="$run/in/prepared"; mkdir -p "$RPREP"
@@ -185,6 +199,7 @@ bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 remote_file="$LOCALOUT/remote.sh"
 {
   printf 'set -euo pipefail\n'
+  printf 'export BIO_JOB_DEADLINE_EPOCH=$(( $(date +%%s) + 10#%s ))\n' "$seconds"
   printf 'export IN=%q OUT=%q LABELS=%q MODEL=%q SUB=%q CONTIGS=%q NUM=%q TEMP=%q NAME=%q\n' "$RIN" "$ROUT" "$RLABELS" "$model" "$sub" "$contigs" "$num" "$temp" "${name:-$recipe}"
   printf 'EXTRA_ARGS=('
   if [ "${#extra[@]}" -gt 0 ]; then printf ' %q' "${extra[@]}"; fi
@@ -194,6 +209,7 @@ remote_file="$LOCALOUT/remote.sh"
   if [ "$recipe" = rfaa ]; then printf 'RFAA_DB_NFS=%q\n' "$db_nfs"; else printf 'RFAA_DB_NFS=""\n'; fi
   if [ "$recipe" = msa ]; then printf 'MSA_DB_NFS=%q\n' "$db_nfs"; else printf 'MSA_DB_NFS=""\n'; fi
   printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$RPREP"
+  printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
   printf 'export RFAA_CPU=%q RFAA_MEM_GB=%q\n' "${RFAA_CPU:-4}" "${RFAA_MEM_GB:-64}"
   # Protenix's ColabFold mode does not select the ColabFold host automatically.
@@ -203,6 +219,10 @@ remote_file="$LOCALOUT/remote.sh"
 export BIO_TOOLS_DIR
 BIO_TOOLS_DIR=$(mktemp -d /tmp/bio-tools.XXXXXXXX)
 trap 'rm -rf -- "$BIO_TOOLS_DIR"' EXIT
+# Keep Python bytecode off NFS: one inference stalled in a shared-cache OPEN
+# even though fresh mounts could read the same file immediately.
+export PYTHONPYCACHEPREFIX="$BIO_TOOLS_DIR/cache/python"
+mkdir -p "$PYTHONPYCACHEPREFIX"
 base64 --decode > "$BIO_TOOLS_DIR/bundle.tar.gz" <<'BIO_TOOLS_ARCHIVE'
 BUNDLE
   base64 "$bundle"
@@ -371,6 +391,10 @@ PY
 [ "$status" -eq 0 ] || { echo "bio-submit: FAILED ($status); logs at $LOCALOUT" >&2; exit "$status"; }
 if [ "$recipe" = msa ] && [ "$sub" = prepare ]; then
   python3 "$TOOLS_SRC/msa/prepared.py" validate --bundle "$LOCALOUT/prepared" --model "$model" --fasta "$infile"
+fi
+if [ -n "$panel_manifest_sha" ]; then
+  python3 "$TOOLS_SRC/msa/panel.py" verify --manifest "$LOCALOUT/panel-manifest.json" \
+    --expected-sha256 "$panel_manifest_sha" --out "$LOCALOUT/panel"
 fi
 dc rm "$id"; id=""
 if [ "$recipe" = msa ] && [ "$sub" = prepare ] && [ -n "$bundle_result" ]; then

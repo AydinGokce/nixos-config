@@ -56,6 +56,32 @@ class NativeMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(p.Error, "ambiguous mapping"):
             p.local_template_mappings({"1abc"}, self.receipt, self.root / "ambiguous")
 
+    def test_materialized_native_npz_members_remain_integrity_bound(self):
+        import numpy as np
+        run = self.root / "of3"
+        run.mkdir()
+        archive = run / "msa.npz"
+        data = {"msa": np.array([list("ACDE"), list("AC-E")]),
+                "deletion_matrix": np.zeros((2, 4)), "metadata": np.array(["query", "hit"])}
+        np.savez(archive, main=data)
+        p.write_json(run / "inference_query_set.json", {"queries": {"query": {"chains": [{
+            "molecule_type": "protein", "chain_ids": ["A"], "sequence": "ACDE",
+            "main_msa_file_paths": [str(archive)]}]}}})
+        p.write_json(run / "experiment_config.json", {"experiment_settings": {"use_templates": False}})
+        bundle = self.root / "bundle"
+        p.capture("openfold3", run, bundle, trust_native_npz=True)
+        output = self.root / "native"
+        p.materialize(bundle, "openfold3", output)
+        manifest = p.validate_materialized(output, "openfold3")
+        rel = next(rel for rel in manifest["files"] if rel.endswith(".npz"))
+        target = output / rel
+        data["deletion_matrix"][1, 1] = 2
+        np.savez(target, main=data)
+        manifest["files"][rel].update(bytes=target.stat().st_size, sha256=p.digest(target))
+        p.write_json(output / "source_manifest.json", manifest)
+        with self.assertRaisesRegex(p.Error, "Native NPZ changed"):
+            p.validate_materialized(output, "openfold3")
+
 
 @unittest.skipUnless(parse_csv is not None, "Run in Boltz environment for its actual CSV parser")
 class NativeBoltzTests(unittest.TestCase):

@@ -398,6 +398,10 @@ def native_layout(model, native):
 def validate(bundle, model=None, fasta=None):
     bundle = Path(bundle).resolve()
     manifest = load_json(bundle / "manifest.json")
+    return _validate_manifest(bundle, manifest, model, fasta)
+
+
+def _validate_manifest(bundle, manifest, model=None, fasta=None):
     require(manifest.get("schema_version") == 1, "Unsupported preparation bundle schema")
     name = manifest.get("model")
     require(name in VERSIONS and (model is None or name == model), "Prepared model mismatch")
@@ -444,6 +448,30 @@ def validate(bundle, model=None, fasta=None):
             if binding["kind"] == "of3_msa_npz":
                 require(files[rel].get("alignment", {}).get("semantic_validation") == "trusted native preparation output",
                         "OpenFold3 NPZ requires semantic validation in its preparation environment")
+    return manifest
+
+
+def validate_materialized(path, model, fasta=None, original_out=None):
+    """Verify a native replay tree, including its exact expanded input/runtime.
+
+    A fetched tree retains paths from its worker. In that case original_out is
+    the original absolute materialization directory, which need not exist here.
+    No native fields are removed or rewritten while comparing the documents.
+    """
+    root = Path(path).resolve()
+    manifest = load_json(safe_file(root, "source_manifest.json"))
+    _validate_manifest(root, manifest, model, fasta)
+    destination = Path(original_out) if original_out is not None else Path(path).absolute()
+    require(destination.is_absolute(), "Original materialization path must be absolute")
+    native = copy.deepcopy(manifest["native_input"])
+    for binding in manifest["bindings"]:
+        rel = get_at(native, binding["pointer"])[len(MARKER):]
+        set_at(native, binding["pointer"], str(destination / rel))
+    for filename, expected in [(INPUT_NAMES[model], native["document"]),
+                               ("runtime.json", native["runtime"])]:
+        actual = load_json(safe_file(root, filename))
+        require(json_digest(actual) == json_digest(expected),
+                f"Materialized native document mismatch: {filename}")
     return manifest
 
 
@@ -770,6 +798,11 @@ def main(argv=None):
         p.add_argument("--fasta")
         if command == "materialize":
             p.add_argument("--out", required=True)
+    p = commands.add_parser("validate-materialized")
+    p.add_argument("--path", required=True)
+    p.add_argument("--model", choices=VERSIONS, required=True)
+    p.add_argument("--fasta")
+    p.add_argument("--original-out")
     p = commands.add_parser("capture")
     p.add_argument("--model", choices=VERSIONS, required=True)
     p.add_argument("--run-dir", required=True)
@@ -799,6 +832,9 @@ def main(argv=None):
     try:
         if args.command == "validate":
             manifest = validate(args.bundle, args.model, args.fasta)
+            print(json.dumps({"valid": True, "model": manifest["model"], "chains": manifest["chains"]}))
+        elif args.command == "validate-materialized":
+            manifest = validate_materialized(args.path, args.model, args.fasta, args.original_out)
             print(json.dumps({"valid": True, "model": manifest["model"], "chains": manifest["chains"]}))
         elif args.command == "materialize":
             print(materialize(args.bundle, args.model, args.out, args.fasta))

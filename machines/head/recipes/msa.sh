@@ -28,7 +28,7 @@ PY
       --tools-root "$MSA_TOOLS_ROOT" --threads "$threads" > "$OUT/database-install.json"
     python3 "$TOOLS/msa/databases.py" validate --root "$MSA_DB_ROOT" \
       --tools-root "$MSA_TOOLS_ROOT" > "$OUT/database-validation.json"
-    exit 0
+    [ -n "${BIO_MSA_PANEL_SHA256:-}" ] || exit 0
   fi
   # MMseqs otherwise inherits every core on large hosts, multiplying its
   # per-thread prefilter memory. This bounds concurrency, not search depth.
@@ -74,6 +74,12 @@ PY
   if [ "$SUB" = serve ]; then
     echo 'msa: private API listening only on worker localhost:8080'
     wait "$server_pid"
+    exit 0
+  fi
+  if [ -n "${BIO_MSA_PANEL_SHA256:-}" ]; then
+    python3 "$TOOLS/msa/panel.py" run --manifest "$IN" --out "$OUT/panel" --tools "$TOOLS" \
+      --expected-sha256 "$BIO_MSA_PANEL_SHA256" --deadline "$BIO_JOB_DEADLINE_EPOCH" \
+      --config "$OUT/msa-server.json" --provenance "$OUT/msa-server.provenance.json"
     exit 0
   fi
   python3 "$TOOLS/msa/server.py" proxy --audit "$OUT/api-audit" > "$OUT/api-audit.log" 2>&1 &

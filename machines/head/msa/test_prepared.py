@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -56,6 +57,68 @@ class PreparedTests(unittest.TestCase):
         self.assertEqual(alignment["insertion_count"], 1)
         self.assertEqual(alignment["gap_count"], 2)
         self.assertEqual(report["accuracy_benchmark"]["status"], "not_run")
+
+    def test_materialized_validation_preserves_original_worker_paths_after_fetch(self):
+        bundle = self.bundle(paired=MSA)
+        original = self.root / "worker-out"
+        p.materialize(bundle, "protenix", original)
+        self.assertEqual(p.validate_materialized(original, "protenix"), p.validate(bundle))
+        fetched = self.root / "fetched"
+        shutil.copytree(original, fetched)
+        before = {str(f.relative_to(fetched)): f.read_bytes() for f in fetched.rglob("*") if f.is_file()}
+        p.validate_materialized(fetched, "protenix", original_out=original)
+        after = {str(f.relative_to(fetched)): f.read_bytes() for f in fetched.rglob("*") if f.is_file()}
+        self.assertEqual(before, after)
+        with self.assertRaisesRegex(p.Error, "native document mismatch"):
+            p.validate_materialized(fetched, "protenix")
+        with self.assertRaisesRegex(p.Error, "must be absolute"):
+            p.validate_materialized(fetched, "protenix", original_out="relative")
+
+    def test_materialized_validation_rejects_asset_input_and_runtime_changes(self):
+        bundle = self.bundle()
+        original = self.root / "worker-out"
+        p.materialize(bundle, "protenix", original)
+        manifest = p.validate_materialized(original, "protenix")
+        asset = original / next(iter(manifest["files"]))
+        saved = asset.read_bytes()
+        asset.write_bytes(saved + b"\n")
+        with self.assertRaisesRegex(p.Error, "integrity mismatch"):
+            p.validate_materialized(original, "protenix")
+        asset.write_bytes(saved)
+        for filename in ["input.json", "runtime.json"]:
+            target = original / filename
+            before = target.read_bytes()
+            changed = p.load_json(target)
+            if isinstance(changed, list):
+                changed[0]["unexpected_field"] = {"seed": 17}
+            else:
+                changed["unexpected_field"] = {"seed": 17}
+            p.write_json(target, changed)
+            with self.assertRaisesRegex(p.Error, "native document mismatch"):
+                p.validate_materialized(original, "protenix")
+            target.write_bytes(before)
+        actual = p.load_json(original / "input.json")
+        actual[0]["sequences"][0]["proteinChain"]["count"] = True
+        p.write_json(original / "input.json", actual)
+        with self.assertRaisesRegex(p.Error, "native document mismatch"):
+            p.validate_materialized(original, "protenix")
+
+    def test_materialized_validation_rechecks_native_semantics_and_chain_identity(self):
+        bundle = self.bundle()
+        original = self.root / "worker-out"
+        p.materialize(bundle, "protenix", original)
+        fasta = self.root / "wrong.fasta"
+        fasta.write_text(">query\nACDF\n")
+        with self.assertRaisesRegex(p.Error, "FASTA chain"):
+            p.validate_materialized(original, "protenix", fasta=fasta)
+        with self.assertRaisesRegex(p.Error, "model mismatch"):
+            p.validate_materialized(original, "boltz2")
+        manifest = p.load_json(original / "source_manifest.json")
+        rel = next(rel for rel, entry in manifest["files"].items() if "alignment" in entry)
+        manifest["files"][rel]["alignment"]["rows"] += 1
+        p.write_json(original / "source_manifest.json", manifest)
+        with self.assertRaisesRegex(p.Error, "Alignment semantics changed"):
+            p.validate_materialized(original, "protenix")
 
     def test_public_private_same_native_preparation_can_compare_equal(self):
         left = self.bundle()

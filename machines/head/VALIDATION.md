@@ -118,20 +118,35 @@ pair, not proof of a particular kernel/server fault or validation of every
 worker's filesystem view. Verified code transmission, worker-direct output
 retrieval and database validation on each worker remain necessary.
 
+The first public prepared Protenix replay subsequently stalled in one NFS `OPEN`
+for SymPy bytecode on a worker. Fresh read-only NFS 4.1 and 4.2 mounts, and a new
+read through the original mount, returned identical valid bytes immediately;
+only the existing open request remained blocked. That attempt was stopped and
+its worker/OS disk deletion confirmed. Fresh workers now set
+`PYTHONPYCACHEPREFIX` to their local temporary tools directory before any Python
+starts. Both subsequent Protenix reference cases completed with five structures
+each. This supports cache isolation as a practical workaround, without proving
+the cause of the earlier stuck request. Full evidence, failed-attempt records
+and settings are retained under `~/bio-runs/msa-public-inference-20260906`.
+
 ## Local and simulated checks
 
-- Budget controller: 54 tests for accounting, reservations, uncertain creates,
+- Budget controller: 59 tests for accounting, reservations, uncertain creates,
   deadlines, storage lifetime checks, protected-resource cleanup and retaining
-  persistent-volume accounting during unexplained inventory omissions.
+  persistent-volume accounting during unexplained inventory omissions. Fresh
+  hourly quote limits fail before reservations or resource creation; malformed
+  limits also fail closed.
 - Persistent database allocator: 18 tests cover serialized creation, durable
   intents, conservative quotes, uncertain-request reconciliation and retirement.
-- Submission orchestration: 37 tests cover retrieval/failure propagation, budget
+- Submission orchestration: 52 tests cover retrieval/failure propagation, budget
   denial, RFAA storage/memory requirements and expiry races, Protenix GPU and
   endpoint configuration, verified code delivery despite stale shared files or
   corrupted transfer, and cleanup after the log pipe closes during failures or
   termination. They also cover private preparation before inference rental,
   explicit NFS 4.1 mount arguments, and head-side database readiness checks
-  before any paid launch. Workstation wrapper: six tests.
+  before any paid launch. Complete panel manifests are validated before rental,
+  checked again after the lock and on the worker, and all failures are retained.
+  Workstation wrapper: six tests.
 - Database storage lifecycle: 36 offline tests for exact-volume identity,
   concurrent expiry/launches, process identity across reboots, preserving
   completed outputs, confirmed cleanup/retry behavior, persistent retention and
@@ -176,9 +191,13 @@ results above do not establish production corpus completeness or scientific
 parity. Persistent storage remains billable after the $500 launch/compute guard
 halts new paid work; it is not a hard storage spending cap.
 
-Five numerical scoring tests pass, covering proper rotation, mirror exclusion
+Six numerical scoring tests pass, covering proper rotation, mirror exclusion
 from RMSD, local distortion, invalid coordinates and strict complete-sequence
 prediction parsing, including rejection of multiple models and duplicate atoms.
+The native OpenFold3 CIF omits occupancy. For predictions with no alternate atom
+conformers, the parser supplies occupancy 1.0 in memory while preserving original
+bytes; missing occupancy with alternate conformers still fails. Real OpenFold3
+outputs now score, and prior Protenix scores remain exactly unchanged.
 Six classical and twelve recent experimental references retain full construct
 FASTA sequences, observed-residue mappings and source hashes. The recent panel
 has a frozen selection/exclusion audit under
@@ -186,3 +205,37 @@ has a frozen selection/exclusion audit under
 Its engineered, truncated and fusion constructs are explicitly labeled.
 See [the quality comparison protocol](msa/QUALITY.md). Public preparation remains
 the default until appropriate comparisons support a change.
+
+All six **public-MSA** reference replays are now complete: two experimental
+targets (1UBQ and 2LZM), each with Protenix, OpenFold3 and Boltz2. All 22 generated
+structures are scored, and every temporary worker and OS disk is removed. The
+stopped first Protenix attempt remains in the report as a failed job. The report
+verifies complete sequences, original structures and hashes, every expected
+sample, native prepared inputs, runtime/package/checkpoint identity and resolved
+settings. Nine report tests cover omissions, mutations and aggregation. Attempt
+coverage is explicitly unverified without an immutable prelaunch attempt ledger.
+
+The retained result is
+`~/bio-runs/msa-public-inference-20260906/public-baseline-report.json`. This is a
+public baseline against experimental structures, **not a comparison with full
+private databases**. Both public Protenix settings snapshots must be reconstructed
+with the final frozen helper on the next naturally available matching A100 before
+strict private comparison; earlier helper snapshots remain retained. Boltz
+settings were reconstructed on the head with the exact package snapshot, without
+renting another GPU or running inference.
+
+All 42 public native preparation bundles for the frozen 14-case, three-model
+panel are validated. One recent Boltz target had a transient HTTP 404; the
+original failure and a successful explicitly recorded identical-input retry are
+both retained. The 12 recent cases have no GPU predictions yet. Their frozen
+private panel is `~/bio-runs/msa-private-panel-20260906/panel-input.json`, canonical
+SHA256 `8bb1eb328c2bd0258b3e868be3f0c496e456f31c6e646e3428e8812d882334f0`.
+
+Private panel preparation passes 11 tests, including actual localhost proxy
+isolation and retained official paired-job archive evidence. The resumable build
+queue passes 35 tests for download prerequisites, promoted-component resumption,
+capacity/price limits, uncertain starts, exact cleanup and panel-only retries.
+A head-only systemd probe confirmed retained process/invocation metadata used
+for reconciliation. These checks establish orchestration behavior, not a
+completed full corpus or prediction-quality parity. See
+[the panel interface](msa/PANEL.md) and [the build queue](msa/BUILD_QUEUE.md).

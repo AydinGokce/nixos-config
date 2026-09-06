@@ -6,13 +6,14 @@ Reports C-alpha metrics; it does not attest all-atom, assembly or ligand accurac
 """
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
 import urllib.request
 
 import numpy as np
-from Bio.PDB import MMCIFParser, PDBParser
+from Bio.PDB import MMCIFIO, MMCIFParser, PDBParser
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBException, PDBConstructionException
 from Bio.SeqUtils import seq1
@@ -41,7 +42,22 @@ def structure(path, single_model=False):
     path = Path(path)
     parser = (MMCIFParser(QUIET=True, auth_chains=False, auth_residues=False)
               if path.suffix.lower() == ".cif" else PDBParser(QUIET=True, PERMISSIVE=False))
-    parsed = parser.get_structure("structure", str(path))
+    source = str(path)
+    if single_model and path.suffix.lower() == ".cif":
+        data = MMCIF2Dict(str(path))
+        if "_atom_site.occupancy" not in data:
+            # Native OF3/Biotite predictions omit this optional CIF column.
+            # CA scoring does not use occupancy; supply it only to the parser
+            # and only when there is no alternate-conformer selection to infer.
+            require(all(value in {".", "?", ""} for value in data["_atom_site.label_alt_id"]),
+                    "Missing occupancy with alternate conformers is ambiguous")
+            data["_atom_site.occupancy"] = ["1.0"] * len(data["_atom_site.id"])
+            source = io.StringIO()
+            writer = MMCIFIO()
+            writer.set_dict(data)
+            writer.save(source)
+            source.seek(0)
+    parsed = parser.get_structure("structure", source)
     require(not single_model or len(parsed) == 1,
             "Multi-model prediction files must be separated and every sample scored explicitly")
     return parsed[0]
@@ -160,8 +176,9 @@ def score(case_path, predictions, chain=None):
                            minimum=float(min(r[key] for r in records)),
                            maximum=float(max(r[key] for r in records)))
                  for key in ("ca_rmsd_angstrom", "lddt_ca_mean")}
-    return dict(version=1, case=case["name"], case_sha256=sha(case_path),
+    return dict(version=1, scorer_sha256=sha(__file__), case=case["name"], case_sha256=sha(case_path),
                 reference_sha256=case["reference_sha256"], observed_fraction=len(positions) / len(seq),
+                parser_policy="Missing prediction occupancy is 1.0 in memory only when alternate conformers are absent; source bytes are unchanged",
                 metrics_scope="C-alpha of experimentally observed residues; all supplied samples",
                 samples=records, aggregate=aggregate, scientific_parity="not_established")
 

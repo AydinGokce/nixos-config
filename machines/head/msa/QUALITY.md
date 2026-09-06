@@ -59,6 +59,12 @@ checks remain necessary when extending the workflow to those tasks. Structural
 reference metadata and coordinates come from the [RCSB archive](https://www.rcsb.org/)
 and its [documented data model](https://data.rcsb.org/).
 
+Native OpenFold3 CIFs may omit occupancy. When alternate conformers are absent,
+the scorer supplies occupancy 1.0 only in memory to satisfy Biopython's parser;
+the metric uses the original C-alpha coordinates and retained files stay
+byte-for-byte unchanged. Missing occupancy with alternate conformers is rejected.
+Each score records this parser policy and the scorer source hash.
+
 ## Frozen recent-release diagnostic panel
 
 The full reference audit is retained locally at
@@ -132,3 +138,47 @@ target and length bin, keeping every generated sample. Investigate apparent
 regressions against repeated same-input runs to separate numerical variation
 from preparation effects. A favorable mean across twelve targets is not proof
 of scientific parity and does not authorize switching the production default.
+
+## Reconcile a retained prediction panel
+
+`report.py` reads each backend's `expected-runs.json`, frozen `quality.py`,
+`references/` files and every observed `MODEL/CASE/JOB/job.json`. Each completed
+job supplies the scorer's `accuracy.json`, `runtime-audit.json`, the complete
+`prepared-native/` tree and its effective inference settings. Use the same
+reference files for both backends, preserving the original filenames and hashes:
+
+```sh
+python report.py --public /path/to/public-runs --out public-progress.json
+python report.py --public /path/to/public-runs --private /path/to/private-runs \
+  --out comparison.json
+```
+
+This uses the standard library and `prepared.py`. It checks actual frozen FASTA,
+experimental CIF and residue-mapping hashes, coverage, native materialized files
+and rewritten input/runtime documents, exact seed/sample identities, and every
+prediction's score binding. OpenFold3 contributes its native `model_config.json`
+and `experiment_config.json`. Protenix and Boltz contribute `resolved-settings.json`
+from `settings.py`, bound to the runtime audit and source/helper hashes. That
+helper reconstructs native resolved options from recorded process arguments in
+the same installed package environment; Protenix additionally requires the same
+GPU type and applies its native token-count adjustment. It does not load weights
+or query an MSA service. This is a settings reconstruction, not a snapshot of
+internal inference tensors. The full model/checkpoint/GPU/package audit remains
+separate from CPU preparation provenance.
+
+Pairing requires equal frozen scientific settings, references, measured runtime,
+effective configurations and scorer versions within a model. Only the original
+job path and manifest-bound preparation locations are canonicalized in effective
+configurations; scientific values remain intact. Both backend labels must agree
+with their actual preparation manifests. Field-level incompatibilities remain
+visible. Every complete retry contributes its sample mean, then each compatible
+case receives equal weight; no best sample or best retry is selected. The report
+lists failed and missing runs, incomplete samples, saved cleanup evidence, and
+the complete-pair denominator. Its means describe that subset; missing cases can
+bias the result. Failed runs with partial unscored structures are explicitly
+counted and need separate investigation.
+
+Directory discovery cannot detect a wholly missing or deleted retry if another
+attempt survives. The report therefore labels attempt coverage as unverified;
+an immutable prelaunch attempt ledger would be needed for a stronger claim.
+Nothing in the report approves parity or changes the public default.

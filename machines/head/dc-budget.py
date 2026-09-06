@@ -10,6 +10,8 @@ recoverable. DC_PRIOR_SPEND_USD adds a known correction at first initialization.
 Run `dc watchdog` every minute. Only managed ephemeral instances and their OS
 disks are deleted. The head/shared data remain and keep accruing costs after GPU
 cutoff. This is NOT a provider hard spending cap; outages can delay teardown.
+DC_MAX_INSTANCE_HOURLY optionally caps each fresh instance quote before launch;
+OS/storage charges still count toward the separate overall spending guard.
 API schema: https://api.verda.com/v1/openapi.json (verified 2026-09-05).
 """
 from __future__ import annotations
@@ -558,7 +560,18 @@ class Controller:
             raise Error("--max-hours must be in (0,24]; --os-size must be positive")
         if not args.image.startswith("ubuntu-"):
             raise Error("Ephemeral launches require an Ubuntu image type, not an existing OS volume")
+        maximum_hourly = None
+        if "DC_MAX_INSTANCE_HOURLY" in os.environ:
+            try:
+                maximum_hourly = number(os.environ["DC_MAX_INSTANCE_HOURLY"], "DC_MAX_INSTANCE_HOURLY")
+            except Error as exc:
+                raise LaunchBlocked(str(exc)) from None
         rate, os_rate = self.quote(args.type, args.spot, args.os_size)
+        # Use this launch's fresh instance quote before touching reservations.
+        # OS and persistent storage remain included in the overall budget guard.
+        if maximum_hourly is not None and rate > maximum_hourly:
+            raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
+                                f"${maximum_hourly:g}/h; launch refused")
         keys = self.api.request("GET", "/sshkeys")
         token = uuid.uuid4().hex
         now = self.clock()

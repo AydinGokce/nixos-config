@@ -69,6 +69,31 @@ class QualityTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing C-alpha"):
                 q.prediction_ca(path, "ACDE")
 
+    def test_native_cif_without_occupancy_preserves_coordinates_and_source_bytes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source.pdb"
+            lines = []
+            for index, (residue, coords) in enumerate(zip(["ALA", "CYS", "ASP", "GLU"], self.reference), 1):
+                x, y, z = coords
+                lines.append(f"ATOM  {index:5d}  CA  {residue} A{index:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00 90.00           C  \n")
+            path.write_text("".join(lines) + "END\n")
+            cif = path.with_suffix(".cif")
+            writer = q.MMCIFIO()
+            writer.set_structure(q.structure(path))
+            writer.save(str(cif))
+            data = q.MMCIF2Dict(str(cif))
+            del data["_atom_site.occupancy"]
+            writer.set_dict(data)
+            writer.save(str(cif))
+            original = cif.read_bytes()
+            self.assertTrue(q.np.array_equal(q.prediction_ca(cif, "ACDE"), self.reference))
+            self.assertEqual(cif.read_bytes(), original)
+            data["_atom_site.label_alt_id"][0] = "A"
+            writer.set_dict(data)
+            writer.save(str(cif))
+            with self.assertRaisesRegex(ValueError, "alternate conformers"):
+                q.prediction_ca(cif, "ACDE")
+
 
 if __name__ == "__main__":
     unittest.main()

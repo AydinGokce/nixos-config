@@ -65,6 +65,8 @@ class FakeAPI:
         self.purge_lands = True
         self.inventory_error = False
         self.created = 0
+        self.ondemand_quote = "2"
+        self.spot_quote = "1"
 
     def inventory(self):
         if self.inventory_error:
@@ -74,7 +76,8 @@ class FakeAPI:
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
         if method == "GET" and path == "/instance-types":
-            return [{"instance_type": "GPU", "price_per_hour": "2", "spot_price": "1", "currency": "usd"}]
+            return [{"instance_type": "GPU", "price_per_hour": self.ondemand_quote,
+                     "spot_price": self.spot_quote, "currency": "usd"}]
         if method == "GET" and path == "/volume-types":
             return [{"type": "NVMe", "price": {"currency": "usd", "cps_per_gb": .01 / 3600 / 50}}]
         if method == "GET" and path == "/sshkeys":
@@ -84,7 +87,7 @@ class FakeAPI:
                 raise self.post_error
             ident = str(dc.uuid.UUID(int=dc.uuid.UUID(self.ID).int + self.created))
             self.created += 1
-            row = instance(ident, self.clock())
+            row = instance(ident, self.clock(), float(self.spot_quote if body["is_spot"] else self.ondemand_quote))
             row.update(description=body["description"], created_at=stamp(self.clock()), status=self.provisioning_status)
             self.instances.append(row)
             disk = volume("os-" + ident, self.clock())
@@ -252,6 +255,65 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(dc.Error, "BUDGET HALT"):
             self.c.launch(self.args())
         self.assertFalse(any(m == "POST" and p == "/instances" for m, p, _ in self.api.calls))
+
+    def test_malformed_hourly_ceiling_blocks_without_quote_post_or_reservation(self):
+        self.init()
+        before = self.store.path.read_bytes()
+        for value in ("", "not-a-rate", "nan", "NaN", "inf", "-inf", "1e309", "-0.01"):
+            with self.subTest(value=value), patch.dict(os.environ, DC_MAX_INSTANCE_HOURLY=value):
+                self.api.calls.clear()
+                with self.assertRaisesRegex(dc.LaunchBlocked, "DC_MAX_INSTANCE_HOURLY"):
+                    self.c.launch(self.args())
+                self.assertEqual(self.api.calls, [])
+                self.assertEqual(self.store.path.read_bytes(), before)
+                self.assertEqual(self.api.created, 0)
+
+    def test_hourly_ceiling_uses_fresh_spot_quote_before_any_post_or_reservation(self):
+        self.init()
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.c.quote("GPU", True, 50)[0], 1)
+        self.api.spot_quote = "13.0001"
+        args = self.args()
+        args.spot = True
+        self.api.calls.clear()
+        with patch.dict(os.environ, DC_MAX_INSTANCE_HOURLY="13"):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "13.0001/h exceeds.*13/h"):
+                self.c.launch(args)
+        self.assertEqual([method for method, _, _ in self.api.calls], ["GET", "GET"])
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual(self.api.created, 0)
+
+    def test_hourly_ceiling_allows_exact_boundary_and_uses_requested_contract(self):
+        self.init()
+        for spot, ceiling in ((False, "2"), (True, "1"), (True, "0")):
+            with self.subTest(spot=spot), patch.dict(os.environ, DC_MAX_INSTANCE_HOURLY=ceiling):
+                args = self.args()
+                args.spot = spot
+                if spot:
+                    self.api.spot_quote = ceiling
+                ident = self.c.launch(args)
+                job = next(j for j in self.state()["jobs"].values() if j.get("id") == ident)
+                self.assertEqual(job["rate"], float(ceiling))
+                self.assertGreater(job["os_rate"], 0)
+                self.c.remove(ident)
+
+    def test_hourly_ceiling_does_not_replace_overall_runtime_storage_budget(self):
+        self.init()
+        self.c.ceiling = 15
+        before = copy.deepcopy(self.state()["jobs"])
+        with patch.dict(os.environ, DC_MAX_INSTANCE_HOURLY="2"):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "BUDGET HALT"):
+                self.c.launch(self.args())
+        self.assertEqual(self.state()["jobs"], before)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_unset_hourly_ceiling_preserves_existing_launch_behavior(self):
+        self.init()
+        self.api.ondemand_quote = "13.01"
+        environment = {k: v for k, v in os.environ.items() if k != "DC_MAX_INSTANCE_HOURLY"}
+        with patch.dict(os.environ, environment, clear=True):
+            ident = self.c.launch(self.args())
+        self.assertEqual(next(j for j in self.state()["jobs"].values() if j.get("id") == ident)["rate"], 13.01)
 
     def test_locked_reservations_prevent_concurrent_overspend(self):
         self.init()

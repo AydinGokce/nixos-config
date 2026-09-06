@@ -11,6 +11,7 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).with_name("bio-submit.sh")
@@ -38,6 +39,16 @@ case "$1" in
     fi
     if [ "${REMOVE_DATABASE_RECEIPT_ON_CHECK:-0}" = "$count" ]; then
       rm -f -- "$DATABASE_RECEIPT_TO_REMOVE"
+    fi
+    if [ "$count" = 2 ] && [ -n "${MUTATE_PANEL_ON_CHECK:-}" ]; then
+      python3 - "$MUTATE_PANEL_ON_CHECK" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data['targets'][-1]['name'] = 'changed-after-queue'
+path.write_text(json.dumps(data))
+PY
     fi ;;
   track)
     if [[ "$*" != *--instance* ]] && [ "${EXPIRE_BEFORE_LAUNCH:-0}" = 1 ]; then
@@ -104,6 +115,9 @@ target.mkdir(exist_ok=True)
     'ready': os.environ.get('FETCH_BAD_PREPARED') != '1'}))
 (target / 'native-input.bin').write_bytes(b'opaque native model input')
 PY
+    fi
+    if [ -n "${FETCH_PANEL_DIR:-}" ]; then
+      cp -R "$FETCH_PANEL_DIR" "${!#}/panel"
     fi ;;
 esac
 ''',
@@ -213,6 +227,31 @@ except (OSError, ValueError, KeyError, AssertionError):
         (path / "complete.json").write_text(json.dumps(dict(model=model, ready=True)))
         (path / "native-input.bin").write_bytes(b"opaque native model input")
         return path
+
+    def panel_fixture(self):
+        # Use the actual portable bundle validator for panel fetches; the
+        # simpler single-preparation boundary stub remains unchanged elsewhere.
+        msa = SCRIPT.parent / "msa"
+        sys.path.insert(0, str(msa))
+        self.addCleanup(sys.path.remove, str(msa))
+        import panel
+        import databases
+        from test_panel import fixture_bundle, fixture_audit, target
+        manifest = self.root / "frozen panel.json"
+        databases.write_json(manifest, dict(version=1, targets=[target("one"), target("two")]))
+        config = self.root / "panel-server.json"
+        provenance = self.root / "panel-provenance.json"
+        databases.write_json(config, dict(server=dict(address="127.0.0.1:8080")))
+        databases.write_json(provenance, dict(namespace="fixture", database=dict(mode="full")))
+        output = self.root / "panel-fixture"
+        def prepare(item, directory, _tools, _config, provenance, _deadline):
+            digest = fixture_bundle(item, directory, provenance)
+            fixture_audit(directory)
+            return digest
+        with patch.object(panel, "prepare_target", side_effect=prepare):
+            self.assertEqual(panel.run(manifest, output, SCRIPT.parent, config, provenance, 10**12), 0)
+        shutil.copyfile(msa / "prepared.py", self.root / "tools/msa/prepared.py")
+        return manifest, output
 
     def test_success_fetches_before_reporting_completion(self):
         result = self.run_job()
@@ -525,7 +564,108 @@ sleep() { :; }
         self.assertIn("without full search indexes", help_result.stdout)
         submit_help = self.submit("msa", "--help")
         self.assertEqual(submit_help.returncode, 0, submit_help.stderr)
-        self.assertIn("install|convert|prepare|serve", submit_help.stdout)
+        self.assertIn("install|convert|panel|prepare|serve", submit_help.stdout)
+
+    def test_panel_validates_all_rows_before_any_worker_rental(self):
+        manifest = self.root / "bad-panel.json"
+        manifest.write_text(json.dumps(dict(version=1, targets=[dict(name="valid", model="protenix", sequence="ACDE"),
+                                                               dict(name="bad", model="boltz2", sequence="ACDX")])) )
+        for sub in ("panel", "install"):
+            with self.subTest(sub=sub):
+                result = self.submit("msa", "--sub", sub, "--json", manifest, **self.msa_settings())
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn("standard amino acids", result.stderr)
+                self.assertFalse((self.root / "launches").exists())
+                self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_panel_uses_one_readonly_worker_binds_input_and_verifies_retrieved_bundles(self):
+        manifest, fixture = self.panel_fixture()
+        result = self.submit("msa", "--sub", "panel", "--json", manifest, "--timeout", "14400",
+                             **self.msa_settings(FETCH_PANEL_DIR=str(fixture)))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn("DONE", result.stdout)
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"])
+        self.assertIn(",ro", self.execute_msa_mount_block("panel"))
+        remote = (self.root / "transmitted.sh").read_text()
+        digest = json.loads((fixture / "panel.json").read_text())["manifest_sha256"]
+        self.assertIn("export BIO_MSA_PANEL_SHA256="+digest, remote)
+        self.assertIn("BIO_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 10#14400 ))", remote)
+        self.assertLess(remote.index("BIO_JOB_DEADLINE_EPOCH"), remote.index("# END VERIFIED TOOL BUNDLE"))
+        self.assertIn('export PYTHONPYCACHEPREFIX="$BIO_TOOLS_DIR/cache/python"', remote)
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
+        copied = next((self.root / "results").glob("*/panel/panel.json"))
+        self.assertTrue(json.loads(copied.read_text())["complete"])
+
+    def test_panel_manifest_changed_while_queued_is_rejected_before_rental(self):
+        manifest, _ = self.panel_fixture()
+        result = self.submit("msa", "--sub", "panel", "--json", manifest,
+                             **self.msa_settings(MUTATE_PANEL_ON_CHECK=str(manifest)))
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn("changed after validation", result.stdout+result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+        self.assertFalse((self.root / "transmitted.sh").exists())
+
+    def test_combined_install_panel_allows_uninstalled_data_and_verifies_after_one_writable_worker(self):
+        manifest, fixture = self.panel_fixture()
+        (self.msa_root / ".msa-databases.json").unlink()
+        result = self.submit("msa", "--sub", "install", "--json", manifest, "--timeout", "21600",
+                             **self.msa_settings(FETCH_PANEL_DIR=str(fixture)))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn("DONE", result.stdout)
+        self.assertEqual((self.root / "launches").read_text().splitlines(), ["CPU.360V.1440G"])
+        self.assertNotIn(",ro", self.execute_msa_mount_block("install"))
+        remote = (self.root / "transmitted.sh").read_text()
+        self.assertIn("SUB=install", remote)
+        self.assertIn("BIO_JOB_DEADLINE_EPOCH=$(( $(date +%s) + 10#21600 ))", remote)
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
+
+    def test_panel_missing_database_receipt_never_rents(self):
+        manifest, _ = self.panel_fixture()
+        (self.msa_root / ".msa-databases.json").unlink()
+        result = self.submit("msa", "--sub", "panel", "--json", manifest, **self.msa_settings())
+        self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_panel_worker_failure_retains_partial_receipt_before_exact_cleanup(self):
+        manifest, fixture = self.panel_fixture()
+        receipt = json.loads((fixture / "panel.json").read_text())
+        receipt["complete"] = False
+        receipt["targets"][1]["status"] = "failed"
+        (fixture / "panel.json").write_text(json.dumps(receipt))
+        result = self.submit("msa", "--sub", "panel", "--json", manifest,
+                             **self.msa_settings(FETCH_PANEL_DIR=str(fixture), MODEL_EXIT="17"))
+        self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
+        self.assertNotIn("DONE", result.stdout)
+        copied = next((self.root / "results").glob("*/panel/panel.json"))
+        self.assertEqual(json.loads(copied.read_text()), receipt)
+        events = (self.root / "events").read_text().splitlines()
+        self.assertLess(events.index("fetch"), next(i for i, e in enumerate(events) if e.startswith("cleanup:rm ")))
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
+
+    def test_panel_fetch_corruption_prevents_completion_and_still_cleans_worker(self):
+        manifest, fixture = self.panel_fixture()
+        (fixture / "targets/protenix/two/api-audit/1/response.body").write_bytes(b"corruption")
+        for sub in ("panel", "install"):
+            with self.subTest(sub=sub):
+                result = self.submit("msa", "--sub", sub, "--json", manifest,
+                                     **self.msa_settings(FETCH_PANEL_DIR=str(fixture)))
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn("API body", result.stdout+result.stderr)
+                self.assertNotIn("DONE", result.stdout)
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 2)
+
+    def test_panel_cli_forwards_manifest_and_rejects_global_model_overrides(self):
+        manifest, _ = self.panel_fixture()
+        result = self.submit("msa", "--sub", "panel", "--json", manifest, "--model", "boltz2", **self.msa_settings())
+        self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+        forwarded = self.root / "bin/bio-submit"
+        forwarded.write_text('#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+        forwarded.chmod(0o700)
+        result = subprocess.run(["bash", str(SCRIPT.with_name("bio-msa.sh")), "panel", "--json", str(manifest),
+                                 "--spot"], env=self.env, text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["msa", "--sub", "panel", "--json", str(manifest), "--spot"])
 
     def test_nested_private_preparation_with_uninstalled_databases_rents_no_worker(self):
         (self.msa_root / ".msa-databases.json").unlink()
@@ -772,13 +912,69 @@ print(json.dumps({'stage': 'databases-converted', 'production_ready': False}))
         self.assertFalse((self.root / "calls.jsonl").exists())
 
     def test_full_install_prepare_and_serve_still_require_768_gib(self):
-        for sub in ("install", "prepare", "serve"):
+        for sub in ("install", "panel", "prepare", "serve"):
             with self.subTest(sub=sub):
                 result = self.recipe(sub, 767)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("full indexed CPU reference requires at least 768 GiB", result.stderr)
                 self.assertFalse((self.root / "events").exists())
                 self.assertFalse((self.root / "calls.jsonl").exists())
+
+    def test_panel_starts_one_server_routes_manifest_and_preserves_failure_during_cleanup(self):
+        tools = Path(self.env["TOOLS"])
+        with (tools / "msa/tools.sh").open("a") as output:
+            output.write('export MMSEQS_SERVER="$AUDIT/server"\n')
+        server = self.root / "server"
+        server.write_text(f'#!{sys.executable}\n' + '''import os
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+root = Path(os.environ['AUDIT'])
+(root/'server.pid').write_text(str(os.getpid()))
+with (root/'events').open('a') as f: f.write('server-start\\n')
+HTTPServer(('127.0.0.1',8080),BaseHTTPRequestHandler).serve_forever()
+''')
+        server.chmod(0o700)
+        (tools / "msa/server.py").write_text('''import json,os,sys
+from pathlib import Path
+assert sys.argv[1] == 'config', 'recipe must leave per-target auditing to panel.py'
+path = Path(sys.argv[sys.argv.index('--output')+1])
+path.write_text('{}')
+path.with_suffix('.provenance.json').write_text('{}')
+with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('config\\n')
+''')
+        (tools / "msa/panel.py").write_text('''import json,os,sys
+from pathlib import Path
+root = Path(os.environ['AUDIT'])
+(root/'panel-args.json').write_text(json.dumps(sys.argv[1:]))
+assert os.environ['MMSEQS_NUM_THREADS'] == '16'
+with (root/'events').open('a') as f: f.write('panel\\n')
+raise SystemExit(17)
+''')
+        (tools / "msa/databases.py").write_text('''import os,sys
+from pathlib import Path
+assert sys.argv[1] in ('install','validate')
+with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('database-'+sys.argv[1]+'\\n')
+''')
+        for sub in ("panel", "install"):
+            with self.subTest(sub=sub):
+                (self.root / "events").unlink(missing_ok=True)
+                result = self.recipe(sub, 800, SHARED=str(self.root / "shared"), IN="manifest.json",
+                                     BIO_MSA_PANEL_SHA256="expected-manifest-sha", BIO_JOB_DEADLINE_EPOCH="1234567890")
+                self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
+                expected = ["bootstrap"] + (["database-install", "database-validate"] if sub == "install" else [])
+                self.assertEqual((self.root / "events").read_text().splitlines(), expected+["config", "server-start", "panel"])
+                pid = int((self.root / "server.pid").read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+        args = json.loads((self.root / "panel-args.json").read_text())
+        self.assertEqual(args[0], "run")
+        self.assertEqual(args[args.index("--manifest")+1], "manifest.json")
+        self.assertEqual(args[args.index("--expected-sha256")+1], "expected-manifest-sha")
+        self.assertEqual(args[args.index("--deadline")+1], "1234567890")
+        (self.root / "events").unlink()
+        result = self.recipe("install", 800, BIO_MSA_PANEL_SHA256="")
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual((self.root / "events").read_text().splitlines(), ["bootstrap", "database-install", "database-validate"])
 
 
 if __name__ == "__main__":
