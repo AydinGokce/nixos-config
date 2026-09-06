@@ -24,3 +24,17 @@ JSON
 have_gpu
 # shellcheck disable=SC2086
 "$VENV/bin/run_openfold" predict --query_json="$J" --use_msa_server=True --output_dir="$OUT" "${EXTRA_ARGS[@]}"
+# The upstream runner catches per-query inference/output errors. Its process
+# can exit zero with failed queries, so check the summary and real structures.
+"$P" - "$OUT" <<'PY'
+from pathlib import Path
+import re
+import sys
+out = Path(sys.argv[1])
+summary = (out / "summary.txt").read_text()
+success = re.search(r"Successful Queries:\s*(\d+)", summary)
+failed = re.search(r"Failed Queries:\s*(\d+)", summary)
+if (not success or int(success[1]) < 1 or not failed or int(failed[1]) != 0
+        or not any(path.stat().st_size for path in out.rglob("*_model.cif"))):
+    sys.exit("openfold3: incomplete prediction; inspect summary.txt and inference errors")
+PY

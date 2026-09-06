@@ -59,6 +59,16 @@ Unknown launch outcomes and unconfirmed cleanup block additional launches until
 they are reconciled. Missing prices, unsupported currencies/contracts, corrupt
 state, or unavailable inventory also prevent new paid launches.
 
+For a registered RFAA database allocation, each new reservation records its
+attached volume IDs. While holding the accounting lock, `dc launch` checks that
+the allocation's private receipt is active and has not expired. The storage
+expiry service marks that receipt retiring before inspecting reservations under
+the same lock. This prevents a new worker from racing database teardown, including
+workers still provisioning. An expired or invalid receipt returns exit code 4.
+The separate [storage lifecycle helper](rfaa/STORAGE_PLAN.md) manages only the
+explicitly registered database volume; the GPU watchdog still protects shared
+volumes from ordinary worker cleanup.
+
 `dc launch --max-hours HOURS` accepts a duration greater than zero and no more
 than 24 hours; its default is 4 hours. The deadline starts immediately before the
 create request, including provisioning time. Provisioning has its own maximum
@@ -104,9 +114,24 @@ request fails, it still attempts cleanup of already known overdue workers.
 
 Deletion explicitly selects the worker's OS disk and preserves other attached
 volumes. The command checks that both the instance and its OS disk have left
-active inventory before reporting success. OS disks go into recoverable trash;
-they are not immediately erased. Deleting resources can take time, and failed
-confirmation retains the job for a later retry.
+active inventory before reporting success. It then permanently removes a new
+managed worker's disposable OS disk after proving ownership from all of:
+the recorded job's OS UUID, its 32-character job token, the exact volume name
+`bio-os-<token>`, its `NVMe`/OS/pay-as-you-go metadata, and no attachments or
+remaining instance references. An OS UUID associated with multiple jobs is
+ambiguous and is never permanently purged. The command confirms disappearance
+from active/recoverable storage, or an explicit permanently-deleted tombstone,
+before recording purge success. This deletion is irreversible; retrieve outputs
+before stopping the worker. Normal jobs keep results outside the disposable OS.
+
+Disks without that ownership proof retain the older soft-delete behavior.
+Their recoverable trash lasts 96 hours and still consumes storage quota.
+`dc gc` permanently purges only matching trashed OS disks of already closed new
+managed jobs, allowing safe recovery from that accumulated quota. It preserves
+legacy, shared, unmanaged, restored, attached, and ambiguously identified
+volumes. It does not purge by name alone or clear all provider trash. Failed
+confirmation leaves cleanup retryable; normal job cleanup remains unresolved
+until its proven disposable OS purge is confirmed.
 
 The watchdog and `dc rm all` operate on **recorded managed workers only**. The
 existing CPU head and persistent shared/database volumes are not automatic
@@ -118,6 +143,7 @@ Inspect status and logs:
 ```bash
 dc spend
 dc ls
+dc gc
 systemctl status dc-budget-watchdog.timer dc-budget-watchdog.service
 journalctl -u dc-budget-watchdog.service -n 50 --no-pager
 jq -r '.jobs[] | select(.status != "closed") | [.id // "unknown", .status, .deadline] | @tsv' /var/lib/dc/budget.json
@@ -132,7 +158,10 @@ runs an immediate reconciliation and applies the same deletion rules.
 Budget and unresolved-operation stops return exit code **4**. `bio-submit`
 recognizes that code and stops trying alternative GPU types. A capacity
 rejection can still try the next compatible type without retaining a paid
-reservation for the rejected launch.
+reservation for the rejected launch. The provider's HTTP 400 `Storage limit
+exceeded` also returns exit code 4 after releasing the rejected reservation:
+changing GPU types cannot resolve an account storage quota. Run `dc gc` for
+proven disposable disks, then review quota if unmatched storage still fills it.
 
 ## State, configuration, and limitations
 

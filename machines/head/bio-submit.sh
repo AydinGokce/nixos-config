@@ -27,7 +27,7 @@ case "$tool" in
   rfaa) recipe=rfaa; inkind=fasta; tier=ampere ;;
   evolvepro) recipe=evolvepro; inkind=fasta; tier=modern ;;
   boltz2|boltz) recipe=boltz2; inkind=fasta; tier=latest ;;
-  protenix) recipe=protenix; inkind=fasta; tier=latest ;;
+  protenix) recipe=protenix; inkind=fasta; tier=cuda128 ;;
   openfold3|of3) recipe=openfold3; inkind=fasta; tier=latest ;;
   af3|alphafold3) recipe=af3; inkind=json; tier=latest ;;
   -h|--help) usage; exit 0 ;;
@@ -59,6 +59,12 @@ done
 [ -z "$labels" ] || [ -f "$labels" ] || { echo "bio-submit: labels not found: $labels" >&2; exit 2; }
 [ -n "$infile" ] || [ "$inkind" = optpdb ] || { echo 'bio-submit: input required' >&2; exit 2; }
 [ "$recipe" != rfdiffusion ] || [ -n "$contigs" ] || { echo 'bio-submit: --contigs required' >&2; exit 2; }
+if [ "$recipe" = protenix ] && [ -n "$gpu" ]; then
+  case "$gpu" in
+    1A100.22V|1A100.40S.22V|1L40S.20V|1H100.80S.32V) ;;
+    *) echo 'bio-submit: Protenix requires an A100, L40S or H100 worker with CUDA 12.8; its pinned kernels do not support Blackwell' >&2; exit 2 ;;
+  esac
+fi
 db_nfs=""; volumes=(--volume "$SHARED_VOL")
 if [ "$recipe" = rfaa ]; then
   for setting in RFAA_CPU RFAA_MEM_GB; do
@@ -68,8 +74,12 @@ if [ "$recipe" = rfaa ]; then
   python3 "$TOOLS_SRC/rfaa/prepare.py" --fasta "$infile" --validate-only
   case "${sub:-full}" in
     full)
+      # The default 64 GiB HHsuite limit needs the A100 nodes' 120 GB host RAM.
+      # A6000 workers have only 60 GB; keep those for single-sequence jobs.
+      tier=ampere_full
       [ -n "${RFAA_DB_VOLUME:-}" ] && [ -n "${RFAA_DB_NFS:-}" ] \
         || { echo 'bio-submit: full RFAA needs the database volume configured in rfaa-storage.nix' >&2; exit 2; }
+      bio-rfaa-storage check --volume "$RFAA_DB_VOLUME"
       db_nfs="$RFAA_DB_NFS"; volumes+=(--volume "$RFAA_DB_VOLUME") ;;
     single-seq) ;;
     *) echo 'bio-submit: RFAA --sub must be full or single-seq' >&2; exit 2 ;;
@@ -89,6 +99,8 @@ fi
 mkdir -p "$STATE_DIR" "$RESULTS_DIR"
 exec 9>"$STATE_DIR/bio-submit.lock"
 flock 9
+# Queued submissions may have passed the first check before storage expired.
+if [ -n "$db_nfs" ]; then bio-rfaa-storage check --volume "$RFAA_DB_VOLUME"; fi
 jobid="$recipe-$(date -u +%Y%m%d-%H%M%S)-$$"
 LOCALOUT="$RESULTS_DIR/$jobid"; mkdir -p "$LOCALOUT"
 exec > >(tee -a "$LOCALOUT/run.log") 2>&1
@@ -97,8 +109,11 @@ RIN=""; RLABELS=""
 if [ -n "$infile" ]; then cp "$infile" "$run/in/input.${infile##*.}"; RIN="$run/in/input.${infile##*.}"; fi
 if [ -n "$labels" ]; then cp "$labels" "$run/in/labels.csv"; RLABELS="$run/in/labels.csv"; fi
 ROUT="$run/out"
-mkdir -p "$SHARED_MNT/tools"
-rsync -aL --delete "$TOOLS_SRC/" "$SHARED_MNT/tools/"
+# NFS clients have returned stale recipe contents after deployment. Snapshot
+# authoritative code on the head and transmit it with the script over SSH.
+bundle="$LOCALOUT/tools.tar.gz"
+tar -czhf "$bundle" -C "$TOOLS_SRC" recipes py requirements rfaa
+bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 # printf %q preserves argument boundaries and prevents input text becoming code.
 remote_file="$LOCALOUT/remote.sh"
 {
@@ -112,6 +127,24 @@ remote_file="$LOCALOUT/remote.sh"
   printf 'RFAA_DB_NFS=%q\n' "$db_nfs"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
   printf 'export RFAA_CPU=%q RFAA_MEM_GB=%q\n' "${RFAA_CPU:-4}" "${RFAA_MEM_GB:-64}"
+  # Protenix's ColabFold mode does not select the ColabFold host automatically.
+  # Forward the configured endpoint to the new VM; its environment is separate.
+  printf 'export MMSEQS_SERVICE_HOST_URL=%q\n' "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}"
+  cat <<'BUNDLE'
+export BIO_TOOLS_DIR
+BIO_TOOLS_DIR=$(mktemp -d /tmp/bio-tools.XXXXXXXX)
+trap 'rm -rf -- "$BIO_TOOLS_DIR"' EXIT
+base64 --decode > "$BIO_TOOLS_DIR/bundle.tar.gz" <<'BIO_TOOLS_ARCHIVE'
+BUNDLE
+  base64 "$bundle"
+  printf 'BIO_TOOLS_ARCHIVE\n'
+  printf 'printf "%%s  %%s\\n" %q "$BIO_TOOLS_DIR/bundle.tar.gz" | sha256sum --check --status\n' "$bundle_sha256"
+  cat <<'BUNDLE'
+tar -xzf "$BIO_TOOLS_DIR/bundle.tar.gz" -C "$BIO_TOOLS_DIR" --no-same-owner
+rm "$BIO_TOOLS_DIR/bundle.tar.gz"
+BUNDLE
+  printf 'printf "bio-submit: code bundle verified %%s\\n" %q\n' "$bundle_sha256"
+  printf '# END VERIFIED TOOL BUNDLE\n'
   cat <<'REMOTE'
 export HOME=/root PATH=/root/.local/bin:$PATH
 need=()
@@ -155,18 +188,24 @@ if [ -n "$RFAA_DB_NFS" ]; then
 fi
 command -v uv >/dev/null 2>&1 || curl --fail -LsS https://astral.sh/uv/install.sh | sh
 mkdir -p "$OUT"
-source /mnt/bio-shared/tools/recipes/_common.sh
+source "$BIO_TOOLS_DIR/recipes/_common.sh"
 REMOTE
-  printf 'source %q\n' "/mnt/bio-shared/tools/recipes/$recipe.sh"
+  printf 'source "$BIO_TOOLS_DIR/recipes/%s.sh"\n' "$recipe"
   printf 'sync\n'
 } > "$remote_file"
 id=""; ip=""
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  # A service stop can kill tee before this trap runs. Write cleanup directly
+  # to the retained log so a broken output pipe cannot prevent worker removal.
+  exec >> "$LOCALOUT/run.log" 2>&1
   if [ -n "$id" ]; then
     echo "bio-submit: removing $id"
-    dc rm "$id" || { echo "bio-submit: ERROR deleting $id; inspect dc ls" >&2; status=1; }
+    dc rm "$id" || {
+      echo "bio-submit: ERROR deleting $id; inspect dc ls" >&2
+      [ "$status" -ne 0 ] || status=1
+    }
   fi
   exit "$status"
 }
@@ -174,11 +213,16 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+if [ -n "$db_nfs" ]; then
+  bio-rfaa-storage track --volume "$RFAA_DB_VOLUME" --job-dir "$LOCALOUT" --pid "$$"
+fi
 # Older CUDA wheels do not support Blackwell. CUDA 11 RF stacks use Ampere.
 if [ -n "$gpu" ]; then candidates=("$gpu")
 else
   case "$tier" in
+    ampere_full) candidates=(1A100.22V 1A100.40S.22V) ;;
     ampere) candidates=(1A100.22V 1A6000.10V 1A100.40S.22V) ;;
+    cuda128) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V) ;;
     modern) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V 1A6000.10V) ;;
     latest) candidates=(1A100.22V 1L40S.20V 1RTXPRO6000.30V 1H100.80S.32V) ;;
   esac
@@ -199,6 +243,9 @@ for g in "${candidates[@]}"; do
   fi
 done
 [ -n "$id" ] || { echo 'bio-submit: no compatible GPU capacity' >&2; exit 5; }
+if [ -n "$db_nfs" ]; then
+  bio-rfaa-storage track --volume "$RFAA_DB_VOLUME" --job-dir "$LOCALOUT" --pid "$$" --instance "$id"
+fi
 SSHO=(-i /root/.ssh/datacrunch_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
 ready=0
 for _ in $(seq 1 30); do
@@ -206,10 +253,10 @@ for _ in $(seq 1 30); do
   sleep 8
 done
 [ "$ready" = 1 ] || { echo 'bio-submit: sshd never became ready' >&2; exit 1; }
-python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" <<'PY'
+python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" "${db_nfs:+$RFAA_DB_VOLUME}" "$bundle_sha256" <<'PY'
 import json,sys,datetime
-p,job,model,instance,ip,gpu,timeout=sys.argv[1:]
-with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
+p,job,model,instance,ip,gpu,timeout,db_volume,bundle_sha256=sys.argv[1:]
+with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
 PY
 echo "bio-submit: running $recipe on $id ($ip), timeout ${seconds}s"
 status=0

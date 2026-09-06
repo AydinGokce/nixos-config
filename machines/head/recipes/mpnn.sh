@@ -1,7 +1,7 @@
 # ProteinMPNN — fixed-backbone sequence design. Weights ship in the repo.
 VENV="$SHARED/envs/proteinmpnn"; SRC="$SHARED/src/proteinmpnn"
 sys_venv "$VENV"
-uv pip install --python "$VENV/bin/python" -r "$SHARED/tools/requirements/proteinmpnn.txt"
+uv pip install --python "$VENV/bin/python" -r "$TOOLS/requirements/proteinmpnn.txt"
 [ -d "$SRC/.git" ] || git clone https://github.com/dauparas/ProteinMPNN "$SRC"
 git -C "$SRC" checkout -q 8907e6671bfbfc92303b5f79c4b5e6ce47cdef57
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"

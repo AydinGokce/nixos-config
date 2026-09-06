@@ -6,7 +6,7 @@ input_args=(-i "$IN")
 if [ "$sub" = mutate ]; then
   # The native mutate command accepts a WT sequence, not an input FASTA. Read
   # exactly one record before loading model weights and preserve its sequence.
-  seq=$("$VENV/bin/python" - "$SHARED/tools/py" "$IN" <<'PY'
+  seq=$("$VENV/bin/python" - "$TOOLS/py" "$IN" <<'PY'
 import argparse
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -19,10 +19,10 @@ PY
   )
   input_args=(-s "$seq")
 fi
-uv pip install --python "$VENV/bin/python" -r "$SHARED/tools/requirements/esm2.txt"
+uv pip install --python "$VENV/bin/python" -r "$TOOLS/requirements/esm2.txt"
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
 have_gpu
 # shellcheck disable=SC2086
 args=(); [ -z "${MODEL:-}" ] || args+=(--model "$MODEL")
-"$VENV/bin/python" "$SHARED/tools/py/esm_cli.py" "$sub" "${input_args[@]}" \
+"$VENV/bin/python" "$TOOLS/py/esm_cli.py" "$sub" "${input_args[@]}" \
   -o "$OUT/result" "${args[@]}" "${EXTRA_ARGS[@]}" --device cuda

@@ -1,14 +1,20 @@
 # Protenix (ByteDance AF3 reproduction; Apache-2.0, commercial OK). Weights
 # auto-download. Uses the remote ColabFold MSA server. IN = query FASTA.
-# Uses torch 2.7.1+cu128 and the default cuEquivariance kernels. The CUDA image
-# also provides nvcc for optional JIT kernels. Weights download can be slow.
+# Uses torch 2.7.1+cu128 and the default cuEquivariance kernels. Importing its
+# fused LayerNorm also requires nvcc and Ninja. Weights download can be slow.
 VENV="$SHARED/envs/protenix"
 # protenix 2.0.0 reads PROTENIX_ROOT_DIR (NOT ..._DATA_...) and keeps checkpoints
 # in $PROTENIX_ROOT_DIR/checkpoint; unset it and weights re-download from the slow
 # Beijing host onto the ephemeral node's disk on EVERY run.
 export PROTENIX_ROOT_DIR="$SHARED/protenix/release_data"
+# Selecting ColabFold mode alone still defaults upstream to the Protenix API.
+# Set the matching endpoint before importing the module that reads this env var.
+export MMSEQS_SERVICE_HOST_URL="${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}"
 mkdir -p "$PROTENIX_ROOT_DIR" "$TORCH_HOME" "$HF_HOME"
 sys_venv "$VENV"; P="$VENV/bin/python"
+# PyTorch invokes Ninja by name when Protenix JIT-compiles its fused LayerNorm.
+# Calling the venv's Python directly does not otherwise expose venv executables.
+export PATH="$VENV/bin:/usr/local/cuda/bin:$PATH"
 "$P" -c 'import torch; assert torch.__version__ == "2.7.1+cu128"' >/dev/null 2>&1 || uv pip install --python "$P" torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
 # scikit-learn-extra 0.3.0 (hard-pinned by protenix, no cp312 wheel) must build
 # from source, and its isolated build would grab numpy 1.26 → the extension then
@@ -30,6 +36,43 @@ uv pip install --python "$P" protenix==2.0.0
 # fail fast here rather than mid-predict if the numpy ABI still mismatches
 "$P" -c 'import sklearn_extra.cluster'
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
+"$P" - <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import torch
+from torch.utils.cpp_extension import CUDA_HOME, verify_ninja_availability
+
+verify_ninja_availability()
+assert CUDA_HOME, "protenix: CUDA toolkit/nvcc was not found"
+nvcc = Path(CUDA_HOME) / "bin/nvcc"
+assert nvcc.is_file(), f"protenix: missing {nvcc}"
+version = subprocess.check_output([str(nvcc), "--version"], text=True)
+release = re.search(r"release ([0-9]+\.[0-9]+)", version)
+assert release and release.group(1) == torch.version.cuda, (
+    f"protenix: nvcc must match torch CUDA {torch.version.cuda}: {version}"
+)
+assert torch.cuda.is_available(), "protenix: a CUDA GPU is required"
+major, minor = torch.cuda.get_device_capability()
+assert (major, minor) in {(8, 0), (8, 9), (9, 0)}, (
+    "protenix: pinned Torch/Triton/cuEquivariance stack requires A100, L40S or H100; "
+    f"GPU architecture {major}.{minor} is unsupported"
+)
+arches = subprocess.check_output([str(nvcc), "--list-gpu-arch"], text=True)
+assert f"compute_{major}{minor}" in arches.split(), (
+    f"protenix: nvcc does not support GPU architecture {major}.{minor}"
+)
+print("Protenix CUDA toolchain:", nvcc, "GPU:", torch.cuda.get_device_name(0), flush=True)
+# Compile/import now and execute the real kernel, so missing runtime support
+# fails before downloading checkpoints or submitting an MSA request.
+from protenix.model.layer_norm import FusedLayerNorm
+layer = FusedLayerNorm(32).cuda()
+x = torch.randn(2, 32, device="cuda")
+with torch.no_grad():
+    torch.testing.assert_close(layer(x), torch.nn.functional.layer_norm(x, (32,)),
+                               rtol=1e-4, atol=1e-4)
+print("Protenix fused CUDA LayerNorm check passed", flush=True)
+PY
 SEQ=$(grep -v '^>' "$IN" | tr -d '\n\r \t'); JOB="${NAME:-protenix_job}"
 J="$OUT/input.json"
 cat > "$J" <<JSON
@@ -37,7 +80,8 @@ cat > "$J" <<JSON
 JSON
 have_gpu
 # shellcheck disable=SC2086
-"$VENV/bin/protenix" predict --input "$J" --out_dir "$OUT" --seeds 101 \
+# The function is named predict upstream, but 2.0.0 registers it as `pred`.
+"$VENV/bin/protenix" pred --input "$J" --out_dir "$OUT" --seeds 101 \
   --model_name "${MODEL:-protenix_base_default_v1.0.0}" \
   --use_msa true --msa_server_mode colabfold --use_template false "${EXTRA_ARGS[@]}"
 # Protenix 2.0.0 catches per-input MSA/inference exceptions and can exit zero

@@ -8,6 +8,7 @@
 # and must build/reuse its env + weights on the shared FS, then write to $OUT.
 set -euo pipefail
 SHARED=/mnt/bio-shared
+TOOLS=${BIO_TOOLS_DIR:-$SHARED/tools}
 export HOME=/root
 export PATH=/root/.local/bin:$PATH
 export HF_HOME="$SHARED/cache/hf" TORCH_HOME="$SHARED/cache/torch" UV_CACHE_DIR="$SHARED/cache/uv"

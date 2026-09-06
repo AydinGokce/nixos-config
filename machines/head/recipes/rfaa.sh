@@ -2,7 +2,20 @@
 # SUB=single-seq explicitly for a database-free smoke test. IN = one-chain FASTA.
 MODE="${SUB:-full}"
 case "$MODE" in full|single-seq) ;; *) echo 'rfaa: --sub must be full or single-seq' >&2; exit 2 ;; esac
-RFAA_SCRIPTS="$SHARED/tools/rfaa"
+if [ "$MODE" = full ]; then
+  RFAA_MEM_GB="${RFAA_MEM_GB:-64}"
+  [[ "$RFAA_MEM_GB" =~ ^[1-9][0-9]*$ ]] \
+    || { echo 'rfaa: RFAA_MEM_GB must be a positive integer' >&2; exit 2; }
+  available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  [[ "$available_kib" =~ ^[0-9]+$ ]] \
+    || { echo 'rfaa: cannot determine available host memory' >&2; exit 2; }
+  required_kib=$(( (RFAA_MEM_GB + 8) * 1024 * 1024 ))
+  if (( available_kib < required_kib )); then
+    echo "rfaa: full mode needs $((RFAA_MEM_GB + 8)) GiB available host RAM ($RFAA_MEM_GB GiB search limit + 8 GiB headroom); only $((available_kib / 1024 / 1024)) GiB is available. Choose a larger worker or lower RFAA_MEM_GB explicitly." >&2
+    exit 2
+  fi
+fi
+RFAA_SCRIPTS="$TOOLS/rfaa"
 export RFAA_DB_DIR="${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
 python3 "$RFAA_SCRIPTS/prepare.py" --fasta "$IN" --validate-only
 if [ "$MODE" = full ]; then
@@ -15,7 +28,7 @@ P="$VENV/bin/python"
 [ -d "$SRC/.git" ] || git clone https://github.com/baker-laboratory/RoseTTAFold-All-Atom "$SRC"
 git -C "$SRC" checkout -q d69ab3a73f8ede31a4cc005fbc076a341d848469
 git -C "$SRC" submodule update --init --recursive -q
-uv pip install --python "$P" -r "$SHARED/tools/requirements/rfaa.txt"
+uv pip install --python "$P" -r "$TOOLS/requirements/rfaa.txt"
 # PyTorch's cu118 wheel does not provide DGL's unversioned cu11 library names.
 # The Ubuntu image has CUDA 12, so these libraries must travel with the venv.
 uv pip install --python "$P" nvidia-cuda-runtime-cu11==11.8.89 \
@@ -31,7 +44,7 @@ uv pip install --python "$P" "git+https://github.com/NVIDIA/dllogger.git@0540a43
 uv pip install --python "$P" --no-deps "$SRC/rf2aa/SE3Transformer"
 # Empty results from a completed HHsearch are valid; support that case as well
 # as the explicitly selected single-seq mode. Never alter a real template DB.
-"$P" "$SHARED/tools/py/rfaa_singleseq_patch.py" "$SRC/rf2aa/data/protein.py"
+"$P" "$TOOLS/py/rfaa_singleseq_patch.py" "$SRC/rf2aa/data/protein.py"
 "$P" "$RFAA_SCRIPTS/patch_templates.py" "$SRC/rf2aa/data/parsers.py"
 WEIGHTS="$SRC/RFAA_paper_weights.pt"
 if [ "$(stat -c %s "$WEIGHTS" 2>/dev/null || echo 0)" != 1336673865 ]; then
@@ -54,7 +67,7 @@ fi
 export LD_LIBRARY_PATH="$(venv_ld "$VENV")${LD_LIBRARY_PATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 WANDB_MODE=disabled
 sp=$(echo "$VENV"/lib/python*/site-packages)
-"$P" "$SHARED/tools/py/clear_execstack.py" "$sp"/torch/lib/*.so* "$sp"/dgl/*.so*
+"$P" "$TOOLS/py/clear_execstack.py" "$sp"/torch/lib/*.so* "$sp"/dgl/*.so*
 "$P" - <<'PY'
 import torch, dgl
 assert torch.cuda.is_available(), "RFAA needs a CUDA GPU"

@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,52 @@ def reserve(state, token, rate, os_rate, hours, now, ceiling, margin, persistent
                             "rate": rate, "os_rate": os_rate, "os_id": None, "status": "pending"}
 
 
+def purgeable_os(state, token, job, disk, inventory):
+    """Prove a detached trash item is this new managed job's disposable OS."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or not job.get("id") or job.get("legacy"):
+        return False
+    ident = job.get("os_id")
+    if not ident or disk.get("id") != ident or disk.get("name") != "bio-os-" + token:
+        return False
+    if (disk.get("is_os_volume") is not True or disk.get("type") != "NVMe"
+            or disk.get("contract") != "PAY_AS_YOU_GO" or disk.get("status") != "deleted"
+            or disk.get("is_permanently_deleted") is True
+            or not disk.get("deleted_at") or disk.get("instance_id")
+            or disk.get("instances") != []):
+        return False
+    if any(other != token and row.get("os_id") == ident for other, row in state["jobs"].items()):
+        return False
+    instances, volumes, _ = inventory
+    return not (any(row.get("id") == job["id"] or row.get("os_volume_id") == ident
+                    for row in instances) or any(row.get("id") == ident for row in volumes))
+
+
+def check_storage_lifetime(root, volumes, now):
+    """Gate new reservations after database expiry, while holding budget.lock.
+
+    Expiry marks its receipt retiring before taking this same accounting lock.
+    It therefore sees every older reservation, and later ones cannot launch.
+    """
+    path = Path(os.environ.get("RFAA_STORAGE_RECEIPT", str(Path(root) / "rfaa-storage.json")))
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    try:
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            raise ValueError("receipt must be private and owned by the controller user")
+        receipt = json.loads(path.read_text())
+        volume = receipt["volume_id"]
+        if not isinstance(volume, str) or not volume:
+            raise ValueError("invalid volume identity")
+        expired = volume in volumes and (receipt["status"] != "active" or epoch(receipt["expires_at"]) <= now)
+    except (OSError, ValueError, KeyError, TypeError, Error) as exc:
+        raise LaunchBlocked(f"Invalid RFAA storage receipt: {exc}") from None
+    if expired:
+        raise LaunchBlocked("RFAA database storage is expired or retiring; launch refused")
+
+
 class Controller:
     def __init__(self, api, store, clock=time.time, sleep=time.sleep):
         self.api, self.store, self.clock, self.sleep = api, store, clock, sleep
@@ -386,8 +433,10 @@ class Controller:
         with self.store.locked(now) as state:
             self.refresh(state)
             now = self.clock()
+            check_storage_lifetime(self.store.root, args.volume, now)
             reserve(state, token, rate, os_rate, args.max_hours, now,
                     self.ceiling, self.margin, self.persistent_hours)
+            state["jobs"][token]["volumes"] = list(args.volume)
         body = {"instance_type": args.type, "image": args.image,
                 "hostname": args.name or "bio-" + token[:12],
                 "description": f"bio-dc:{token} ephemeral deadline={int(now + args.max_hours * 3600)}",
@@ -408,6 +457,9 @@ class Controller:
                     rejected = isinstance(exc, APIError) and exc.status in {400, 401, 402, 403, 404, 409, 422, 429, 503}
                     state["jobs"][token]["status"] = "closed" if rejected else "uncertain"
                 if rejected:
+                    if exc.status == 400 and "storage limit exceeded" in str(exc).lower():
+                        raise LaunchBlocked(f"Storage quota blocked launch: {exc}; run dc gc for owned disposable OS disks "
+                                            "or review the provider quota before retrying") from None
                     raise Error(f"Launch rejected: {exc}") from None
                 reason = str(exc) if isinstance(exc, APIError) else "invalid create response"
                 raise LaunchBlocked(f"Launch outcome unknown ({reason}); reservation retained for watchdog reconciliation") from None
@@ -439,10 +491,12 @@ class Controller:
 
     def remove(self, ident):
         with self.store.locked(self.clock()) as state:
-            jobs = [job for job in state["jobs"].values() if job.get("id") == ident]
+            jobs = [(token, job) for token, job in state["jobs"].items() if job.get("id") == ident]
             if not jobs:
                 raise Error(f"Refusing to remove unmanaged instance {ident}")
-            job = jobs[0]
+            if len(jobs) != 1:
+                raise Error(f"Ambiguous managed instance {ident}; cleanup needs review")
+            token, job = jobs[0]
             job["status"] = "cleanup"
             try:
                 row = self.api.request("GET", "/instances/" + ident)
@@ -477,15 +531,74 @@ class Controller:
                     continue
                 self.api.request("DELETE", "/volumes/" + os_id, {"is_permanent": False})
             if not present and not disk:
+                purged = self.purge_os(token)
                 with self.store.locked(self.clock()) as state:
-                    reconcile(state, inventory, self.clock())
+                    self.refresh(state)
                     for job in state["jobs"].values():
                         if job.get("id") == ident:
                             job["status"] = "closed"
-                print(f"removed {ident} (confirmed; shared volumes retained)", flush=True)
+                detail = "; managed OS permanently removed" if purged else ""
+                print(f"removed {ident} (confirmed{detail}; shared volumes retained)", flush=True)
                 return
             self.sleep(5)
         raise Error(f"Deletion of {ident} unconfirmed; cost remains active and watchdog will retry")
+
+    def purge_os(self, token, *, closed_only=False):
+        with self.store.locked(self.clock()) as state:
+            inventory = self.refresh(state)
+            job = state["jobs"].get(token)
+            if not job or job["status"] not in ({"closed"} if closed_only else {"closed", "cleanup"}):
+                return False
+            ident = job.get("os_id")
+            matches = [row for row in inventory[2] if row.get("id") == ident]
+            if len(matches) != 1 or not purgeable_os(state, token, job, matches[0], inventory):
+                return False
+            # Save reconciled costs before the only irreversible request. The
+            # UUID/name/token/OS/type/attachment checks above exclude legacy,
+            # shared, live, restored and ambiguous volumes from this operation.
+            self.store.save(state)
+        try:
+            self.api.request("DELETE", "/volumes/" + ident, {"is_permanent": True})
+        except APIError as exc:
+            # The watchdog and submitter can race after both prove ownership.
+            # This response is only a reason to reconcile; success still needs
+            # the fresh active/trash inventory confirmation below.
+            already_deleted = exc.status == 400 and "already permanently deleted" in str(exc).lower()
+            if exc.status != 404 and not already_deleted:
+                raise
+        for _ in range(18):
+            inventory = self.api.inventory()
+            active = any(row.get("id") == ident for row in inventory[1])
+            recoverable = any(row.get("id") == ident and not (
+                row.get("status") == "deleted" and row.get("is_permanently_deleted") is True)
+                for row in inventory[2])
+            if not active and not recoverable:
+                with self.store.locked(self.clock()) as state:
+                    reconcile(state, inventory, self.clock())
+                    job = state["jobs"][token]
+                    if job.get("os_id") != ident:
+                        raise Error("Managed OS identity changed during purge; cleanup needs review")
+                    job["os_purged_at"] = self.clock()
+                print(f"purged managed OS {ident} (permanent removal confirmed)", flush=True)
+                return True
+            self.sleep(5)
+        raise Error(f"Permanent removal of managed OS {ident} unconfirmed; retry dc gc or cleanup")
+
+    def gc(self):
+        with self.store.locked(self.clock()) as state:
+            inventory = self.refresh(state)
+            tokens = [token for token, job in state["jobs"].items() if job["status"] == "closed"
+                      and any(purgeable_os(state, token, job, disk, inventory) for disk in inventory[2])]
+        count, failures = 0, []
+        for token in tokens:
+            try:
+                count += bool(self.purge_os(token, closed_only=True))
+            except Error as exc:
+                failures.append(str(exc))
+        print(f"purged {count} managed ephemeral OS volume(s); other storage retained", flush=True)
+        if failures:
+            raise Error("; ".join(failures))
+        return count
 
     def watchdog(self):
         targets = []
@@ -546,6 +659,7 @@ def parser():
     launch.add_argument("--os-size", type=int, default=50)
     sub.add_parser("spend")
     sub.add_parser("watchdog", help="enforce deadlines/budget; run every minute via systemd")
+    sub.add_parser("gc", help="permanently purge proven disposable OS disks of closed managed jobs")
     sub.add_parser("ls")
     types = sub.add_parser("types")
     types.add_argument("--gpu", action="store_true")
@@ -568,6 +682,8 @@ def main(argv=None):
         controller.launch(args)
     elif args.command == "watchdog":
         controller.watchdog()
+    elif args.command == "gc":
+        controller.gc()
     elif args.command == "spend":
         with controller.store.locked(controller.clock()) as state:
             controller.refresh(state)

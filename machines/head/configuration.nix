@@ -45,17 +45,29 @@ in
       ${builtins.readFile ./dc.sh}
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
-      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-submit.sh}
     '')
     (pkgs.writeShellScriptBin "bio-rfaa-databases" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 curl gnutar gzip coreutils util-linux ])}''${PATH:+:$PATH}
       exec python3 /etc/bio-tools/rfaa/databases.py "$@"
     '')
+    (pkgs.writeShellScriptBin "bio-rfaa-storage" ''
+      set -euo pipefail
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd util-linux coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      # Local receipt checks need no credentials; lifecycle operations use the
+      # same private credential file as dc and never print its contents.
+      case "''${1:-}" in
+        register|expire)
+          source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+          export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET ;;
+      esac
+      exec python3 /etc/bio-tools/rfaa/storage.py "$@"
+    '')
   ];
 
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
-  # to the head; bio-submit rsyncs these onto the shared FS for the GPU nodes.
+  # to the head; bio-submit sends a verified snapshot to each GPU over SSH.
   environment.etc = {
     "bio-tools/dc-budget.py".source = ./dc-budget.py;
     "bio-tools/py".source = ../../modules/bio/py;                # esm_cli, rfaa patch, etc.
@@ -87,6 +99,27 @@ in
       OnBootSec = "30s";
       OnUnitActiveSec = "60s";
       AccuracySec = "5s";
+    };
+  };
+
+  # No receipt means no work. Once an allocation is registered, the persistent
+  # timer catches overdue storage after a reboot and retries incomplete cleanup.
+  systemd.services.rfaa-storage-expiry = {
+    description = "Expire the registered RFAA database volume";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/bio-rfaa-storage expire";
+      TimeoutStartSec = 240;
+    };
+  };
+  systemd.timers.rfaa-storage-expiry = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "*-*-* *:*:00";
+      Persistent = true;
+      AccuracySec = "1s";
     };
   };
 

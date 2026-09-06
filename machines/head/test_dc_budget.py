@@ -33,7 +33,7 @@ def instance(ident, now, rate=2, **extra):
 def volume(ident, now, rate=.01, **extra):
     return dict(id=ident, created_at=stamp(now - 3600), base_hourly_cost=rate,
                 status="attached", currency="usd", is_os_volume=True,
-                instance_id=None, **extra)
+                instance_id=None, instances=[], type="NVMe", contract="PAY_AS_YOU_GO", **extra)
 
 
 class Clock:
@@ -62,7 +62,9 @@ class FakeAPI:
         self.provisioning_status = "running"
         self.delete_lands = True
         self.keep_os = False
+        self.purge_lands = True
         self.inventory_error = False
+        self.created = 0
 
     def inventory(self):
         if self.inventory_error:
@@ -80,15 +82,17 @@ class FakeAPI:
         if method == "POST" and path == "/instances":
             if self.post_error and not self.land_before_error:
                 raise self.post_error
-            row = instance(self.ID, self.clock())
+            ident = str(dc.uuid.UUID(int=dc.uuid.UUID(self.ID).int + self.created))
+            self.created += 1
+            row = instance(ident, self.clock())
             row.update(description=body["description"], created_at=stamp(self.clock()), status=self.provisioning_status)
             self.instances.append(row)
-            disk = volume("os-" + self.ID, self.clock())
-            disk["created_at"] = stamp(self.clock())
+            disk = volume("os-" + ident, self.clock())
+            disk.update(created_at=stamp(self.clock()), name=body["os_volume"]["name"])
             self.volumes.append(disk)
             if self.post_error:
                 raise self.post_error
-            return self.ID
+            return ident
         if method == "GET" and path.startswith("/instances/"):
             row = next((r for r in self.instances if r["id"] == path.rsplit("/", 1)[1]), None)
             if not row:
@@ -106,7 +110,14 @@ class FakeAPI:
                         disk["status"] = "detached"
             return [{"status": "success"}]
         if method == "DELETE" and path.startswith("/volumes/"):
-            disk = next(r for r in self.volumes if r["id"] == path.rsplit("/", 1)[1])
+            disk = next((r for r in self.volumes + self.trash if r["id"] == path.rsplit("/", 1)[1]), None)
+            if not disk:
+                raise dc.APIError(method, path, 404)
+            if body["is_permanent"]:
+                if self.purge_lands:
+                    self.volumes = [r for r in self.volumes if r["id"] != disk["id"]]
+                    self.trash = [r for r in self.trash if r["id"] != disk["id"]]
+                return None
             disk.update(deleted_at=stamp(self.clock()), status="deleted")
             self.trash.append(disk)
             self.volumes.remove(disk)
@@ -131,6 +142,18 @@ class BudgetTests(unittest.TestCase):
 
     def init(self):
         self.c.watchdog()
+
+    def closed_trash(self):
+        """A previous-version managed job whose OS disk remains in trash."""
+        self.init()
+        ident = self.c.launch(self.args())
+        self.api.request("PUT", "/instances", {"id": ident, "action": "delete",
+                         "volume_ids": ["os-" + ident], "delete_permanently": False})
+        with self.store.locked(self.clock()) as state:
+            dc.reconcile(state, self.api.inventory(), self.clock())
+            token = next(iter(state["jobs"]))
+            state["jobs"][token]["status"] = "closed"
+        return token, self.api.trash[0]
 
     def test_baseline_includes_head_shared_os_and_old_closed_gpu_and_trash(self):
         (Path(self.tmp.name) / "ledger.tsv").write_text("old\tGPU\t2\t96400\t100000\n")
@@ -238,7 +261,11 @@ class BudgetTests(unittest.TestCase):
         deletion = next(b for m, p, b in self.api.calls if m == "PUT")
         self.assertEqual(deletion["volume_ids"], ["os-" + ident])
         self.assertIn("shared", [v["id"] for v in self.api.volumes])
+        self.assertFalse(self.api.trash)
+        self.assertTrue(any(method == "DELETE" and body == {"is_permanent": True}
+                            for method, _, body in self.api.calls))
         self.assertEqual({j["status"] for j in self.state()["jobs"].values()}, {"closed"})
+        self.assertIn("os_purged_at", next(iter(self.state()["jobs"].values())))
         self.assertGreater(self.state()["resources"]["instance:" + ident]["cost"], .16)
 
     def test_spot_removal_policy_is_sent_only_for_spot_contracts(self):
@@ -275,7 +302,8 @@ class BudgetTests(unittest.TestCase):
         ident = self.c.launch(self.args())
         self.api.keep_os = True
         self.c.remove(ident)
-        self.assertEqual([p for m, p, _ in self.api.calls if m == "DELETE"], ["/volumes/os-" + ident])
+        self.assertEqual([(p, b["is_permanent"]) for m, p, b in self.api.calls if m == "DELETE"],
+                         [("/volumes/os-" + ident, False), ("/volumes/os-" + ident, True)])
         self.assertIn("shared", [v["id"] for v in self.api.volumes])
 
     def test_cleanup_waits_for_os_attachment_metadata_to_clear(self):
@@ -297,7 +325,8 @@ class BudgetTests(unittest.TestCase):
         start = self.clock()
         self.c.remove(ident)
         self.assertGreaterEqual(self.clock() - start, 10)
-        self.assertEqual([path for method, path, _ in self.api.calls if method == "DELETE"], ["/volumes/os-" + ident])
+        self.assertEqual([(path, body["is_permanent"]) for method, path, body in self.api.calls if method == "DELETE"],
+                         [("/volumes/os-" + ident, False), ("/volumes/os-" + ident, True)])
         self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
 
     def test_cleanup_never_deletes_a_still_attached_os_disk(self):
@@ -353,6 +382,206 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(dc.Error, "HTTP 503.*No capacity available"):
             self.c.launch(self.args())
         self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+
+    def test_storage_quota_rejection_stops_gpu_fallback_and_releases_reservation(self):
+        self.init()
+        self.api.post_error = dc.APIError("POST", "/instances", 400, "invalid_request; Storage limit exceeded")
+        with self.assertRaisesRegex(dc.LaunchBlocked, "Storage quota.*dc gc"):
+            self.c.launch(self.args())
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+
+    def test_storage_retirement_blocks_new_matching_reservations_only(self):
+        self.init()
+        receipt = self.store.root / "rfaa-storage.json"
+        receipt.write_text(json.dumps(dict(volume_id="database", status="retiring",
+                                           expires_at=stamp(self.clock() + 3600))))
+        receipt.chmod(0o600)
+        args = self.args()
+        args.volume = ["shared", "database"]
+        with self.assertRaisesRegex(dc.LaunchBlocked, "expired or retiring"):
+            self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+        self.c.launch(self.args())
+
+    def test_storage_expiry_blocks_launch_and_live_allocation_records_volume_before_post(self):
+        self.init()
+        receipt = self.store.root / "rfaa-storage.json"
+        args = self.args()
+        args.volume = ["shared", "database"]
+        receipt.write_text(json.dumps(dict(volume_id="database", status="active",
+                                           expires_at=stamp(self.clock()))))
+        receipt.chmod(0o600)
+        with self.assertRaisesRegex(dc.LaunchBlocked, "expired or retiring"):
+            self.c.launch(args)
+        receipt.write_text(json.dumps(dict(volume_id="database", status="active",
+                                           expires_at=stamp(self.clock() + 3600))))
+        original = self.api.request
+        def request(method, path, body=None):
+            if method == "POST" and path == "/instances":
+                job = next(iter(self.state()["jobs"].values()))
+                self.assertEqual(job["status"], "pending")
+                self.assertEqual(job["volumes"], ["shared", "database"])
+            return original(method, path, body)
+        self.api.request = request
+        self.c.launch(args)
+
+    def test_storage_receipt_with_unsafe_permissions_blocks_launch(self):
+        self.init()
+        receipt = self.store.root / "rfaa-storage.json"
+        receipt.write_text(json.dumps(dict(volume_id="database", status="active",
+                                           expires_at=stamp(self.clock() + 3600))))
+        receipt.chmod(0o666)
+        with self.assertRaisesRegex(dc.LaunchBlocked, "private"):
+            self.c.launch(self.args())
+        self.assertFalse(self.state()["jobs"])
+
+    def test_malformed_storage_expiry_fails_closed_without_gpu_fallback(self):
+        self.init()
+        receipt = self.store.root / "rfaa-storage.json"
+        receipt.write_text(json.dumps(dict(volume_id="database", status="active", expires_at="bad-date")))
+        receipt.chmod(0o600)
+        args = self.args()
+        args.volume = ["database"]
+        with self.assertRaisesRegex(dc.LaunchBlocked, "Invalid RFAA storage receipt"):
+            self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+
+    def test_storage_receipt_override_cannot_bypass_retirement_gate(self):
+        self.init()
+        receipt = self.store.root / "custom-storage.json"
+        receipt.write_text(json.dumps(dict(volume_id="database", status="retiring",
+                                           expires_at=stamp(self.clock() + 3600))))
+        receipt.chmod(0o600)
+        args = self.args()
+        args.volume = ["database"]
+        with patch.dict(os.environ, RFAA_STORAGE_RECEIPT=str(receipt)):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "expired or retiring"):
+                self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+
+    def test_gc_purges_matching_closed_job_and_preserves_legacy_unmanaged_and_shared(self):
+        token, disk = self.closed_trash()
+        for ident, name, is_os, kind in (("old-os", "OS-NVMe-old", True, "NVMe"),
+                                          ("unmanaged-os", "bio-os-" + "f" * 32, True, "NVMe"),
+                                          ("data", "data", False, "NVMe_Shared")):
+            other = volume(ident, self.clock())
+            other.update(name=name, is_os_volume=is_os, type=kind, status="deleted", deleted_at=stamp(self.clock()))
+            self.api.trash.append(other)
+        with self.store.locked(self.clock()) as state:
+            state["jobs"]["legacy-old"] = dict(state["jobs"][token], id="old", os_id="old-os")
+        self.assertEqual(self.c.gc(), 1)
+        self.assertEqual({row["id"] for row in self.api.trash}, {"old-os", "unmanaged-os", "data"})
+        self.assertEqual({row["id"] for row in self.api.volumes}, {"os-head", "shared"})
+        self.assertEqual(self.c.gc(), 0)
+        self.assertIn("os_purged_at", self.state()["jobs"][token])
+        self.assertEqual([path for method, path, body in self.api.calls
+                          if method == "DELETE" and body["is_permanent"]], ["/volumes/" + disk["id"]])
+
+    def test_gc_refuses_unproven_os_identity_or_attachment(self):
+        token, disk = self.closed_trash()
+        original = copy.deepcopy(disk)
+        for changed in ({"name": "OS-NVMe-old"}, {"is_os_volume": False},
+                        {"type": "NVMe_Shared"}, {"contract": "LONG_TERM"},
+                        {"instance_id": "head"}, {"instances": [{"id": "head"}]},
+                        {"instances": None}, {"deleted_at": None}, {"status": "detached"}):
+            with self.subTest(changed=changed):
+                disk.clear()
+                disk.update(original, **changed)
+                if changed.get("contract") == "LONG_TERM":
+                    with self.assertRaisesRegex(dc.Error, "pay-as-you-go"):
+                        self.c.gc()
+                else:
+                    self.assertEqual(self.c.gc(), 0)
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.api.calls))
+        self.assertNotIn("os_purged_at", self.state()["jobs"][token])
+
+    def test_gc_refuses_duplicate_job_ownership_and_mismatched_recorded_id(self):
+        token, disk = self.closed_trash()
+        with self.store.locked(self.clock()) as state:
+            state["jobs"]["f" * 32] = copy.deepcopy(state["jobs"][token])
+        self.assertEqual(self.c.gc(), 0)
+        with self.store.locked(self.clock()) as state:
+            del state["jobs"]["f" * 32]
+            state["jobs"][token]["os_id"] = "different-disk"
+        self.assertEqual(self.c.gc(), 0)
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.api.calls))
+
+    def test_gc_refuses_open_job_live_instance_or_restored_volume(self):
+        token, disk = self.closed_trash()
+        with self.store.locked(self.clock()) as state:
+            state["jobs"][token]["status"] = "cleanup"
+        self.assertEqual(self.c.gc(), 0)
+        with self.store.locked(self.clock()) as state:
+            state["jobs"][token]["status"] = "closed"
+        self.api.instances.append(instance(FakeAPI.ID, self.clock()))
+        self.assertEqual(self.c.gc(), 0)
+        self.api.instances.pop()
+        restored = copy.deepcopy(disk)
+        restored.update(status="detached")
+        restored.pop("deleted_at")
+        self.api.volumes.append(restored)
+        self.assertEqual(self.c.gc(), 0)
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.api.calls))
+
+    def test_gc_unconfirmed_permanent_delete_does_not_claim_success_and_can_retry(self):
+        token, disk = self.closed_trash()
+        self.api.purge_lands = False
+        with self.assertRaisesRegex(dc.Error, "Permanent removal.*unconfirmed"):
+            self.c.gc()
+        self.assertNotIn("os_purged_at", self.state()["jobs"][token])
+        self.assertTrue(self.api.trash)
+        self.api.purge_lands = True
+        self.assertEqual(self.c.gc(), 1)
+        self.assertFalse(self.api.trash)
+
+    def test_concurrent_purge_already_deleted_response_requires_inventory_confirmation(self):
+        self.closed_trash()
+        original = self.api.request
+        def request(method, path, body=None):
+            result = original(method, path, body)
+            if method == "DELETE" and body.get("is_permanent"):
+                raise dc.APIError(method, path, 400, "invalid_request; Volume is already permanently deleted")
+            return result
+        self.api.request = request
+        self.assertEqual(self.c.gc(), 1)
+        self.assertFalse(self.api.trash)
+        self.assertIn("os_purged_at", next(iter(self.state()["jobs"].values())))
+
+    def test_already_deleted_response_alone_is_not_purge_confirmation(self):
+        self.closed_trash()
+        original = self.api.request
+        def request(method, path, body=None):
+            if method == "DELETE" and body.get("is_permanent"):
+                raise dc.APIError(method, path, 400, "invalid_request; Volume is already permanently deleted")
+            return original(method, path, body)
+        self.api.request = request
+        with self.assertRaisesRegex(dc.Error, "Permanent removal.*unconfirmed"):
+            self.c.gc()
+        self.assertTrue(self.api.trash)
+        self.assertNotIn("os_purged_at", next(iter(self.state()["jobs"].values())))
+
+    def test_normal_cleanup_retains_reservation_until_managed_os_purge_confirmed(self):
+        self.init()
+        ident = self.c.launch(self.args())
+        self.api.purge_lands = False
+        with self.assertRaisesRegex(dc.Error, "Permanent removal.*unconfirmed"):
+            self.c.remove(ident)
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "cleanup")
+        with self.assertRaisesRegex(dc.LaunchBlocked, "Unresolved"):
+            self.c.launch(self.args())
+        self.api.purge_lands = True
+        self.c.remove(ident)
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+
+    def test_normal_cleanup_retains_soft_trash_when_os_identity_not_proven(self):
+        self.init()
+        ident = self.c.launch(self.args())
+        next(row for row in self.api.volumes if row["id"] == "os-" + ident)["name"] = "legacy-os-name"
+        self.c.remove(ident)
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+        self.assertEqual([row["id"] for row in self.api.trash], ["os-" + ident])
+        self.assertFalse(any(method == "DELETE" and body["is_permanent"] for method, _, body in self.api.calls))
 
     def test_watchdog_kills_expired_job_not_head(self):
         self.init()

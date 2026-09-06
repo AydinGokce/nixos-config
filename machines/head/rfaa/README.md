@@ -32,11 +32,22 @@ headroom. A 3300 GB volume is approximately 3 TiB. Retaining all archives requir
 another 399 GiB. Provision the volume only with the intended storage retention
 and budget accounted for; it continues to incur storage charges without a GPU.
 
-On the head, inspect the manifest and install explicitly:
+The [storage lifecycle guide](STORAGE_PLAN.md) contains the verified provider
+payloads, current cost estimate, and allocation/expiry procedure. Once retention
+is chosen, `bio-rfaa-storage register` verifies the new volume and records its
+exact UTC expiry. Full submissions require an active root-owned receipt; the
+head's minute timer retires expired storage while retaining the original share
+and results. No production database volume has been allocated or registered yet.
+
+After registration, inspect the manifest and run the production installer under
+the named head service that the expiry helper can stop:
 
 ```bash
 bio-rfaa-databases plan
-bio-rfaa-databases install
+systemd-run --collect --unit=rfaa-database-install --property=RuntimeMaxSec=172800 \
+  /run/current-system/sw/bin/bio-rfaa-databases install
+journalctl -u rfaa-database-install -f
+# After the service finishes successfully:
 bio-rfaa-databases validate
 ```
 
@@ -47,8 +58,11 @@ python3 /path/to/rfaa/databases.py install --root /mnt/bio-databases/rfaa
 ```
 
 The downloader needs Python 3, curl, GNU tar with gzip support, and GNU `du`.
-Keep it under a persistent service or terminal session; these downloads and
-extractions can take hours. `--only uniref30`, `--only bfd`, or `--only pdb100`
+Downloads and extractions can take hours. Automatic expiry stops only the named
+head installer. Stop other installers before expiry and remove any separate
+download worker's database sharing. Otherwise a live attachment or busy mount
+blocks deletion and extends storage charges.
+`--only uniref30`, `--only bfd`, or `--only pdb100`
 operates on one dataset. Repeat the same command after an interruption: partial
 downloads resume, incomplete extraction staging is reused, and installed datasets
 are checked before being skipped. Archives are removed only after successful
@@ -86,7 +100,12 @@ bio-submit rfaa --fasta target.fasta --sub single-seq --name quick-check
 Full preparation defaults to four CPU threads and a 64 GiB HHsuite memory
 limit. The worker environment supports `RFAA_CPU` and `RFAA_MEM_GB` overrides;
 use a worker with enough host memory for both preprocessing and the model.
-The cloud recipe selects Ampere GPUs for the older torch/DGL stack. `RFAA_TOOLS_ROOT` can
+Full mode defaults to A100 workers with 120 GB host RAM; an A6000 has only 60 GB
+and cannot fit the default 64 GiB search allowance. The recipe checks available
+memory against the requested limit plus 8 GiB before setup. A deliberately chosen
+smaller worker can use head-side `RFAA_MEM_GB=32`. Single-sequence mode can still
+select A6000 workers. All default choices use Ampere for the older torch/DGL stack.
+`RFAA_TOOLS_ROOT` can
 override the CPU environment location; its default is
 `/mnt/bio-shared/envs/rfaa-tools-v1`.
 
@@ -94,6 +113,23 @@ SignalP is not included. Its licensed signal-peptide trimming stage is optional
 and is also omitted by the upstream Docker workflow. Full MSA and template
 searches require no API key or gated database credentials. Inputs retain their
 complete submitted sequence; provide an already trimmed FASTA when appropriate.
+
+API access and commercial licensing are separate. RFAA's pinned
+[BSD license](https://github.com/baker-laboratory/RoseTTAFold-All-Atom/blob/d69ab3a73f8ede31a4cc005fbc076a341d848469/LICENSE)
+explicitly covers its source code and linked model weights. Downloaded databases
+and third-party tools retain their own terms. In particular,
+[PSIPRED's license](https://github.com/psipred/psipred/blob/master/LICENSE) permits
+individual commercial research but restricts incorporation into commercial
+software or services and paid-access results databases.
+
+The exact commercial terms of `pdb100_2021Mar03.tar.gz` remain unverified. The
+[older RoseTTAFold README](https://github.com/RosettaCommons/RoseTTAFold) describes
+its weights and data as noncommercial and links that same archive; RFAA's BSD
+text expressly covers code and weights without expressly covering these database
+downloads. This does not establish that the archive is restricted, but the
+[wwPDB policy](https://www.wwpdb.org/about/usage-policies) for original coordinates
+alone does not settle the terms of the packaged template profiles. Self-hosting
+does not resolve this question.
 
 Preparation runs checked subprocesses before model inference. Each output is
 promoted from a temporary file only after its command succeeds, and a query/mode
