@@ -60,6 +60,41 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def tools_pin(path, *, store_root=Path('/nix/store'), owner=0):
+    """Verify an explicitly retained immutable submission/source snapshot."""
+    path = Path(path)
+    require(path.is_absolute(), 'Tool pin must be an absolute path')
+    data = read(path)
+    require(path.stat().st_uid == owner and not path.stat().st_mode & 0o022, 'Unsafe tool pin ownership/mode')
+    require(data.get('version') == 1, 'Unsupported tool pin version')
+    root = Path(data['tools_src'])
+    immutable = Path(data['immutable_store'])
+    require(root.resolve() == immutable and immutable.is_relative_to(store_root.resolve()), 'Tool pin must resolve to retained Nix storage')
+    require(immutable.is_dir() and not immutable.stat().st_mode & 0o222, 'Pinned source root is not immutable')
+    manifest_path = Path(data['source_manifest'])
+    require(sha(manifest_path) == data['source_manifest_sha256'], 'Pinned source manifest changed')
+    manifest = read(manifest_path)
+    require(manifest.get('version') == 1 and manifest.get('content_sha256') == data['content_sha256'], 'Pinned content identity changed')
+    actual = {}
+    for item in sorted(immutable.rglob('*')):
+        require(not item.is_symlink() and not item.stat().st_mode & 0o222, 'Pinned source must be immutable ordinary files/directories')
+        if item.is_dir():
+            continue
+        require(item.is_file(), 'Unsupported pinned source file type')
+        actual[item.relative_to(immutable).as_posix()] = dict(sha256=sha(item), bytes=item.stat().st_size)
+    require(actual == manifest['files'], 'Pinned source bytes or file inventory changed')
+    digest = hashlib.sha256(json.dumps(actual, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    require(digest == data['content_sha256'], 'Pinned source content digest mismatch')
+    submit = Path(data['bio_submit'])
+    require(submit.is_file() and submit.resolve().is_relative_to(store_root.resolve())
+            and not submit.stat().st_mode & 0o222 and os.access(submit, os.X_OK), 'Pinned bio-submit is not an immutable executable')
+    require(sha(submit) == data['bio_submit_sha256'], 'Pinned bio-submit executable changed')
+    require(Path(data['cluster_config']) == root / 'cluster.sh', 'Pinned cluster configuration differs from source tree')
+    return dict(path=str(path), sha256=sha(path), content_sha256=digest,
+                tools_src=str(root), bio_submit=str(submit), bio_submit_sha256=data['bio_submit_sha256'],
+                cluster_config=data['cluster_config'], source_manifest_sha256=data['source_manifest_sha256'])
+
+
 def verified_inputs(root, db):
     """Bounded archive metadata checks; promoted data uses the full validator."""
     if not (root / 'manifest.json').exists():
@@ -175,6 +210,11 @@ class Operations:
         result = self.run(['findmnt', '--json', '--target', self.database_root.parent, '--output', 'SOURCE,FSTYPE,OPTIONS'])
         require(result.returncode == 0, 'Cannot verify database mount')
         rows = loads(result.stdout).get('filesystems', [])
+        # systemd automounts appear alongside their real mounted NFS export.
+        # Ignore only that autofs placeholder, never a competing data mount.
+        require(isinstance(rows, list) and all(isinstance(row, dict) and row.get('fstype') in {'autofs', 'nfs', 'nfs4'}
+                                             for row in rows), 'Unexpected database mount stack')
+        rows = [row for row in rows if row.get('fstype') != 'autofs']
         require(len(rows) == 1 and rows[0].get('source') == receipt['nfs']
                 and rows[0].get('fstype') in {'nfs', 'nfs4'}
                 and 'vers=4.1' in rows[0].get('options', '').split(','), 'Wrong database NFS export or protocol')
@@ -216,8 +256,17 @@ class Operations:
         except self.budget['APIError'] as exc:
             raise Unavailable('Read-only capacity check unavailable: ' + str(exc)) from None
 
+    def submission_pin(self):
+        path = os.environ.get('BIO_MSA_QUEUE_TOOLS_PIN')
+        return tools_pin(path, owner=self.owner) if path else None
+
     def launch(self, attempt, panel):
-        command = ['bio-msa', attempt['stage'], '--worker', attempt['worker']['instance_type'], '--timeout', str(WORK_SECONDS)]
+        pin = self.submission_pin()
+        require(pin == attempt.get('tools_pin'), 'Submission source pin changed after durable launch intent')
+        command = ([pin['bio_submit'], 'msa', '--sub', attempt['stage']] if pin else ['bio-msa', attempt['stage']])
+        command += ['--worker', attempt['worker']['instance_type'], '--timeout', str(WORK_SECONDS)]
+        environment = [] if pin is None else ['--setenv=BIO_TOOLS_SRC=' + pin['tools_src'],
+                                              '--setenv=BIO_CLUSTER_CONFIG=' + pin['cluster_config']]
         if attempt['worker']['spot']:
             command.append('--spot')
         if panel:
@@ -229,7 +278,7 @@ class Operations:
                          '--property=StandardOutput=append:' + attempt['log'], '--property=StandardError=journal',
                          '--setenv=DC_STATE_DIR=' + str(self.root), '--setenv=BIO_STATE_DIR=' + str(self.root),
                          '--setenv=DC_MAX_INSTANCE_HOURLY=13',
-                         '--', *command])
+                         *environment, '--', *command])
 
     def cleanup(self, attempt, receipt, jobs, unit):
         involved = {token: row for token, row in jobs.items() if receipt['volume_id'] in row.get('volumes', [])
@@ -292,6 +341,14 @@ class Queue:
                 require(isinstance(attempt.get(key), list) and all(isinstance(v, str) for v in attempt[key])
                         and len(set(attempt[key])) == len(attempt[key]), 'Invalid attempt reconciliation ledger')
             require('closed' not in attempt or type(attempt['closed']) is bool, 'Invalid attempt closure flag')
+            if 'tools_pin' in attempt:
+                pin = attempt['tools_pin']
+                hashes = {'sha256', 'content_sha256', 'bio_submit_sha256', 'source_manifest_sha256'}
+                paths = {'path', 'tools_src', 'bio_submit', 'cluster_config'}
+                require(isinstance(pin, dict) and set(pin) == hashes | paths
+                        and all(isinstance(pin[k], str) and re.fullmatch(r'[a-f0-9]{64}', pin[k]) for k in hashes)
+                        and all(isinstance(pin[k], str) and Path(pin[k]).is_absolute() for k in paths),
+                        'Invalid frozen submission source identity')
         panel = state.get('panel')
         if panel is not None:
             require(isinstance(panel, dict) and set(panel) == {'path', 'sha256', 'canonical_sha256'}
@@ -409,6 +466,9 @@ class Queue:
                            stage=stage, worker=candidate, log=str(self.store.path.parent / (unit + '.log')),
                            created_at=self.clock(), boot_id=self.ops.boot(), jobs_before=sorted(jobs),
                            tracked_before=sorted(receipt['jobs']), job_tokens=[])
+            pin = getattr(self.ops, 'submission_pin', lambda: None)()
+            if pin is not None:
+                attempt['tools_pin'] = pin
             state['attempts'].append(attempt)
             self.save(state, 'dispatching', 'Durable intent saved before systemd submission', stage=stage)
             try:

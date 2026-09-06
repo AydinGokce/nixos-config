@@ -176,6 +176,19 @@ stops unrelated jobs or deletes persistent volumes to force progress.
 
 ## Local checks
 
+When an existing prediction baseline must survive later deployments, set
+`BIO_MSA_QUEUE_TOOLS_PIN` to its retained `pin.json`. The optional pin binds an
+immutable Nix source tree, complete file manifest, exact `bio-submit` executable
+and cluster configuration. The queue verifies these before recording intent and
+again before dispatch, records their hashes in the attempt, and invokes that
+exact executable with `BIO_TOOLS_SRC` and `BIO_CLUSTER_CONFIG`. A changed or
+missing pin stops dispatch; it never silently selects newly deployed recipes.
+The current head configuration pins the September 6 comparison artifacts.
+
+Mount admission ignores systemd's `autofs` placeholder while still requiring
+exactly one matching data export using NFS 4.1. Additional or wrong data mounts
+remain errors.
+
 ```sh
 cd machines/head/msa
 python3 -m unittest -v test_build_queue.py

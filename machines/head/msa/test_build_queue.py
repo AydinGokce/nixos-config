@@ -215,6 +215,15 @@ class QueueTests(unittest.TestCase):
         for _ in range(4): self.assertEqual(self.queue.tick()['status'], 'uncertain')
         self.assertEqual(len(self.ops.launches), 1); self.assertEqual(len(self.state()['attempts']), 1)
 
+    def test_source_pin_is_saved_before_the_dispatch(self):
+        pin = dict(path='/private/pin.json', tools_src='/private/tools', bio_submit='/nix/store/old/bin/bio-submit',
+                   cluster_config='/private/tools/cluster.sh', sha256='a'*64, content_sha256='b'*64,
+                   bio_submit_sha256='c'*64, source_manifest_sha256='d'*64)
+        self.ops.submission_pin = Mock(return_value=pin)
+        self.ops.before_launch = lambda attempt: self.assertEqual(self.state()['attempts'][-1]['tools_pin'], pin)
+        self.assertEqual(self.queue.tick()['status'], 'uncertain')
+        self.assertEqual(self.state()['attempts'][0]['tools_pin'], pin)
+
     def test_running_unit_requires_exact_description_and_invocation(self):
         self.queue.tick(); attempt = self.finish()
         self.ops.units[attempt['unit']].update(SubState='running', ExecMainCode='0')
@@ -374,6 +383,16 @@ class OperationsTests(unittest.TestCase):
         row['options'] = 'rw,vers=4.2'; self.ops.run.return_value.stdout = json.dumps({'filesystems': [row]})
         with self.assertRaisesRegex(q['Error'], 'export or protocol'): self.ops.mounted(self.receipt)
 
+    def test_automount_placeholder_does_not_hide_the_real_nfs41_mount(self):
+        rows = [{'source': 'systemd-1', 'fstype': 'autofs', 'options': 'rw'},
+                {'source': self.receipt['nfs'], 'fstype': 'nfs4', 'options': 'rw,vers=4.1'}]
+        self.ops.run = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps({'filesystems': rows}), ''))
+        self.ops.mounted(self.receipt)
+        rows.append(dict(rows[1], source='nfs.example:/different'))
+        self.ops.run.return_value.stdout = json.dumps({'filesystems': rows})
+        with self.assertRaisesRegex(q['Error'], 'export or protocol'):
+            self.ops.mounted(self.receipt)
+
     def test_only_active_persistent_colabfold_receipt_can_admit_work(self):
         receipt = dict(version=1, profile='colabfold', volume_id=VOLUME, retention='persistent', expires_at=None,
                        status='active', name='bio-colabfold-db-123456789', location='FIN-02', size_gb=3000,
@@ -389,6 +408,61 @@ class OperationsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.ops.storage_receipt()
         self.api.request.assert_not_called()
+
+
+
+class ToolPinTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name); self.store = self.root/'store'; self.tools = self.store/'frozen-tools'
+        self.tools.mkdir(parents=True); (self.tools/'cluster.sh').write_text('SHARED_NFS=retained\n')
+        self.submit = self.store/'frozen-submit'; self.submit.write_text('#!/bin/sh\nexit 0\n'); self.submit.chmod(0o555)
+        files = {'cluster.sh': {'bytes': (self.tools/'cluster.sh').stat().st_size, 'sha256': q['sha'](self.tools/'cluster.sh')}}
+        digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.manifest = self.root/'manifest.json'
+        write(self.manifest, dict(version=1, files=files, content_sha256=digest))
+        self.pin = self.root/'pin.json'
+        write(self.pin, dict(version=1, tools_src=str(self.tools), immutable_store=str(self.tools),
+              content_sha256=digest, source_manifest=str(self.manifest), source_manifest_sha256=q['sha'](self.manifest),
+              bio_submit=str(self.submit), bio_submit_sha256=q['sha'](self.submit), cluster_config=str(self.tools/'cluster.sh')))
+        (self.tools/'cluster.sh').chmod(0o444); self.tools.chmod(0o555)
+        self.addCleanup(lambda: self.tools.chmod(0o755))
+
+    def verify(self):
+        return q['tools_pin'](self.pin, store_root=self.store, owner=os.getuid())
+
+    def test_verified_immutable_snapshot_and_executable(self):
+        result = self.verify()
+        self.assertEqual(result['bio_submit'], str(self.submit))
+        self.assertEqual(result['sha256'], q['sha'](self.pin))
+
+    def test_changed_bytes_or_extra_files_fail_closed(self):
+        source = self.tools/'cluster.sh'; source.chmod(0o644); source.write_text('changed'); source.chmod(0o444)
+        with self.assertRaisesRegex(q['Error'], 'bytes or file inventory'):
+            self.verify()
+
+    def test_missing_pin_or_unretained_source_does_not_fallback(self):
+        with self.assertRaises(FileNotFoundError):
+            q['tools_pin'](self.root/'missing.json', store_root=self.store, owner=os.getuid())
+        with self.assertRaisesRegex(q['Error'], 'retained Nix'):
+            q['tools_pin'](self.pin, store_root=self.root/'different-store', owner=os.getuid())
+
+    def test_pinned_launch_retains_scientific_args_and_environment(self):
+        ops = q['Operations'](self.root, self.root/'db', storage, {'API': Mock}, owner=os.getuid())
+        pin = self.verify(); ops.submission_pin = Mock(return_value=pin)
+        ops.run = Mock(return_value=subprocess.CompletedProcess([], 0))
+        attempt = dict(stage='install', worker=dict(instance_type='CPU.360V.1440G', spot=True),
+                       unit='exact.service', description='exact', log='/private/log', tools_pin=pin)
+        ops.launch(attempt, {'path': '/private/frozen-panel.json'})
+        args = ops.run.call_args.args[0]
+        self.assertIn('--setenv=BIO_TOOLS_SRC='+str(self.tools), args)
+        self.assertIn('--setenv=BIO_CLUSTER_CONFIG='+str(self.tools/'cluster.sh'), args)
+        self.assertEqual(args[args.index('--')+1:], [str(self.submit), 'msa', '--sub', 'install', '--worker',
+            'CPU.360V.1440G', '--timeout', '21600', '--spot', '--json', '/private/frozen-panel.json'])
+        ops.run.reset_mock(); ops.submission_pin.return_value = None
+        with self.assertRaisesRegex(q['Error'], 'changed after durable'):
+            ops.launch(attempt, {'path': '/private/frozen-panel.json'})
+        ops.run.assert_not_called()
 
 
 if __name__ == '__main__':
