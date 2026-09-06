@@ -1,0 +1,337 @@
+"""Small actor-scoped JSON RPC surface; launch work belongs to the daemon."""
+from __future__ import annotations
+
+import base64
+from copy import deepcopy
+import os
+from pathlib import Path
+
+from . import catalog, inputs
+from .common import (CHUNK, UPLOAD, TERMINAL, Error, atomic, canonical, decode_chunk,
+                     file_sha, identifier, keys, now, number, require, safe_file,
+                     sha, string, uid)
+
+
+def public(value):
+    if isinstance(value, dict):
+        return {key: public(item) for key, item in value.items() if not key.startswith('_')}
+    if isinstance(value, list):
+        return [public(item) for item in value]
+    return value
+
+
+class API:
+    def __init__(self, store, actor):
+        self.store, self.actor = store, string(actor, 'trusted actor', 128)
+
+    def call(self, method, params):
+        require(isinstance(method, str), 'Method must be a string')
+        function = {
+            'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
+            'upload.chunk': self.upload_chunk, 'upload.finish': self.upload_finish,
+            'batch.validate': self.batch_validate, 'batch.create': self.batch_create,
+            'batch.get': self.batch_get, 'batch.list': self.batch_list, 'batch.cancel': self.batch_cancel,
+            'job.get': self.job_get, 'job.logs': self.job_logs, 'job.artifacts': self.job_artifacts,
+            'job.cancel': self.job_cancel, 'artifact.read': self.artifact_read,
+            'annotation.put': self.annotation_put, 'annotation.list': self.annotation_list,
+        }.get(method)
+        require(function is not None, 'Unknown method')
+        return public(function(params))
+
+    def catalog(self, params):
+        keys(params)
+        return catalog.catalog()
+
+    def upload_begin(self, params):
+        keys(params, ('name', 'size'), ('sha256',))
+        string(params['name'], 'name', 200); number(params['size'], 'size', 1, UPLOAD)
+        if 'sha256' in params:
+            sha(params['sha256'])
+        ident = uid()
+        folder = self.store.directory('uploads', ident)
+        folder.mkdir(parents=True, mode=0o700)
+        atomic(folder / 'content.part', b'', exclusive=True)
+        data = {'upload_id': ident, 'name': params['name'], 'size': params['size'], 'offset': 0,
+                'state': 'uploading', 'chunk_bytes': CHUNK, '_expected_sha256': params.get('sha256')}
+        with self.store.transaction() as db:
+            self.store.put(db, 'upload', data, self.actor)
+        return data
+
+    def upload_get(self, params):
+        keys(params, ('upload_id',))
+        return self.store.read('upload', params['upload_id'], self.actor)
+
+    def upload_chunk(self, params):
+        keys(params, ('upload_id', 'offset', 'data_base64'))
+        offset = number(params['offset'], 'offset', 0, UPLOAD)
+        chunk = decode_chunk(params['data_base64'])
+        with self.store.transaction() as db:
+            data = self.store.get(db, 'upload', params['upload_id'], self.actor)
+            require(offset + len(chunk) <= data['size'], 'Chunk exceeds declared file size', 'limit')
+            folder = self.store.directory('uploads', data['upload_id'])
+            path = folder / ('content' if data['state'] == 'complete' or (folder / 'content').exists() else 'content.part')
+            safe_file(path)
+            with path.open('r+b' if path.name == 'content.part' else 'rb') as stream:
+                size = os.fstat(stream.fileno()).st_size
+                require(offset <= data['offset'] and offset <= size, 'Upload gap or incorrect offset', 'conflict')
+                if offset + len(chunk) <= size:
+                    stream.seek(offset)
+                    require(stream.read(len(chunk)) == chunk, 'Repeated chunk differs from retained bytes', 'conflict')
+                else:
+                    require(data['state'] == 'uploading' and offset == data['offset'] == size,
+                            'Chunk overlaps existing bytes', 'conflict')
+                    stream.seek(offset); stream.write(chunk); stream.flush(); os.fsync(stream.fileno())
+                data['offset'] = max(data['offset'], offset + len(chunk))
+            self.store.put(db, 'upload', data)
+        return {'upload_id': data['upload_id'], 'offset': data['offset']}
+
+    def upload_finish(self, params):
+        keys(params, ('upload_id', 'sha256')); sha(params['sha256'])
+        with self.store.transaction() as db:
+            data = self.store.get(db, 'upload', params['upload_id'], self.actor)
+            folder = self.store.directory('uploads', data['upload_id'])
+            path = folder / ('content' if (folder / 'content').exists() else 'content.part')
+            require(safe_file(path).stat().st_size == data['offset'] == data['size'], 'Upload is incomplete', 'conflict')
+            value = file_sha(path)
+            require(value == params['sha256'] and data['_expected_sha256'] in (None, value), 'Upload SHA-256 mismatch', 'integrity')
+            if path.name != 'content':
+                os.rename(path, folder / 'content')
+                os.chmod(folder / 'content', 0o400)
+                fd = os.open(folder, os.O_DIRECTORY); os.fsync(fd); os.close(fd)
+            data.update(state='complete', sha256=value)
+            self.store.put(db, 'upload', data)
+        return data
+
+    def batch_validate(self, params):
+        document = inputs.request(params)
+        # Ownership and completeness are checked before a preview can refer to
+        # any upload. Expensive chemistry and FASTA expansion run asynchronously.
+        for item in document['inputs']:
+            source = item['source']
+            uploads = list(source.get('attachments', {}).values())
+            if source['kind'] == 'upload':
+                uploads.append(source['upload_id'])
+            for ident in uploads:
+                data = self.store.read('upload', ident, self.actor)
+                require(data['state'] == 'complete', 'An input upload is incomplete', 'conflict')
+        for settings in document['settings'].values():
+            if 'labels_upload_id' in settings:
+                data = self.store.read('upload', settings['labels_upload_id'], self.actor)
+                require(data['state'] == 'complete', 'Labels upload is incomplete', 'conflict')
+        with self.store.transaction() as db:
+            old = self.store.idem(db, self.actor, 'batch.validate', document['request_key'], document)
+            if old:
+                return self._batch(old, db)
+            ident = uid()
+            data = {'batch_id': ident, 'name': document['name'], 'mode': document['mode'],
+                    'state': 'validating', 'msa_backend': document['msa_backend'], 'execution': document['execution'],
+                    'inputs': [{k: v for k, v in item.items() if k != 'source'} for item in document['inputs']],
+                    'models': document['models'], 'pairs': [], 'errors': [], '_request': document, '_committed': False}
+            base = [{'id': 'assembly', 'name': document['name']}] if document['mode'] == 'assembly' else document['inputs']
+            data['pairs'] = [{'pair_id': uid(), 'input_id': item['id'], 'input_name': item['name'],
+                              'model': model, 'state': 'pending', 'reasons': [], 'job_id': None}
+                             for item in base for model in document['models']]
+            require(len(data['pairs']) <= 512, 'Too many input/model combinations', 'limit')
+            self.store.put(db, 'batch', data, self.actor)
+            self.store.idem(db, self.actor, 'batch.validate', document['request_key'], document, ident)
+            self.store.event(db, ident, 'validation_requested', {'models': document['models']})
+            return self._batch(ident, db)
+
+    def batch_create(self, params):
+        keys(params, ('batch_id', 'request_key', 'pair_ids'))
+        require(isinstance(params['pair_ids'], list) and 0 < len(params['pair_ids']) <= 512,
+                'Select at least one validated pair')
+        require(all(isinstance(x, str) for x in params['pair_ids']) and len(set(params['pair_ids'])) == len(params['pair_ids']), 'Repeated or invalid pair IDs')
+        with self.store.transaction() as db:
+            old = self.store.idem(db, self.actor, 'batch.create', params['request_key'], params)
+            if old:
+                return self._batch(old, db)
+            batch = self.store.get(db, 'batch', params['batch_id'], self.actor)
+            require(batch['state'] == 'validated' and not batch['_committed'], 'Preview is not ready or already submitted', 'conflict')
+            selected = {p['pair_id']: p for p in batch['pairs']}
+            require(all(ident in selected and selected[ident]['state'] == 'compatible' for ident in params['pair_ids']),
+                    'Every selected pair must have completed compatible validation', 'conflict')
+            require(all(selected[ident]['_prepared'].get('tools_dir') for ident in params['pair_ids']),
+                    'This preview predates the current execution contract; validate a new preview before submitting', 'conflict')
+            for ident in params['pair_ids']:
+                pair = selected[ident]
+                job_id = uid(); pair['job_id'] = job_id
+                job = {'job_id': job_id, 'batch_id': batch['batch_id'], 'pair_id': ident,
+                       'input_id': pair['input_id'], 'input_name': pair['input_name'], 'model': pair['model'],
+                       'state': 'queued', 'phase': 'queued', 'started_at': None, 'finished_at': None,
+                       'exit_code': None, 'error': None, 'progress': {'message': 'Waiting for the head dispatcher', 'observed_at': now()},
+                       'provenance': {'settings': pair['_prepared']['settings'], 'msa_backend': batch['msa_backend'],
+                                      'execution_requested': batch['execution'], 'automatic_retry': False},
+                       '_prepared': pair['_prepared']}
+                self.store.put(db, 'job', job, self.actor)
+                self.store.event(db, job_id, 'enqueued', {'batch_id': batch['batch_id'], 'pair_id': ident})
+            batch.update(state='queued', _committed=True)
+            self.store.put(db, 'batch', batch)
+            self.store.idem(db, self.actor, 'batch.create', params['request_key'], params, batch['batch_id'])
+            return self._batch(batch['batch_id'], db)
+
+    def _job(self, job, db, with_artifacts=True):
+        result = deepcopy(job)
+        from .common import parse
+        where = "kind='artifact' AND actor=? AND json_extract(data,'$.job_id')=?"
+        args = (self.actor, job['job_id'])
+        result['artifacts'] = [parse(row['data']) for row in db.execute('SELECT data FROM objects WHERE ' + where + ' ORDER BY created,id LIMIT 100', args)] if with_artifacts else []
+        result['artifact_count'] = db.execute('SELECT COUNT(*) FROM objects WHERE ' + where, args).fetchone()[0]
+        return result
+
+    def _batch(self, ident, db):
+        batch = deepcopy(self.store.get(db, 'batch', ident, self.actor))
+        jobs = [self._job(self.store.get(db, 'job', p['job_id'], self.actor), db, False) for p in batch['pairs'] if p.get('job_id')]
+        for job in jobs:
+            job.pop('_prepared', None)
+            job['provenance'] = {k: v for k, v in job['provenance'].items() if k in {'msa_backend', 'execution_requested', 'automatic_retry', 'resident_job_id'}}
+            if job.get('error'):
+                job['error'] = {'message': job['error'].get('message', '')[:500]}
+        for pair in batch['pairs']:
+            pair['reasons'] = [reason[:500] for reason in pair['reasons'][:4]]
+        counts = {key: 0 for key in ('pairs', 'compatible', 'rejected', 'jobs', 'queued', 'running', 'complete', 'failed', 'cancelled', 'interrupted')}
+        counts['pairs'] = len(batch['pairs']); counts['jobs'] = len(jobs)
+        for pair in batch['pairs']:
+            if pair['state'] in {'compatible', 'rejected'}:
+                counts[pair['state']] += 1
+        for job in jobs:
+            state = job['state']; counts['running' if state in {'running', 'starting', 'cancel_requested'} else state] += 1
+        batch['jobs'], batch['counts'] = jobs, counts
+        if jobs:
+            states = {j['state'] for j in jobs}
+            if states <= TERMINAL:
+                batch['state'] = 'complete' if states == {'complete'} else 'cancelled' if states == {'cancelled'} else 'failed' if not counts['complete'] else 'partial'
+            elif 'cancel_requested' in states:
+                batch['state'] = 'cancel_requested'
+            elif states & {'running', 'starting'}:
+                batch['state'] = 'running'
+            else:
+                batch['state'] = 'queued'
+        return batch
+
+    def batch_get(self, params):
+        keys(params, ('batch_id',))
+        with self.store.connection() as db:
+            return self._batch(params['batch_id'], db)
+
+    def batch_list(self, params):
+        keys(params, (), ('limit', 'cursor'))
+        limit = number(params.get('limit', 50), 'limit', 1, 100)
+        all_items = self.store.listing('batch', self.actor)
+        all_items.reverse()
+        cursor = params.get('cursor')
+        if cursor is not None:
+            identifier(cursor)
+            indexes = [n for n, b in enumerate(all_items) if b['batch_id'] == cursor]
+            require(indexes, 'Unknown pagination cursor')
+            all_items = all_items[indexes[0] + 1:]
+        page = all_items[:limit]
+        with self.store.connection() as db:
+            batches = [{k: v for k, v in self._batch(item['batch_id'], db).items()
+                        if k in {'batch_id', 'name', 'mode', 'state', 'created_at', 'updated_at', 'msa_backend', 'execution', 'models', 'counts'}} for item in page]
+        return {'batches': batches, 'next_cursor': page[-1]['batch_id'] if len(all_items) > limit else None}
+
+    def job_get(self, params):
+        keys(params, ('job_id',))
+        with self.store.connection() as db:
+            return self._job(self.store.get(db, 'job', params['job_id'], self.actor), db)
+
+    def job_cancel(self, params):
+        keys(params, ('job_id',))
+        with self.store.transaction() as db:
+            job = self.store.get(db, 'job', params['job_id'], self.actor)
+            self._cancel_job(db, job)
+            return self._job(job, db)
+
+    def _cancel_job(self, db, job):
+        if job['state'] not in TERMINAL:
+            operation = db.execute('SELECT 1 FROM operations WHERE object_id=?', (job['job_id'],)).fetchone()
+            if job['state'] == 'queued' and operation is None:
+                job.update(state='cancelled', phase='cancelled', finished_at=now())
+            else:
+                job.update(state='cancel_requested', phase='cancellation requested')
+            job['progress'] = {'message': 'Cancellation requested; any owned execution is being reconciled', 'observed_at': now()}
+            self.store.put(db, 'job', job)
+            self.store.event(db, job['job_id'], 'cancel_requested', {})
+
+    def batch_cancel(self, params):
+        keys(params, ('batch_id',))
+        with self.store.transaction() as db:
+            batch = self.store.get(db, 'batch', params['batch_id'], self.actor)
+            for pair in batch['pairs']:
+                if pair.get('job_id'):
+                    self._cancel_job(db, self.store.get(db, 'job', pair['job_id'], self.actor))
+            if not batch['_committed']:
+                batch['state'] = 'cancelled'
+                self.store.put(db, 'batch', batch)
+        return self.batch_get(params)
+
+    def job_logs(self, params):
+        keys(params, ('job_id',), ('offset', 'max_bytes'))
+        job = self.store.read('job', params['job_id'], self.actor)
+        offset = number(params.get('offset', 0), 'offset', 0, 2**63 - 1)
+        maximum = number(params.get('max_bytes', 65536), 'max_bytes', 1, CHUNK)
+        path = self.store.directory('jobs', job['job_id']) / 'run.log'
+        chunk = b''; size = 0
+        if path.exists():
+            with safe_file(path).open('rb') as stream:
+                size = os.fstat(stream.fileno()).st_size
+                require(offset <= size, 'Log offset exceeds size')
+                stream.seek(offset); chunk = stream.read(maximum)
+        else:
+            require(offset == 0, 'Log offset exceeds size')
+        return {'job_id': job['job_id'], 'offset': offset, 'next_offset': offset + len(chunk),
+                'text': chunk.decode('utf-8', errors='replace'), 'eof': offset + len(chunk) >= size}
+
+    def job_artifacts(self, params):
+        keys(params, ('job_id',), ('limit', 'cursor'))
+        job = self.store.read('job', params['job_id'], self.actor)
+        limit = number(params.get('limit', 100), 'limit', 1, 100)
+        from .common import parse
+        with self.store.connection() as db:
+            artifacts = [parse(row['data']) for row in db.execute("SELECT data FROM objects WHERE kind='artifact' AND actor=? AND json_extract(data,'$.job_id')=? ORDER BY created,id", (self.actor, job['job_id']))]
+        if params.get('cursor'):
+            cursor = identifier(params['cursor'])
+            indexes = [n for n, a in enumerate(artifacts) if a['artifact_id'] == cursor]
+            require(indexes, 'Unknown pagination cursor')
+            artifacts = artifacts[indexes[0] + 1:]
+        page = artifacts[:limit]
+        return {'job_id': job['job_id'], 'artifacts': page,
+                'next_cursor': page[-1]['artifact_id'] if len(artifacts) > limit else None}
+
+    def artifact_read(self, params):
+        keys(params, ('artifact_id',), ('offset', 'max_bytes'))
+        data = self.store.read('artifact', params['artifact_id'], self.actor)
+        path = self.store.directory('artifacts', data['artifact_id']) / 'content'
+        require(path.stat().st_size == data['size'] and file_sha(path) == data['sha256'], 'Artifact integrity check failed', 'integrity')
+        offset = number(params.get('offset', 0), 'offset', 0, data['size'])
+        maximum = number(params.get('max_bytes', CHUNK), 'max_bytes', 1, CHUNK)
+        with safe_file(path).open('rb') as stream:
+            stream.seek(offset); chunk = stream.read(maximum)
+        return {'artifact_id': data['artifact_id'], 'offset': offset, 'data_base64': base64.b64encode(chunk).decode(),
+                'next_offset': offset + len(chunk), 'eof': offset + len(chunk) == data['size'],
+                'size': data['size'], 'sha256': data['sha256'], 'name': data['name'], 'media_type': data['media_type']}
+
+    def annotation_put(self, params):
+        keys(params, ('artifact_id', 'text'), ('annotation_id', 'expected_revision', 'selection'))
+        self.store.read('artifact', params['artifact_id'], self.actor)
+        require(isinstance(params['text'], str) and len(params['text'].encode()) <= 16384, 'Annotation text exceeds 16 KiB', 'limit')
+        selection = params.get('selection')
+        require(len(canonical(selection)) <= 16384, 'Annotation selection exceeds 16 KiB', 'limit')
+        with self.store.transaction() as db:
+            if 'annotation_id' in params:
+                data = self.store.get(db, 'annotation', params['annotation_id'], self.actor)
+                require(data['artifact_id'] == params['artifact_id'] and params.get('expected_revision') == data['revision'], 'Annotation revision conflicts', 'conflict')
+                data['revision'] += 1
+            else:
+                require('expected_revision' not in params, 'New annotations have no expected revision')
+                data = {'annotation_id': uid(), 'artifact_id': params['artifact_id'], 'revision': 1, 'author': self.actor}
+            data.update(text=params['text'], selection=selection)
+            self.store.put(db, 'annotation', data, self.actor)
+            self.store.event(db, data['annotation_id'], 'annotation_revision', data)
+        return data
+
+    def annotation_list(self, params):
+        keys(params, ('artifact_id',))
+        self.store.read('artifact', params['artifact_id'], self.actor)
+        return {'artifact_id': params['artifact_id'], 'annotations': [a for a in self.store.listing('annotation', self.actor) if a['artifact_id'] == params['artifact_id']]}

@@ -181,6 +181,22 @@ class Queue:
             db.execute("UPDATE jobs SET state='queued',worker=NULL,generation=NULL,token=NULL,lease_until=NULL,result=NULL,error=NULL,updated=? WHERE id=?", (now(), job_id))
             self.event(db, job_id, 'explicit_retry', {'previous_attempt': row['attempt']})
 
+    def cancel_queued(self, job_id):
+        """Cancel only an unclaimed request; never interrupt a shared worker.
+
+        The claim and cancellation use the same immediate SQLite transaction,
+        so the caller learns whether work was already claimed. Running and
+        predicted requests finish through their existing bounded lifecycle.
+        """
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise ValueError('Unknown inference request')
+            if row['state'] == 'queued':
+                db.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?", (now(), job_id))
+                self.event(db, job_id, 'cancelled', {'before_claim': True, 'automatic_retry': False})
+            return self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
+
     def get(self, job_id):
         with self.connection() as db:
             result = self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())

@@ -31,6 +31,8 @@ in
   users.users.root.openssh.authorizedKeys.keys = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMZxDYvXnUamAyyZSFXM/3szlx8cSvGv2q8zEbeRfOAX datacrunch-automation"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKhgT1nfjBfMPyAw3EIJKM9WzhQ57/Vl5JjDpvCUu135 aydin@nixos"
+    # Harrison gets the actor-scoped workbench RPC only, with no shell/forwarding.
+    ''restrict,command="env BIO_WORKBENCH_ACTOR=harrison /run/current-system/sw/bin/bio-workbench rpc" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAy2tj+Uoq/hQ3C9VAb3Y4eTJp6rEIGSqqTZB4krNm0D harrison-bio-workbench''
   ];
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
@@ -55,6 +57,11 @@ in
       export PATH=${lib.makeBinPath [ pkgs.systemd pkgs.python3 ]}:/run/current-system/sw/bin''${PATH:+:$PATH}
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/library/cli.py "$@"
+    '')
+    (pkgs.writeShellScriptBin "bio-workbench" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      umask 077
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/cli.py "$@"
     '')
     (pkgs.writeShellScriptBin "bio-inference" ''
       set -euo pipefail
@@ -133,6 +140,7 @@ in
     "bio-tools/rf3".source = ./rf3;
     "bio-tools/msa".source = ./msa;
     "bio-tools/library".source = ./library;
+    "bio-tools/workbench".source = ./workbench;
     "bio-tools/inference".source = ./inference;
     "bio-tools/library-runtime.json".text = builtins.toJSON {
       python = "${pkgs.python312}/bin/python3.12";
@@ -265,6 +273,7 @@ in
   };
 
   systemd.tmpfiles.rules = [
+    "d /var/lib/bio-workbench 0700 root root - -"
     "d /var/lib/bio-inference 0700 root root - -"
     "d /var/lib/bio-library 0700 root root - -"
     "d /var/lib/bio-library-runtime 0700 root root - -"
@@ -288,6 +297,22 @@ in
       Restart = "on-failure";
       RestartSec = 5;
       KillMode = "control-group";
+      TimeoutStopSec = 30;
+      UMask = "0077";
+    };
+  };
+
+  systemd.services.bio-workbench = {
+    description = "Durable desktop and Harrison molecular model jobs";
+    restartTriggers = [ ./workbench ];
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network-online.target" "systemd-tmpfiles-setup.service" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "/run/current-system/sw/bin/bio-workbench daemon";
+      Restart = "on-failure";
+      RestartSec = 5;
       TimeoutStopSec = 30;
       UMask = "0077";
     };

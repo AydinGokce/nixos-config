@@ -1,0 +1,429 @@
+"""Owned head executions; immutable inputs, no implicit inference retries."""
+from __future__ import annotations
+
+import mimetypes
+import fcntl
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+from . import inputs
+from .common import (TERMINAL, Error, atomic, canonical, digest, file_sha, inventory,
+                     no_links, now, read_json, require, safe_file, uid, write_json)
+
+
+def verify_prepared(prepared):
+    for path, expected in prepared['source_pins'].items():
+        require(file_sha(path) == expected, 'Validated tool source changed; create a new preview', 'integrity')
+    root = Path(prepared['input_root'])
+    actual = {name: value for name, value in inventory(root).items()
+              if not (name.startswith('registry/') and (name.endswith(('.sqlite', '.sqlite-wal', '.sqlite-shm')) or '/.registry.lock' in name))}
+    require(actual == prepared['input_files'], 'Validated input changed; no inference was launched', 'integrity')
+    for name, expected in prepared['input_files'].items():
+        path = no_links(root / name)
+        require(path.is_relative_to(root) and path.stat().st_size == expected['size'] and file_sha(path) == expected['sha256'],
+                'Validated input changed; no inference was launched', 'integrity')
+
+
+def validation(store, batch_id, config, compiler=inputs.native_compile):
+    batch = store.read('batch', batch_id)
+    if batch['state'] != 'validating':
+        return
+    combinations = inputs.pairs(store, store.actor(batch_id), batch['_request'])
+    with store.transaction() as db:
+        batch = store.get(db, 'batch', batch_id)
+        if batch['state'] != 'validating':
+            return
+        batch['pairs'] = combinations
+        store.put(db, 'batch', batch)
+    for pair in combinations:
+        with store.transaction() as db:
+            current = store.get(db, 'batch', batch_id)
+            if current['state'] != 'validating':
+                return
+            entry = next(p for p in current['pairs'] if p['pair_id'] == pair['pair_id'])
+            entry['state'] = 'validating'; store.put(db, 'batch', current)
+        try:
+            prepared = inputs.prepare_pair(store, batch, pair, config, compiler)
+            outcome = {'state': 'compatible', 'reasons': [], '_prepared': prepared}
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            reason = str(exc)[-3000:]
+            outcome = {'state': 'rejected', 'reasons': [reason]}
+        with store.transaction() as db:
+            current = store.get(db, 'batch', batch_id)
+            entry = next(p for p in current['pairs'] if p['pair_id'] == pair['pair_id'])
+            entry.update(outcome)
+            store.put(db, 'batch', current)
+            store.event(db, batch_id, 'pair_validated', {'pair_id': pair['pair_id'], **{k: v for k, v in outcome.items() if not k.startswith('_')}})
+    with store.transaction() as db:
+        current = store.get(db, 'batch', batch_id)
+        if current['state'] == 'validating':
+            current['state'] = 'validated'; store.put(db, 'batch', current)
+
+
+def resident_request(root, job_id, token):
+    receipt = root / 'resident-request.json'
+    if not receipt.exists():
+        return None
+    data = read_json(receipt)
+    require(data['workbench_owner'] == {'job_id': job_id, 'token': token}, 'Resident ownership receipt differs', 'integrity')
+    require(re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', data['request_id']) is not None, 'Invalid resident request ID', 'integrity')
+    return data
+
+
+def observe_phase(log):
+    if not log.exists():
+        return 'starting', 'Starting the validated submission'
+    with safe_file(log).open('rb') as stream:
+        size = stream.seek(0, 2); stream.seek(max(0, size - 32768))
+        text = stream.read().decode(errors='replace')
+    if 'resident request' in text:
+        return 'resident inference', 'Native resident request submitted; waiting for its durable result'
+    rules = [('prefilter', 'MSA search'), ('MSA', 'MSA preparation'), ('checkpoint', 'model initialization'),
+             ('Inference', 'inference'), ('diffusion', 'inference'), ('sampling', 'inference'),
+             ('removing ', 'worker cleanup'), ('result retrieval', 'result transfer')]
+    for word, phase in reversed(rules):
+        if word in text:
+            return phase, phase[0].upper() + phase[1:] + ' observed in native log'
+    return 'running', 'Managed submission is running; native logs are available'
+
+
+def cancel_resident(config, receipt):
+    tools = str(Path(config['tools_dir']))
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from inference.job_queue import Queue
+    from inference.common import digest as native_digest
+    queue = Queue(Path(config['inference_state']) / 'jobs.sqlite')
+    row = queue.get(receipt['request_id'])
+    if row is None and receipt['state'] == 'intent':
+        return {'state': 'intent'}
+    require(row is not None and row['payload'].get('provenance', {}).get('workbench_owner') == receipt['workbench_owner'],
+            'Resident request is not owned by this workbench execution', 'integrity')
+    require(native_digest(row['payload']) == receipt['request_sha256'], 'Resident request payload binding differs', 'integrity')
+    return queue.cancel_queued(receipt['request_id'])
+
+
+def request_cancel(root, job_id, token, config):
+    """Fence future resident enqueue before signalling an owned cold client."""
+    path = no_links(root / 'resident-enqueue.lock')
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        marker = root / 'resident-cancel.json'
+        owner = {'job_id': job_id, 'token': token}
+        if not marker.exists():
+            write_json(marker, {'workbench_owner': owner, 'requested_at': now()}, exclusive=True)
+        else:
+            require(read_json(marker)['workbench_owner'] == owner, 'Cancellation marker ownership differs', 'integrity')
+        receipt = resident_request(root, job_id, token)
+        return (receipt, cancel_resident(config, receipt)) if receipt else (None, None)
+    finally:
+        os.close(fd)
+
+
+def owned_resident(config, receipt):
+    tools = str(Path(config['tools_dir']))
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from inference.job_queue import Queue
+    from inference.common import digest as native_digest
+    queue = Queue(Path(config['inference_state']) / 'jobs.sqlite')
+    row = queue.get(receipt['request_id'])
+    if row is None and receipt['state'] == 'intent':
+        return queue, {'id': receipt['request_id'], 'state': 'cancelled', 'never_enqueued': True}
+    require(row is not None and row['payload'].get('provenance', {}).get('workbench_owner') == receipt['workbench_owner']
+            and native_digest(row['payload']) == receipt['request_sha256'], 'Resident reconciliation ownership differs', 'integrity')
+    return queue, row
+
+
+def reconcile_resident(store, job):
+    """Continue tracking an owned native request after its waiting client exits.
+
+    This runs from the persistent head daemon, including after daemon restart.
+    It performs no search, model call, new allocation, or automatic retry.
+    """
+    pending = job['_resident_pending']
+    config, receipt = pending['config'], pending['receipt']
+    queue, row = owned_resident(config, receipt)
+    if row['state'] == 'queued':
+        row = queue.cancel_queued(row['id'])
+    root = store.directory('jobs', job['job_id'])
+    write_json(root / 'resident-reconciliation.json', {'observed_at': now(), 'request': row,
+                 'client_exit_code': pending['client_exit_code']})
+    if row['state'] in {'running', 'predicted'}:
+        with store.transaction() as db:
+            current = store.get(db, 'job', job['job_id'])
+            current['phase'] = 'resident execution continues' if row['state'] == 'running' else 'native output processing'
+            current['progress'] = {'message': 'The waiting client ended; the owned native request is still tracked and its eventual outputs will be retained', 'observed_at': now()}
+            store.put(db, 'job', current)
+        return False
+    require(row['state'] in {'complete', 'failed', 'interrupted', 'cancelled'}, 'Unknown resident reconciliation state', 'integrity')
+    results = root / 'results'
+    if row['state'] == 'complete':
+        verify_prepared(job['_prepared'])
+        from inference.common import verify_inventory as verify_native, atomic_json
+        destination = results / row['id']
+        if destination.exists():
+            saved = read_json(destination / '.workbench-recovery.json')
+            require(saved['request_sha256'] == receipt['request_sha256'], 'Recovered output belongs to another request', 'integrity')
+            actual = {k: v for k, v in inventory(destination).items() if k != '.workbench-recovery.json'}
+            require(actual == saved['files'], 'Recovered result changed', 'integrity')
+        else:
+            stage_root = root / ('recovery-transfer-' + uid())
+            stage_root.mkdir(mode=0o700)
+            stage = stage_root / 'result'
+            if job['model'] == 'rf3':
+                from inference.frontend import publish_rf3
+                publish_rf3(row, row['payload'], stage)
+            else:
+                verify_native(row['result']['output_dir'], row['result']['files'], exact=True)
+                shutil.copytree(row['result']['output_dir'], stage)
+                atomic_json(stage / 'resident-result.json', row, exclusive=True)
+                atomic_json(stage / 'job.json', row['payload'], exclusive=True)
+            write_json(stage / '.workbench-recovery.json', {'request_sha256': receipt['request_sha256'], 'files': inventory(stage)}, exclusive=True)
+            os.rename(stage, destination)
+        state = 'complete'
+    else:
+        terminal = results / 'resident-terminal.json'
+        if terminal.exists():
+            require(read_json(terminal) == row, 'Resident terminal receipt changed', 'integrity')
+        else:
+            write_json(terminal, row, exclusive=True)
+        state = 'cancelled' if row['state'] == 'cancelled' and job['state'] == 'cancel_requested' else 'interrupted' if row['state'] == 'cancelled' else row['state']
+    artifacts = seal_results(store, job, results, 'resident-recovered')
+    with store.transaction() as db:
+        current = store.get(db, 'job', job['job_id'])
+        current.update(state=state, phase=state, finished_at=now(), exit_code=0 if state == 'complete' else pending['client_exit_code'])
+        current.pop('_resident_pending', None)
+        current['provenance'].update(resident_reconciled=True, client_exit_code=pending['client_exit_code'],
+                                     artifacts_sha256=digest(artifacts))
+        if state != 'complete':
+            current['error'] = {'message': 'Owned resident request ended as ' + row['state'], 'automatic_retry': False}
+        elif current.get('error'):
+            current['error'] = None
+        store.put(db, 'job', current)
+        store.event(db, job['job_id'], 'resident_reconciled', {'state': state, 'client_exit_code': pending['client_exit_code']})
+    return True
+
+
+def seal_results(store, job, root, source='native'):
+    """Copy stopped execution artifacts; never trust a changing source tree."""
+    root = no_links(root)
+    before = inventory(root)
+    actor = store.actor(job['job_id'])
+    with store.connection() as db:
+        from .common import parse
+        existing = [parse(row['data']) for row in db.execute("SELECT data FROM objects WHERE kind='artifact' AND actor=? AND json_extract(data,'$.job_id')=?", (actor, job['job_id']))]
+    existing = {a['name']: a for a in existing if a.get('_source') == source}
+    results = []
+    for relative, expected in before.items():
+        if relative.endswith(('.pyc', '.lock')):
+            continue
+        if relative in existing:
+            old = existing[relative]
+            require(old['sha256'] == expected['sha256'] and old['size'] == expected['size'], 'Previously sealed output changed', 'integrity')
+            require(file_sha(store.directory('artifacts', old['artifact_id']) / 'content') == expected['sha256'], 'Retained artifact changed', 'integrity')
+            results.append(old)
+            continue
+        ident = uid(); destination = store.directory('artifacts', ident)
+        destination.mkdir(parents=True, mode=0o700)
+        original = safe_file(root / relative)
+        with original.open('rb') as incoming, (destination / 'content').open('xb') as outgoing:
+            shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
+            outgoing.flush(); os.fsync(outgoing.fileno())
+        os.chmod(destination / 'content', 0o400)
+        require(file_sha(destination / 'content') == expected['sha256'], 'Output changed during archival', 'integrity')
+        extension = original.suffix.lower().lstrip('.')
+        excluded = {'prepared', 'prepared-bundle', 'features', 'template_data', 'template_structures', 'templates', 'library-input', 'native-input'}
+        input_file = any(part in excluded for part in Path(relative).parts[:-1]) or original.stem.lower() in {'input', 'source', 'native-input'}
+        known_output = (job['model'] == 'rf3' or 'predictions' in original.parts or
+                        (job['model'] == 'openfold3' and re.search(r'_seed_\d+_sample_\d+_model$', original.stem)) or
+                        (job['model'] == 'rfdiffusion' and original.stem.startswith('design')))
+        role = 'structure' if extension in {'cif', 'mmcif', 'pdb'} and not input_file and known_output else 'log' if extension == 'log' else 'confidence' if 'confidence' in original.name else 'provenance' if extension == 'json' else 'data'
+        artifact = {'artifact_id': ident, 'job_id': job['job_id'], 'name': relative, 'size': expected['size'],
+                    'sha256': expected['sha256'], 'media_type': mimetypes.guess_type(original.name)[0] or 'application/octet-stream',
+                    'format': extension, 'role': role, 'model': job['model'],
+                    'sample_id': str(Path(relative).with_suffix('')) if role == 'structure' else None,
+                    'confidence': None, 'qa': None, '_source': source}
+        if role == 'structure':
+            from .artifact_metadata import structure_metadata
+            artifact.update(structure_metadata(original, root, job['model']))
+        results.append(artifact)
+    require(inventory(root) == before, 'Output tree changed during archival', 'integrity')
+    with store.transaction() as db:
+        for artifact in results:
+            store.put(db, 'artifact', artifact, actor)
+    return [{'artifact_id': a['artifact_id'], 'sha256': a['sha256'], 'size': a['size'], 'name': a['name']} for a in results]
+
+
+def run_job(store, job_id, config):
+    job = store.read('job', job_id)
+    require(job['state'] in {'starting', 'cancel_requested'}, 'Job is not admitted to this execution', 'conflict')
+    root = store.directory('jobs', job_id)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    prepared = job['_prepared']; verify_prepared(prepared)
+    results = root / 'results'; results.mkdir(mode=0o700, exist_ok=False)
+    log = root / 'run.log'
+    cancelled = False
+    process = None
+    def signal_cancel(signum, frame):
+        nonlocal cancelled
+        cancelled = True
+    old = {sig: signal.signal(sig, signal_cancel) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        with store.transaction() as db:
+            current = store.get(db, 'job', job_id)
+            if current['state'] == 'cancel_requested':
+                current.update(state='cancelled', finished_at=now(), phase='cancelled')
+                store.put(db, 'job', current)
+                return
+            current.update(state='running', started_at=now(), phase='starting'); store.put(db, 'job', current)
+        env = os.environ.copy()
+        # The actor and forced-command transport have no authority over launch
+        # options. Only trusted config and validated generated paths enter env.
+        env.pop('BIO_WORKBENCH_ACTOR', None)
+        env.update(BIO_RESULTS_DIR=str(results), BIO_TOOLS_SRC=prepared['tools_dir'], PYTHONUNBUFFERED='1')
+        env.update(prepared['environment'])
+        token = uid()
+        write_json(root / 'resident-binding.json', {'schema': 1, 'job_id': job_id, 'token': token}, exclusive=True)
+        env['BIO_WORKBENCH_BINDING_FILE'] = str(root / 'resident-binding.json')
+        write_json(root / 'submission.json', {'argv': prepared['argv'], 'environment': {k: env[k] for k in ('BIO_RESULTS_DIR', 'BIO_TOOLS_SRC', 'BIO_LIBRARY_ROOT') if k in env},
+                                             'prepared_sha256': digest(prepared), 'started_at': now()}, exclusive=True)
+        with log.open('ab', buffering=0) as stream:
+            process = subprocess.Popen(prepared['argv'], env=env, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            write_json(root / 'head-process.json', {'pid': process.pid, 'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19],
+                        'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'created_at': now()}, exclusive=True)
+            sent_term = None; resident = None; resident_cancelled = False
+            deadline = time.monotonic() + prepared['timeout'] + 1200
+            while process.poll() is None:
+                current = store.read('job', job_id)
+                cancelled = cancelled or current['state'] == 'cancel_requested'
+                resident = resident_request(root, job_id, token) or resident
+                phase, message = observe_phase(log)
+                row = None
+                if cancelled:
+                    resident, row = request_cancel(root, job_id, token, config)
+                if cancelled and resident:
+                    resident_cancelled = row['state'] == 'cancelled'
+                    phase = 'cancellation requested'
+                    message = ('Resident request cancelled before claim' if resident_cancelled else
+                               'Resident enqueue was cancelled' if row['state'] == 'intent' else
+                               'Resident prediction already claimed; its bounded execution is finishing and outputs will be retained')
+                    # Never kill the waiting client for an already claimed
+                    # durable request, or the shared resident worker.
+                elif cancelled and sent_term is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    sent_term = time.monotonic()
+                    message = 'Cancellation signalled to the exact owned submission; waiting for managed cleanup'
+                if sent_term is not None and time.monotonic() - sent_term > 840:
+                    raise Error('unavailable', 'Owned submission cleanup exceeded its stop bound; retained for operator reconciliation')
+                require(time.monotonic() < deadline, 'Submission exceeded its owned work and cleanup bound', 'unavailable')
+                with store.transaction() as db:
+                    current = store.get(db, 'job', job_id)
+                    if cancelled:
+                        current['state'] = 'cancel_requested'
+                    current['phase'] = phase
+                    current['progress'] = {'message': message, 'observed_at': now()}
+                    if resident:
+                        current['provenance']['resident_job_id'] = resident['request_id']
+                    store.put(db, 'job', current)
+                time.sleep(1)
+        status = process.returncode
+        latest_receipt = resident_request(root, job_id, token)
+        if status != 0 and latest_receipt is not None:
+            # Preserve any interrupted client copy separately. The authoritative
+            # native result is fetched later only from its verified terminal
+            # inventory, never from a partially copied directory.
+            os.rename(results, root / 'client-partial')
+            results.mkdir(mode=0o700)
+            write_json(root / 'client-exit.json', {'exit_code': status, 'finished_at': now(),
+                         'resident_receipt': latest_receipt}, exclusive=True)
+            with store.transaction() as db:
+                current = store.get(db, 'job', job_id)
+                current.update(state='cancel_requested' if cancelled else 'running', phase='resident reconciliation')
+                current['_resident_pending'] = {'receipt': latest_receipt, 'config': {**config, 'tools_dir': prepared['tools_dir']}, 'client_exit_code': status}
+                current['provenance'].update(resident_job_id=latest_receipt['request_id'], client_exit_code=status)
+                current['progress'] = {'message': 'Waiting client ended; reconciling the owned durable native request', 'observed_at': now()}
+                store.put(db, 'job', current)
+            # The head process has stopped. Its logs and partial bytes remain
+            # durable, while the daemon continues native-request reconciliation.
+            return
+        verify_prepared(prepared)
+        artifacts = seal_results(store, job, results)
+        # Retain the head log and submit binding separately from native files.
+        head = root / 'head-evidence'; head.mkdir(mode=0o700)
+        for name in ('run.log', 'submission.json', 'head-process.json'):
+            shutil.copyfile(root / name, head / name)
+        artifacts += seal_results(store, job, head, 'head')
+        state = 'complete' if status == 0 else 'cancelled' if cancelled else 'failed'
+        with store.transaction() as db:
+            current = store.get(db, 'job', job_id)
+            current.update(state=state, exit_code=status, finished_at=now(), phase=state,
+                           error=None if status == 0 else {'message': 'Submission exited with status ' + str(status), 'automatic_retry': False})
+            if cancelled and status == 0:
+                current['provenance']['cancel_requested_but_prediction_finished'] = True
+            current['provenance']['artifacts_sha256'] = digest(artifacts)
+            store.put(db, 'job', current); store.event(db, job_id, 'terminal', {'state': state, 'exit_code': status})
+        write_json(root / 'result.json', {'job_id': job_id, 'state': state, 'exit_code': status, 'artifacts': artifacts, 'finished_at': now()}, exclusive=True)
+    finally:
+        for sig, previous in old.items():
+            signal.signal(sig, previous)
+        if process is not None and process.poll() is None:
+            # Preserve uncertainty. The owning unit's mixed-stop grace and the
+            # existing cloud watchdog remain authoritative; no unbound delete.
+            with store.transaction() as db:
+                current = store.get(db, 'job', job_id)
+                current.update(state='interrupted', phase='cleanup reconciliation',
+                               error={'message': 'Head runner interrupted with an owned process still present', 'automatic_retry': False})
+                store.put(db, 'job', current)
+
+
+def execute(store, kind, ident, intent_sha256, config):
+    root = store.directory('operations', ident)
+    intent = read_json(root / 'intent.json')
+    require(file_sha(root / 'intent.json') == intent_sha256 and intent['object_id'] == ident and intent['kind'] == kind,
+            'Execution intent binding failed', 'integrity')
+    require(file_sha(root / 'config.json') == intent['config_sha256'], 'Trusted execution configuration changed', 'integrity')
+    invocation = os.environ.get('INVOCATION_ID', '')
+    require(re.fullmatch('[a-f0-9]{32}', invocation) is not None, 'Owned systemd InvocationID required', 'integrity')
+    receipt = {'kind': kind, 'object_id': ident, 'unit': intent['unit'], 'invocation_id': invocation,
+               'intent_sha256': intent_sha256, 'started_at': now()}
+    write_json(root / 'started.json', receipt, exclusive=True)
+    with store.transaction() as db:
+        row = db.execute('SELECT * FROM operations WHERE object_id=?', (ident,)).fetchone()
+        require(row is not None and row['intent_sha256'] == intent_sha256 and row['state'] == 'intent', 'Execution was already started or differs from its intent', 'conflict')
+        db.execute("UPDATE operations SET invocation_id=?,state='running',updated=? WHERE object_id=?", (invocation, now(), ident))
+    try:
+        if kind == 'validation':
+            validation(store, ident, config)
+        else:
+            run_job(store, ident, config)
+        receipt.update(state='complete', finished_at=now())
+    except BaseException as exc:
+        receipt.update(state='failed', error=str(exc)[-4000:], finished_at=now())
+        with store.transaction() as db:
+            object_kind = 'batch' if kind == 'validation' else 'job'
+            data = store.get(db, object_kind, ident)
+            if data['state'] not in TERMINAL:
+                data['state'] = 'validation_failed' if kind == 'validation' else 'interrupted'
+                if kind == 'validation':
+                    data['errors'].append(str(exc)[-3000:])
+                else:
+                    data['error'] = {'message': str(exc)[-3000:], 'automatic_retry': False}
+                    data['finished_at'] = now()
+                store.put(db, object_kind, data)
+        raise
+    finally:
+        write_json(root / 'terminal.json', receipt, exclusive=True)
+        with store.transaction() as db:
+            db.execute('UPDATE operations SET state=?,data=?,updated=? WHERE object_id=?',
+                       (receipt['state'], canonical(receipt).decode(), now(), ident))

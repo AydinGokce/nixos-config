@@ -88,7 +88,7 @@ def wait(queue, job_id, timeout):
         result = queue.get(job_id)
         if result is None:
             raise ValueError('Unknown inference request')
-        if result['state'] in ('complete', 'failed', 'interrupted'):
+        if result['state'] in ('complete', 'failed', 'interrupted', 'cancelled'):
             if result['state'] != 'complete':
                 print(json.dumps(result, indent=2), file=sys.stderr)
                 raise SystemExit(1)

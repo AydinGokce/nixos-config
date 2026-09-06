@@ -37,6 +37,61 @@ class Unavailable(Exception):
     pass
 
 
+def workbench_binding(job):
+    """Bind an optional trusted caller before durable enqueue, never from logs."""
+    value = os.environ.get('BIO_WORKBENCH_BINDING_FILE')
+    if not value:
+        return None
+    path = _no_symlinks(Path(value))
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 4096:
+        raise ValueError('Workbench binding must be a private owned regular file')
+    binding = read(path)
+    if (set(binding) != {'schema', 'job_id', 'token'} or binding['schema'] != 1
+            or any(not isinstance(binding[k], str) or len(binding[k]) != 32
+                   or set(binding[k]) - set('0123456789abcdef') for k in ('job_id', 'token'))):
+        raise ValueError('Invalid workbench ownership binding')
+    owner = {'job_id': binding['job_id'], 'token': binding['token']}
+    job.setdefault('provenance', {})['workbench_owner'] = owner
+    receipt = {'schema': 1, 'request_id': job['id'], 'workbench_owner': owner,
+               'request_sha256': digest(job), 'state': 'intent'}
+    destination = path.with_name('resident-request.json')
+    if destination.exists():
+        _no_symlinks(destination)
+        old = read(destination)
+        if any(old.get(key) != receipt[key] for key in ('request_id', 'workbench_owner', 'request_sha256')):
+            raise ValueError('Workbench execution already belongs to a different resident request')
+    else:
+        atomic_json(destination, receipt, exclusive=True)
+    return destination
+
+
+def enqueue_bound(queue, job, binding):
+    if binding is None:
+        return queue.enqueue(job)
+    lock_path = _no_symlinks(binding.with_name('resident-enqueue.lock'))
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        receipt = read(binding)
+        cancelled = binding.with_name('resident-cancel.json')
+        if cancelled.exists():
+            _no_symlinks(cancelled)
+            if read(cancelled).get('workbench_owner') != receipt['workbench_owner']:
+                raise ValueError('Workbench cancellation ownership differs')
+            # A caller cancellation that wins this lock prevents a later claim,
+            # even if its signal crosses the frontend's enqueue boundary.
+            raise ValueError('Workbench request cancelled before resident enqueue')
+        result = queue.enqueue(job)
+        if receipt['request_id'] != result['id'] or receipt['request_sha256'] != digest(result['payload']):
+            raise ValueError('Enqueued request differs from its workbench ownership intent')
+        receipt.update(state='enqueued', observed_request_state=result['state'])
+        atomic_json(binding, receipt)
+        return result
+    finally:
+        os.close(fd)
+
+
 def profile(state, model, native_seed=None):
     path = state / 'profiles' / (model + '.json')
     if not path.is_file():
@@ -607,9 +662,10 @@ def submit_rf3(args, policy, config, worker):
             'library_reference': args.library_reference, 'chemistry_sha256': args.chemistry_sha,
             'profile': policy, 'preparation_seconds': now() - started},
         'input_files': {'root': str(bundle), 'files': inventory(bundle)}}
+    binding = workbench_binding(job)
     atomic_json(run / 'job.json', job, exclusive=True)
     queue = Queue(args.state / 'jobs.sqlite')
-    queue.enqueue(job)
+    enqueue_bound(queue, job, binding)
     print('bio-submit: resident request ' + job_id + ' queued', flush=True)
     result = wait(queue, job_id, args.timeout)
     destination = publish_rf3(result, job, args.results / job_id)
@@ -673,9 +729,10 @@ def submit(args):
     if getattr(args, 'native_seed', None) is not None:
         job['provenance']['requested_native_seed'] = args.native_seed
     job['input_files'] = {'root': str(run / 'native-input'), 'files': inventory(run / 'native-input')}
+    binding = workbench_binding(job)
     atomic_json(run / 'job.json', job, exclusive=True)
     queue = Queue(args.state / 'jobs.sqlite')
-    queue.enqueue(job)
+    enqueue_bound(queue, job, binding)
     print('bio-submit: resident request ' + job_id + ' queued', flush=True)
     result = wait(queue, job_id, args.timeout)
     receipt = result['result']
