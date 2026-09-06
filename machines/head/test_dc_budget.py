@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -130,6 +131,9 @@ class FakeAPI:
 
 class BudgetTests(unittest.TestCase):
     def setUp(self):
+        cooldown = patch.dict(os.environ, {"DC_LAUNCH_COOLDOWN_SECONDS": "0"})
+        cooldown.start()
+        self.addCleanup(cooldown.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.clock = Clock()
@@ -328,6 +332,136 @@ class BudgetTests(unittest.TestCase):
         with ThreadPoolExecutor(2) as pool:
             results = list(pool.map(attempt, ["one", "two"]))
         self.assertEqual(sum(results), 1)
+
+    def recent_cleanup(self):
+        self.init()
+        ident = self.c.launch(self.args())
+        self.c.remove(ident)
+        self.api.calls.clear()
+        return self.clock()
+
+    def test_cooldown_waiters_overlap_and_reset_after_new_confirmed_cleanup(self):
+        self.init()
+        first = self.c.launch(self.args())
+        second = self.c.launch(self.args())
+        self.c.remove(first)
+        start = self.clock()
+        self.api.calls.clear()
+        progress = []
+        def tick():
+            self.clock.sleep(30)
+            if self.clock() == start + 60:
+                self.c.remove(second)
+            # This takes the accounting lock while both callers are sleeping.
+            # It also proves cleanup/watchdog make progress during the wait.
+            self.c.watchdog()
+            progress.append(self.clock())
+        barrier = threading.Barrier(2, action=tick, timeout=5)
+        def sleep(seconds):
+            self.assertEqual(seconds, 30)
+            self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+            barrier.wait()
+        controllers = [dc.Controller(self.api, self.store, self.clock, sleep) for _ in range(2)]
+        with ThreadPoolExecutor(2) as pool:
+            results = list(pool.map(lambda controller: controller.wait_for_launch_cooldown(180), controllers))
+        self.assertEqual(results, [None, None])
+        self.assertEqual(self.clock(), start + 240)  # New cleanup at +60, then 180 seconds.
+        self.assertEqual(len(progress), 8)
+        self.assertTrue(all(job['status'] == 'closed' for job in self.state()['jobs'].values()))
+        with patch.dict(os.environ, {"DC_LAUNCH_COOLDOWN_SECONDS": "180"}):
+            ident = self.c.launch(self.args())
+        self.assertEqual(self.clock(), start + 240)
+        job = next(job for job in self.state()['jobs'].values() if job.get('id') == ident)
+        self.assertEqual(job['created'], start + 240)
+        self.assertEqual(job['deadline'], start + 240 + 3600)
+
+    def test_cooldown_rechecks_cleanup_under_reservation_lock_and_requotes(self):
+        self.init()
+        first = self.c.launch(self.args())
+        second = self.c.launch(self.args())
+        self.c.remove(first)
+        start = self.clock()
+        self.api.calls.clear()
+        quote, quotations = self.c.quote, []
+        def quoted(*args):
+            result = quote(*args)
+            quotations.append((self.clock(), result[0]))
+            if len(quotations) == 1:
+                # Another workflow finishes after the outer wait but before
+                # this launch obtains its reservation lock.
+                self.c.remove(second)
+                self.api.ondemand_quote = "3"
+            return result
+        self.c.quote = quoted
+        with patch.dict(os.environ, {"DC_LAUNCH_COOLDOWN_SECONDS": "60"}):
+            ident = self.c.launch(self.args())
+        self.assertEqual(quotations, [(start + 60, 2), (start + 120, 3)])
+        self.assertEqual(len([call for call in self.api.calls if call[0] == 'POST']), 1)
+        job = next(job for job in self.state()['jobs'].values() if job.get('id') == ident)
+        self.assertEqual(job['created'], start + 120)
+        self.assertEqual(job['rate'], 3)
+
+    def test_cooldown_uses_only_confirmed_managed_cleanup_timestamps(self):
+        state = {'jobs': {
+            'rejected': {'id': None, 'status': 'closed', 'created': 900, 'cleanup_confirmed_at': 900},
+            'unconfirmed': {'id': 'pending-cleanup', 'status': 'cleanup', 'created': 800, 'last': 900},
+            'historical': {'id': 'old', 'status': 'closed', 'created': 500},
+            'purged': {'id': 'confirmed', 'status': 'closed', 'os_purged_at': 100},
+            'removed': {'id': 'confirmed-soft-trash', 'status': 'closed', 'cleanup_confirmed_at': 120},
+        }, 'last_inventory': 999}
+        self.assertEqual(dc.launch_not_before(state, 180), 300)
+        self.assertEqual(dc.launch_not_before(state, 0), 0)
+        state['jobs']['purged']['os_purged_at'] = 'unknown'
+        with self.assertRaisesRegex(dc.LaunchBlocked, 'Invalid confirmed cleanup timestamp'):
+            dc.launch_not_before(state, 180)
+
+    def test_cooldown_defaults_to_zero_and_never_delays_cleanup_or_watchdog(self):
+        start = self.recent_cleanup()
+        with patch.dict(os.environ, {key: value for key, value in os.environ.items()
+                                   if key != 'DC_LAUNCH_COOLDOWN_SECONDS'}, clear=True):
+            ident = self.c.launch(self.args())
+        self.assertEqual(self.clock(), start)
+        with patch.dict(os.environ, {'DC_LAUNCH_COOLDOWN_SECONDS': 'invalid-for-launch'}):
+            self.c.remove(ident)
+            self.c.watchdog()
+        self.assertEqual(self.clock(), start)
+        self.assertTrue(all('cleanup_confirmed_at' in job for job in self.state()['jobs'].values()))
+
+    def test_cooldown_preserves_fresh_quote_ceiling_and_watchdog_guards(self):
+        start = self.recent_cleanup()
+        def sleep(seconds):
+            self.clock.sleep(seconds)
+            self.api.ondemand_quote = '9'
+        self.c.sleep = sleep
+        with patch.dict(os.environ, {'DC_LAUNCH_COOLDOWN_SECONDS': '60', 'DC_MAX_INSTANCE_HOURLY': '5'}):
+            with self.assertRaisesRegex(dc.LaunchBlocked, 'exceeds DC_MAX_INSTANCE_HOURLY'):
+                self.c.launch(self.args())
+        self.assertEqual(self.clock(), start + 60)
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.api.calls))
+        self.api.ondemand_quote = '2'
+        with patch.dict(os.environ, {'DC_LAUNCH_COOLDOWN_SECONDS': '181'}):
+            self.c.sleep = self.clock.sleep
+            with self.assertRaisesRegex(dc.LaunchBlocked, 'watchdog'):
+                self.c.launch(self.args())
+        self.assertEqual(self.clock(), start + 181)
+        self.assertFalse(any(method == 'POST' for method, _, _ in self.api.calls))
+        self.assertEqual(len(self.state()['jobs']), 1)
+
+    def test_invalid_or_interrupted_cooldown_creates_no_reservation_or_post(self):
+        self.recent_cleanup()
+        for invalid in ('-1', 'nan', 'inf', '', 'bad'):
+            with self.subTest(value=invalid), patch.dict(os.environ, {'DC_LAUNCH_COOLDOWN_SECONDS': invalid}):
+                with self.assertRaisesRegex(dc.LaunchBlocked, 'DC_LAUNCH_COOLDOWN_SECONDS'):
+                    self.c.launch(self.args())
+        self.assertEqual(self.api.calls, [])
+        def interrupted(seconds):
+            raise KeyboardInterrupt
+        self.c.sleep = interrupted
+        with patch.dict(os.environ, {'DC_LAUNCH_COOLDOWN_SECONDS': '180'}):
+            with self.assertRaises(KeyboardInterrupt):
+                self.c.launch(self.args())
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(len(self.state()['jobs']), 1)
 
     def test_launch_and_delete_preserve_shared_volume_and_confirm(self):
         self.init()
@@ -840,6 +974,7 @@ class BudgetTests(unittest.TestCase):
         next(row for row in self.api.volumes if row["id"] == "os-" + ident)["name"] = "legacy-os-name"
         self.c.remove(ident)
         self.assertEqual(next(iter(self.state()["jobs"].values()))["status"], "closed")
+        self.assertEqual(next(iter(self.state()["jobs"].values()))["cleanup_confirmed_at"], self.clock())
         self.assertEqual([row["id"] for row in self.api.trash], ["os-" + ident])
         self.assertFalse(any(method == "DELETE" and body["is_permanent"] for method, _, body in self.api.calls))
 

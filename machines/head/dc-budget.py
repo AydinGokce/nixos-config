@@ -12,6 +12,9 @@ disks are deleted. The head/shared data remain and keep accruing costs after GPU
 cutoff. This is NOT a provider hard spending cap; outages can delay teardown.
 DC_MAX_INSTANCE_HOURLY optionally caps each fresh instance quote before launch;
 OS/storage charges still count toward the separate overall spending guard.
+DC_LAUNCH_COOLDOWN_SECONDS optionally waits after confirmed managed cleanup
+before the next launch (default 0). Accounting/cleanup locks are not held while
+waiting, and budget checks and quotes are refreshed after the wait.
 API schema: https://api.verda.com/v1/openapi.json (verified 2026-09-05).
 """
 from __future__ import annotations
@@ -386,6 +389,23 @@ def reserve(state, token, rate, os_rate, hours, now, ceiling, margin, persistent
                             "rate": rate, "os_rate": os_rate, "os_id": None, "status": "pending"}
 
 
+def launch_not_before(state, seconds):
+    """Use observed cleanup completion, never creation/reconciliation times."""
+    if seconds == 0:
+        return 0
+    completed = []
+    for job in state["jobs"].values():
+        if not job.get("id"):
+            continue  # A rejected create is not a cleanup event.
+        for key in ("cleanup_confirmed_at", "os_purged_at"):
+            if key in job:
+                value = job[key]
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise LaunchBlocked(f"Invalid confirmed cleanup timestamp {key}; reconcile the budget ledger before launch")
+                completed.append(value)
+    return max(completed) + seconds if completed else 0
+
+
 def purgeable_os(state, token, job, disk, inventory):
     """Prove a detached trash item is this new managed job's disposable OS."""
     if not re.fullmatch(r"[0-9a-f]{32}", token) or not job.get("id") or job.get("legacy"):
@@ -555,6 +575,23 @@ class Controller:
         os_rate = number(storage.get("cps_per_gb"), "OS storage quote") * 3600 * size
         return rate, os_rate
 
+    def wait_for_launch_cooldown(self, seconds):
+        if seconds == 0:
+            return
+        reported_deadline = None
+        while True:
+            with self.store.locked(self.clock()) as state:
+                deadline = launch_not_before(state, seconds)
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return
+            if deadline != reported_deadline:
+                print(f"dc: waiting {remaining:.0f}s after confirmed managed cleanup before launch", file=sys.stderr, flush=True)
+                reported_deadline = deadline
+            # Releases budget.lock so watchdog/cleanup and other waiters can
+            # progress; a newer completion moves the deadline on the next read.
+            self.sleep(min(remaining, 30))
+
     def launch(self, args):
         if not 0 < args.max_hours <= 24 or args.os_size <= 0:
             raise Error("--max-hours must be in (0,24]; --os-size must be positive")
@@ -566,22 +603,31 @@ class Controller:
                 maximum_hourly = number(os.environ["DC_MAX_INSTANCE_HOURLY"], "DC_MAX_INSTANCE_HOURLY")
             except Error as exc:
                 raise LaunchBlocked(str(exc)) from None
-        rate, os_rate = self.quote(args.type, args.spot, args.os_size)
-        # Use this launch's fresh instance quote before touching reservations.
-        # OS and persistent storage remain included in the overall budget guard.
-        if maximum_hourly is not None and rate > maximum_hourly:
-            raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
-                                f"${maximum_hourly:g}/h; launch refused")
-        keys = self.api.request("GET", "/sshkeys")
+        try:
+            cooldown = number(os.environ.get("DC_LAUNCH_COOLDOWN_SECONDS", "0"), "DC_LAUNCH_COOLDOWN_SECONDS")
+        except Error as exc:
+            raise LaunchBlocked(str(exc)) from None
         token = uuid.uuid4().hex
-        now = self.clock()
-        with self.store.locked(now) as state:
-            self.refresh(state)
+        while True:
+            self.wait_for_launch_cooldown(cooldown)
+            rate, os_rate = self.quote(args.type, args.spot, args.os_size)
+            # Use a fresh quote after any wait, before touching reservations.
+            # OS and persistent storage remain in the overall budget guard.
+            if maximum_hourly is not None and rate > maximum_hourly:
+                raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
+                                    f"${maximum_hourly:g}/h; launch refused")
+            keys = self.api.request("GET", "/sshkeys")
             now = self.clock()
-            check_storage_lifetime(self.store.root, args.volume, now)
-            reserve(state, token, rate, os_rate, args.max_hours, now,
-                    self.ceiling, self.margin, self.persistent_hours)
-            state["jobs"][token]["volumes"] = list(args.volume)
+            with self.store.locked(now) as state:
+                self.refresh(state)
+                now = self.clock()
+                if launch_not_before(state, cooldown) > now:
+                    continue  # Cleanup advanced during quote/inventory calls.
+                check_storage_lifetime(self.store.root, args.volume, now)
+                reserve(state, token, rate, os_rate, args.max_hours, now,
+                        self.ceiling, self.margin, self.persistent_hours)
+                state["jobs"][token]["volumes"] = list(args.volume)
+            break
         body = {"instance_type": args.type, "image": args.image,
                 "hostname": args.name or "bio-" + token[:12],
                 "description": f"bio-dc:{token} ephemeral deadline={int(now + args.max_hours * 3600)}",
@@ -682,6 +728,7 @@ class Controller:
                     for job in state["jobs"].values():
                         if job.get("id") == ident:
                             job["status"] = "closed"
+                            job.setdefault("cleanup_confirmed_at", self.clock())
                 detail = "; managed OS permanently removed" if purged else ""
                 print(f"removed {ident} (confirmed{detail}; shared volumes retained)", flush=True)
                 return
