@@ -152,17 +152,80 @@ def preparation_identity(model, input_path, parser, backend, source, *, chemistr
             'template_mode': 'native-default', 'pairing_mode': 'native-default'}}
 
 
+def public_preparation_sources(worker):
+    toolkit = Path(__file__).absolute().parent.parent
+    sources = {}
+    for relative in ('msa/prepared.py', 'py/public_msa_client.py'):
+        path = worker['tools_root'] + '/' + relative
+        source = toolkit / relative
+        if not source.is_file():
+            raise Unavailable('Head toolkit lacks the guarded public preparation helper')
+        expected = sha256(source)
+        if worker.get('source_files', {}).get(path) != expected:
+            raise Unavailable('Resident worker lacks the matching guarded public preparation generation')
+        sources[path] = expected
+    return sources
+
+
+def public_preparation_identity(args, worker, fasta):
+    parser = Path(__file__).absolute().parent.parent / 'msa/prepared.py'
+    source = {'endpoint': args.endpoint,
+              'database': {'status': 'provider-unreported', 'provider': args.endpoint}}
+    identity = preparation_identity(args.model, fasta, parser, 'public', source,
+        chemistry_sha=args.chemistry_sha, runtime_id=worker['runtime_image']['sha256'])
+    identity['preparation_toolchain_sha256'] = digest(worker['source_files'])
+    return identity
+
+
+@contextmanager
+def public_preparation_slot(state, target, deadline):
+    """One SSH reverse port per physical worker; other workers remain parallel."""
+    root = _no_symlinks(state / 'public-preparation-locks')
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = digest({'instance_id': target['instance_id'], 'boot_id': target['boot_id']})
+    descriptor = os.open(root / (key + '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise ValueError('Unsafe resident public-preparation lock')
+        while True:
+            remaining = deadline - now()
+            if remaining <= 0:
+                raise Unavailable('Allocation preparation deadline elapsed while waiting for its SSH tunnel')
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(.2, remaining))
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def prepare_public(state, worker, model, fasta, destination, timeout, endpoint):
+    sources = public_preparation_sources(worker)
+    deadline = min(now() + timeout, worker['deadline_epoch'] - 60)
+    target = read(state / 'launches' / worker['worker_id'] / 'intent.json')['target']
+    with public_preparation_slot(state, target, deadline):
+        return _prepare_public_locked(state, worker, model, fasta, destination, deadline, endpoint, sources, target)
+
+
+def _prepare_public_locked(state, worker, model, fasta, destination, deadline, endpoint, sources, target):
     parser = worker['tools_root'] + '/msa/prepared.py'
-    expected = worker['source_files'][parser]
-    if expected != sha256(Path(__file__).absolute().parent.parent / 'msa/prepared.py'):
-        raise ValueError('CPU preparation parser differs from the cached head parser identity')
-    launch = read(state / 'launches' / worker['worker_id'] / 'intent.json')
-    target = launch['target']
+    helper = worker['tools_root'] + '/py/public_msa_client.py'
+    head_helper = Path(__file__).absolute().parent.parent / 'py/public_msa_client.py'
+    spec = importlib.util.spec_from_file_location('resident_public_msa_guard', head_helper)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    port = int(os.environ.get('BIO_PUBLIC_MSA_HEAD_PORT', '18763'))
+    if not 1 <= port <= 65535:
+        raise ValueError('Invalid head public-MSA proxy port')
+    guard.public_endpoint(endpoint)
+    guard.check_proxy('http://127.0.0.1:' + str(port), deadline)
     actual = remote(target, ['/usr/bin/cat', '/proc/sys/kernel/random/boot_id']).decode().strip()
     if actual != target['boot_id']:
         raise ValueError('CPU preparation allocation boot identity changed')
-    remaining = min(timeout, int(worker['deadline_epoch'] - now()) - 60)
+    remaining = int(deadline - now())
     if remaining < 120:
         raise Unavailable('Insufficient remaining allocation time for preparation')
     unit = 'bio-prepare-' + uuid.uuid4().hex
@@ -171,6 +234,10 @@ def prepare_public(state, worker, model, fasta, destination, timeout, endpoint):
         'Environment=CUDA_VISIBLE_DEVICES=', 'Environment=OMP_NUM_THREADS=1',
         'Environment=OPENBLAS_NUM_THREADS=1', 'Environment=MKL_NUM_THREADS=1',
         'Environment=NUMEXPR_NUM_THREADS=1', 'Environment=PYTHONDONTWRITEBYTECODE=1',
+        'Environment=BIO_PUBLIC_MSA_PROXY=http://127.0.0.1:18763',
+        'Environment=BIO_PUBLIC_MSA_LOCK=' + os.environ.get('BIO_PUBLIC_MSA_LOCK', '/mnt/bio-shared/coordination/public-msa.lock'),
+        'Environment=BIO_JOB_DEADLINE_EPOCH=' + str(deadline),
+        'Environment=MMSEQS_SERVICE_HOST_URL=' + endpoint,
         'Environment=BOLTZ_CACHE=/mnt/bio-shared/cache/boltz',
         'Environment=OPENFOLD_CACHE=/mnt/bio-shared/openfold3/home/.openfold3',
         'Environment=PROTENIX_ROOT_DIR=/mnt/bio-shared/protenix/release_data']
@@ -179,13 +246,18 @@ def prepare_public(state, worker, model, fasta, destination, timeout, endpoint):
     command = ['systemd-run', '--quiet', '--wait', '--collect', '--unit', unit]
     for prop in properties:
         command += ['--property', prop]
-    checked_exec = 'import hashlib,os,pathlib,sys; p=pathlib.Path(sys.argv[1]); assert hashlib.sha256(p.read_bytes()).hexdigest()==sys.argv[2]; os.execv(sys.executable,[sys.executable,str(p),*sys.argv[3:]])'
-    command += [worker['python'], '-c', checked_exec, parser, expected, 'prepare', '--model', model,
+    checked_exec = ('import hashlib,json,os,pathlib,sys; files=json.loads(sys.argv[1]); '
+        'assert all(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()==h for p,h in files.items()); '
+        'os.execv(sys.executable,[sys.executable,*sys.argv[2:]])')
+    command += [worker['python'], '-c', checked_exec, json.dumps(sources), helper, '--model', model,
+        '--entrypoint', parser, '--', 'prepare', '--model', model,
         '--fasta', str(fasta), '--out', str(destination), '--source', 'public', '--server-url', endpoint]
+    ssh_options = ['-o', 'ExitOnForwardFailure=yes', '-R', '127.0.0.1:18763:127.0.0.1:' + str(port)]
     atomic_json(destination.parent / 'cpu-preparation.json', {'unit': unit, 'command': command,
-        'worker_id': worker['worker_id'], 'boot_id': actual, 'deadline_epoch': now() + remaining}, exclusive=True)
+        'worker_id': worker['worker_id'], 'boot_id': actual, 'deadline_epoch': deadline,
+        'sources': sources, 'ssh_options': ssh_options}, exclusive=True)
     try:
-        output = remote(target, command, timeout=remaining + 45)
+        output = remote(target, command, timeout=remaining + 45, ssh_options=ssh_options)
         (destination.parent / 'cpu-preparation.log').write_bytes(output)
     finally:
         journal = remote(target, ['journalctl', '-u', unit, '--no-pager', '-o', 'short-iso'], timeout=30)
@@ -678,6 +750,16 @@ def submit(args):
         return rf3_prepare_cached(args)
     policy, config, worker = profile(args.state, args.model, getattr(args, 'native_seed', None))
     if args.probe:
+        if args.model != 'rf3' and args.backend == 'public' and not args.bundle:
+            try:
+                public_preparation_sources(worker)
+            except Unavailable:
+                # A legacy worker can still consume an exact retained search.
+                # Only a fresh public query requires the newly pinned helper.
+                cached = None if args.refresh_preparation else ArtifactCache(args.shared / 'inference/cache').lookup(
+                    public_preparation_identity(args, worker, args.fasta))
+                if cached is None:
+                    raise
         return {'available': True, 'config_id': policy['config_id']}
     if args.model == 'rf3':
         return submit_rf3(args, policy, config, worker)
@@ -706,11 +788,7 @@ def submit(args):
     else:
         if args.backend != 'public':
             raise ValueError('Private inference requires a validated private MSA preparation bundle')
-        source = {'endpoint': args.endpoint,
-                  'database': {'status': 'provider-unreported', 'provider': args.endpoint}}
-        identity = preparation_identity(args.model, fasta, parser, 'public', source,
-            chemistry_sha=args.chemistry_sha, runtime_id=worker['runtime_image']['sha256'])
-        identity['preparation_toolchain_sha256'] = digest(worker['source_files'])
+        identity = public_preparation_identity(args, worker, fasta)
         cached = None if args.refresh_preparation else cache.lookup(identity)
         reused = cached is not None
         if cached is None:

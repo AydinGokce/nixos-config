@@ -20,7 +20,7 @@ def configuration(path=None):
                 'systemctl': '/run/current-system/sw/bin/systemctl'}
     require(isinstance(data, dict) and set(data) <= set(defaults), 'Invalid trusted workbench configuration')
     defaults.update(data)
-    require(type(defaults['max_jobs']) is int and 1 <= defaults['max_jobs'] <= 4, 'max_jobs must be1..4')
+    require(type(defaults['max_jobs']) is int and 1 <= defaults['max_jobs'] <= 32, 'max_jobs must be 1..32')
     if defaults['tools_dir'] == '/etc/bio-tools':
         # Preserve the complete deployed hierarchy: resolving only the
         # workbench source symlink would lose its sibling inference/library
@@ -97,12 +97,24 @@ class Daemon:
         write_json(folder / 'launch-result.json', {'returncode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}, exclusive=True)
 
     def reconcile(self, row):
-        operation = read_json(self.store.directory('operations', row['object_id']) / 'intent.json')
+        folder = self.store.directory('operations', row['object_id'])
+        operation = read_json(folder / 'intent.json')
+        require(file_sha(folder / 'intent.json') == row['intent_sha256'] and
+                operation.get('object_id') == row['object_id'] and operation.get('kind') == row['kind'] and
+                operation.get('unit') == row['unit'], 'Execution intent binding differs', 'integrity')
         base = operation['command_prefix'] + ['--intent-sha256', row['intent_sha256']]
         state = self.system(self.config, row['unit'])
-        folder = self.store.directory('operations', row['object_id'])
         write_json(folder / 'last-unit-state.json', {'observed_at': now(), **state})
+        # execute() publishes its receipt before committing the operation row.
+        # Recover that exact crash window, including after systemd has forgotten
+        # the unit. A malformed or differently bound receipt keeps its slot.
+        terminal = folder / 'terminal.json'
+        receipt = self.terminal_receipt(row, folder) if terminal.exists() else None
+        if receipt and state.get('LoadState') == 'not-found':
+            self.finish_operation(row, receipt)
+            return
         if not matches(state, base, row['invocation_id']):
+            require(receipt is None, 'Terminal receipt owned unit identity differs', 'integrity')
             self.interrupted(row, 'Owned unit is absent or identity differs; no automatic retry')
             return
         with self.store.transaction() as db:
@@ -116,12 +128,45 @@ class Daemon:
             require(matches(fresh, base, state['InvocationID']), 'Validation unit changed before cancellation', 'integrity')
             self.launch_command([self.config['systemctl'], 'stop', '--no-block', row['unit']], timeout=15, check=True, capture_output=True, text=True)
         elif state['ActiveState'] in {'failed', 'inactive'} or state['SubState'] == 'exited':
-            terminal = folder / 'terminal.json'
-            if not terminal.exists():
+            if receipt is None:
                 self.interrupted(row, 'Owned unit ended without a terminal receipt; retained, never retried')
             else:
-                receipt = read_json(terminal)
-                require(receipt['invocation_id'] == state['InvocationID'] and receipt['intent_sha256'] == row['intent_sha256'], 'Terminal receipt binding differs', 'integrity')
+                require(receipt['invocation_id'] == state['InvocationID'], 'Terminal receipt invocation differs', 'integrity')
+                self.finish_operation(row, receipt)
+
+    def terminal_receipt(self, row, folder):
+        receipt = read_json(folder / 'terminal.json')
+        started = read_json(folder / 'started.json')
+        binding = {'kind': row['kind'], 'object_id': row['object_id'], 'unit': row['unit'],
+                   'invocation_id': row['invocation_id'], 'intent_sha256': row['intent_sha256']}
+        require(isinstance(receipt, dict) and isinstance(started, dict) and
+                re.fullmatch('[a-f0-9]{32}', row['invocation_id'] or '') is not None and
+                all(receipt.get(key) == value and started.get(key) == value for key, value in binding.items()) and
+                isinstance(receipt.get('started_at'), str) and bool(receipt['started_at']) and
+                receipt['started_at'] == started.get('started_at') and
+                isinstance(receipt.get('finished_at'), str) and bool(receipt['finished_at']) and
+                isinstance(receipt.get('state'), str) and receipt['state'] in {'complete', 'failed'},
+                'Terminal receipt binding differs', 'integrity')
+        return receipt
+
+    def finish_operation(self, row, receipt):
+        with self.store.transaction() as db:
+            object_kind = 'batch' if row['kind'] == 'validation' else 'job'
+            data = self.store.get(db, object_kind, row['object_id'])
+            terminal_states = ({'validated', 'validation_failed', 'cancelled'} if row['kind'] == 'validation'
+                               else {'complete', 'failed', 'cancelled', 'interrupted'})
+            require(data['state'] in terminal_states or
+                    (row['kind'] == 'job' and data.get('_resident_pending') and
+                     data['state'] in {'running', 'cancel_requested', 'interrupted'}),
+                    'Terminal receipt has no matching completed or tracked execution', 'integrity')
+            # The runner may have committed while systemctl was being queried.
+            # Only a still-active operation is updated, so recovery is once-only.
+            cursor = db.execute("UPDATE operations SET state=?,data=?,updated=? WHERE object_id=? "
+                                "AND state IN ('intent','running') AND intent_sha256=? AND invocation_id=?",
+                                (receipt['state'], canonical(receipt).decode(), now(), row['object_id'],
+                                 receipt['intent_sha256'], receipt['invocation_id']))
+            if cursor.rowcount:
+                self.store.event(db, row['object_id'], 'terminal_receipt_recovered', {'state': receipt['state']})
 
     def interrupted(self, row, message):
         with self.store.transaction() as db:
@@ -166,14 +211,15 @@ class Daemon:
                 reconcile_resident(self.store, job)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 errors.append({'id': job['job_id'], 'error': str(exc)})
-        with self.store.connection() as db:
-            operations = [dict(row) for row in db.execute("SELECT * FROM operations WHERE state IN ('intent','running')")]
-            known = {row['object_id'] for row in db.execute('SELECT object_id FROM operations')}
+        operations, _, _ = self.snapshot()
         for row in operations:
             try:
                 self.reconcile(row)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 errors.append({'id': row['object_id'], 'error': str(exc)})
+        # Reconciliation may release operations or finish an orphaned native
+        # request. Refresh all slot evidence before admitting the next work.
+        operations, known, active_jobs = self.snapshot()
         running_validation = any(row['kind'] == 'validation' for row in operations)
         if not running_validation:
             candidates = [b for b in self.store.listing('batch', states=['validating']) if b['batch_id'] not in known]
@@ -183,11 +229,43 @@ class Daemon:
                 except (ValueError, OSError, subprocess.SubprocessError) as exc:
                     self.start_failed('validation', candidates[0], exc)
                     errors.append({'id': candidates[0]['batch_id'], 'error': str(exc)})
-        slots = self.config['max_jobs'] - len([row for row in operations if row['kind'] == 'job']) - len(pending_resident)
+        slots = self.config['max_jobs'] - len(active_jobs)
         for job in [j for j in self.store.listing('job', states=['queued']) if j['job_id'] not in known][:max(0, slots)]:
             try:
                 self.start('job', job)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 self.start_failed('job', job, exc)
                 errors.append({'id': job['job_id'], 'error': str(exc)})
+        self.queued_progress()
         return {'observed_at': now(), 'errors': errors}
+
+    def snapshot(self, db=None):
+        if db is None:
+            with self.store.connection() as connection:
+                return self.snapshot(connection)
+        operations = [dict(row) for row in db.execute("SELECT * FROM operations WHERE state IN ('intent','running')")]
+        known = {row['object_id'] for row in db.execute('SELECT object_id FROM operations')}
+        active_jobs = {row['object_id'] for row in operations if row['kind'] == 'job'}
+        # A client and its continuing resident request are one job. This also
+        # retains the slot after the client operation has a terminal receipt.
+        for row in db.execute("SELECT id,data FROM objects WHERE kind='job' AND state IN ('running','cancel_requested','interrupted')"):
+            if parse(row['data']).get('_resident_pending'):
+                active_jobs.add(row['id'])
+        return operations, known, active_jobs
+
+    def queued_progress(self):
+        with self.store.transaction() as db:
+            _, _, active_jobs = self.snapshot(db)
+            active, capacity = len(active_jobs), self.config['max_jobs']
+            queued = list(db.execute("SELECT data FROM objects WHERE kind='job' AND state='queued' ORDER BY created,id"))
+            for position, row in enumerate(queued, 1):
+                job = parse(row['data'])
+                message = f'Queue position {position}; {active} of {capacity} execution slots occupied'
+                if active < capacity:
+                    message += '; the dispatcher will admit queued jobs on its next pass'
+                progress = {'message': message, 'queue_position': position, 'active_jobs': active, 'max_jobs': capacity}
+                previous = {key: value for key, value in job.get('progress', {}).items() if key != 'observed_at'}
+                if previous != progress:
+                    job['phase'] = 'queued'
+                    job['progress'] = {**progress, 'observed_at': now()}
+                    self.store.put(db, 'job', job)

@@ -19,15 +19,30 @@ from .common import atomic_json, configuration_id, digest, identifier, now, read
 from .control_storage import ensure as ensure_control_storage
 
 
-def ssh_command(target, argv):
+def ssh_command(target, argv, *, ssh_options=()):
     return ['ssh', '-i', target['key'], '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
             '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + target['known_hosts'],
+            *ssh_options,
             'root@' + target['ip'], shlex.join([str(x) for x in argv])]
 
 
-def remote(target, argv, *, input=None, timeout=60):
-    return subprocess.run(ssh_command(target, argv), input=input, capture_output=True,
+def remote(target, argv, *, input=None, timeout=60, ssh_options=()):
+    return subprocess.run(ssh_command(target, argv, ssh_options=ssh_options), input=input, capture_output=True,
                           check=True, timeout=timeout).stdout
+
+
+def source_assets(root):
+    """Logical toolkit names and exact files to pin into a new worker archive."""
+    assets = {str(path.relative_to(root)): path
+              for folder in ('inference', 'msa', 'rf3', 'library')
+              for path in sorted((root / folder).rglob('*.py'))
+              if not path.name.startswith('test_') and '__pycache__' not in path.parts}
+    for relative in ('rf3/requirements.lock', 'py/public_msa_client.py'):
+        path = root / relative
+        if not path.is_file():
+            raise ValueError('Resident toolkit is missing required source: ' + relative)
+        assets[relative] = path
+    return assets
 
 
 def relocate_config(value, aliases):
@@ -125,19 +140,15 @@ print(json.dumps({'hostname':socket.gethostname(),'boot_id':pathlib.Path('/proc/
     if any(line.split(',')[0].strip() == policy['gpu_uuid'] for line in observed['active'].splitlines()):
         raise ValueError('Selected physical GPU is occupied')
     root = Path(__file__).absolute().parent
-    sources = {str(path.relative_to(root.parent)): sha256(path)
-               for folder in ('inference', 'msa', 'rf3', 'library')
-               for path in sorted((root.parent / folder).rglob('*.py'))
-               if not path.name.startswith('test_') and '__pycache__' not in path.parts}
-    for path in (root.parent / 'rf3/requirements.lock',):
-        sources[str(path.relative_to(root.parent))] = sha256(path)
+    assets = source_assets(root.parent)
+    sources = {name: sha256(path) for name, path in assets.items()}
     source_id = digest(sources)
     remote_source = '/opt/bio-inference/' + source_id
     remote(target, ['mkdir', '-p', remote_source])
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode='w:gz') as tar:
         for name in sources:
-            tar.add(root.parent / name, arcname=name, recursive=False)
+            tar.add(assets[name], arcname=name, recursive=False)
     remote(target, ['tar', '-xzf', '-', '-C', remote_source, '--no-same-owner'], input=archive.getvalue())
     control = policy.get('control_storage', {
         'source': os.environ.get('BIO_INFERENCE_CONTROL_SOURCE', ''),

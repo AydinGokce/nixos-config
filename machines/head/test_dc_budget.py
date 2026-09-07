@@ -9,10 +9,13 @@ from datetime import datetime, timezone
 import importlib.util
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -332,6 +335,105 @@ class BudgetTests(unittest.TestCase):
         with ThreadPoolExecutor(2) as pool:
             results = list(pool.map(attempt, ["one", "two"]))
         self.assertEqual(sum(results), 1)
+
+    def test_ten_launches_serialize_admission_but_provision_together(self):
+        self.init()
+        started = threading.Barrier(10, timeout=10)
+        readiness = threading.Barrier(10, timeout=10)
+        create_entered, allow_create = threading.Event(), threading.Event()
+        original = self.api.request
+        first = True
+
+        def request(method, path, body=None):
+            nonlocal first
+            if method == "POST" and path == "/instances" and first:
+                first = False
+                create_entered.set()
+                self.assertTrue(allow_create.wait(10))
+            if method == "GET" and path.startswith("/instances/"):
+                # Every admitted create must reach readiness before any is
+                # allowed to finish. A whole-provisioning lock deadlocks here.
+                readiness.wait()
+            return original(method, path, body)
+
+        self.api.request = request
+
+        def launch(_):
+            controller = dc.Controller(self.api, dc.Store(self.tmp.name), self.clock, self.clock.sleep)
+            started.wait()
+            return controller.launch(self.args())
+
+        with ThreadPoolExecutor(10) as pool:
+            pending = [pool.submit(launch, index) for index in range(10)]
+            try:
+                self.assertTrue(create_entered.wait(10))
+                # Provider POST is still pending, but the independent budget
+                # lock remains available to the watchdog/accounting process.
+                with self.store.locked(self.clock()) as state:
+                    self.assertEqual(len(state["jobs"]), 1)
+                    self.assertEqual(next(iter(state["jobs"].values()))["status"], "pending")
+                    state["last_watchdog"] = self.clock()
+            finally:
+                allow_create.set()
+            results = [item.result(timeout=15) for item in pending]
+        self.assertEqual(len(set(results)), 10)
+        self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 10)
+        state = self.state()
+        self.assertEqual(len(state["jobs"]), 10)
+        self.assertEqual({job["status"] for job in state["jobs"].values()}, {"running"})
+        self.assertAlmostEqual(dc.summary(state, self.clock())["reserved"], 20.1)
+
+    def test_ten_launches_share_the_500_dollar_cumulative_guard(self):
+        self.init()
+        with self.store.locked(self.clock()) as state:
+            state["historical_correction"] = 475
+        started = threading.Barrier(10, timeout=10)
+
+        def launch(_):
+            controller = dc.Controller(self.api, dc.Store(self.tmp.name), self.clock, self.clock.sleep)
+            controller.ceiling = 500
+            started.wait()
+            try:
+                return controller.launch(self.args())
+            except dc.LaunchBlocked as exc:
+                self.assertIn("BUDGET HALT", str(exc))
+                return None
+
+        with ThreadPoolExecutor(10) as pool:
+            results = list(pool.map(launch, range(10)))
+        self.assertEqual(sum(result is not None for result in results), 5)
+        self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 5)
+        state = self.state()
+        self.assertEqual(len(state["jobs"]), 5)
+        report = dc.summary(state, self.clock())
+        projected = report["spent"] + report["reserved"] + report["background_reserve"] + self.c.margin
+        self.assertLess(projected, 500)
+        self.assertGreaterEqual(projected + 2.01, 500)
+
+    def test_ten_waiting_launches_cannot_bypass_an_ambiguous_create(self):
+        self.init()
+        self.api.post_error = dc.APIError("POST", "/instances")
+        self.api.land_before_error = True
+        started = threading.Barrier(10, timeout=10)
+
+        def launch(_):
+            controller = dc.Controller(self.api, dc.Store(self.tmp.name), self.clock, self.clock.sleep)
+            started.wait()
+            try:
+                controller.launch(self.args())
+            except dc.LaunchBlocked as exc:
+                return str(exc)
+            self.fail("An ambiguous create must fence every waiting launch")
+
+        with ThreadPoolExecutor(10) as pool:
+            errors = list(pool.map(launch, range(10)))
+        self.assertEqual(sum("outcome unknown" in error for error in errors), 1)
+        self.assertEqual(sum("Unresolved launch or cleanup" in error for error in errors), 9)
+        self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 1)
+        state = self.state()
+        self.assertEqual(len(state["jobs"]), 1)
+        self.assertEqual(next(iter(state["jobs"].values()))["status"], "uncertain")
+        self.assertTrue(dc.summary(state, self.clock())["uncertain"])
 
     def recent_cleanup(self):
         self.init()
@@ -985,6 +1087,174 @@ class BudgetTests(unittest.TestCase):
         self.c.watchdog()
         self.assertEqual([r["id"] for r in self.api.instances], ["head"])
 
+    def test_watchdog_requests_all_ten_deletes_before_bounded_confirmation(self):
+        self.init()
+        identifiers = [self.c.launch(self.args()) for _ in range(10)]
+        self.clock.sleep(3601)
+        confirm = self.c.confirm_remove
+        initial_confirmations = threading.Barrier(4, timeout=10)
+        monitor = threading.Lock()
+        active = maximum = entered = 0
+
+        def held_confirmation(ident, token, os_id):
+            nonlocal active, maximum, entered
+            deletes = [body["id"] for method, _, body in self.api.calls if method == "PUT"]
+            self.assertCountEqual(deletes, identifiers)
+            with monitor:
+                active += 1
+                entered += 1
+                position = entered
+                maximum = max(maximum, active)
+            try:
+                if position <= 4:
+                    initial_confirmations.wait()
+                return confirm(ident, token, os_id)
+            finally:
+                with monitor:
+                    active -= 1
+
+        self.c.confirm_remove = held_confirmation
+        self.c.watchdog()
+        self.assertEqual(maximum, 4)
+        self.assertEqual(entered, 10)
+        self.assertEqual([row["id"] for row in self.api.instances], ["head"])
+        self.assertEqual({row["id"] for row in self.api.volumes}, {"os-head", "shared"})
+        self.assertEqual(self.api.trash, [])
+        self.assertEqual({job["status"] for job in self.state()["jobs"].values()}, {"closed"})
+
+    def test_watchdog_one_delete_rejection_does_not_starve_other_targets(self):
+        self.init()
+        identifiers = [self.c.launch(self.args()) for _ in range(10)]
+        self.clock.sleep(3601)
+        original = self.api.request
+
+        def reject_one(method, path, body=None):
+            if method == "PUT" and path == "/instances" and body["id"] == identifiers[0]:
+                self.api.calls.append((method, path, body))
+                raise dc.APIError(method, path, 429, "retry after 5s")
+            return original(method, path, body)
+
+        self.api.request = reject_one
+        with self.assertRaisesRegex(dc.Error, "429.*retry after 5s"):
+            self.c.watchdog()
+        self.assertCountEqual([body["id"] for method, _, body in self.api.calls if method == "PUT"], identifiers)
+        self.assertEqual({row["id"] for row in self.api.instances}, {"head", identifiers[0]})
+        jobs = {job["id"]: job for job in self.state()["jobs"].values()}
+        self.assertEqual(jobs[identifiers[0]]["status"], "cleanup")
+        self.assertEqual({jobs[ident]["status"] for ident in identifiers[1:]}, {"closed"})
+        self.assertTrue(dc.summary(self.state(), self.clock())["uncertain"])
+
+    def test_watchdog_inventory_outage_still_requests_all_ten_deletes(self):
+        self.init()
+        identifiers = [self.c.launch(self.args()) for _ in range(10)]
+        self.clock.sleep(3601)
+        self.api.inventory_error = True
+        with self.assertRaisesRegex(dc.Error, "inventory unavailable"):
+            self.c.watchdog()
+        self.assertCountEqual([body["id"] for method, _, body in self.api.calls if method == "PUT"], identifiers)
+        self.assertEqual([row["id"] for row in self.api.instances], ["head"])
+        self.assertEqual({job["status"] for job in self.state()["jobs"].values()}, {"cleanup"})
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "Head cleanup uses POSIX process locks")
+    def test_ten_independent_processes_share_four_confirmation_slots(self):
+        self.init()
+        context = multiprocessing.get_context("fork")
+        start, release = context.Event(), context.Event()
+        arrivals = context.Queue()
+        active, maximum = context.Value("i", 0), context.Value("i", 0)
+
+        def confirm(index):
+            store = dc.Store(self.tmp.name)
+            if not start.wait(10):
+                raise AssertionError("Confirmation start was not released")
+            with store.confirming("process-" + str(index)), store.confirmation_slot():
+                with active.get_lock():
+                    active.value += 1
+                    maximum.value = max(maximum.value, active.value)
+                arrivals.put(index)
+                if not release.wait(10):
+                    raise AssertionError("Confirmation was not released")
+                with active.get_lock():
+                    active.value -= 1
+
+        children = [context.Process(target=confirm, args=(index,)) for index in range(10)]
+        for child in children:
+            child.start()
+        start.set()
+        try:
+            first = [arrivals.get(timeout=10) for _ in range(4)]
+            self.assertEqual(len(set(first)), 4)
+            with self.assertRaises(queue.Empty):
+                arrivals.get(timeout=.2)
+            # Neither occupied slots nor waiting contenders hold budget.lock.
+            with self.store.locked(self.clock()) as state:
+                self.assertIn("last_watchdog", state)
+        finally:
+            release.set()
+            for child in children:
+                child.join(timeout=10)
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=5)
+        self.assertEqual([child.exitcode for child in children], [0] * 10)
+        self.assertEqual(maximum.value, 4)
+        self.assertEqual(len({*first, *(arrivals.get(timeout=5) for _ in range(6))}), 10)
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "Head cleanup uses POSIX process locks")
+    def test_ten_processes_deduplicate_one_confirmed_cleanup(self):
+        self.init()
+        ident = self.c.launch(self.args())
+        token, os_id = self.c.request_remove(ident)
+        context = multiprocessing.get_context("fork")
+        start, entered, release = context.Event(), context.Event(), context.Event()
+        confirmations = context.Value("i", 0)
+
+        def confirm():
+            controller = dc.Controller(self.api, dc.Store(self.tmp.name), self.clock, time.sleep)
+            def complete(_ident, _token, _os_id):
+                with confirmations.get_lock():
+                    confirmations.value += 1
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("Confirmation was not released")
+                with controller.store.locked(self.clock()) as state:
+                    state["jobs"][token]["status"] = "closed"
+            controller._confirm_remove = complete
+            if not start.wait(10):
+                raise AssertionError("Confirmation start was not released")
+            controller.confirm_remove(ident, token, os_id)
+
+        children = [context.Process(target=confirm) for _ in range(10)]
+        for child in children:
+            child.start()
+        start.set()
+        try:
+            self.assertTrue(entered.wait(10))
+            with self.store.locked(self.clock()) as state:
+                self.assertEqual(state["jobs"][token]["status"], "cleanup")
+        finally:
+            release.set()
+            for child in children:
+                child.join(timeout=10)
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=5)
+        self.assertEqual([child.exitcode for child in children], [0] * 10)
+        self.assertEqual(confirmations.value, 1)
+        self.assertEqual(self.state()["jobs"][token]["status"], "closed")
+        calls = len(self.api.calls)
+        self.c.remove(ident)
+        self.assertEqual(len(self.api.calls), calls)
+
+    def test_confirmation_refuses_changed_owned_identity_before_provider_reads(self):
+        self.init()
+        ident = self.c.launch(self.args())
+        token, os_id = self.c.request_remove(ident)
+        calls = len(self.api.calls)
+        with self.assertRaisesRegex(dc.Error, "identity changed"):
+            self.c.confirm_remove(ident, token, "another-os")
+        self.assertEqual(len(self.api.calls), calls)
+
     def test_watchdog_budget_cutoff_accounts_for_storage(self):
         self.init()
         self.c.launch(self.args())
@@ -1046,6 +1316,18 @@ class APIErrorTests(unittest.TestCase):
         self.assertLessEqual(len(dc.error_detail(json.dumps({"message": "a" * 5000}))), 300)
         self.assertEqual(dc.error_detail(b"<html>private proxy error</html>"), "")
         self.assertEqual(dc.error_detail(json.dumps({"access_token": "private"})), "")
+
+    def test_rate_limit_exposes_bounded_retry_delay_without_repeating_request(self):
+        api = dc.API()
+        api.token, api.token_expires = "test-token", float("inf")
+        for method, path in (("POST", "/instances"), ("PUT", "/instances"), ("GET", "/volumes")):
+            with self.subTest(method=method):
+                failure = dc.urllib.error.HTTPError(api.base + path, 429, "Too Many Requests",
+                    {"Retry-After": "49"}, io.BytesIO(b'{"code":"rate_limit_exceeded"}'))
+                with patch.object(dc.urllib.request, "urlopen", side_effect=failure) as request:
+                    with self.assertRaisesRegex(dc.APIError, "429.*retry after 49s"):
+                        api.request(method, path, {} if method != "GET" else None)
+                self.assertEqual(request.call_count, 1)
 
 
 if __name__ == "__main__":

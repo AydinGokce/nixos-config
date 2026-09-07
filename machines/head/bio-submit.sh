@@ -95,6 +95,28 @@ if [[ "$recipe" = protenix || "$recipe" = rf3 ]] && [ -n "$gpu" ]; then
   esac
 fi
 case "$msa_backend" in public|private) ;; *) echo 'bio-submit: --msa-backend must be public or private' >&2; exit 2;; esac
+head_preparation_acquire() {
+  echo 'bio-submit: waiting for a head preparation slot (at most two preparations at once)'
+  coproc BIO_PREPARATION_GATE { python3 "$TOOLS_SRC/py/head_preparation_gate.py" --state "$STATE_DIR" --timeout "$seconds"; }
+  preparation_gate_pid=$BIO_PREPARATION_GATE_PID
+  preparation_gate_input=${BIO_PREPARATION_GATE[1]}
+  if ! IFS= read -r preparation_ready <&"${BIO_PREPARATION_GATE[0]}" || [ "$preparation_ready" != ready ]; then
+    wait "$preparation_gate_pid" || true
+    echo 'bio-submit: could not acquire a head preparation slot; no inference worker was launched' >&2
+    exit 2
+  fi
+}
+head_preparation_release() {
+  printf 'release\n' >&"$preparation_gate_input"
+  exec {preparation_gate_input}>&-
+  wait "$preparation_gate_pid"
+}
+# Native CPU parsers/preparation run on the small head before GPU allocation.
+# Bound those phases independently of the number of concurrent GPU workers.
+# Database workers bypass this gate: private preparation can invoke one here.
+if [ "$recipe" != msa ]; then
+  head_preparation_acquire
+fi
 if [ -n "$library_ref" ]; then
   case "$recipe" in boltz2|openfold3|protenix|rf3|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
   if [ "$msa_backend" = private ]; then
@@ -306,6 +328,11 @@ if [ "$recipe" != msa ] && [ "$recipe" != rf3 ] && { [ "$msa_backend" = private 
   fi
   python3 "$TOOLS_SRC/msa/prepared.py" validate --bundle "$msa_bundle" --model "$recipe" --fasta "$infile"
 fi
+# Unlock the head CPU permit before resident waiting or ephemeral GPU rental.
+# Coprocess pipe descriptors are not inherited by model subprocesses.
+if [ "$recipe" != msa ]; then
+  head_preparation_release
+fi
 # Reuse an audited resident default configuration when the request matches it.
 # All optional model arguments remain on the existing fully configurable route.
 resident_eligible=0; resident_native_seed=""
@@ -345,13 +372,21 @@ elif [ "$execution" = resident ]; then
   echo 'bio-submit: resident execution requires a compatible native-default input; use bio-inference for an explicit prepared configuration' >&2
   exit 2
 fi
-# Serialize ephemeral jobs while legacy environments and provider attachment are shared.
-# The lock is independent of dc's accounting lock.
+# New workers isolate every mutable runtime/cache tree on their own local disk.
+# Shared leases let them run in parallel while excluding old deployments whose
+# exclusive locks covered mutations of those same persistent NFS runtimes.
+# Keep these leases until worker deletion, including error/timeout cleanup.
 mkdir -p "$STATE_DIR" "$RESULTS_DIR"
-lock_name=bio-submit
-[ "$recipe" != msa ] || lock_name=msa-submit
-exec 9>"$STATE_DIR/$lock_name.lock"
-flock 9
+exec 9>"$STATE_DIR/bio-submit.lock"
+flock --shared 9
+exec 8>"$STATE_DIR/msa-submit.lock"
+flock --shared 8
+if [ "$recipe" = msa ]; then
+  # Database install/conversion and MSA server operations keep their existing
+  # serialization, independently of concurrent molecular prediction workers.
+  exec 7>"$STATE_DIR/msa-operation.lock"
+  flock 7
+fi
 # Queued submissions may have passed the first check before storage expired.
 if [ -n "$db_nfs" ]; then "$storage_tool" check --volume "$db_volume"; fi
 # Check installed data on the head before renting a worker. The worker still
@@ -396,6 +431,44 @@ if [ -n "$library_bundle" ]; then
   fi
 fi
 ROUT="$run/out"
+public_msa_proxy=0
+public_msa_head_port=${BIO_PUBLIC_MSA_HEAD_PORT:-18763}
+if [[ "$recipe" = boltz2 || "$recipe" = protenix || "$recipe" = openfold3 ]] && \
+   [ "$msa_backend" = public ] && [ -z "$msa_bundle" ] && [ "$library_has_protein" != 0 ]; then
+  public_msa_proxy=1
+  # Public queries leave through the head and hold one cross-worker query lock.
+  # Fail before rental if the loopback forwarding destination is unavailable.
+  python3 - "$public_msa_head_port" <<'PUBLICMSAREADY'
+import http.client,json,sys
+connection=None
+try:
+    port=int(sys.argv[1])
+    if not 1 <= port <= 65535:
+        raise ValueError('invalid port')
+    # HTTPConnection ignores ambient proxies and does not follow redirects.
+    connection=http.client.HTTPConnection('127.0.0.1',port,timeout=5)
+    connection.request('GET','/health')
+    response=connection.getresponse()
+    body=response.read(1025)
+    if response.status != 200 or len(body)>1024:
+        raise ValueError('invalid health status or size')
+    value=json.loads(body)
+    if value != {'service':'bio-public-msa-proxy','schema':1} or type(value['schema']) is not int:
+        raise ValueError('unexpected health service or schema')
+except (ValueError,OSError,http.client.HTTPException) as error:
+    raise SystemExit(f'bio-submit: head public-MSA proxy unavailable: {error}; no worker launched')
+finally:
+    if connection is not None:
+        connection.close()
+PUBLICMSAREADY
+fi
+# Count only this model's runtime/checkpoint assets before rental. The quoted
+# OS disk includes room for private copies and setup; dc accounts for its cost.
+[ "$recipe" = msa ] || head_preparation_acquire
+python3 "$TOOLS_SRC/py/worker_runtime.py" plan --shared "$SHARED_MNT" \
+  --recipe "$recipe" --model "$model" --sub "$sub" > "$LOCALOUT/runtime-plan.json"
+worker_os_size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["os_size_gb"])' "$LOCALOUT/runtime-plan.json")
+[ "$recipe" = msa ] || head_preparation_release
 # NFS clients have returned stale recipe contents after deployment. Snapshot
 # authoritative code on the head and transmit it with the script over SSH.
 bundle="$LOCALOUT/tools.tar.gz"
@@ -431,10 +504,22 @@ remote_msa_bundle="$RPREP"
   # Protenix's ColabFold mode does not select the ColabFold host automatically.
   # Forward the configured endpoint to the new VM; its environment is separate.
   printf 'export MMSEQS_SERVICE_HOST_URL=%q\n' "${MMSEQS_SERVICE_HOST_URL:-https://api.colabfold.com}"
+  if [ "$public_msa_proxy" = 1 ]; then
+    printf 'export BIO_PUBLIC_MSA_PROXY=http://127.0.0.1:18763 BIO_PUBLIC_MSA_LOCK=/mnt/bio-shared/coordination/public-msa.lock\n'
+  fi
   cat <<'BUNDLE'
 export BIO_TOOLS_DIR
 BIO_TOOLS_DIR=$(mktemp -d /tmp/bio-tools.XXXXXXXX)
-trap 'rm -rf -- "$BIO_TOOLS_DIR"' EXIT
+cleanup_worker_runtime() {
+  local status=$?
+  trap - EXIT
+  if declare -F bio_worker_cleanup_runtime >/dev/null; then
+    bio_worker_cleanup_runtime || { [ "$status" -ne 0 ] || status=1; }
+  fi
+  rm -rf -- "$BIO_TOOLS_DIR"
+  exit "$status"
+}
+trap cleanup_worker_runtime EXIT
 # Keep Python bytecode off NFS: one inference stalled in a shared-cache OPEN
 # even though fresh mounts could read the same file immediately.
 export PYTHONPYCACHEPREFIX="$BIO_TOOLS_DIR/cache/python"
@@ -450,6 +535,9 @@ rm "$BIO_TOOLS_DIR/bundle.tar.gz"
 BUNDLE
   printf 'printf "bio-submit: code bundle verified %%s\\n" %q\n' "$bundle_sha256"
   printf '# END VERIFIED TOOL BUNDLE\n'
+  printf 'base64 --decode > "$BIO_TOOLS_DIR/runtime-plan.json" <<\x27BIO_RUNTIME_PLAN\x27\n'
+  base64 "$LOCALOUT/runtime-plan.json"
+  printf 'BIO_RUNTIME_PLAN\n'
   cat <<'REMOTE'
 export HOME=/root PATH=/root/.local/bin:$PATH
 need=()
@@ -504,6 +592,8 @@ if [ -n "$MSA_DB_NFS" ]; then
 fi
 command -v uv >/dev/null 2>&1 || curl --fail -LsS https://astral.sh/uv/install.sh | sh
 mkdir -p "$OUT"
+source "$BIO_TOOLS_DIR/recipes/_isolate-runtime.sh"
+bio_worker_isolate_runtime /mnt/bio-shared "$BIO_TOOLS_DIR/runtime-plan.json"
 source "$BIO_TOOLS_DIR/recipes/_common.sh"
 REMOTE
   printf 'source "$BIO_TOOLS_DIR/recipes/%s.sh"\n' "$recipe"
@@ -593,7 +683,7 @@ for g in "${candidates[@]}"; do
   [ "$g" != 1A6000.10V ] || image_args=(--image ubuntu-24.04-cuda-12.6-docker)
   if [ "$recipe" = msa ] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
   [ -z "$msa_worker_image" ] || image_args=(--image "$msa_worker_image")
-  if out=$("${launch_environment[@]}" dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --max-hours "$max_hours" 2>&1); then
+  if out=$("${launch_environment[@]}" dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --os-size "$worker_os_size" --max-hours "$max_hours" 2>&1); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)
     ip=$(printf '%s\n' "$out" | sed -n 's/.*READY.*ip=\([^ ]*\).*/\1/p' | tail -1)
     [ -n "$id" ] && [ -n "$ip" ] && break
@@ -623,6 +713,13 @@ if library:
     source = {k: native[k] for k in ('source_ref', 'source_snapshot_sha256', 'sha256', 'format', 'msa_backend')}
 with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,library_input=source,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
 PY
+python3 - "$LOCALOUT/job.json" "$LOCALOUT/runtime-plan.json" <<'RUNTIMEPLAN'
+import hashlib,json,pathlib,sys
+job,plan=map(pathlib.Path,sys.argv[1:]); value=json.loads(job.read_text()); runtime=json.loads(plan.read_text())
+value['runtime_isolation']={'kind':runtime['isolation'],'plan':plan.name,
+    'plan_sha256':hashlib.sha256(plan.read_bytes()).hexdigest(),'os_size_gb':runtime['os_size_gb']}
+job.write_text(json.dumps(value,indent=2)+'\n')
+RUNTIMEPLAN
 if [ -n "$rf3_preparation_receipt" ]; then
   python3 - "$LOCALOUT/job.json" "$LOCALOUT/rf3-preparation-cache.json" <<'RF3CACHEJOB'
 import hashlib,json,pathlib,sys
@@ -637,7 +734,11 @@ if [ "$recipe" = msa ] && [ "$sub" = session ]; then
 fi
 echo "bio-submit: running $recipe on $id ($ip), timeout ${seconds}s"
 status=0
-timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "root@$ip" bash -s < "$remote_file" || status=$?
+msa_forward=()
+if [ "$public_msa_proxy" = 1 ]; then
+  msa_forward=(-o ExitOnForwardFailure=yes -R "127.0.0.1:18763:127.0.0.1:$public_msa_head_port")
+fi
+timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" bash -s < "$remote_file" || status=$?
 # Fetch partial outputs even on failure; model status must remain nonzero.
 echo "bio-submit: fetching results -> $LOCALOUT"
 rsync -a -e "ssh ${SSHO[*]}" "root@$ip:$ROUT/" "$LOCALOUT/" || { echo 'bio-submit: result retrieval failed' >&2; status=1; }

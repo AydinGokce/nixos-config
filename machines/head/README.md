@@ -4,8 +4,10 @@
 use resident GPU workers that load a pinned model once and process multiple
 requests. The head keeps a durable queue, prepares inputs and validates outputs
 on CPUs. Other jobs use the existing temporary Ubuntu/CUDA worker path, which
-reuses model environments and weights on managed shared storage and removes the
-worker after retrieval. Temporary-worker provisioning remains serialized.
+copies the selected model environment and weights from managed shared storage
+to its private disk, and removes the worker after retrieval. Independent jobs
+can provision and run concurrently; the Workbench dispatcher admits up to ten
+jobs. No temporary GPU is kept running between jobs.
 
 The workstation's `bio-fold` submits a job, downloads its results and optionally
 renders a structure with PyMOL. This is temporary VM compute, not a serverless
@@ -36,6 +38,38 @@ bio-fold evolvepro --fasta variants.fasta --labels measured.csv --num 4
 temporary worker. Auto also uses the temporary path when no compatible live
 worker exists. Once queued, a failed resident request needs an explicit retry.
 See [resident execution and operator commands](inference/README.md).
+
+Temporary workers preserve the existing absolute environment/source paths with
+local bind mounts. Package installs, source checkouts and cache writes cannot
+change another worker's runtime. `runtime-plan.json` records the selected assets,
+their byte count, and the quoted OS disk (50–200 GB, with setup headroom); requests
+that exceed the cap stop before rental. Initial copies add NFS transfer/setup
+time. Inputs, model options, checkpoints and MSA choices retain their native
+behavior. Outputs remain on shared staging storage and are fetched to the head
+before the instance and its OS disk are removed.
+
+Public MSA queries remain serial through the head's IP, following the
+[ColabFold service guidance](https://github.com/sokrypton/ColabFold/blob/main/README.md#faq).
+Boltz, Protenix and OpenFold3 keep their native search functions and HTTPS
+connections; an SSH tunnel routes that stage through the head. An NFSv4 query
+lock shared with RF3 is held across complete searches, then released before GPU
+inference. Existing prepared inputs and private MSA runs bypass this public
+transport. This preserves the public source and native features while allowing
+prediction work to overlap. Two head preparation slots bound CPU/memory work;
+the head and persistent database volumes remain billed between bursts.
+
+Public MSA queries from temporary folding workers use an SSH tunnel through the
+head and a shared query lock. Only query generation is serialized; GPU inference
+continues independently. Prepared/private inputs and assemblies without protein
+skip that route. The public MSA proxy must be healthy before worker rental.
+
+Two CPU preparation permits protect the small head while independent GPU jobs
+continue. Private MSA database operations retain a separate serial lock. New
+submissions take shared leases on the legacy `bio-submit.lock` and
+`msa-submit.lock`, so previously queued jobs that still use mutable shared
+runtimes finish safely before new copies start. Operators changing cached
+runtime assets must acquire both locks exclusively in that order; normal
+temporary jobs only modify their own local copies.
 
 `--timeout SECONDS` limits a run (default two hours). `--gpu TYPE` requests a
 specific instance; omit it for compatibility-aware capacity fallback. The suffix

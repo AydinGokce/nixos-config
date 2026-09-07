@@ -110,7 +110,11 @@ sequences:
 YAML
 fi
 # shellcheck disable=SC2086
-"$VENV/bin/boltz" predict "$YAML" "${msa_args[@]}" --accelerator gpu --devices 1 \
+boltz_command=("$VENV/bin/boltz")
+if [ -n "${BIO_PUBLIC_MSA_PROXY:-}" ]; then
+  boltz_command=("$P" "$TOOLS/py/public_msa_client.py" --model boltz2 --entrypoint "$VENV/bin/boltz" --)
+fi
+"${boltz_command[@]}" predict "$YAML" "${msa_args[@]}" --accelerator gpu --devices 1 \
   --out_dir "$OUT" --output_format "$output_format" --cache "$BOLTZ_CACHE" "${EXTRA_ARGS[@]}"
 # Boltz catches preprocessing and prediction failures and can still exit zero.
 # Input files and intermediate caches are not evidence of a completed structure.

@@ -128,7 +128,11 @@ have_gpu
 # The function is named predict upstream, but 2.0.0 registers it as `pred`.
 # Keep use_msa true for prepared input: false also disables MSA featurization.
 # Existing validated paired/unpaired paths make the native search unnecessary.
-"$VENV/bin/protenix" pred --input "$J" --out_dir "$OUT" --seeds 101 \
+protenix_command=("$VENV/bin/protenix")
+if [ -n "${BIO_PUBLIC_MSA_PROXY:-}" ]; then
+  protenix_command=("$P" "$TOOLS/py/public_msa_client.py" --model protenix --entrypoint "$VENV/bin/protenix" --)
+fi
+"${protenix_command[@]}" pred --input "$J" --out_dir "$OUT" --seeds 101 \
   --model_name "${MODEL:-protenix_base_default_v1.0.0}" \
   --use_msa true --msa_server_mode colabfold --use_template false "${EXTRA_ARGS[@]}"
 # Protenix 2.0.0 catches per-input MSA/inference exceptions and can exit zero

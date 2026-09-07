@@ -1,15 +1,19 @@
 """Exercise orchestration failures with a fake cloud, never real credentials."""
 import json
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import fcntl
 import os
 from pathlib import Path
 import runpy
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import tarfile
+import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +24,24 @@ RFAA_DATABASES = runpy.run_path(str(SCRIPT.parent / "rfaa" / "databases.py"))
 
 class SubmissionTests(unittest.TestCase):
     def setUp(self):
+        class ReadinessHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = self.server.health_body
+                self.send_response(self.server.health_status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), ReadinessHandler)
+        proxy.health_body = b'{"service":"bio-public-msa-proxy","schema":1}'
+        proxy.health_status = 200
+        self.proxy = proxy
+        thread = threading.Thread(target=lambda: proxy.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -79,6 +101,7 @@ fi
 ''',
             "ssh": '''#!/usr/bin/env bash
 set -eu
+echo "$*" >> "$AUDIT/ssh-args"
 if [ "${!#}" = true ]; then exit 0; fi
 echo 'worker' >> "$AUDIT/events"
 cat > "$AUDIT/transmitted.sh"
@@ -191,6 +214,7 @@ PY
                         BIO_CLUSTER_CONFIG=str(self.root / "cluster.sh"),
                         BIO_STATE_DIR=str(self.root / "state"),
                         BIO_RESULTS_DIR=str(self.root / "results"),
+                        BIO_PUBLIC_MSA_HEAD_PORT=str(proxy.server_address[1]),
                         RFAA_DB_DIR=str(self.rfaa_root), MSA_DB_ROOT=str(self.msa_root),
                         BIO_SUBMIT_SCRIPT=str(SCRIPT))
         (self.root / "tools").mkdir()
@@ -223,6 +247,9 @@ except (OSError, ValueError, KeyError, AssertionError):
         (self.root / "tools" / "recipes").mkdir()
         (self.root / "tools" / "recipes" / "boltz2.sh").write_text("# authoritative deployed recipe\n")
         (self.root / "tools" / "py").mkdir()
+        for helper in ("head_preparation_gate.py", "worker_runtime.py"):
+            shutil.copy2(SCRIPT.parents[2] / "modules/bio/py" / helper, self.root / "tools/py" / helper)
+        shutil.copy2(SCRIPT.parent / "recipes/_isolate-runtime.sh", self.root / "tools/recipes/_isolate-runtime.sh")
         (self.root / "tools" / "requirements").mkdir()
 
     def run_job(self, **settings):
@@ -338,6 +365,30 @@ print(json.dumps(result))
         self.assertEqual(len(list((self.root / "results").glob("*/result.pdb"))), 1)
         self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
         self.assertIn("a\\ quoted\\ value", (self.root / "transmitted.sh").read_text())
+        self.assertIn("BIO_PUBLIC_MSA_PROXY=http://127.0.0.1:18763", (self.root / "transmitted.sh").read_text())
+        self.assertIn("-o ExitOnForwardFailure=yes -R 127.0.0.1:18763:127.0.0.1:" + self.env["BIO_PUBLIC_MSA_HEAD_PORT"],
+                      (self.root / "ssh-args").read_text())
+
+    def test_unavailable_head_public_msa_proxy_stops_before_worker_rental(self):
+        with socket.socket() as unavailable:
+            unavailable.bind(("127.0.0.1", 0))
+            result = self.run_job(BIO_PUBLIC_MSA_HEAD_PORT=str(unavailable.getsockname()[1]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("head public-MSA proxy unavailable", result.stdout + result.stderr)
+        self.assertFalse((self.root / "launches").exists())
+
+    def test_wrong_or_malformed_proxy_health_stops_before_worker_rental(self):
+        for status, body in [(200, b'{"service":"another-service","schema":1}'),
+                             (200, b'{"service":"bio-public-msa-proxy","schema":true}'),
+                             (200, b'not-json'), (200, b' ' * 1025),
+                             (503, b'{"service":"bio-public-msa-proxy","schema":1}')]:
+            with self.subTest(status=status, body=body[:80]):
+                self.proxy.health_status = status
+                self.proxy.health_body = body
+                result = self.run_job()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("head public-MSA proxy unavailable", result.stdout + result.stderr)
+                self.assertFalse((self.root / "launches").exists())
 
     def test_model_failure_is_preserved_and_worker_deleted(self):
         result = self.run_job(MODEL_EXIT="17")
@@ -730,7 +781,7 @@ sleep() { :; }
                          ["CPU.360V.1440G", "CPU.16V.64G", "CPU.360V.1440G", "CPU.360V.1440G"])
         self.assertTrue(all("--volume msa-database-volume" in line
                             for line in (self.root / "launch-args").read_text().splitlines()))
-        self.assertTrue(all("--image ubuntu-24.04 --max-hours" in line
+        self.assertTrue(all("--image ubuntu-24.04 --os-size 50 --max-hours" in line
                             for line in (self.root / "launch-args").read_text().splitlines()))
 
     def test_msa_prepare_requires_model_fasta_and_configured_storage_before_rental(self):
@@ -993,14 +1044,49 @@ sleep() { :; }
         self.assertEqual((self.root / "removals").read_text().count("rm "), 1)
         self.assertFalse((self.root / "transmitted.sh").exists())
 
-    def test_msa_uses_its_own_lock_while_inference_lock_is_held(self):
+    def test_msa_waits_for_legacy_runtime_writer_before_rental(self):
         state = self.root / "state"
         state.mkdir()
         with (state / "bio-submit.lock").open("w") as locked:
             fcntl.flock(locked.fileno(), fcntl.LOCK_EX)
-            result = self.submit("msa", "--sub", "convert", **self.msa_settings())
-        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            process = subprocess.Popen(["bash", str(SCRIPT), "msa", "--sub", "convert"],
+                env=dict(self.env, **self.msa_settings()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(0.2)
+            self.assertIsNone(process.poll())
+            self.assertFalse((self.root / "launches").exists())
+        stdout, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertTrue((state / "msa-submit.lock").exists())
+        self.assertTrue((state / "msa-operation.lock").exists())
+
+    def test_two_ephemeral_jobs_reach_their_workers_before_either_finishes(self):
+        ssh = self.root / "bin/ssh"
+        ssh.write_text('''#!/usr/bin/env bash
+set -eu
+[ "${!#}" != true ] || exit 0
+cat > "$AUDIT/transmitted-$$.sh"
+touch "$AUDIT/worker-$$"
+until [ -e "$AUDIT/release-workers" ]; do sleep 0.05; done
+''')
+        processes = [subprocess.Popen(["bash", str(SCRIPT), "boltz2", "--fasta", str(self.input), "--execution", "ephemeral"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        try:
+            deadline = time.monotonic() + 10
+            while len(list(self.root.glob("worker-*"))) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(list(self.root.glob("worker-*"))), 2)
+            self.assertTrue(all(process.poll() is None for process in processes))
+            self.assertFalse((self.root / "removals").exists())
+        finally:
+            (self.root / "release-workers").touch()
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=20)
+                self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual((self.root / "removals").read_text().count("rm "), 2)
+        for plan in (self.root / "results").glob("*/runtime-plan.json"):
+            value = json.loads(plan.read_text())
+            self.assertEqual(value["isolation"], "private-local-copies")
+            self.assertEqual(value["paths"], ["cache/boltz", "envs/boltz"])
 
     def test_private_preparation_validates_canonical_model_bundle_before_inference_rental(self):
         for alias, model in (("of3", "openfold3"), ("boltz", "boltz2"), ("protenix", "protenix")):
@@ -1033,7 +1119,8 @@ sleep() { :; }
 
     def test_explicit_prepared_bundle_is_validated_staged_and_includes_verified_msa_code(self):
         bundle = self.valid_bundle()
-        result = self.submit("boltz2", "--fasta", self.input, "--msa-bundle", bundle, EXECUTE_BUNDLE="1")
+        result = self.submit("boltz2", "--fasta", self.input, "--msa-bundle", bundle, EXECUTE_BUNDLE="1",
+                             BIO_PUBLIC_MSA_HEAD_PORT="0")
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertFalse((self.root / "preparation-calls").exists())
         event = (self.root / "events").read_text().splitlines()
@@ -1046,6 +1133,8 @@ sleep() { :; }
                              (self.root / "tools" / "msa" / "prepared.py").read_bytes())
             self.assertIn("msa/databases.py", packed.getnames())
         self.assertIn("BIO_MSA_BUNDLE=", (self.root / "transmitted.sh").read_text())
+        self.assertNotIn("BIO_PUBLIC_MSA_PROXY=", (self.root / "transmitted.sh").read_text())
+        self.assertNotIn(" -R ", (self.root / "ssh-args").read_text())
 
     def test_invalid_explicit_bundle_stops_before_gpu_without_calling_preparation(self):
         bundle = self.valid_bundle("openfold3")
@@ -1133,9 +1222,10 @@ sleep() { :; }
 
     def test_library_nucleic_acid_input_sets_native_has_protein_false(self):
         self.library_fixture()
-        result = self.submit("boltz2", "--construct", "oligo")
+        result = self.submit("boltz2", "--construct", "oligo", BIO_PUBLIC_MSA_HEAD_PORT="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("BIO_NATIVE_HAS_PROTEIN=0", (self.root / "transmitted.sh").read_text())
+        self.assertNotIn("BIO_PUBLIC_MSA_PROXY=", (self.root / "transmitted.sh").read_text())
 
     def test_rfaa_library_nucleic_acid_needs_no_protein_database(self):
         self.library_fixture()

@@ -8,11 +8,13 @@ pair keys in TaxID fields; these synthetic keys are NOT biological taxonomy.
 from __future__ import annotations
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -142,6 +144,32 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+@contextlib.contextmanager
+def public_query_lock(deadline):
+    """Share the worker clients' NFSv4 lease for the entire public search."""
+    path = os.environ.get('BIO_PUBLIC_MSA_LOCK')
+    if not path:
+        yield  # Standalone library callers may supply their own coordinator.
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Error('Public MSA query lock must be a regular file')
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    raise Error('RF3 deadline exceeded waiting for public MSA query slot')
+                time.sleep(min(0.5, max(0, deadline - time.time())))
+        yield
+    finally:
+        os.close(fd)
+
+
 class Client:
     def __init__(self, endpoint, source, deadline):
         parsed = urllib.parse.urlsplit(endpoint)
@@ -223,9 +251,11 @@ def search(query_map, out, endpoint, source, deadline, provenance=None):
     pair = None
     if unique:
         client = Client(endpoint, source, deadline)
-        raw = client.search(unique, 'msa', 'env', out/'raw/unpaired')
-        if len(unique) > 1:
-            pair = client.search(unique, 'pair', 'pairgreedy', out/'raw/paired')[0]
+        guard = public_query_lock(deadline) if source == 'public' else contextlib.nullcontext()
+        with guard:
+            raw = client.search(unique, 'msa', 'env', out/'raw/unpaired')
+            if len(unique) > 1:
+                pair = client.search(unique, 'pair', 'pairgreedy', out/'raw/paired')[0]
         alignments = merge_alignments(query_map, raw, pair)
     else:
         alignments = {}

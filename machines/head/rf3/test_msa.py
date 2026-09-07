@@ -1,4 +1,6 @@
 import json
+import fcntl
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import tempfile
@@ -10,6 +12,21 @@ import msa
 
 
 class SearchTests(unittest.TestCase):
+    def test_public_query_lock_excludes_worker_lock_and_releases_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp)/'public-msa.lock'
+            with patch.dict(os.environ, {'BIO_PUBLIC_MSA_LOCK': str(lock)}):
+                with open(lock, 'a') as worker:
+                    fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaisesRegex(msa.Error, 'waiting for public MSA'):
+                        with msa.public_query_lock(time.time() - 1):
+                            self.fail('An occupied query lease was acquired')
+                with self.assertRaisesRegex(RuntimeError, 'native search failed'):
+                    with msa.public_query_lock(time.time() + 5):
+                        raise RuntimeError('native search failed')
+                with open(lock, 'a') as worker:
+                    fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_no_protein_needs_no_api_and_does_not_claim_public_or_private_search(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(msa,'Client',side_effect=AssertionError('No API needed')):
             path=msa.search({},Path(tmp)/'empty','unused','private',10**20)

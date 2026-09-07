@@ -5,6 +5,9 @@
 let
   rfaaStorage = import ./rfaa-storage.nix;
   msaStorage = import ./msa-storage.nix;
+  workbenchConfig = pkgs.writeText "bio-workbench-config.json" (builtins.toJSON {
+    max_jobs = 10;
+  });
 in
 {
   imports = [ (modulesPath + "/profiles/qemu-guest.nix") ]; # virtio drivers for KVM
@@ -141,6 +144,9 @@ in
     "bio-tools/msa".source = ./msa;
     "bio-tools/library".source = ./library;
     "bio-tools/workbench".source = ./workbench;
+    # Bursty interactive use: allocate temporary workers for up to ten jobs,
+    # then return to zero GPU workers as their managed runs finish.
+    "bio-tools/workbench-config.json".source = workbenchConfig;
     "bio-tools/inference".source = ./inference;
     "bio-tools/library-runtime.json".text = builtins.toJSON {
       python = "${pkgs.python312}/bin/python3.12";
@@ -158,6 +164,7 @@ in
       export MSA_DB_NFS=${lib.escapeShellArg msaStorage.nfs}
       export MSA_DB_ROOT=/mnt/bio-msa-databases/colabfold
       export BIO_MSA_DEFAULT_BACKEND=public
+      export BIO_PUBLIC_MSA_LOCK=/mnt/bio-shared/coordination/public-msa.lock
     '';
   };
 
@@ -170,7 +177,9 @@ in
     serviceConfig = {
       Type = "oneshot";
       ExecStart = "/run/current-system/sw/bin/dc watchdog";
-      TimeoutStartSec = 240;
+      # Burst expiry requests are issued across workers first; allow the
+      # subsequent bounded instance/OS confirmations to finish for the batch.
+      TimeoutStartSec = 900;
     };
   };
   systemd.timers.dc-budget-watchdog = {
@@ -302,12 +311,35 @@ in
     };
   };
 
+  # SSH reverse forwards expose this loopback-only TLS tunnel on temporary
+  # workers. Native search clients serialize whole queries on the shared lock;
+  # inference continues in parallel after each search releases that lock.
+  systemd.services.bio-public-msa-proxy = {
+    description = "Single head egress for native public MSA searches";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    environment.PYTHONDONTWRITEBYTECODE = "1";
+    serviceConfig = {
+      ExecStart = "${pkgs.python3}/bin/python3 ${./msa/public_proxy.py}";
+      DynamicUser = true;
+      Restart = "on-failure";
+      RestartSec = 3;
+      NoNewPrivileges = true;
+      PrivateTmp = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+    };
+  };
+
   systemd.services.bio-workbench = {
     description = "Durable desktop and Harrison molecular model jobs";
-    restartTriggers = [ ./workbench ];
+    restartTriggers = [ ./workbench workbenchConfig ];
     wantedBy = [ "multi-user.target" ];
-    after = [ "network-online.target" "systemd-tmpfiles-setup.service" ];
-    wants = [ "network-online.target" ];
+    after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
+    wants = [ "network-online.target" "bio-public-msa-proxy.service" ];
+    environment.BIO_WORKBENCH_CONFIG = "/etc/bio-tools/workbench-config.json";
     serviceConfig = {
       Type = "simple";
       ExecStart = "/run/current-system/sw/bin/bio-workbench daemon";

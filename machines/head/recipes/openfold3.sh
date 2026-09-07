@@ -77,7 +77,11 @@ JSON
 fi
 have_gpu
 # shellcheck disable=SC2086
-"$VENV/bin/run_openfold" predict --query_json="$J" "${msa_args[@]}" \
+openfold_command=("$VENV/bin/run_openfold")
+if [ -n "${BIO_PUBLIC_MSA_PROXY:-}" ]; then
+  openfold_command=("$P" "$TOOLS/py/public_msa_client.py" --model openfold3 --entrypoint "$VENV/bin/run_openfold" --)
+fi
+"${openfold_command[@]}" predict --query_json="$J" "${msa_args[@]}" \
   --runner_yaml="$runner_cfg" --output_dir="$OUT" "${EXTRA_ARGS[@]}"
 # The upstream runner catches per-query inference/output errors. Its process
 # can exit zero with failed queries, so check the summary and real structures.

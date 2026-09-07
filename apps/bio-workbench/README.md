@@ -60,6 +60,13 @@ work. Closing the app disconnects your view; it does not cancel cloud jobs.
 Cancellation shows the actual state: an already executing resident prediction
 can finish before cancellation takes effect.
 
+The head admits up to ten model jobs at once. Jobs beyond that limit stay in
+the durable queue with their position and the active-job count. When no
+compatible resident worker is running, Auto uses temporary GPU workers that
+are removed after results are collected. This supports occasional bursts
+without keeping GPUs running between them. The existing head and data volumes
+remain online. Provider capacity and the shared spending guard still apply.
+
 ## Inputs and comparisons
 
 Use **Independent inputs** for a file/sequence batch or **Interacting assembly**
@@ -127,7 +134,9 @@ Electron starts and owns a Python service on a random loopback port. This is
 internal app transport; it never opens an external browser. The renderer has
 no Node access and uses a narrow sandboxed preload for native dialogs and
 batch links. SSH uses fixed arguments and the same JSON-RPC schema as Harrison.
-The head has no new HTTP listener. Local HTTP uses session cookies, CSRF tokens,
+Workbench desktop/Harrison RPC uses SSH and adds no head HTTP listener for those
+requests. The separate public MSA transport uses a loopback-only proxy. The app's
+local HTTP uses session cookies, CSRF tokens,
 origin/host checks and a restrictive content policy; artifact downloads verify
 SHA-256 before display. The head protocol is documented in
 [`../../machines/head/workbench/CONTRACT.md`](../../machines/head/workbench/CONTRACT.md).

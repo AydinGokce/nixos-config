@@ -15,12 +15,15 @@ OS/storage charges still count toward the separate overall spending guard.
 DC_LAUNCH_COOLDOWN_SECONDS optionally waits after confirmed managed cleanup
 before the next launch (default 0). Accounting/cleanup locks are not held while
 waiting, and budget checks and quotes are refreshed after the wait.
+A separate admission lock serializes reservation/create bookkeeping only;
+accepted instances provision concurrently after their IDs are durable.
 API schema: https://api.verda.com/v1/openapi.json (verified 2026-09-05).
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import fcntl
 import json
@@ -33,6 +36,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -124,18 +128,21 @@ class API:
         self.base = os.environ.get("DC_API_URL", "https://api.datacrunch.io/v1").rstrip("/")
         self.token = None
         self.token_expires = 0
+        self.auth_lock = threading.Lock()
 
     def request(self, method, path, body=None, *, authenticate=True):
-        if authenticate and (self.token is None or time.time() + 60 >= self.token_expires):
-            auth = self.request("POST", "/oauth2/token", {
-                "grant_type": "client_credentials",
-                "client_id": os.environ.get("DATACRUNCH_CLIENT_ID", ""),
-                "client_secret": os.environ.get("DATACRUNCH_CLIENT_SECRET", ""),
-            }, authenticate=False)
-            self.token = auth.get("access_token")
-            if not self.token:
-                raise Error("API did not return an access token")
-            self.token_expires = time.time() + number(auth.get("expires_in", 3600), "token lifetime")
+        if authenticate:
+            with self.auth_lock:
+                if self.token is None or time.time() + 60 >= self.token_expires:
+                    auth = self.request("POST", "/oauth2/token", {
+                        "grant_type": "client_credentials",
+                        "client_id": os.environ.get("DATACRUNCH_CLIENT_ID", ""),
+                        "client_secret": os.environ.get("DATACRUNCH_CLIENT_SECRET", ""),
+                    }, authenticate=False)
+                    self.token = auth.get("access_token")
+                    if not self.token:
+                        raise Error("API did not return an access token")
+                    self.token_expires = time.time() + number(auth.get("expires_in", 3600), "token lifetime")
         headers = {"Content-Type": "application/json"}
         if authenticate:
             headers["Authorization"] = "Bearer " + self.token
@@ -155,6 +162,9 @@ class API:
                     os.environ.get("DATACRUNCH_CLIENT_ID"), os.environ.get("DATACRUNCH_CLIENT_SECRET")))
             except (OSError, ValueError):
                 detail = ""
+            retry_after = exc.headers.get("Retry-After", "") if exc.headers else ""
+            if exc.code == 429 and re.fullmatch(r"[0-9]{1,4}", retry_after):
+                detail = (detail + "; " if detail else "") + "retry after " + retry_after + "s"
             raise APIError(method, path, exc.code, detail) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
             # Only the transport exception's diagnostic, never the response body.
@@ -204,6 +214,44 @@ class Store:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.root / "budget.json"
+
+    @contextlib.contextmanager
+    def admission(self):
+        # A pending reservation is deliberately an uncertainty fence. Keep
+        # another healthy submitter out of that ordinary reserve-to-create
+        # window without holding the accounting lock during network I/O.
+        # Process exit releases this lock; a retained ambiguous reservation
+        # still blocks new spending until its exact outcome is reconciled.
+        with (self.root / "launch-admission.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @contextlib.contextmanager
+    def confirming(self, token):
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", token):
+            raise Error("Invalid managed cleanup token")
+        # Submitters and the watchdog may finish the same instance together.
+        # This is deliberately separate from budget.lock and the slot pool.
+        with (self.root / ("cleanup-job-" + token + ".lock")).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    @contextlib.contextmanager
+    def confirmation_slot(self, sleep=time.sleep):
+        # All dc processes share four confirmation slots. Delete requests are
+        # issued first; only inventory/purge confirmation waits for a slot.
+        with contextlib.ExitStack() as stack:
+            slots = [stack.enter_context((self.root / f"cleanup-slot-{index}.lock").open("a"))
+                     for index in range(4)]
+            while True:
+                for slot in slots:
+                    try:
+                        fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    yield
+                    return
+                sleep(1)
 
     @contextlib.contextmanager
     def locked(self, now):
@@ -608,54 +656,56 @@ class Controller:
         except Error as exc:
             raise LaunchBlocked(str(exc)) from None
         token = uuid.uuid4().hex
-        while True:
-            self.wait_for_launch_cooldown(cooldown)
-            rate, os_rate = self.quote(args.type, args.spot, args.os_size)
-            # Use a fresh quote after any wait, before touching reservations.
-            # OS and persistent storage remain in the overall budget guard.
-            if maximum_hourly is not None and rate > maximum_hourly:
-                raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
-                                    f"${maximum_hourly:g}/h; launch refused")
-            keys = self.api.request("GET", "/sshkeys")
-            now = self.clock()
-            with self.store.locked(now) as state:
-                self.refresh(state)
-                now = self.clock()
-                if launch_not_before(state, cooldown) > now:
-                    continue  # Cleanup advanced during quote/inventory calls.
-                check_storage_lifetime(self.store.root, args.volume, now)
-                reserve(state, token, rate, os_rate, args.max_hours, now,
-                        self.ceiling, self.margin, self.persistent_hours)
-                state["jobs"][token]["volumes"] = list(args.volume)
-            break
-        body = {"instance_type": args.type, "image": args.image,
-                "hostname": args.name or "bio-" + token[:12],
-                "description": f"bio-dc:{token} ephemeral deadline={int(now + args.max_hours * 3600)}",
-                "ssh_key_ids": [row["id"] for row in keys], "location_code": args.loc,
-                "is_spot": args.spot, "existing_volumes": args.volume,
-                "os_volume": {"name": "bio-os-" + token, "size": args.os_size}}
-        if args.spot:
-            body["os_volume"]["on_spot_discontinue"] = "move_to_trash"
         ident = None
         complete = False
         try:
-            try:
-                reply = self.api.request("POST", "/instances", body)
-                uuid.UUID(str(reply))
-                ident = reply
-            except (APIError, ValueError, TypeError) as exc:
-                with self.store.locked(self.clock()) as state:
-                    rejected = isinstance(exc, APIError) and exc.status in {400, 401, 402, 403, 404, 409, 422, 429, 503}
-                    state["jobs"][token]["status"] = "closed" if rejected else "uncertain"
-                if rejected:
-                    if exc.status == 400 and "storage limit exceeded" in str(exc).lower():
-                        raise LaunchBlocked(f"Storage quota blocked launch: {exc}; run dc gc for owned disposable OS disks "
-                                            "or review the provider quota before retrying") from None
-                    raise Error(f"Launch rejected: {exc}") from None
-                reason = str(exc) if isinstance(exc, APIError) else "invalid create response"
-                raise LaunchBlocked(f"Launch outcome unknown ({reason}); reservation retained for watchdog reconciliation") from None
-            with self.store.locked(self.clock()) as state:
-                state["jobs"][token].update(id=ident, status="starting")
+            while True:
+                self.wait_for_launch_cooldown(cooldown)
+                with self.store.admission():
+                    # Requote after both cooldown and admission waits. This
+                    # lock ends after the provider outcome is durably recorded,
+                    # before readiness polling or model execution begins.
+                    rate, os_rate = self.quote(args.type, args.spot, args.os_size)
+                    if maximum_hourly is not None and rate > maximum_hourly:
+                        raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
+                                            f"${maximum_hourly:g}/h; launch refused")
+                    keys = self.api.request("GET", "/sshkeys")
+                    now = self.clock()
+                    with self.store.locked(now) as state:
+                        self.refresh(state)
+                        now = self.clock()
+                        if launch_not_before(state, cooldown) > now:
+                            continue  # Cleanup advanced while admission waited.
+                        check_storage_lifetime(self.store.root, args.volume, now)
+                        reserve(state, token, rate, os_rate, args.max_hours, now,
+                                self.ceiling, self.margin, self.persistent_hours)
+                        state["jobs"][token]["volumes"] = list(args.volume)
+                    body = {"instance_type": args.type, "image": args.image,
+                            "hostname": args.name or "bio-" + token[:12],
+                            "description": f"bio-dc:{token} ephemeral deadline={int(now + args.max_hours * 3600)}",
+                            "ssh_key_ids": [row["id"] for row in keys], "location_code": args.loc,
+                            "is_spot": args.spot, "existing_volumes": args.volume,
+                            "os_volume": {"name": "bio-os-" + token, "size": args.os_size}}
+                    if args.spot:
+                        body["os_volume"]["on_spot_discontinue"] = "move_to_trash"
+                    try:
+                        reply = self.api.request("POST", "/instances", body)
+                        uuid.UUID(str(reply))
+                        ident = reply
+                    except (APIError, ValueError, TypeError) as exc:
+                        with self.store.locked(self.clock()) as state:
+                            rejected = isinstance(exc, APIError) and exc.status in {400, 401, 402, 403, 404, 409, 422, 429, 503}
+                            state["jobs"][token]["status"] = "closed" if rejected else "uncertain"
+                        if rejected:
+                            if exc.status == 400 and "storage limit exceeded" in str(exc).lower():
+                                raise LaunchBlocked(f"Storage quota blocked launch: {exc}; run dc gc for owned disposable OS disks "
+                                                    "or review the provider quota before retrying") from None
+                            raise Error(f"Launch rejected: {exc}") from None
+                        reason = str(exc) if isinstance(exc, APIError) else "invalid create response"
+                        raise LaunchBlocked(f"Launch outcome unknown ({reason}); reservation retained for watchdog reconciliation") from None
+                    with self.store.locked(self.clock()) as state:
+                        state["jobs"][token].update(id=ident, status="starting")
+                break
             print(f"launched {ident} ({args.type} @ ${rate}/hr; max {args.max_hours:g}h)", flush=True)
             deadline = min(now + args.max_hours * 3600, self.clock() + 600)
             while self.clock() < deadline:
@@ -680,7 +730,8 @@ class Controller:
                 except Error as exc:
                     print(f"dc: cleanup unconfirmed: {exc}; watchdog will retry", file=sys.stderr)
 
-    def remove(self, ident):
+    def request_remove(self, ident):
+        """Record ownership and request deletion without waiting for teardown."""
         with self.store.locked(self.clock()) as state:
             jobs = [(token, job) for token, job in state["jobs"].items() if job.get("id") == ident]
             if not jobs:
@@ -688,6 +739,8 @@ class Controller:
             if len(jobs) != 1:
                 raise Error(f"Ambiguous managed instance {ident}; cleanup needs review")
             token, job = jobs[0]
+            if job["status"] == "closed":
+                return token, job.get("os_id")
             job["status"] = "cleanup"
             try:
                 row = self.api.request("GET", "/instances/" + ident)
@@ -705,7 +758,24 @@ class Controller:
         except APIError as exc:
             if exc.status != 404:
                 raise
-        for _ in range(18):
+        return token, os_id
+
+    def confirm_remove(self, ident, token, os_id):
+        """Confirm one previously requested exact-owned instance/OS cleanup."""
+        with self.store.confirming(token):
+            with self.store.locked(self.clock()) as state:
+                job = state["jobs"].get(token)
+                if not job or job.get("id") != ident or job.get("os_id") != os_id:
+                    raise Error("Managed cleanup identity changed before confirmation")
+                if job["status"] == "closed":
+                    return  # Another exact-owned confirmer completed teardown.
+                if job["status"] != "cleanup":
+                    raise Error("Managed cleanup request is not recorded")
+            with self.store.confirmation_slot(self.sleep):
+                self._confirm_remove(ident, token, os_id)
+
+    def _confirm_remove(self, ident, token, os_id):
+        for _ in range(9):
             inventory = self.api.inventory()
             present = any(row["id"] == ident and row.get("status") not in {"deleted", "notfound"}
                           for row in inventory[0])
@@ -718,7 +788,7 @@ class Controller:
                 # detaching. Wait for affirmative detach evidence; never send
                 # DELETE while any attachment or transition is still reported.
                 if disk.get("instance_id") or disk.get("instances") or disk.get("status") != "detached":
-                    self.sleep(5)
+                    self.sleep(10)
                     continue
                 self.api.request("DELETE", "/volumes/" + os_id, {"is_permanent": False})
             if not present and not disk:
@@ -732,8 +802,12 @@ class Controller:
                 detail = "; managed OS permanently removed" if purged else ""
                 print(f"removed {ident} (confirmed{detail}; shared volumes retained)", flush=True)
                 return
-            self.sleep(5)
+            self.sleep(10)
         raise Error(f"Deletion of {ident} unconfirmed; cost remains active and watchdog will retry")
+
+    def remove(self, ident):
+        token, os_id = self.request_remove(ident)
+        self.confirm_remove(ident, token, os_id)
 
     def purge_os(self, token, *, closed_only=False):
         with self.store.locked(self.clock()) as state:
@@ -758,7 +832,7 @@ class Controller:
             already_deleted = exc.status == 400 and "already permanently deleted" in str(exc).lower()
             if exc.status != 404 and not already_deleted:
                 raise
-        for _ in range(18):
+        for _ in range(9):
             inventory = self.api.inventory()
             active = any(row.get("id") == ident for row in inventory[1])
             recoverable = any(row.get("id") == ident and not (
@@ -773,8 +847,32 @@ class Controller:
                     job["os_purged_at"] = self.clock()
                 print(f"purged managed OS {ident} (permanent removal confirmed)", flush=True)
                 return True
-            self.sleep(5)
+            self.sleep(10)
         raise Error(f"Permanent removal of managed OS {ident} unconfirmed; retry dc gc or cleanup")
+
+    def remove_many(self, targets):
+        """Issue every owned delete before any slow confirmation can hold it up."""
+        if not targets:
+            return []
+        failures, requested = [], []
+        # Admission/accounting uses independent locks. Four bounded workers
+        # avoid a ten-instance watchdog burst multiplying inventory polling
+        # beyond the provider's per-endpoint limits.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            pending = {ident: pool.submit(self.request_remove, ident) for ident in dict.fromkeys(targets)}
+            for ident, future in pending.items():
+                try:
+                    token, os_id = future.result()
+                    requested.append((ident, token, os_id))
+                except Error as exc:
+                    failures.append(str(exc))
+            confirmations = [pool.submit(self.confirm_remove, *request) for request in requested]
+            for future in confirmations:
+                try:
+                    future.result()
+                except Error as exc:
+                    failures.append(str(exc))
+        return failures
 
     def gc(self):
         with self.store.locked(self.clock()) as state:
@@ -819,16 +917,9 @@ class Controller:
                            j["status"] != "closed" and (self.clock() >= j["deadline"] or
                            j["status"] == "cleanup" or (j["status"] in {"pending", "starting", "uncertain"}
                            and self.clock() - j["created"] >= 600))]
-            for ident in targets:
-                with contextlib.suppress(Error):
-                    self.remove(ident)
+            self.remove_many(targets)
             raise
-        failures = []
-        for ident in targets:
-            try:
-                self.remove(ident)
-            except Error as exc:
-                failures.append(str(exc))
+        failures = self.remove_many(targets)
         if failures:
             raise Error("; ".join(failures))
 

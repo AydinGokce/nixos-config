@@ -59,6 +59,15 @@ Unknown launch outcomes and unconfirmed cleanup block additional launches until
 they are reconciled. Missing prices, unsupported currencies/contracts, corrupt
 state, or unavailable inventory also prevent new paid launches.
 
+For burst submissions, a separate admission lock covers reservation, instance
+creation and recording the provider's response. It is released before readiness
+polling, so accepted workers provision concurrently. An ambiguous response keeps
+its reservation and blocks further spending; it is never automatically retried.
+Cleanup requests are issued promptly for all expired workers. Confirmation uses
+four shared slots across submitters and the watchdog, with one confirmer per
+owned job, to bound inventory polling while retaining exact OS-disk ownership
+checks. Reservations remain active until removal is confirmed.
+
 For a registered RFAA database allocation, each new reservation records its
 attached volume IDs. While holding the accounting lock, `dc launch` checks that
 the allocation's private receipt is active and has not expired. The storage

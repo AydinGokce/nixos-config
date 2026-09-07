@@ -2,7 +2,9 @@
 
 The Electron desktop and Harrison use the same actor-scoped JSON-line RPC over
 SSH. The protocol is in [CONTRACT.md](CONTRACT.md). Nix installs `bio-workbench`
-and a dispatcher service; there is no new head network listener.
+and a dispatcher service. Desktop/Harrison RPC uses SSH and adds no head HTTP
+listener for those requests. The separate public MSA transport uses a
+loopback-only HTTP CONNECT proxy.
 
 The shared operator workspace uses `BIO_WORKBENCH_ACTOR=harrison`. The dedicated
 Harrison key has a forced RPC command and OpenSSH `restrict`. Client JSON cannot
@@ -30,11 +32,23 @@ claimed prediction is allowed to finish and remains visible. Ephemeral jobs
 signal only their exact owned submission and retain managed cleanup. Closing a
 desktop window has no effect on cloud job lifetime.
 
-The default trusted configuration permits one model submission at a time.
+The deployed head permits up to ten model submissions at a time, admitting
+queued jobs in creation order across batches. This suits occasional bursts:
+slots open as jobs finish, without reserving ten workers while the queue is
+empty. A slot covers a managed submission through cleanup, or its continuing
+resident request if the waiting client disconnected. The client and request
+consume one slot together. Native worker capacity and the existing cloud budget
+guard still determine whether admitted work can obtain compute.
+
 `--config /absolute/operator-config.json` can override documented paths and
-`max_jobs` (1–4). RPC clients cannot set this configuration. Private/public MSA,
-model settings, native input constraints and runtime budget checks remain
-separate from dispatcher concurrency.
+`max_jobs` (1–32); the generic default is one. RPC clients cannot set this
+configuration. Queued jobs report their FIFO position and occupied/configured
+execution slots. Decreasing the limit lets existing work finish before further
+admission. A recovered, exactly bound terminal receipt releases a completed
+operation even if the daemon or runner restarted before its final database
+update. Invalid receipts retain their slots and report an integrity error.
+Private/public MSA, model settings, native input constraints and runtime budget
+checks remain separate from dispatcher concurrency.
 
 Useful operator commands:
 

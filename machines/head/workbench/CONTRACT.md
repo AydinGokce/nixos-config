@@ -2,7 +2,9 @@
 
 The local app and Harrison use the same JSON-line RPC on bio-head. The fixed SSH
 command is `/run/current-system/sw/bin/bio-workbench rpc`. The local app forwards
-`POST /api/v1/rpc` unchanged. There is no head HTTP listener. Each request is
+`POST /api/v1/rpc` unchanged over SSH. Workbench RPC has no head HTTP listener;
+the separate public MSA transport uses a loopback-only HTTP CONNECT proxy.
+Each request is
 `{"id":"client-id","method":"catalog","params":{}}`; each response is
 `{"id":"client-id","result":...}` or
 `{"id":"client-id","error":{"code":"invalid","message":"..."}}`.
@@ -125,6 +127,12 @@ progress:{message,observed_at},provenance:{...}}`. States: `queued`, `starting`,
 `running`, `cancel_requested`, `complete`, `failed`, `cancelled`, `interrupted`.
 Progress is observed phase/log evidence; there is no invented percentage.
 Errors and cancellation do not hide prior output. No automatic inference retry.
+For queued jobs, dispatcher observations also include
+`progress:{message,observed_at,queue_position,active_jobs,max_jobs}`. Position is
+one-based in the shared FIFO queue; counts describe occupied execution slots,
+not a promise of available GPU instances. A continuing native resident request
+and its client occupy one slot together. Capacity comes from trusted head
+configuration and is not a submission parameter.
 
 Batch.get includes every pair and lightweight jobs (`artifacts:[]`,
 `artifact_count`); use job.get for artifact details and complete provenance.
