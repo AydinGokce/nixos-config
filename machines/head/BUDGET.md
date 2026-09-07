@@ -110,7 +110,8 @@ remain persistent; only the new worker's OS disk is selected for deletion.
 
 `dc-budget-watchdog.timer` starts approximately 30 seconds after boot and runs
 `dc watchdog` every 60 seconds, with a five-second scheduling tolerance. The
-oneshot service has a 240-second systemd timeout. A launch refuses to proceed
+oneshot service has a 900-second systemd timeout to allow concurrent burst
+cleanup confirmations to finish. A launch refuses to proceed
 when the last successful inventory reconciliation by the watchdog is more than
 180 seconds old.
 
