@@ -324,13 +324,41 @@ impl Workbench {
             .default_height(164.)
             .min_height(70.)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.console_tab, 0, "CONSOLE");
                     ui.selectable_value(&mut self.console_tab, 1, "JOB LOG");
                     if ui.button("Clear local log").clicked() {
                         self.console.clear();
                     }
-                    ui.small("reset · cartoon · sticks · spheres · trace · help");
+                    ui.separator();
+                    for (command, tooltip) in [
+                        (
+                            "reset",
+                            "Fit the selected structure; also fit linked cameras.",
+                        ),
+                        ("cartoon", "Show the selected structure as a cartoon."),
+                        ("sticks", "Show the selected structure as sticks."),
+                        ("spheres", "Show the selected structure as spheres."),
+                        ("trace", "Show the selected structure as a backbone trace."),
+                        ("help", "Open Bio Workbench help."),
+                    ] {
+                        let view = self.views[self.state.selected_view].as_ref();
+                        let selected = view.is_some_and(|view| {
+                            view.style.name() == command
+                                || (command == "trace"
+                                    && view.style == scene::Representation::Trace)
+                        });
+                        if ui
+                            .add_enabled(
+                                command == "help" || view.is_some(),
+                                egui::Button::new(command).small().selected(selected),
+                            )
+                            .on_hover_text(tooltip)
+                            .clicked()
+                        {
+                            self.console_command(command);
+                        }
+                    }
                 });
                 egui::ScrollArea::both()
                     .id_salt("console-output")
@@ -371,11 +399,14 @@ impl Workbench {
             });
     }
     fn console_command(&mut self, command: &str) {
+        self.console_tab = 0;
         self.log(format!("bio> {command}"));
         match command.trim() {
             "reset" => self.reset_view(),
-            "help" => self
-                .log("Local view commands only. Preview and submit use the explicit Run controls."),
+            "help" => {
+                self.help_open = true;
+                self.log("View commands: reset, cartoon, sticks, spheres, trace, help. Preview and submit use the explicit Run controls.");
+            }
             name => {
                 if let Some(style) = [
                     scene::Representation::Cartoon,
@@ -455,6 +486,7 @@ impl eframe::App for Workbench {
             ui.label("Jobs and artifacts live on the head. Closing this client does not cancel them. Use the explicit job/batch Cancel controls.");
             ui.label("Choose up to four actual structures under Runs / results, then Compare selected. Linking cameras does not align structures.");
             ui.label("Left drag rotates; right drag pans; wheel zooms; double-click fits. Right-click for lighting. Annotation edits remain local until Save to head.");
+            ui.label("The bottom-bar buttons and bio> commands change the selected structure: cartoon, sticks, spheres, or trace. Reset fits the selected structure and any linked cameras; help opens this window.");
             ui.label("Startup Cas9 is experimental 4OO8, not a prediction. GPU lighting uses rasterization; confidence/chemistry QA comes only from native metadata.");
         });
         self.help_open = help;
