@@ -34,7 +34,8 @@ def validation(store, batch_id, config, compiler=inputs.native_compile):
     batch = store.read('batch', batch_id)
     if batch['state'] != 'validating':
         return
-    combinations = inputs.pairs(store, store.actor(batch_id), batch['_request'])
+    is_md = batch.get('_workflow') == 'md'
+    combinations = batch['pairs'] if is_md else inputs.pairs(store, store.actor(batch_id), batch['_request'])
     with store.transaction() as db:
         batch = store.get(db, 'batch', batch_id)
         if batch['state'] != 'validating':
@@ -49,7 +50,11 @@ def validation(store, batch_id, config, compiler=inputs.native_compile):
             entry = next(p for p in current['pairs'] if p['pair_id'] == pair['pair_id'])
             entry['state'] = 'validating'; store.put(db, 'batch', current)
         try:
-            prepared = inputs.prepare_pair(store, batch, pair, config, compiler)
+            if is_md:
+                from md.gateway import validate_batch
+                prepared = validate_batch(store, batch, config)
+            else:
+                prepared = inputs.prepare_pair(store, batch, pair, config, compiler)
             outcome = {'state': 'compatible', 'reasons': [], '_prepared': prepared}
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             reason = str(exc)[-3000:]
@@ -84,6 +89,13 @@ def observe_phase(log):
         text = stream.read().decode(errors='replace')
     if 'resident request' in text:
         return 'resident inference', 'Native resident request submitted; waiting for its durable result'
+    md_phases = re.findall(r'BIO_MD_STAGE ([A-Za-z0-9_.-]+) (starting|complete|failed|interrupted)', text)
+    if md_phases:
+        name, state = md_phases[-1]
+        phase = ('worker setup' if any(s in name for s in ('grompp', 'topology', 'mutate', 'gentop', 'geometry', 'configure', 'prepare')) else
+                 'MD analysis' if any(s in name for s in ('analysis', 'analyze', 'ddg', 'compare', 'pmf')) else
+                 'MD equilibration' if any(s in name for s in ('minimiz', '_min', '_em', '_nvt', '_npt', 'equil')) else 'MD sampling')
+        return phase, f'MD stage {name}: {state}'
     rules = [('prefilter', 'MSA search'), ('MSA', 'MSA preparation'), ('checkpoint', 'model initialization'),
              ('Inference', 'inference'), ('diffusion', 'inference'), ('sampling', 'inference'),
              ('removing ', 'worker cleanup'), ('result retrieval', 'result transfer')]
@@ -223,6 +235,10 @@ def seal_results(store, job, root, source='native'):
     existing = {a['name']: a for a in existing if a.get('_source') == source}
     results = []
     for relative, expected in before.items():
+        if job['model'] == 'md' and 'input-bundle' in Path(relative).parts:
+            # The simulation retains original inputs and the bundle manifest;
+            # avoid archiving another entire copy of checkpoint-resume payloads.
+            continue
         if relative.endswith(('.pyc', '.lock')):
             continue
         if relative in existing:
@@ -240,9 +256,10 @@ def seal_results(store, job, root, source='native'):
         os.chmod(destination / 'content', 0o400)
         require(file_sha(destination / 'content') == expected['sha256'], 'Output changed during archival', 'integrity')
         extension = original.suffix.lower().lstrip('.')
-        excluded = {'prepared', 'prepared-bundle', 'features', 'template_data', 'template_structures', 'templates', 'library-input', 'native-input'}
+        excluded = {'prepared', 'prepared-bundle', 'features', 'template_data', 'template_structures', 'templates', 'library-input', 'native-input', 'input-bundle', 'inputs'}
         input_file = any(part in excluded for part in Path(relative).parts[:-1]) or original.stem.lower() in {'input', 'source', 'native-input'}
         known_output = (job['model'] == 'rf3' or 'predictions' in original.parts or
+                        (job['model'] == 'md' and original.name == 'final.pdb' and 'simulation' in original.parts) or
                         (job['model'] == 'openfold3' and re.search(r'_seed_\d+_sample_\d+_model$', original.stem)) or
                         (job['model'] == 'rfdiffusion' and original.stem.startswith('design')))
         role = 'structure' if extension in {'cif', 'mmcif', 'pdb'} and not input_file and known_output else 'log' if extension == 'log' else 'confidence' if 'confidence' in original.name else 'provenance' if extension == 'json' else 'data'

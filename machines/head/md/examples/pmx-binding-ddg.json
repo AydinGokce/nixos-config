@@ -1,0 +1,69 @@
+{
+  "schema": "bio-md-request.v1",
+  "protocol": "pmx_binding_ddg",
+  "comparison_id": "replace-with-stable-target-and-transformation-id",
+  "systems": {
+    "bound": {
+      "coordinates": "bound/prepared.gro",
+      "topology": "bound/prepared.top"
+    },
+    "unbound": {
+      "coordinates": "unbound/prepared.gro",
+      "topology": "unbound/prepared.top"
+    }
+  },
+  "conditions": {
+    "force_field": "amber99sb-star-ildn-mut",
+    "water_model": "tip3p",
+    "temperature_kelvin": 300,
+    "pressure_bar": 1,
+    "ionic_strength_molar": 0.15,
+    "prepared_solvated_ionized": true,
+    "protonation": {
+      "method": "explicit",
+      "pH": 7.4,
+      "description": "Reviewed explicit hydrogens in admitted topology"
+    },
+    "nonbonded": {
+      "coulombtype": "PME",
+      "rcoulomb_nm": 1.2,
+      "rvdw_nm": 1.2,
+      "vdw_modifier": "Potential-shift",
+      "dispersion_correction": "EnerPres"
+    }
+  },
+  "simulation": {
+    "dt_ps": 0.002,
+    "minimization_steps": 5000,
+    "nvt_steps": 50000,
+    "npt_steps": 250000,
+    "production_steps": 5000000,
+    "output_stride": 500,
+    "seed": 42,
+    "threads": 8
+  },
+  "pmx": {
+    "topology_mode": "prepared_hybrid",
+    "mutation": {
+      "chain": "A",
+      "resid": 1,
+      "from": "VAL",
+      "to": "ALA"
+    },
+    "lambda_schedule": [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9,
+      1.0
+    ],
+    "replicas": 3,
+    "charge_change_e": 0
+  }
+}

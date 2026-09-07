@@ -16,6 +16,9 @@ def configuration(path=None):
     defaults = {'tools_dir': '/etc/bio-tools', 'bio_submit': '/run/current-system/sw/bin/bio-submit',
                 'library_root': '/var/lib/bio-library', 'runtime_config': '/etc/bio-tools/library-runtime.json',
                 'inference_state': '/var/lib/bio-inference', 'max_jobs': 1,
+                'md_runtime': '/var/lib/bio-md/runtime-cpu',
+                'md_admissions': '/var/lib/bio-md/admissions',
+                'md_runtime_archives': '/mnt/bio-shared/md-runtime',
                 'systemd_run': '/run/current-system/sw/bin/systemd-run',
                 'systemctl': '/run/current-system/sw/bin/systemctl'}
     require(isinstance(data, dict) and set(data) <= set(defaults), 'Invalid trusted workbench configuration')

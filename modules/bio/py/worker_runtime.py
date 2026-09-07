@@ -28,6 +28,7 @@ def paths_for(recipe, model="", sub=""):
         "esm": ["envs/esm2"],
         "evolvepro": ["envs/evolvepro-plm", "envs/evolvepro-core"],
         "msa": ["envs/msa-tools-v1"],
+        "md": [],  # Pinned packed MD runtime is selected by its separate lock.
     }[recipe].copy()
     if recipe in {"esm", "evolvepro"}:
         embedding = model or "esm2_t33_650M_UR50D"

@@ -43,6 +43,10 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# Project-wide authorization, cumulative across folding, MD, head and storage.
+# Environment settings may make a launch more conservative, never raise this.
+PROJECT_BUDGET_CEILING = 750.0
+
 
 class Error(RuntimeError):
     pass
@@ -598,7 +602,8 @@ def check_storage_lifetime(root, volumes, now):
 class Controller:
     def __init__(self, api, store, clock=time.time, sleep=time.sleep):
         self.api, self.store, self.clock, self.sleep = api, store, clock, sleep
-        self.ceiling = number(os.environ.get("DC_BUDGET_CEILING", "500"), "ceiling")
+        self.ceiling = min(PROJECT_BUDGET_CEILING, number(
+            os.environ.get("DC_BUDGET_CEILING", str(PROJECT_BUDGET_CEILING)), "ceiling"))
         self.margin = number(os.environ.get("DC_BUDGET_MARGIN", "10"), "safety margin")
         self.persistent_hours = number(os.environ.get("DC_PERSISTENT_RESERVE_HOURS", "24"), "background reserve")
 

@@ -28,6 +28,9 @@ class API:
         require(isinstance(method, str), 'Method must be a string')
         function = {
             'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
+            'md.catalog': self.md_catalog, 'md.validate': self.md_validate, 'md.plan': self.md_plan,
+            'md.resume': self.md_resume,
+            'md.compare': self.md_compare,
             'upload.chunk': self.upload_chunk, 'upload.finish': self.upload_finish,
             'batch.validate': self.batch_validate, 'batch.create': self.batch_create,
             'batch.get': self.batch_get, 'batch.list': self.batch_list, 'batch.cancel': self.batch_cancel,
@@ -40,7 +43,29 @@ class API:
 
     def catalog(self, params):
         keys(params)
-        return catalog.catalog()
+        from md.gateway import catalog as md_catalog
+        return {**catalog.catalog(), 'molecular_dynamics': md_catalog()}
+
+    def md_catalog(self, params):
+        keys(params)
+        from md.gateway import catalog as md_catalog
+        return md_catalog()
+
+    def md_validate(self, params):
+        from md.gateway import request
+        return request(self, params)
+
+    def md_plan(self, params):
+        from md.gateway import inspect_plan
+        return inspect_plan(self, params)
+
+    def md_resume(self, params):
+        from md.gateway import resume_request
+        return resume_request(self, params)
+
+    def md_compare(self, params):
+        from md.gateway import compare_results
+        return compare_results(self, params)
 
     def upload_begin(self, params):
         keys(params, ('name', 'size'), ('sha256',))

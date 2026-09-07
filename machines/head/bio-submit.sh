@@ -11,7 +11,7 @@ LOC=FIN-02
 [ ! -r "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}" ] || source "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}"
 usage() { cat <<'USAGE'
 bio-submit MODEL --fasta FILE [options]
-Models: boltz2, openfold3, protenix, rf3, rfaa, rfdiffusion, mpnn, esm, evolvepro
+Models: boltz2, openfold3, protenix, rf3, rfaa, rfdiffusion, mpnn, esm, evolvepro, md
 Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
 Library: --construct REF | --assembly REF (pinned and checked before GPU rental)
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
@@ -40,6 +40,7 @@ case "$tool" in
   protenix) recipe=protenix; inkind=fasta; tier=cuda128 ;;
   openfold3|of3) recipe=openfold3; inkind=fasta; tier=latest ;;
   msa) recipe=msa; inkind=optional; tier=msa ;;
+  md) recipe=md; inkind=bundle; tier=cuda128 ;;
   af3|alphafold3) recipe=af3; inkind=json; tier=latest ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -85,6 +86,13 @@ fi
 [[ "$seconds" =~ ^[0-9]+$ ]] && (( seconds >= 60 && seconds <= 85500 )) || { echo 'bio-submit: timeout must be 60..85500 seconds' >&2; exit 2; }
 [ -z "$infile" ] || [ -f "$infile" ] || { echo "bio-submit: input not found: $infile" >&2; exit 2; }
 [ -z "$labels" ] || [ -f "$labels" ] || { echo "bio-submit: labels not found: $labels" >&2; exit 2; }
+if [ "$recipe" = md ]; then
+  [ -n "$infile" ] && [ -z "$labels$model$sub$contigs$num$temp$library_ref$msa_bundle" ] && [ "${#extra[@]}" -eq 0 ] || {
+    echo 'bio-submit: MD accepts only a validated bundle, worker, timeout and name; use bio-md validate/submit' >&2; exit 2;
+  }
+  [ "$execution" != resident ] || { echo 'bio-submit: MD uses managed ephemeral workers' >&2; exit 2; }
+  PYTHONPATH="$TOOLS_SRC" python3 -m md.bundle "$infile" >/dev/null
+fi
 [ -n "$infile$library_ref" ] || [[ "$inkind" = opt* ]] || { echo 'bio-submit: input required' >&2; exit 2; }
 [ -z "$library_ref" ] || [ -z "$infile$contigs$msa_bundle" ] || { echo 'bio-submit: library references conflict with raw input, contigs or prepared bundles' >&2; exit 2; }
 [ "$recipe" != rfdiffusion ] || [ -n "$contigs" ] || { echo 'bio-submit: --contigs required' >&2; exit 2; }
@@ -116,6 +124,14 @@ head_preparation_release() {
 # Database workers bypass this gate: private preparation can invoke one here.
 if [ "$recipe" != msa ]; then
   head_preparation_acquire
+fi
+if [ "$recipe" = md ]; then
+  PYTHONPATH="$TOOLS_SRC" python3 -m md.admission --bundle "$infile" --tools "$TOOLS_SRC" \
+    --runtime "${BIO_MD_CPU_RUNTIME:-/var/lib/bio-md/runtime-cpu}" --state "${BIO_MD_ADMISSIONS:-/var/lib/bio-md/admissions}"
+  md_variant=cuda
+  [[ "$gpu" != CPU.* ]] || md_variant=cpu
+  PYTHONPATH="$TOOLS_SRC" python3 -m md.launch --check --variant "$md_variant" \
+    --runtime-root "${BIO_MD_RUNTIME_ARCHIVES:-/mnt/bio-shared/md-runtime}"
 fi
 if [ -n "$library_ref" ]; then
   case "$recipe" in boltz2|openfold3|protenix|rf3|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
@@ -476,6 +492,7 @@ bundle_dirs=(recipes py requirements rfaa)
 [ ! -d "$TOOLS_SRC/msa" ] || bundle_dirs+=(msa)
 [ ! -d "$TOOLS_SRC/library" ] || bundle_dirs+=(library)
 [ ! -d "$TOOLS_SRC/rf3" ] || bundle_dirs+=(rf3)
+[ "$recipe" != md ] || bundle_dirs+=(md)
 tar -czhf "$bundle" -C "$TOOLS_SRC" "${bundle_dirs[@]}"
 bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 # printf %q preserves argument boundaries and prevents input text becoming code.
@@ -485,6 +502,9 @@ remote_msa_bundle="$RPREP"
 {
   printf 'set -euo pipefail\n'
   printf 'export BIO_JOB_DEADLINE_EPOCH=$(( $(date +%%s) + 10#%s ))\n' "$seconds"
+  if [ "$recipe" = md ]; then
+    case "$gpu" in CPU.*) printf 'export BIO_MD_VARIANT=cpu\n' ;; *) printf 'export BIO_MD_VARIANT=cuda\n' ;; esac
+  fi
   printf 'export IN=%q OUT=%q LABELS=%q MODEL=%q SUB=%q CONTIGS=%q NUM=%q TEMP=%q NAME=%q\n' "$RIN" "$ROUT" "$RLABELS" "$model" "$sub" "$contigs" "$num" "$temp" "${name:-$recipe}"
   printf 'EXTRA_ARGS=('
   if [ "${#extra[@]}" -gt 0 ]; then printf ' %q' "${extra[@]}"; fi
@@ -606,10 +626,30 @@ cleanup() {
   # A service stop can kill tee before this trap runs. Write cleanup directly
   # to the retained log so a broken output pipe cannot prevent worker removal.
   exec >> "$LOCALOUT/run.log" 2>&1
+  if [ "${recipe:-}" = md ] && [ -n "${ROUT:-}" ] && [ -d "$ROUT" ]; then
+    # A killed SSH client cannot deliver a reliable remote signal. The native
+    # worker also watches this per-job flag on persistent shared storage.
+    [ -f "$ROUT/result.json" ] || touch "$ROUT/.cancel-requested" || true
+    if [ -f "$ROUT/.worker.lock" ] && [ ! -f "$ROUT/result.json" ]; then
+      echo 'bio-submit: allowing MD to seal its native checkpoint before cleanup'
+      for _ in $(seq 1 45); do
+        [ ! -f "$ROUT/result.json" ] || break
+        sleep 2
+      done
+    fi
+  fi
   if [ -n "$id" ]; then
     echo "bio-submit: removing $id"
     dc rm "$id" || {
       echo "bio-submit: ERROR deleting $id; inspect dc ls" >&2
+      [ "$status" -ne 0 ] || status=1
+    }
+  fi
+  if [ "${recipe:-}" = md ] && [ -n "${ROUT:-}" ] && [ -d "$ROUT" ]; then
+    # Retrieve from the head's persistent mount even when cancellation killed
+    # the ordinary SSH/rsync path. Unsealed crash checkpoints remain unusable.
+    rsync -a "$ROUT/" "$LOCALOUT/" || {
+      echo 'bio-submit: MD partial-result retention failed; inspect shared job outputs' >&2
       [ "$status" -ne 0 ] || status=1
     }
   fi
@@ -681,7 +721,7 @@ for g in "${candidates[@]}"; do
   max_hours=$(python3 -c 'import sys; print((int(sys.argv[1])+900)/3600)' "$seconds")
   image_args=()
   [ "$g" != 1A6000.10V ] || image_args=(--image ubuntu-24.04-cuda-12.6-docker)
-  if [ "$recipe" = msa ] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
+  if [[ "$recipe" = msa || "$recipe" = md ]] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
   [ -z "$msa_worker_image" ] || image_args=(--image "$msa_worker_image")
   if out=$("${launch_environment[@]}" dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --os-size "$worker_os_size" --max-hours "$max_hours" 2>&1); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)

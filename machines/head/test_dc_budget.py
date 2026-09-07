@@ -51,6 +51,17 @@ class Clock:
         self.now += seconds
 
 
+class AuthorizedCeilingTests(unittest.TestCase):
+    def test_environment_cannot_raise_authorized_project_ceiling(self):
+        for requested, expected in (("500", 500), ("750", 750), ("1000000", 750)):
+            with self.subTest(requested=requested), patch.dict(os.environ, DC_BUDGET_CEILING=requested):
+                self.assertEqual(dc.Controller(None, None).ceiling, expected)
+
+    def test_default_is_750_without_resetting_the_ledger(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(dc.Controller(None, None).ceiling, 750)
+
+
 class FakeAPI:
     ID = "01234567-89ab-4cde-8fab-0123456789ab"
 

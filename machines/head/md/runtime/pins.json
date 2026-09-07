@@ -1,0 +1,42 @@
+{
+  "schema": "bio-md-runtime-pins.v1",
+  "platform": "linux-64",
+  "micromamba": {
+    "version": "2.9.0",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/micromamba-2.9.0-0.tar.bz2",
+    "sha256": "8761c382127e6363bd9e0a2451aa3ef90d071a79133f736e2f759a3bf13040dd",
+    "license": "BSD-3-Clause"
+  },
+  "sources": {
+    "pmx": {
+      "repository": "https://github.com/deGrootLab/pmx",
+      "branch": "develop",
+      "commit": "0dd5f0a9cdf26109eff98bdfeb4ac4e55353aa76",
+      "version": "0+g0dd5f0a9cdf2",
+      "url": "https://codeload.github.com/deGrootLab/pmx/tar.gz/0dd5f0a9cdf26109eff98bdfeb4ac4e55353aa76",
+      "sha256": "75da85af4130c841f10b0be11c3cd80c5ab5c2e8b1a7d41012eacbef1ff44196",
+      "license": "LGPL-3.0",
+      "packaging_patch": "Use locked setuptools instead of obsolete setup_requires; record this archive's Git revision in package/module version metadata without changing scientific algorithms."
+    },
+    "bfee3": {
+      "repository": "https://github.com/fhh2626/BFEE3",
+      "commit": "8b3e33e39b74bf1a7b58167df92af7f5f5795180",
+      "url": "https://codeload.github.com/fhh2626/BFEE3/tar.gz/8b3e33e39b74bf1a7b58167df92af7f5f5795180",
+      "sha256": "4f78774df4133ce89a55dba33747a664d0d67457460d95d423a15d2384468571",
+      "version": "3.2.1",
+      "distribution": "bfee2",
+      "python_module": "BFEE2",
+      "license": "GPL-3.0-only"
+    }
+  },
+  "wheels": {
+    "alchemlyb": {
+      "version": "2.5.0",
+      "filename": "alchemlyb-2.5.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/e4/8a/a9e6735cb8972efd926b8b5ba4508ec7a343c4c6f4fc2478fa7fcc9065fc/alchemlyb-2.5.0-py3-none-any.whl",
+      "sha256": "ad0889628efff410c919effc1171c254908dcfd12494686c4a0272faf2f7920a",
+      "license": "BSD-3-Clause",
+      "reason": "The conda 2.5.0 core build exposes version 0.0.0; use the correctly versioned official release wheel with the locked dependency closure."
+    }
+  }
+}

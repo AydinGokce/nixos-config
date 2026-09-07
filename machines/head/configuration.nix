@@ -41,6 +41,11 @@ in
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   nix.settings.trusted-users = [ "root" ];
 
+  # Pinned upstream MD binary environments supply their own libraries. This
+  # enables their standard ELF interpreter on the NixOS CPU head as well.
+  programs.nix-ld.enable = true;
+  programs.nix-ld.libraries = with pkgs; [ stdenv.cc.cc.lib zlib ];
+
   # Orchestration toolbox + the `dc` ephemeral-GPU CLI (reads creds from
   # /root/.config/datacrunch/credentials.env, ledgers spend under /var/lib/dc).
   environment.systemPackages = (with pkgs; [
@@ -65,6 +70,11 @@ in
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/cli.py "$@"
+    '')
+    (pkgs.writeShellScriptBin "bio-md" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      umask 077
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/md/cli.py "$@"
     '')
     (pkgs.writeShellScriptBin "bio-inference" ''
       set -euo pipefail
@@ -144,6 +154,7 @@ in
     "bio-tools/msa".source = ./msa;
     "bio-tools/library".source = ./library;
     "bio-tools/workbench".source = ./workbench;
+    "bio-tools/md".source = ./md;
     # Bursty interactive use: allocate temporary workers for up to ten jobs,
     # then return to zero GPU workers as their managed runs finish.
     "bio-tools/workbench-config.json".source = workbenchConfig;
@@ -335,7 +346,7 @@ in
 
   systemd.services.bio-workbench = {
     description = "Durable desktop and Harrison molecular model jobs";
-    restartTriggers = [ ./workbench workbenchConfig ];
+    restartTriggers = [ ./workbench ./md ./recipes ./bio-submit.sh workbenchConfig ];
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];

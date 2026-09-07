@@ -431,6 +431,38 @@ mkdir -p "$LOCALOUT"
                          ["rm 12345678-1234-1234-1234-123456789012"])
         self.assertIn("managed OS permanently removed; shared volumes retained", log.read_text())
 
+    def test_md_cancel_waits_for_checkpoint_and_retains_it_without_ssh(self):
+        shared = self.root / 'md-output'
+        shared.mkdir()
+        (shared / '.worker.lock').touch()
+        (self.root / 'bin/rsync').write_text('#!' + sys.executable + '\n' + '''
+import shutil, sys
+shutil.copytree(sys.argv[-2], sys.argv[-1], dirs_exist_ok=True)
+''')
+        observed = []
+        def native_worker():
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                if (shared / '.cancel-requested').exists():
+                    observed.append('cancel observed independently of SSH')
+                    (shared / 'run.cpt').write_bytes(b'native retained checkpoint')
+                    (shared / 'result.json').write_text('{"state":"interrupted"}')
+                    return
+                time.sleep(.01)
+        worker = threading.Thread(target=native_worker)
+        worker.start()
+        try:
+            result, log = self.run_cleanup_with_closed_log_pipe('kill -TERM "$BASHPID"\n',
+                recipe='md', ROUT=str(shared))
+        finally:
+            worker.join(timeout=5)
+        self.assertEqual(result.returncode, 143)
+        self.assertTrue(observed)
+        self.assertEqual((log.parent / 'run.cpt').read_bytes(), b'native retained checkpoint')
+        self.assertEqual(json.loads((log.parent / 'result.json').read_text())['state'], 'interrupted')
+        self.assertIn('allowing MD to seal', log.read_text())
+        self.assertEqual((self.root / 'removals').read_text().count('rm '), 1)
+
     def test_cleanup_deletion_failure_is_logged_without_hiding_original_failure(self):
         result, log = self.run_cleanup_with_closed_log_pipe("exit 17\n", DELETE_FAIL="1")
         self.assertEqual(result.returncode, 17)
