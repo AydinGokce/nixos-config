@@ -324,6 +324,8 @@ impl Workbench {
             .default_height(164.)
             .min_height(70.)
             .show(ctx, |ui| {
+                // Retain the dragged panel height even when its contents use less space.
+                ui.take_available_height();
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.console_tab, 0, "CONSOLE");
                     ui.selectable_value(&mut self.console_tab, 1, "JOB LOG");
