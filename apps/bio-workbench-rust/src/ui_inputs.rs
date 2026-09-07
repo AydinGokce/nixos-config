@@ -12,7 +12,7 @@ fn select(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut String, choic
 }
 impl Workbench {
     pub(super) fn picked(&mut self, kind: Pick, paths: Vec<PathBuf>, ctx: &egui::Context) {
-        for (index, path) in paths.into_iter().enumerate() {
+        for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             match &kind {
                 Pick::Key => self.connection.key_path = path.to_string_lossy().into_owned(),
@@ -71,13 +71,10 @@ impl Workbench {
                             .insert(name, path.to_string_lossy().into_owned());
                     }
                 }
-                Pick::Structure(slot) => {
-                    if *slot + index < 4 {
-                        let (format, _) = infer_file(&path);
-                        let metadata = json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"format":format,"source_kind":"local","local_path":path});
-                        self.load_structure(path, metadata, *slot + index, ctx);
-                        self.state.view_count = self.state.view_count.max(*slot + index + 1);
-                    }
+                Pick::Structure => {
+                    let (format, _) = infer_file(&path);
+                    let metadata = json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"format":format,"source_kind":"local","local_path":path});
+                    self.open_local_tab(path, metadata, ctx);
                 }
                 Pick::Inputs => {
                     if self.state.inputs.len() >= 128 {

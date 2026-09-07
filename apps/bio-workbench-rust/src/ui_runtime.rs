@@ -13,6 +13,12 @@ impl Workbench {
             return None;
         }
         let Some(session) = self.session.as_mut() else {
+            if let Purpose::Job(job) = &purpose {
+                self.job_tab_error(
+                    job,
+                    "Local session unavailable. Reconnect to load this run.",
+                );
+            }
             self.log("The local session is unavailable; reopen it in Connection settings.");
             return None;
         };
@@ -30,18 +36,30 @@ impl Workbench {
                 Some(id)
             }
             Err(error) => {
+                if let Purpose::Job(job) = &purpose {
+                    self.job_tab_error(job, &error.to_string());
+                }
                 self.log(format!("{method}: {error}"));
                 None
             }
         }
     }
     pub(super) fn retry(&mut self, id: &str, purpose: Purpose, label: String) {
+        if let Purpose::Artifact(ArtifactTarget::View(slot)) = &purpose
+            && !self.has_view(*slot)
+        {
+            return;
+        }
         if self.pending.contains_key(id) {
             return;
         }
         if let Some(session) = self.session.as_mut() {
             match session.retry(id) {
                 Ok(id) => {
+                    if let Purpose::Artifact(ArtifactTarget::View(slot)) = &purpose {
+                        self.view_loading.insert(*slot, format!("download:{id}"));
+                        self.view_errors.remove(slot);
+                    }
                     self.pending.insert(
                         id.clone(),
                         Pending {
@@ -58,15 +76,24 @@ impl Workbench {
         }
     }
     fn failure(&mut self, id: String, pending: Pending, message: String) {
+        if let Purpose::Artifact(ArtifactTarget::View(slot)) = &pending.purpose {
+            if !self.has_view(*slot)
+                || self.view_loading.get(slot) != Some(&format!("download:{id}"))
+            {
+                return;
+            }
+            self.view_loading.remove(slot);
+            self.view_errors.insert(*slot, message.clone());
+        }
+        if let Purpose::Job(job) = &pending.purpose {
+            self.job_tab_error(job, &message);
+        }
         self.log(format!("{}: {message}", pending.label));
         if pending.purpose == Purpose::Catalog {
             self.connected = false;
         }
         if matches!(pending.purpose, Purpose::Upload(_)) {
             self.preview_after_uploads = false;
-        }
-        if let Purpose::Artifact(ArtifactTarget::View(slot)) = &pending.purpose {
-            self.view_loading[*slot] = None;
         }
         self.failures.retain(|failure| failure.id != id);
         self.failures.push(Failure {
@@ -117,8 +144,8 @@ impl Workbench {
                     };
                     if let Purpose::Artifact(target) = pending.purpose {
                         if let ArtifactTarget::View(slot) = target
-                            && self.view_loading[slot].as_deref()
-                                != Some(format!("download:{id}").as_str())
+                            && (!self.has_view(slot)
+                                || self.view_loading.get(&slot) != Some(&format!("download:{id}")))
                         {
                             continue;
                         }
@@ -129,13 +156,32 @@ impl Workbench {
                             .and_then(Value::as_object)
                         {
                             for (key, value) in known {
-                                if metadata.get(key).is_none() {
+                                if key != "view_state"
+                                    && key != "slot"
+                                    && metadata.get(key).is_none()
+                                {
                                     metadata[key] = value.clone();
                                 }
                             }
                         }
                         metadata["artifact_id"] = json!(artifact_id);
                         metadata["local_path"] = json!(path);
+                        if let ArtifactTarget::View(slot) = target
+                            && let Some(reference) = self.view_reference(slot)
+                        {
+                            metadata["view_state"] = reference["view_state"].clone();
+                            for key in [
+                                "job_id",
+                                "input_name",
+                                "model",
+                                "job_state",
+                                "job_provenance",
+                            ] {
+                                if metadata.get(key).is_none() && reference.get(key).is_some() {
+                                    metadata[key] = reference[key].clone();
+                                }
+                            }
+                        }
                         self.accept_artifact(path, metadata, target, ctx);
                     }
                 }
@@ -201,6 +247,11 @@ impl Workbench {
             Purpose::Batch(batch_id) => {
                 if self.state.active_batch == batch_id {
                     self.ingest_batch(value);
+                }
+            }
+            Purpose::Job(job_id) => {
+                if text(&value, "job_id") == job_id {
+                    self.ingest_job_view(&value);
                 }
             }
             Purpose::Preview => {
@@ -286,13 +337,7 @@ impl Workbench {
     pub(super) fn ingest_batch(&mut self, value: Value) {
         let id = text(&value, "batch_id").to_owned();
         for job in rows(&value, "jobs") {
-            for artifact in rows(job, "artifacts") {
-                let mut artifact = artifact.clone();
-                artifact["job_state"] = job["state"].clone();
-                artifact["job_provenance"] = job["provenance"].clone();
-                self.artifact_metadata
-                    .insert(text(&artifact, "artifact_id").into(), artifact);
-            }
+            self.ingest_job_view(job);
         }
         self.batches.retain(|batch| text(batch, "batch_id") != id);
         self.batches.insert(0, value.clone());
@@ -305,6 +350,7 @@ impl Workbench {
         }
         if self.last_poll.elapsed() > Duration::from_secs(4) {
             self.last_poll = Instant::now();
+            self.poll_job_tabs();
             if !self.state.active_batch.is_empty() {
                 let id = self.state.active_batch.clone();
                 self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
@@ -391,8 +437,7 @@ impl Workbench {
             });ui.small("Leave key path empty for SSH agent authentication. Verify unknown host keys in SSH first.");
             if ui.add_enabled(!self.busy(&Purpose::Catalog),egui::Button::new("Save & connect")).clicked(){
                 if let Some(session)=self.session.as_mut(){let changed=session.connection.host!=self.connection.host||session.connection.user!=self.connection.user||session.connection.port!=self.connection.port;match session.save_connection(self.connection.clone()){
-                    Ok(())=>{if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.state.preview=None;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.view_loading.fill(None);self.focused_job.clear();self.job_log.clear();
-                    for view in self.views.iter_mut().flatten(){if !text(&view.metadata,"artifact_id").is_empty(){view.metadata["previous_head_artifact"]=view.metadata["artifact_id"].clone();view.metadata.as_object_mut().map(|m|m.remove("artifact_id"));view.metadata["source_kind"]=json!("local");}}
+                    Ok(())=>{if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.state.preview=None;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
                     self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before previewing.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),
                 }}else{match session::Session::open(ctx.clone()){Ok(session)=>{self.session=Some(session);self.log("Local session reopened; save connection settings to connect.");},Err(error)=>self.log(error.to_string())}}

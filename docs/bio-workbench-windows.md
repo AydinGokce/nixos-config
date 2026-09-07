@@ -45,11 +45,11 @@ The installer may request your Ubuntu password when creating `/nix`.
 
 ## 3. Copy the source archive and build
 
-Copy `bio-workbench-rust-0.3.0-source.tar.gz` from the existing workstation to
+Copy `bio-workbench-rust-0.3.0-tabs-source.tar.gz` from the existing workstation to
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/native-rust-workflows-20260907/bio-workbench-rust-0.3.0-source.tar.gz
+/home/aydin/bio-runs/docking-completion-20260907/bio-workbench-rust-0.3.0-tabs-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -57,11 +57,13 @@ folder name:
 
 ```sh
 mkdir -p ~/bio-workbench-rust
-tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/bio-workbench-rust-0.3.0-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
+tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/bio-workbench-rust-0.3.0-tabs-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
 cd ~/bio-workbench-rust
 nix --extra-experimental-features 'nix-command flakes' build path:.
 ./result/bin/bio-workbench
 ```
+
+This archive includes draggable viewer tabs, persistent splits, working quick controls and the console resize fix. To update an existing installation, close the app, extract over its source directory and rebuild with the same command.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem

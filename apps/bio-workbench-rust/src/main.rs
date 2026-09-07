@@ -1,3 +1,4 @@
+mod alignment;
 mod navigation;
 mod pymol;
 mod render;
@@ -5,12 +6,14 @@ mod rpc;
 mod scene;
 mod session;
 mod ui_annotations;
+mod ui_dock;
 mod ui_inputs;
 mod ui_jobs;
 mod ui_runtime;
 mod ui_state;
 mod ui_style;
 mod ui_views;
+mod ui_workspace;
 use eframe::egui::{self, Color32, RichText, Vec2};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +41,7 @@ enum Purpose {
     Catalog,
     History,
     Batch(String),
+    Job(String),
     Preview,
     Commit,
     CancelBatch,
@@ -64,7 +68,7 @@ struct Failure {
 #[derive(Clone)]
 enum Pick {
     Inputs,
-    Structure(usize),
+    Structure,
     Key,
     Labels(String),
     Attachment(String),
@@ -110,8 +114,12 @@ struct Workbench {
     artifact_metadata: BTreeMap<String, Value>,
     annotation_records: BTreeMap<String, Vec<Value>>,
     text_preview: Option<(String, String)>,
-    views: [Option<ui_views::View>; 4],
-    view_loading: [Option<String>; 4],
+    views: BTreeMap<usize, ui_views::View>,
+    view_loading: BTreeMap<usize, String>,
+    view_errors: BTreeMap<usize, String>,
+    dock: egui_dock::DockState<usize>,
+    next_view_id: usize,
+    retired_renderers: Vec<scene::Renderer>,
     gl: Arc<eframe::glow::Context>,
     pymol: pymol::Launcher,
     ui_tx: mpsc::Sender<UiEvent>,
@@ -143,12 +151,28 @@ impl Workbench {
             .map(|s| s.connection.clone())
             .unwrap_or_default();
         let (ui_tx, ui_rx) = mpsc::channel();
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library:Vec::new(),library_filter:String::new(),library_open:false,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Initial display: experimental Cas9 demo. Select an actual job artifact to inspect a model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:std::array::from_fn(|_|None),view_loading:std::array::from_fn(|_|None),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library:Vec::new(),library_filter:String::new(),library_open:false,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
-        app.demo_views();
-        app.restore_views(&cc.egui_ctx);
+        app.next_view_id = app
+            .state
+            .view_refs
+            .iter()
+            .filter_map(|value| value["slot"].as_u64())
+            .max()
+            .map(|slot| slot as usize + 1)
+            .unwrap_or(0);
+        if app.state.view_refs.is_empty() && app.state.dock_layout.is_null() {
+            app.demo_views();
+        } else {
+            app.restore_views(&cc.egui_ctx);
+        }
+        app.dock = ui_dock::restore_layout(
+            &app.state.dock_layout,
+            &app.state.view_refs,
+            app.state.selected_view,
+        );
         app.restoring_views = false;
         app.request("catalog", json!({}), Purpose::Catalog);
         app
@@ -177,7 +201,7 @@ impl Workbench {
                             ui.close();
                         }
                         if ui.button("Open local structure…").clicked() {
-                            self.choose_files(Pick::Structure(self.state.selected_view), ctx);
+                            self.choose_files(Pick::Structure, ctx);
                             ui.close();
                         }
                         if ui.button("Experimental Cas9 demo").clicked() {
@@ -198,12 +222,17 @@ impl Workbench {
                         }
                     });
                     ui.menu_button("View", |ui| {
-                        for count in 1..=4 {
-                            ui.selectable_value(
-                                &mut self.state.view_count,
-                                count,
-                                format!("{count} viewport(s)"),
-                            );
+                        if ui.button("Split right").clicked() {
+                            self.split_active(egui_dock::Split::Right);
+                            ui.close();
+                        }
+                        if ui.button("Split down").clicked() {
+                            self.split_active(egui_dock::Split::Below);
+                            ui.close();
+                        }
+                        if ui.button("Close selected tab").clicked() {
+                            self.close_view(self.state.selected_view);
+                            ui.close();
                         }
                         ui.checkbox(&mut self.state.link_views, "Link cameras");
                         ui.checkbox(&mut self.state.show_axes, "Orientation axes");
@@ -245,23 +274,16 @@ impl Workbench {
                         self.reset_view();
                     }
                     ui.separator();
-                    for count in 1..=4 {
-                        ui.selectable_value(
-                            &mut self.state.view_count,
-                            count,
-                            if count == 1 {
-                                "Single".into()
-                            } else {
-                                format!("{count} views")
-                            },
-                        );
+                    if ui.button("Split right").on_hover_text("Move the active tab into a group on the right; you can also drag a tab to an edge.").clicked() {
+                        self.split_active(egui_dock::Split::Right);
                     }
-                    self.state.selected_view =
-                        self.state.selected_view.min(self.state.view_count - 1);
+                    if ui.button("Split down").on_hover_text("Move the active tab into a group below.").clicked() {
+                        self.split_active(egui_dock::Split::Below);
+                    }
                     ui.checkbox(&mut self.state.link_views, "Link cameras");
                     ui.checkbox(&mut self.state.show_axes, "Axes");
                     ui.separator();
-                    if let Some(view) = self.views[self.state.selected_view].as_mut() {
+                    if let Some(view) = self.views.get_mut(&self.state.selected_view) {
                         egui::ComboBox::from_id_salt("style")
                             .width(88.)
                             .selected_text(view.style.name())
@@ -344,7 +366,7 @@ impl Workbench {
                         ("trace", "Show the selected structure as a backbone trace."),
                         ("help", "Open Bio Workbench help."),
                     ] {
-                        let view = self.views[self.state.selected_view].as_ref();
+                        let view = self.views.get(&self.state.selected_view);
                         let selected = view.is_some_and(|view| {
                             view.style.name() == command
                                 || (command == "trace"
@@ -421,7 +443,7 @@ impl Workbench {
                     style.name() == name
                         || (name == "trace" && *style == scene::Representation::Trace)
                 }) {
-                    if let Some(view) = self.views[self.state.selected_view].as_mut() {
+                    if let Some(view) = self.views.get_mut(&self.state.selected_view) {
                         view.style = style;
                     }
                 } else {
@@ -433,8 +455,14 @@ impl Workbench {
 }
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        for renderer in self.retired_renderers.drain(..) {
+            renderer.destroy(&self.gl);
+        }
         self.events(ctx);
         self.poll();
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+            self.close_view(self.state.selected_view);
+        }
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if !dropped.is_empty() {
             self.picked(
@@ -486,7 +514,7 @@ impl eframe::App for Workbench {
         egui::Window::new("Bio Workbench help").open(&mut help).show(ctx,|ui|{
             ui.label("Paste or load inputs, select models, and request a CPU compatibility preview. Review accepted pairs before submitting cloud jobs.");
             ui.label("Jobs and artifacts live on the head. Closing this client does not cancel them. Use the explicit job/batch Cancel controls.");
-            ui.label("Choose up to four actual structures under Runs / results, then Compare selected. Linking cameras does not align structures.");
+            ui.label("Click a run or structure under Runs / results to open its tab. Drag tabs to reorder, onto another tab bar to group, or to a viewer edge to split. Close a tab with its left X. Linking cameras does not align structures.");
             ui.label("Left drag rotates; right drag pans; wheel zooms; double-click fits. Right-click for lighting. Annotation edits remain local until Save to head.");
             ui.label("The bottom-bar buttons and bio> commands change the selected structure: cartoon, sticks, spheres, or trace. Reset fits the selected structure and any linked cameras; help opens this window.");
             ui.label("Startup Cas9 is experimental 4OO8, not a prediction. GPU lighting uses rasterization; confidence/chemistry QA comes only from native metadata.");
@@ -505,7 +533,10 @@ impl eframe::App for Workbench {
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         self.persist();
         if let Some(gl) = gl {
-            for view in self.views.iter().flatten() {
+            for renderer in self.retired_renderers.drain(..) {
+                renderer.destroy(gl);
+            }
+            for view in self.views.values() {
                 view.renderer.destroy(gl);
             }
         }

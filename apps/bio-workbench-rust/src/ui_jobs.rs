@@ -144,17 +144,12 @@ impl Workbench {
             if !self.selected_artifacts.is_empty() {
                 ui.horizontal(|ui| {
                     if ui
-                        .button(format!(
-                            "Compare {} selected",
-                            self.selected_artifacts.len()
-                        ))
+                        .button(format!("Open {} selected", self.selected_artifacts.len()))
                         .clicked()
                     {
-                        let ids: Vec<_> = self.selected_artifacts.iter().take(4).cloned().collect();
-                        self.state.view_count = ids.len().max(1);
-                        self.state.selected_view = 0;
-                        for (slot, id) in ids.iter().enumerate() {
-                            self.request_artifact(id, ArtifactTarget::View(slot));
+                        let ids: Vec<_> = self.selected_artifacts.iter().cloned().collect();
+                        for id in ids {
+                            self.open_artifact_id(id);
                         }
                     }
                     if ui.small_button("Clear").clicked() {
@@ -169,13 +164,45 @@ impl Workbench {
                         .inner_margin(6)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.strong(text(job, "model"));
+                                let status = text(job, "state");
+                                let status_width = ui
+                                    .painter()
+                                    .layout_no_wrap(
+                                        status.into(),
+                                        egui::TextStyle::Body.resolve(ui.style()),
+                                        state_color(status),
+                                    )
+                                    .size()
+                                    .x;
+                                let title_width = (ui.available_width()
+                                    - status_width
+                                    - ui.spacing().item_spacing.x)
+                                    .max(40.);
+                                if ui
+                                    .add_sized(
+                                        [title_width, ui.spacing().interact_size.y],
+                                        egui::Button::new(format!(
+                                            "{} · {}",
+                                            text(job, "model"),
+                                            text(job, "input_name")
+                                        ))
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} · {}\nJob {}\nOpen this run in a viewer tab, or focus its existing tab.",
+                                        text(job, "model"),
+                                        text(job, "input_name"),
+                                        id
+                                    ))
+                                    .clicked()
+                                {
+                                    self.open_job_tab(id.clone());
+                                }
                                 ui.colored_label(
                                     state_color(text(job, "state")),
                                     text(job, "state"),
                                 );
                             });
-                            ui.label(text(job, "input_name"));
                             if !text(job, "phase").is_empty() {
                                 ui.small(text(job, "phase"));
                             }
@@ -210,6 +237,9 @@ impl Workbench {
                                 ui.colored_label(RED, error.to_string());
                             }
                             ui.horizontal(|ui| {
+                                if ui.small_button("Open tab").clicked() {
+                                    self.open_job_tab(id.clone());
+                                }
                                 if ui.small_button("Log").clicked() {
                                     self.focused_job = id.clone();
                                     self.log_offset = 0;
@@ -282,9 +312,9 @@ impl Workbench {
                 if structure {
                     let mut selected = self.selected_artifacts.contains(&artifact_id);
                     if ui
-                        .add_enabled(
-                            selected || self.selected_artifacts.len() < 4,
-                            egui::Checkbox::without_text(&mut selected),
+                        .add(egui::Checkbox::without_text(&mut selected))
+                        .on_hover_text(
+                            "Select this structure to open with the other selected tabs.",
                         )
                         .changed()
                     {
@@ -295,20 +325,31 @@ impl Workbench {
                         }
                     }
                 }
-                ui.add(egui::Label::new(ui_views::short_name(text(artifact, "name"))).truncate())
-                    .on_hover_text(format!(
-                        "{} · {} bytes\nSHA256 {}",
-                        text(artifact, "role"),
-                        artifact["size"],
-                        text(artifact, "sha256")
-                    ));
+                let label = egui::Label::new(ui_views::short_name(text(artifact, "name")))
+                    .truncate()
+                    .sense(if structure {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    });
+                let response = ui.add(label).on_hover_text(format!(
+                    "{}\n{} · {} bytes\nSHA256 {}",
+                    text(artifact, "name"),
+                    text(artifact, "role"),
+                    artifact["size"],
+                    text(artifact, "sha256")
+                ));
+                if structure
+                    && response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                {
+                    self.open_artifact_id(artifact_id.clone());
+                }
             });
             ui.horizontal_wrapped(|ui| {
-                if structure && ui.small_button("View").clicked() {
-                    self.request_artifact(
-                        &artifact_id,
-                        ArtifactTarget::View(self.state.selected_view),
-                    );
+                if structure && ui.small_button("Open tab").clicked() {
+                    self.open_artifact_id(artifact_id.clone());
                 }
                 if !structure && ui.small_button("Preview text / table").clicked() {
                     self.request_artifact(&artifact_id, ArtifactTarget::Text);
@@ -371,6 +412,9 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
             Purpose::Batch(batch) => {
                 self.request("batch.get", json!({"batch_id":batch}), purpose);
             }
+            Purpose::Job(job) => {
+                self.request("job.get", json!({"job_id":job}), purpose);
+            }
             Purpose::Logs(job, offset) => {
                 self.request(
                     "job.logs",
@@ -379,11 +423,16 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                 );
             }
             Purpose::Artifact(target) => {
-                let artifact = self
-                    .artifact_metadata
-                    .iter()
-                    .find(|(_, v)| text(v, "download_operation") == id)
-                    .map(|(id, _)| id.clone());
+                let artifact = if let ArtifactTarget::View(slot) = &target {
+                    self.view_reference(*slot)
+                        .and_then(|r| r["artifact_id"].as_str())
+                        .map(str::to_owned)
+                } else {
+                    self.artifact_metadata
+                        .iter()
+                        .find(|(_, v)| text(v, "download_operation") == id)
+                        .map(|(id, _)| id.clone())
+                };
                 if let Some(artifact) = artifact {
                     self.request_artifact(&artifact, target);
                 } else {

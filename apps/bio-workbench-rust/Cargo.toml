@@ -19,6 +19,7 @@ rfd = "=0.17.2"
 fs2 = "=0.4.3"
 libc = "0.2"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
+egui_dock = { version = "=0.18.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"

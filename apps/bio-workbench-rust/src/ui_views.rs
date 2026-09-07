@@ -17,8 +17,29 @@ pub(super) struct View {
 pub(super) fn short_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
-fn display_name(metadata: &Value) -> String {
-    let name = short_name(text(metadata, "name"));
+pub(super) fn loading_status(metadata: Option<&Value>) -> String {
+    if let Some(metadata) = metadata.filter(|value| text(value, "source_kind") == "job") {
+        let status = [text(metadata, "job_state"), text(metadata, "job_phase")]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if status.is_empty() {
+            "Waiting for run output…".into()
+        } else {
+            format!("Waiting for run output · {status}")
+        }
+    } else {
+        "Downloading / reading structure…".into()
+    }
+}
+pub(super) fn display_name(metadata: &Value) -> String {
+    let input = text(metadata, "input_name");
+    let name = if input.is_empty() {
+        short_name(text(metadata, "name"))
+    } else {
+        input
+    };
     let model = text(metadata, "model");
     if model.is_empty() {
         name.into()
@@ -82,21 +103,20 @@ fn restore_view(view: &mut View, value: &Value) {
 }
 impl Workbench {
     pub(super) fn demo_views(&mut self) {
-        for slot in 0..self.state.view_count {
-            let molecule = scene::Molecule::reference();
-            let bytes = Arc::new(scene::Molecule::reference_bytes());
-            let metadata = json!({"name":"Cas9 · 4OO8 / A+B+C","format":"pdb","source_kind":"demo","source_url":"https://www.rcsb.org/structure/4OO8","load_token":uid()});
-            self.view_loading[slot] = Some(view_token(&metadata));
-            self.accept_molecule(slot, metadata, bytes, Ok(molecule));
-        }
+        let molecule = scene::Molecule::reference();
+        let bytes = Arc::new(scene::Molecule::reference_bytes());
+        let metadata = json!({"name":"Cas9 · 4OO8 / A+B+C","format":"pdb","source_kind":"demo","source_url":"https://www.rcsb.org/structure/4OO8","load_token":uid()});
+        let slot = self.reserve_view(metadata.clone());
+        self.view_loading.insert(slot, view_token(&metadata));
+        self.accept_molecule(slot, metadata, bytes, Ok(molecule));
     }
     pub(super) fn reset_view(&mut self) {
         let slot = self.state.selected_view;
-        if let Some(view) = self.views[slot].as_mut() {
+        if let Some(view) = self.views.get_mut(&slot) {
             view.camera = scene::Camera::fit(&view.molecule);
         }
         if self.state.link_views {
-            for view in self.views.iter_mut().flatten() {
+            for view in self.views.values_mut() {
                 view.camera = scene::Camera::fit(&view.molecule);
             }
         }
@@ -108,11 +128,18 @@ impl Workbench {
         slot: usize,
         ctx: &egui::Context,
     ) {
-        if slot >= 4 {
+        if !self.has_view(slot) {
             return;
         }
+        metadata["view_state"] = self
+            .view_reference(slot)
+            .and_then(|reference| reference.get("view_state"))
+            .cloned()
+            .unwrap_or(Value::Null);
         metadata["load_token"] = json!(uid());
-        self.view_loading[slot] = Some(view_token(&metadata));
+        self.update_view_reference(slot, metadata.clone());
+        self.view_loading.insert(slot, view_token(&metadata));
+        self.view_errors.remove(&slot);
         let sender = self.ui_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -154,31 +181,40 @@ impl Workbench {
         bytes: Arc<Vec<u8>>,
         molecule: Result<scene::Molecule, String>,
     ) {
-        if slot >= 4 || self.view_loading[slot].as_deref() != Some(&view_token(&metadata)) {
+        if !self.has_view(slot)
+            || self.view_loading.get(&slot).map(String::as_str)
+                != Some(text(&metadata, "load_token"))
+        {
             return;
         }
-        self.view_loading[slot] = None;
+        self.view_loading.remove(&slot);
         let molecule = match molecule {
             Ok(molecule) => molecule,
             Err(error) => {
-                self.log(format!(
-                    "Cannot display {}: {error}",
-                    text(&metadata, "name")
-                ));
+                let message = format!("Cannot display {}: {error}", text(&metadata, "name"));
+                self.view_errors.insert(slot, message.clone());
+                self.log(message);
                 return;
             }
         };
         use sha2::Digest;
         let actual_sha = format!("{:x}", sha2::Sha256::digest(bytes.as_slice()));
         if !text(&metadata, "sha256").is_empty() && text(&metadata, "sha256") != actual_sha {
-            self.log(format!("Structure identity changed for {}. Reopen the local file explicitly to load its new revision; retained annotations remain bound to the old SHA.",text(&metadata,"name")));
+            let message = format!(
+                "Structure identity changed for {}. Reopen the local file explicitly to load its new revision; retained annotations remain bound to the old SHA.",
+                text(&metadata, "name")
+            );
+            self.view_errors.insert(slot, message.clone());
+            self.log(message);
             return;
         }
         metadata["sha256"] = json!(actual_sha);
         let renderer = match scene::Renderer::new(&self.gl, &molecule) {
             Ok(renderer) => renderer,
             Err(error) => {
-                self.log(format!("GPU renderer: {error}"));
+                let message = format!("GPU renderer: {error}");
+                self.view_errors.insert(slot, message.clone());
+                self.log(message);
                 return;
             }
         };
@@ -203,8 +239,10 @@ impl Workbench {
         for warning in &view.molecule.warnings {
             self.log(format!("{}: {warning}", view.molecule.name));
         }
-        if let Some(old) = self.views[slot].replace(view) {
-            old.renderer.destroy(&self.gl);
+        self.update_view_reference(slot, view.metadata.clone());
+        self.view_errors.remove(&slot);
+        if let Some(old) = self.views.insert(slot, view) {
+            self.retire_renderer(old.renderer);
         }
         if !artifact.is_empty() {
             self.request(
@@ -215,14 +253,25 @@ impl Workbench {
         }
     }
     pub(super) fn request_artifact(&mut self, id: &str, target: ArtifactTarget) {
+        if let ArtifactTarget::View(slot) = &target
+            && !self.has_view(*slot)
+        {
+            return;
+        }
         let purpose = Purpose::Artifact(target.clone());
         if self.busy(&purpose) {
             self.log(
-                "That artifact slot is still downloading. Wait for its current request to finish.",
+                "That structure tab is still downloading. Wait for its current request to finish.",
             );
             return;
         }
         let Some(session) = self.session.as_mut() else {
+            let message = "Local session is unavailable. Reconnect, then close this tab and reopen the result.";
+            if let ArtifactTarget::View(slot) = target {
+                self.view_loading.remove(&slot);
+                self.view_errors.insert(slot, message.into());
+            }
+            self.log(message);
             return;
         };
         match session.artifact(id) {
@@ -232,7 +281,9 @@ impl Workbench {
                     .or_insert_with(|| json!({"artifact_id":id}))["download_operation"] =
                     json!(operation);
                 if let ArtifactTarget::View(slot) = target {
-                    self.view_loading[slot] = Some(format!("download:{operation}"));
+                    self.view_loading
+                        .insert(slot, format!("download:{operation}"));
+                    self.view_errors.remove(&slot);
                 }
                 self.pending.insert(
                     operation,
@@ -244,7 +295,14 @@ impl Workbench {
                     },
                 );
             }
-            Err(error) => self.log(error.to_string()),
+            Err(error) => {
+                let message = error.to_string();
+                if let ArtifactTarget::View(slot) = target {
+                    self.view_loading.remove(&slot);
+                    self.view_errors.insert(slot, message.clone());
+                }
+                self.log(message);
+            }
         }
     }
     pub(super) fn accept_artifact(
@@ -306,7 +364,7 @@ impl Workbench {
         }
     }
     pub(super) fn export_active(&mut self, ctx: &egui::Context) {
-        if let Some(view) = self.views[self.state.selected_view].as_ref() {
+        if let Some(view) = self.views.get(&self.state.selected_view) {
             let name = if text(&view.metadata, "source_kind") == "demo" {
                 "experimental-4oo8-ABC.pdb".into()
             } else if std::path::Path::new(text(&view.metadata, "name"))
@@ -334,7 +392,7 @@ impl Workbench {
         });
     }
     pub(super) fn pymol_active(&mut self) {
-        if let Some(view) = self.views[self.state.selected_view].as_ref()
+        if let Some(view) = self.views.get(&self.state.selected_view)
             && let Err(error) = self.pymol.launch_structure(
                 &view.molecule.name,
                 view.bytes.as_slice(),
@@ -348,90 +406,89 @@ impl Workbench {
         if self.restoring_views {
             return;
         }
-        let previous = self.state.view_refs.clone();
-        self.state.view_refs = (0..4)
-            .filter_map(|slot| {
-                if self.view_loading[slot].is_some() {
-                    return previous
-                        .iter()
-                        .find(|v| v["slot"].as_u64() == Some(slot as u64))
-                        .cloned();
-                }
-                self.views[slot].as_ref().map(|view| {
-                    let mut value = view.metadata.clone();
-                    if let Some(object) = value.as_object_mut() {
-                        object.remove("load_token");
-                    }
-                    value["slot"] = json!(slot);
-                    value["view_state"] = view_state(view);
-                    value
-                })
-            })
-            .collect();
+        for reference in &mut self.state.view_refs {
+            let Some(slot) = reference["slot"]
+                .as_u64()
+                .and_then(|slot| usize::try_from(slot).ok())
+            else {
+                continue;
+            };
+            if !self.view_loading.contains_key(&slot)
+                && !self.view_errors.contains_key(&slot)
+                && let Some(view) = self.views.get(&slot)
+            {
+                *reference = view.metadata.clone();
+                reference["view_state"] = view_state(view);
+                reference["slot"] = json!(slot);
+            }
+            if let Some(object) = reference.as_object_mut() {
+                object.remove("load_token");
+                object.remove("download_operation");
+            }
+        }
+        self.state.dock_layout = ui_dock::save_layout(&self.dock);
     }
     pub(super) fn restore_views(&mut self, ctx: &egui::Context) {
         let saved = self.state.view_refs.clone();
         for mut metadata in saved {
-            let slot = metadata["slot"].as_u64().unwrap_or(0) as usize;
-            if slot >= 4 {
+            let Some(slot) = metadata["slot"]
+                .as_u64()
+                .and_then(|slot| usize::try_from(slot).ok())
+            else {
+                continue;
+            };
+            if !self.has_view(slot) {
                 continue;
             }
             let artifact = text(&metadata, "artifact_id").to_owned();
             if !artifact.is_empty() {
-                self.artifact_metadata.insert(artifact.clone(), metadata);
+                let mut shared = metadata.clone();
+                if let Some(object) = shared.as_object_mut() {
+                    object.remove("slot");
+                    object.remove("view_state");
+                    object.remove("load_token");
+                }
+                self.artifact_metadata.insert(artifact.clone(), shared);
                 self.request_artifact(&artifact, ArtifactTarget::View(slot));
             } else if text(&metadata, "source_kind") == "local" {
                 let path = PathBuf::from(text(&metadata, "local_path"));
                 self.load_structure(path, metadata, slot, ctx);
-            } else if text(&metadata, "source_kind") == "demo"
-                && let Some(view) = self.views[slot].as_mut()
-            {
-                restore_view(view, &metadata["view_state"]);
-                metadata["load_token"] = view.metadata["load_token"].clone();
-                view.metadata = metadata;
-            }
-        }
-    }
-    pub(super) fn viewports(&mut self, ui: &mut egui::Ui) {
-        let count = self.state.view_count;
-        let columns = if count == 1 { 1 } else { 2 };
-        let grid_rows = count.div_ceil(columns);
-        let width = (ui.available_width() - (columns - 1) as f32 * 4.) / columns as f32;
-        let height = (ui.available_height() - (grid_rows - 1) as f32 * 4.) / grid_rows as f32;
-        let mut linked = None;
-        for row in 0..grid_rows {
-            ui.horizontal(|ui|{for column in 0..columns{let slot=row*columns+column;if slot>=count{continue;}ui.allocate_ui_with_layout(Vec2::new(width,height),egui::Layout::top_down(egui::Align::Min),|ui|{
-            let active=self.state.selected_view==slot;let name=self.views[slot].as_ref().map(|view|view.molecule.name.as_str()).unwrap_or("No structure selected");let header=ui.add_sized([width,24.],egui::Button::new(RichText::new(format!("{}  {}",slot+1,name)).color(if active{AMBER}else{Color32::LIGHT_GRAY})).selected(active));if header.clicked(){self.state.selected_view=slot;}
-            if let Some(view)=self.views[slot].as_mut(){
-                let source=if text(&view.metadata,"source_kind")=="demo"{"EXPERIMENTAL DEMO · 4OO8 · 2.50 Å · not a prediction".into()}else if text(&view.metadata,"source_kind")=="local"{"LOCAL STRUCTURE · original coordinates".into()}else{format!("{} · {} · {}",text(&view.metadata,"model"),short_name(text(&view.metadata,"sample_id")),text(&view.metadata,"job_state"))};ui.label(RichText::new(source).size(10.).color(if text(&view.metadata,"source_kind")=="demo"{AMBER}else{GREEN}));
-                egui::ScrollArea::horizontal().id_salt(("sequence",slot)).max_height(22.).show(ui,|ui|{ui.horizontal(|ui|{for residue in &view.molecule.residues{if !view.chains[residue.chain]{continue;}let selected=view.selected.as_ref()==Some(&residue.key);if ui.add(egui::Button::new(RichText::new(residue.letter.to_string()).monospace().color(view.molecule.chains[residue.chain].color)).min_size(Vec2::new(9.,17.)).selected(selected)).on_hover_text(residue.key.to_string()).clicked(){view.selected=Some(residue.key.clone());self.state.selected_view=slot;}}});});
-                let before=view.selected.clone();let changed=scene::viewport(ui,&view.molecule,&view.renderer,&mut view.camera,view.style,slot,&mut view.selected,view.visible,view.labels,self.state.show_axes,&view.chains);if before!=view.selected{self.state.selected_view=slot;}
-if changed{self.state.selected_view=slot;if self.state.link_views{linked=Some(view.camera);}}
-            }else{ui.centered_and_justified(|ui|{ui.label("Choose an actual result under Runs / results, or open a local PDB / mmCIF.");});}
-        });}});
-        }
-        if let Some(camera) = linked {
-            for view in self.views.iter_mut().flatten() {
-                view.camera.yaw = camera.yaw;
-                view.camera.pitch = camera.pitch;
-                view.camera.zoom = camera.zoom;
-                view.camera.pan = camera.pan;
-                view.camera.ambient = camera.ambient;
-                view.camera.bloom = camera.bloom;
+            } else if text(&metadata, "source_kind") == "demo" {
+                let bytes = Arc::new(scene::Molecule::reference_bytes());
+                let molecule = scene::Molecule::reference();
+                metadata["load_token"] = json!(uid());
+                self.update_view_reference(slot, metadata.clone());
+                self.view_loading.insert(slot, view_token(&metadata));
+                self.accept_molecule(slot, metadata, bytes, Ok(molecule));
+            } else if text(&metadata, "source_kind") == "job" {
+                let job = text(&metadata, "job_id").to_owned();
+                if job.is_empty() {
+                    self.view_errors.insert(slot,"The saved run has no job identifier. Close this tab and reopen the run from the sidebar.".into());
+                } else {
+                    self.view_loading.insert(slot, format!("job:{job}"));
+                    self.request("job.get", json!({"job_id":job}), Purpose::Job(job));
+                }
+            } else {
+                self.view_errors.insert(slot,"The saved structure has no readable source. Close this tab and reopen its file or result.".into());
             }
         }
     }
     pub(super) fn inspector(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let slot = self.state.selected_view;
-        Self::section(ui, &format!("OBJECTS / VIEW {}", slot + 1));
-        if self.view_loading[slot].is_some() {
+        Self::section(ui, "OBJECTS / ACTIVE TAB");
+        if self.view_loading.contains_key(&slot) {
+            let status = loading_status(self.view_reference(slot));
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Downloading / reading structure…");
+                ui.add(egui::Label::new(&status).truncate())
+                    .on_hover_text(status);
             });
         }
-        let Some(view) = self.views[slot].as_mut() else {
-            ui.label("No structure in this viewport.");
+        if let Some(error) = self.view_errors.get(&slot) {
+            ui.colored_label(RED, error);
+        }
+        let Some(view) = self.views.get_mut(&slot) else {
+            ui.label("No structure in the active tab.");
             return;
         };
         ui.horizontal(|ui| {
@@ -475,7 +532,9 @@ if changed{self.state.selected_view=slot;if self.state.link_views{linked=Some(vi
                             view.chains[index] = true;
                             ui.close();
                         }
-                    });
+                    })
+                    .response
+                    .on_hover_text("Actions for this chain");
                     if ui
                         .small_button("S")
                         .on_hover_text("Show only this chain")

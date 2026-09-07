@@ -104,6 +104,7 @@ pub struct UiState {
     pub active_batch: String,
     pub preview: Option<Preview>,
     pub view_refs: Vec<Value>,
+    pub dock_layout: Value,
     pub view_count: usize,
     pub selected_view: usize,
     pub link_views: bool,
@@ -127,6 +128,7 @@ impl Default for UiState {
             active_batch: String::new(),
             preview: None,
             view_refs: Vec::new(),
+            dock_layout: Value::Null,
             view_count: 2,
             selected_view: 0,
             link_views: true,
@@ -154,13 +156,35 @@ impl UiState {
                 value["saved_editors"][if tab == "library" { "library" } else { "text" }].clone()
             };
         }
+        let selected_view = value.get("selected_view").and_then(view_id);
+        if let Some(object) = value.as_object_mut() {
+            // A damaged view selector must not discard input drafts and notes.
+            object.insert("selected_view".into(), json!(0));
+            if object.get("view_count").is_some_and(|count| {
+                count
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .is_none()
+            }) {
+                object.insert("view_count".into(), json!(2));
+            }
+        }
         let mut state = serde_json::from_value::<Self>(value.clone()).unwrap_or_else(|_| {
             let mut state = Self::default();
             state.extra.insert("unparsed_original_draft".into(), value);
             state
         });
-        state.view_count = state.view_count.clamp(1, 4);
-        state.selected_view = state.selected_view.min(state.view_count - 1);
+        let ids = normalize_view_ids(&mut state.view_refs);
+        state.selected_view = selected_view
+            .filter(|id| ids.contains(id))
+            .or_else(|| {
+                state
+                    .view_refs
+                    .first()
+                    .and_then(|view| view.get("slot"))
+                    .and_then(view_id)
+            })
+            .unwrap_or(0);
         state
     }
     pub fn switch_editor(&mut self, kind: &str) {
@@ -278,6 +302,43 @@ impl UiState {
         })
     }
 }
+
+fn view_id(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .and_then(|id| usize::try_from(id).ok())
+        .filter(|id| *id < usize::MAX / 2)
+}
+
+fn normalize_view_ids(views: &mut [Value]) -> BTreeSet<usize> {
+    // Reserve every valid ID before assigning replacements, including IDs that
+    // occur later in the saved order. Dock order never determines identity.
+    let mut reserved: BTreeSet<_> = views
+        .iter()
+        .filter_map(|view| view.get("slot").and_then(view_id))
+        .collect();
+    let mut used = BTreeSet::new();
+    let mut next = 0;
+    for view in views {
+        let id = match view.get("slot").and_then(view_id) {
+            Some(id) if used.insert(id) => id,
+            _ => {
+                while reserved.contains(&next) {
+                    next += 1;
+                }
+                reserved.insert(next);
+                used.insert(next);
+                next
+            }
+        };
+        if !view.is_object() {
+            *view = json!({"unparsed_original_view_ref": std::mem::take(view)});
+        }
+        view["slot"] = json!(id);
+    }
+    used
+}
+
 pub fn infer_file(path: &std::path::Path) -> (&'static str, &'static str) {
     match path
         .extension()
@@ -344,6 +405,139 @@ mod tests {
         state.switch_editor("library");
         assert_eq!(state.editor.text, "construct:editor@7");
         assert!(state.extra.contains_key("legacy_annotations"));
+    }
+    #[test]
+    fn docking_migration_retains_hidden_legacy_views_and_selection() {
+        let original = json!({
+            "view_count":2,
+            "selected_view":3,
+            "view_refs":[
+                {"slot":0,"artifact_id":"same-artifact","view_state":{"style":"cartoon","camera":{"yaw":0.1}}},
+                {"slot":1,"artifact_id":"same-artifact","view_state":{"style":"sticks","camera":{"yaw":0.9}}},
+                {"slot":2,"source_kind":"local","local_path":"/tmp/editor.cif","sha256":"editor-sha"},
+                {"slot":3,"source_kind":"demo","view_state":{"selected":{"chain":"A","sequence":"20"}}}
+            ],
+            "notes":{"same-artifact":{"text":"Keep both independent views","operation":"pending-save"}}
+        });
+        let state = UiState::restore(&original);
+        assert_eq!(state.view_count, 2);
+        assert_eq!(state.selected_view, 3);
+        assert_eq!(json!(state.view_refs), original["view_refs"]);
+        assert_eq!(state.notes["same-artifact"].operation, "pending-save");
+        assert!(state.dock_layout.is_null());
+    }
+    #[test]
+    fn docking_migration_repairs_ids_without_losing_view_metadata_or_drafts() {
+        let large = usize::MAX / 2 - 1;
+        let original = json!({
+            "name":"Editor design",
+            "editor":{"text":"  MAGK\n","id":"draft-sequence"},
+            "selected_view":u64::MAX,
+            "view_refs":[
+                {"slot":-1,"artifact_id":"negative","view_state":{"style":"sticks"}},
+                {"slot":1,"artifact_id":"first-one","sha256":"first-sha"},
+                {"slot":1,"artifact_id":"second-one","sha256":"second-sha"},
+                {"slot":"2","artifact_id":"string-id"},
+                {"slot":null,"artifact_id":"null-id"},
+                {"slot":u64::MAX,"artifact_id":"overflow-id"},
+                {"artifact_id":"missing-id"},
+                {"slot":large,"artifact_id":"large-valid-id"},
+                {"slot":0,"artifact_id":"valid-zero-later"},
+                "retained malformed reference"
+            ],
+            "notes":{"first-one":{"text":"Pending local edit","local_id":"keep-note","operation":"exact-save"}},
+            "note_history":[{"text":"Earlier edit"}]
+        });
+        let state = UiState::restore(&original);
+        assert_eq!(state.name, "Editor design");
+        assert_eq!(state.editor.text, "  MAGK\n");
+        assert_eq!(state.editor.id, "draft-sequence");
+        assert_eq!(state.view_refs.len(), 10);
+        let ids: BTreeSet<_> = state
+            .view_refs
+            .iter()
+            .map(|view| view_id(&view["slot"]).unwrap())
+            .collect();
+        assert_eq!(ids.len(), state.view_refs.len());
+        assert!(ids.contains(&state.selected_view));
+        assert_eq!(state.view_refs[1]["slot"], 1);
+        assert_eq!(state.view_refs[7]["slot"], large);
+        assert_eq!(state.view_refs[8]["slot"], 0);
+        for (before, after) in original["view_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(&state.view_refs)
+        {
+            if let Some(object) = before.as_object() {
+                for (key, value) in object.iter().filter(|(key, _)| key.as_str() != "slot") {
+                    assert_eq!(&after[key], value);
+                }
+            } else {
+                assert_eq!(&after["unparsed_original_view_ref"], before);
+            }
+        }
+        assert_eq!(state.notes["first-one"].text, "Pending local edit");
+        assert_eq!(state.notes["first-one"].operation, "exact-save");
+        assert_eq!(state.extra["note_history"], original["note_history"]);
+        let again = UiState::restore(&json!(state));
+        assert_eq!(again.view_refs, state.view_refs);
+        assert_eq!(again.selected_view, state.selected_view);
+    }
+    #[test]
+    fn docking_migration_keeps_sparse_ids_and_has_no_four_view_cap() {
+        let large = usize::MAX / 2 - 1;
+        let state = UiState::restore(&json!({
+            "view_count":8,"selected_view":large,
+            "view_refs":[{"slot":0},{"slot":large}]
+        }));
+        assert_eq!(state.view_count, 8);
+        assert_eq!(state.view_refs.len(), 2);
+        assert_eq!(state.selected_view, large);
+    }
+    #[test]
+    fn malformed_dock_layout_does_not_reset_valid_session_state() {
+        for layout in [
+            json!("broken layout"),
+            json!([null, false]),
+            json!({"tree":{"tabs":"wrong type"}}),
+        ] {
+            let state = UiState::restore(&json!({
+                "dock_layout":layout,
+                "editor":{"text":"Preserve unsent input"},
+                "inputs":[{"id":"existing-input","name":"Editor"}],
+                "notes":{"artifact":{"text":"Keep annotation"}},
+                "view_refs":[{"slot":4,"artifact_id":"artifact"}],
+                "selected_view":-9
+            }));
+            assert_eq!(state.dock_layout, layout);
+            assert_eq!(state.editor.text, "Preserve unsent input");
+            assert_eq!(state.inputs[0].id, "existing-input");
+            assert_eq!(state.notes["artifact"].text, "Keep annotation");
+            assert_eq!(state.selected_view, 4);
+            assert!(!state.extra.contains_key("unparsed_original_draft"));
+        }
+    }
+    #[test]
+    fn never_initialized_and_intentionally_empty_docks_stay_distinct() {
+        let fresh = UiState::restore(&json!({"view_refs":[]}));
+        assert!(fresh.dock_layout.is_null());
+        assert_eq!(fresh.selected_view, 0);
+        let empty_layout = json!({"schema":1,"groups":[]});
+        let closed = UiState::restore(&json!({
+            "view_refs":[],"dock_layout":empty_layout,"selected_view":14,
+            "notes":{"local:sha":{"text":"Keep notes after closing every tab"}}
+        }));
+        assert_eq!(closed.dock_layout, empty_layout);
+        assert_eq!(closed.selected_view, 0);
+        assert!(closed.view_refs.is_empty());
+        let restored = UiState::restore(&json!(closed));
+        assert_eq!(restored.dock_layout, empty_layout);
+        assert!(restored.view_refs.is_empty());
+        assert_eq!(
+            restored.notes["local:sha"].text,
+            "Keep notes after closing every tab"
+        );
     }
     #[test]
     fn duplicate_assembly_chains_are_rejected_before_submission() {

@@ -1,5 +1,7 @@
 //! The bot and desktop share the exact parser, geometry, shaders and capture code.
 #![allow(dead_code, unused_imports)]
+#[path = "../alignment.rs"]
+mod alignment;
 #[path = "../render.rs"]
 mod render;
 #[path = "../scene.rs"]

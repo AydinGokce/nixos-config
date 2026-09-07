@@ -1,6 +1,6 @@
 //! One-shot structure figures, using the desktop's studio renderer unchanged.
 //! Run on a local display, or with bio-render-headless on Linux (private Xvfb).
-use crate::scene;
+use crate::{alignment, scene};
 use eframe::egui::{self, Color32, Vec2};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +29,8 @@ struct Request {
     height: u32,
     #[serde(default = "style")]
     style: String,
+    #[serde(default)]
+    align: bool,
 }
 fn width() -> u32 {
     1600
@@ -79,6 +81,19 @@ struct StructureReceipt {
     residues: usize,
     chains: usize,
     notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alignment: Option<alignment::AlignmentReceipt>,
+}
+#[derive(Serialize, Clone)]
+struct AlignmentSummary {
+    requested: bool,
+    reference_index: usize,
+    status: &'static str,
+    aligned_structures: usize,
+    unavailable_structures: usize,
+    transform_convention: &'static str,
+    shared_center_angstrom: [f32; 3],
+    shared_radius_angstrom: f32,
 }
 #[derive(Serialize, Clone)]
 struct Receipt {
@@ -89,6 +104,8 @@ struct Receipt {
     height: usize,
     sha256: String,
     structures: Vec<StructureReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alignment: Option<AlignmentSummary>,
 }
 struct View {
     molecule: scene::Molecule,
@@ -106,6 +123,7 @@ struct Capture {
     frames: usize,
     size: [u32; 2],
     started: Instant,
+    alignment: Option<AlignmentSummary>,
 }
 impl Capture {
     fn finish(&self, result: Result<Receipt, String>, ctx: &egui::Context) {
@@ -151,6 +169,7 @@ impl Capture {
             height: image.height(),
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             structures: self.sources.clone(),
+            alignment: self.alignment.clone(),
         })
     }
 }
@@ -192,7 +211,12 @@ impl eframe::App for Capture {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(3, 5, 7)))
             .show(ctx, |ui| {
                 let count = self.views.len();
-                let columns = if count == 1 { 1 } else { 2 };
+                let columns = match count {
+                    1 => 1,
+                    2..=4 => 2,
+                    5..=9 => 3,
+                    _ => 4,
+                };
                 let row_count = count.div_ceil(columns);
                 let full = ui.available_rect_before_wrap();
                 let size = Vec2::new(
@@ -239,7 +263,7 @@ impl eframe::App for Capture {
 pub fn run(args: Vec<OsString>) -> Result<(), String> {
     if args.len() == 1 && args[0] == "--help" {
         println!(
-            "bio-render --manifest request.json\nManifest: {{\"structures\":[{{\"path\":\"structure.cif\",\"title\":\"Model / sample\"}}],\"output\":\"figure.png\",\"style\":\"cartoon\",\"width\":1600,\"height\":1000}}\nOne to four PDB/mmCIF files. Relative paths resolve beside the manifest. Existing output is never overwritten. Linux servers: bio-render-headless --manifest request.json. Prints a PNG/source SHA256 receipt; no network or cloud calls."
+            "bio-render --manifest request.json\nManifest: {{\"structures\":[{{\"path\":\"structure.cif\",\"title\":\"Model / sample\"}}],\"output\":\"figure.png\",\"style\":\"cartoon\",\"width\":1600,\"height\":1000,\"align\":false}}\nOne to sixteen PDB/mmCIF files. Optional align:true fits unique matching polymer chains onto the first structure, without changing source files. Unavailable fits are visibly marked UNALIGNED and explained in the receipt. Relative paths resolve beside the manifest. Existing output is never overwritten. Linux servers: bio-render-headless --manifest request.json. Prints a PNG/source SHA256 receipt; no network or cloud calls."
         );
         return Ok(());
     }
@@ -250,11 +274,11 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         std::fs::canonicalize(Path::new(&args[1])).map_err(|_| "Cannot open render manifest")?;
     let request: Request = serde_json::from_slice(&read_bounded(&manifest, 64 * 1024)?)
         .map_err(|_| "Invalid render manifest")?;
-    if !(1..=4).contains(&request.structures.len())
+    if !(1..=16).contains(&request.structures.len())
         || !(640..=2560).contains(&request.width)
         || !(480..=2160).contains(&request.height)
     {
-        return Err("Use 1–4 structures and dimensions 640–2560 × 480–2160".into());
+        return Err("Use 1–16 structures and dimensions 640–2560 × 480–2160".into());
     }
     let style = representation(&request.style)?;
     let base = manifest.parent().ok_or("Manifest directory missing")?;
@@ -300,9 +324,15 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
             notes: std::iter::once(molecule.secondary_source.clone())
                 .chain(molecule.warnings.clone())
                 .collect(),
+            alignment: None,
         });
         molecules.push(molecule);
     }
+    let alignment = if request.align {
+        Some(align_structures(&mut molecules, &mut sources)?)
+    } else {
+        None
+    };
     let outcome: Outcome = Arc::new(Mutex::new(None));
     let shared = outcome.clone();
     let options = eframe::NativeOptions {
@@ -341,6 +371,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
                 frames: 0,
                 size: [request.width, request.height],
                 started: Instant::now(),
+                alignment,
             }))
         }),
     )
@@ -355,4 +386,86 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         serde_json::to_string(&result).map_err(|_| "Cannot serialize render receipt")?
     );
     Ok(())
+}
+
+fn align_structures(
+    molecules: &mut [scene::Molecule],
+    sources: &mut [StructureReceipt],
+) -> Result<AlignmentSummary, String> {
+    let (reference, moving) = molecules
+        .split_first_mut()
+        .ok_or("No alignment reference")?;
+    sources[0].alignment = Some(alignment::AlignmentReceipt::reference());
+    let mut aligned_structures = 0;
+    let mut unavailable_structures = 0;
+    for (molecule, source) in moving.iter_mut().zip(&mut sources[1..]) {
+        source.alignment = Some(match alignment::align_to_reference(reference, molecule) {
+            Ok(receipt) => {
+                aligned_structures += 1;
+                source.notes.push(format!("Display-only rigid alignment to source 0 using {} matching polymer anchors; RMSD is a fit residual, not a prediction-quality score. Source bytes are unchanged.", receipt.matched_anchors));
+                if receipt.unmatched_reference_polymer_chains != 0
+                    || receipt.unmatched_moving_polymer_chains != 0
+                {
+                    source.notes.push(format!("Alignment omitted {} reference and {} moving polymer chains without unique exact sequence correspondence.", receipt.unmatched_reference_polymer_chains, receipt.unmatched_moving_polymer_chains));
+                }
+                receipt
+            }
+            Err(reason) => {
+                unavailable_structures += 1;
+                molecule.name = format!("UNALIGNED · {}", molecule.name);
+                source.notes.push(format!("UNALIGNED: {reason}"));
+                alignment::AlignmentReceipt::unavailable(reason)
+            }
+        });
+    }
+    // Geometry is centered by the renderer. Use one origin and scale for the
+    // fitted structures, so that individual centering cannot undo translation.
+    let center = reference.center;
+    let mut radius = 1_f64;
+    for (molecule, source) in molecules.iter().zip(sources.iter()) {
+        if source
+            .alignment
+            .as_ref()
+            .is_some_and(|a| a.status != "unavailable")
+        {
+            for atom in &molecule.atoms {
+                let delta = [
+                    atom.p.0 as f64 - center.0 as f64,
+                    atom.p.1 as f64 - center.1 as f64,
+                    atom.p.2 as f64 - center.2 as f64,
+                ];
+                radius = radius.max(delta.iter().map(|x| x * x).sum::<f64>().sqrt());
+            }
+        }
+    }
+    let radius = radius as f32;
+    if !radius.is_finite() {
+        return Err("Aligned display bounds are not finite".into());
+    }
+    for (molecule, source) in molecules.iter_mut().zip(sources.iter()) {
+        if source
+            .alignment
+            .as_ref()
+            .is_some_and(|a| a.status != "unavailable")
+        {
+            molecule.center = center;
+            molecule.radius = radius;
+        }
+    }
+    Ok(AlignmentSummary {
+        requested: true,
+        reference_index: 0,
+        status: if unavailable_structures == 0 {
+            "complete"
+        } else if aligned_structures == 0 {
+            "unavailable"
+        } else {
+            "partial"
+        },
+        aligned_structures,
+        unavailable_structures,
+        transform_convention: "reference_xyz = rotation * source_xyz + translation_angstrom; column vectors, no scaling or reflection",
+        shared_center_angstrom: [center.0, center.1, center.2],
+        shared_radius_angstrom: radius,
+    })
 }

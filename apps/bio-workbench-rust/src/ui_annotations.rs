@@ -65,7 +65,7 @@ impl Workbench {
     pub(super) fn annotations_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         Self::section(ui, "ANNOTATIONS / RESEARCH NOTES");
         let slot = self.state.selected_view;
-        let Some(view) = self.views[slot].as_ref() else {
+        let Some(view) = self.views.get(&slot) else {
             return;
         };
         let key = note_key(&view.metadata);
@@ -221,7 +221,7 @@ impl Workbench {
                             operation: String::new(),
                         },
                     );
-                    if let Some(view) = self.views[slot].as_mut() {
+                    if let Some(view) = self.views.get_mut(&slot) {
                         view.selected = selection_key(&selection, &view.molecule);
                     }
                 }

@@ -73,9 +73,18 @@ replayed against the current connection.
 
 Each job lists its actual artifacts. Structure artifacts are shown first;
 additional logs, confidence/QA files, sequences, and other results remain under
-**Other artifacts**. Choose up to four structures and **Compare selected**, or
-load a structure into the selected pane with **View**. Text and CSV/TSV previews
+**Other artifacts**. Click a run to open its preferred structure in a tab, or
+click individual artifacts and **Open selected** to compare any number of results.
+A pending run opens a tab that follows its progress and displays the output when
+available, even if you select a different batch in the sidebar. Text and CSV/TSV previews
 are bounded; **Export…** writes the complete original artifact.
+
+Drag tabs to reorder them, drop at a viewer edge to split, or onto another tab
+bar to combine groups. **View → Split right / Split down** also moves the active
+tab into a new group when another tab remains in its current group. Close with
+the tab's left **×**, middle-click, or Ctrl+W (Cmd+W on macOS). Closing a tab keeps
+the run, artifacts and annotations. Tabs, splits and each structure's camera and
+display settings survive restart. Closing every tab leaves an empty workspace.
 
 The native viewer reads PDB and mmCIF, including protein, nucleic acid, ligand,
 ion, modified residue, author/label chain IDs, insertion codes, and coordinate
@@ -104,7 +113,7 @@ or experimental secondary-structure evidence. Cartoon widths, smoothed paths,
 atom radii, and inferred proximity bonds are visualization conventions, not
 chemical validation.
 
-Until an actual result is selected, the panes show an explicitly labeled
+On first launch, one tab shows an explicitly labeled
 experimental reference: [RCSB PDB 4OO8](https://www.rcsb.org/structure/4OO8), a
 Cas9–guide RNA–target DNA complex at 2.50 Å. The local demo contains chains A/B/C
 only: 9,999 protein atoms, 2,082 RNA atoms, and 404 DNA atoms. It is never presented
@@ -167,3 +176,10 @@ directory and display for testing so the current user window is not driven.
 The companion `bio-render` executable and `bio-workbench --render --manifest
 request.json` entry point use the same parser and GPU renderer for one-shot
 structure PNGs. This rendering path does not submit predictions.
+Manifests accept 1–16 structures and optional `"align": true`. Alignment fits
+unique matching polymer sequences rigidly onto the first structure and uses a
+shared display origin and scale. It preserves original files and records the
+transformation and matched anchors. Unavailable fits show **UNALIGNED** on the
+panel and an explicit reason in the receipt. Fit RMSD describes the display
+alignment, not prediction quality. Labels and the bottom-right XYZ indicator
+use the same viewer code as the desktop.
