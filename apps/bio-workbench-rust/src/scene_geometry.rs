@@ -1,5 +1,5 @@
 //! Static, coordinate-derived meshes. Constructed once, then retained on the GPU.
-use super::{Atom, Molecule, V3, chain_color};
+use super::{Atom, Molecule, MoleculeKind, Secondary, V3};
 use std::collections::BTreeMap;
 use std::f32::consts::TAU;
 
@@ -14,25 +14,30 @@ pub(super) struct Chain {
     pub trace: Mesh,
     pub sticks: Mesh,
     pub atoms: Vec<[f32; 8]>,
+    pub details: Vec<[f32; 8]>,
 }
-fn color(chain: char) -> V3 {
-    let c = chain_color(chain);
-    // Materials are lit in linear space, then tone mapped in the postprocess.
+fn color(molecule: &Molecule, chain: usize) -> V3 {
+    let c = molecule.chains[chain].color;
     V3(
         (c.r() as f32 / 255.).powf(2.2),
         (c.g() as f32 / 255.).powf(2.2),
         (c.b() as f32 / 255.).powf(2.2),
     )
 }
-fn atom_color(atom: &Atom) -> V3 {
-    if atom.chain != 'A' {
-        return color(atom.chain);
+fn atom_color(molecule: &Molecule, atom: &Atom) -> V3 {
+    if matches!(
+        molecule.residues[atom.residue].kind,
+        MoleculeKind::Rna | MoleculeKind::Dna
+    ) {
+        return color(molecule, atom.chain);
     }
     match atom.element.as_str() {
         "N" => V3(0.14, 0.28, 0.78),
         "O" => V3(0.83, 0.12, 0.085),
         "S" | "P" => V3(0.88, 0.56, 0.06),
-        _ => color('A'),
+        "H" | "D" => V3(0.65, 0.65, 0.65),
+        "CL" | "F" => V3(0.18, 0.72, 0.16),
+        _ => color(molecule, atom.chain),
     }
 }
 impl Mesh {
@@ -47,6 +52,9 @@ impl Mesh {
         self.indices.extend_from_slice(&[a, b, c]);
     }
     fn cylinder(&mut self, a: V3, b: V3, radius: f32, color: V3, residue: f32) {
+        if b.sub(a).length() < 0.001 {
+            return;
+        }
         let tangent = b.sub(a).unit();
         let axis = if tangent.0.abs() < 0.8 {
             V3(1., 0., 0.)
@@ -91,6 +99,7 @@ impl Mesh {
         }
         for v in &mut self.vertices[start..] {
             let n = V3(v[3], v[4], v[5]).unit();
+            let n = if n.length() < 0.5 { V3(0., 1., 0.) } else { n };
             v[3] = n.0;
             v[4] = n.1;
             v[5] = n.2;
@@ -169,7 +178,7 @@ fn sweep(mesh: &mut Mesh, guides: &[Guide], color: V3) {
                 high,
                 b.width * (1. - ease) + c.width * ease,
                 b.height * (1. - ease) + c.height * ease,
-                b.residue * (1. - t) + c.residue * t,
+                if t < 0.5 { b.residue } else { c.residue },
             ));
         }
     }
@@ -221,119 +230,125 @@ fn sweep(mesh: &mut Mesh, guides: &[Guide], color: V3) {
     }
     mesh.smooth_normals(start, triangles);
 }
-fn protein(molecule: &Molecule, cartoon: bool) -> Mesh {
+fn atom_named(molecule: &Molecule, residue: usize, name: &str) -> Option<V3> {
+    molecule.residues[residue]
+        .atoms
+        .iter()
+        .find_map(|&i| (molecule.atoms[i].name == name).then_some(molecule.atoms[i].p))
+}
+fn protein(molecule: &Molecule, chain: usize, cartoon: bool) -> Mesh {
     let mut mesh = Mesh::default();
     let mut guide = Vec::new();
-    let oxygens: BTreeMap<_, _> = molecule
-        .atoms
-        .iter()
-        .filter(|a| a.chain == 'A' && a.name == "O")
-        .map(|a| (a.residue, a.p))
-        .collect();
-    let carbons: BTreeMap<_, _> = molecule
-        .atoms
-        .iter()
-        .filter(|a| a.chain == 'A' && a.name == "C")
-        .map(|a| (a.residue, a.p))
-        .collect();
     let mut previous = V3::default();
-    for (i, (&point, &id)) in molecule.ca.iter().zip(&molecule.ca_ids).enumerate() {
-        if i > 0
-            && (point.sub(molecule.ca[i - 1]).length() > 4.8 || id != molecule.ca_ids[i - 1] + 1)
-        {
-            sweep(&mut mesh, &guide, color('A'));
+    let ids = &molecule.chains[chain].residues;
+    for (i, &id) in ids.iter().enumerate() {
+        let residue = &molecule.residues[id];
+        let point =
+            atom_named(molecule, id, "CA").filter(|_| residue.kind == MoleculeKind::Protein);
+        if !residue.connected_to_previous || point.is_none() {
+            sweep(&mut mesh, &guide, color(molecule, chain));
             guide.clear();
             previous = V3::default();
         }
-        let helix = molecule.helices.iter().any(|&(a, b)| (a..=b).contains(&id));
-        let sheet = molecule
-            .sheets
-            .iter()
-            .find(|&&(a, b)| (a..=b).contains(&id));
+        let Some(point) = point else {
+            continue;
+        };
+        let next = ids
+            .get(i + 1)
+            .map(|&r| &molecule.residues[r])
+            .filter(|r| r.connected_to_previous);
+        let after = ids
+            .get(i + 2)
+            .map(|&r| &molecule.residues[r])
+            .filter(|r| r.connected_to_previous);
         let (mut width, height) = if !cartoon {
             (0.24, 0.24)
-        } else if helix {
-            (1.18, 0.25)
-        } else if sheet.is_some() {
-            (1.35, 0.24)
         } else {
-            (0.26, 0.26)
+            match residue.secondary {
+                Secondary::Helix => (1.18, 0.25),
+                Secondary::Sheet => (1.35, 0.24),
+                Secondary::Coil => (0.26, 0.26),
+            }
         };
-        if cartoon && let Some(&(_, end)) = sheet {
-            if id + 1 == end {
-                width = 1.85;
-            } else if id == end {
+        if cartoon && residue.secondary == Secondary::Sheet {
+            if next.is_none_or(|r| r.secondary != Secondary::Sheet) {
                 width = 0.22;
+            } else if after.is_none_or(|r| r.secondary != Secondary::Sheet) {
+                width = 1.85;
             }
         }
-        let mut wide = oxygens
-            .get(&id)
-            .zip(carbons.get(&id))
-            .map_or(V3(0., 1., 0.), |(o, c)| o.sub(*c).unit());
+        let mut wide = atom_named(molecule, id, "O")
+            .zip(atom_named(molecule, id, "C"))
+            .map_or(V3(0., 1., 0.), |(o, c)| o.sub(c).unit());
         if wide.dot(previous) < 0. {
             wide = wide.mul(-1.);
         }
         previous = wide;
-        // Suppress beta-strand zigzag while preserving actual coordinate origin.
-        let p = if cartoon
-            && sheet.is_some()
+        let mut p = point;
+        if cartoon
+            && residue.secondary == Secondary::Sheet
+            && residue.connected_to_previous
             && i > 0
-            && i + 1 < molecule.ca.len()
-            && molecule.ca[i - 1].sub(point).length() < 4.8
-            && molecule.ca[i + 1].sub(point).length() < 4.8
+            && next.is_some()
+            && let Some((a, b)) =
+                atom_named(molecule, ids[i - 1], "CA").zip(atom_named(molecule, ids[i + 1], "CA"))
         {
-            point
-                .mul(0.6)
-                .add(molecule.ca[i - 1].add(molecule.ca[i + 1]).mul(0.2))
-        } else {
-            point
-        };
+            p = point.mul(0.6).add(a.add(b).mul(0.2));
+        }
         guide.push(Guide {
             p: p.sub(molecule.center),
             wide,
             width,
             height,
-            residue: id as f32,
+            residue: (id + 1) as f32,
         });
     }
-    sweep(&mut mesh, &guide, color('A'));
+    sweep(&mut mesh, &guide, color(molecule, chain));
     mesh
 }
-fn nucleic(molecule: &Molecule, chain: char, bases: bool) -> Mesh {
+fn nucleic(molecule: &Molecule, chain: usize, bases: bool) -> Mesh {
     let mut mesh = Mesh::default();
     let mut guide: Vec<Guide> = Vec::new();
-    for atom in molecule
-        .atoms
-        .iter()
-        .filter(|a| a.chain == chain && a.name == "P")
-    {
-        let p = atom.p.sub(molecule.center);
-        if let Some(last) = guide.last()
-            && last.p.sub(p).length() > 9.
+    for &id in &molecule.chains[chain].residues {
+        let residue = &molecule.residues[id];
+        if !residue.connected_to_previous
+            || !matches!(residue.kind, MoleculeKind::Rna | MoleculeKind::Dna)
         {
-            sweep(&mut mesh, &guide, color(chain));
+            sweep(&mut mesh, &guide, color(molecule, chain));
             guide.clear();
         }
+        if !matches!(residue.kind, MoleculeKind::Rna | MoleculeKind::Dna) {
+            continue;
+        }
+        let p = molecule.atoms[residue.anchor].p.sub(molecule.center);
         guide.push(Guide {
             p,
             wide: V3(0., 1., 0.),
             width: 0.48,
             height: 0.48,
-            residue: -1.,
+            residue: (id + 1) as f32,
         });
     }
-    sweep(&mut mesh, &guide, color(chain));
+    sweep(&mut mesh, &guide, color(molecule, chain));
     if !bases {
         return mesh;
     }
-    let mut residues: BTreeMap<usize, BTreeMap<&str, V3>> = BTreeMap::new();
-    for atom in molecule.atoms.iter().filter(|a| a.chain == chain) {
-        residues
-            .entry(atom.residue)
-            .or_default()
-            .insert(&atom.name, atom.p.sub(molecule.center));
-    }
-    for residue in residues.values() {
+    for &id in &molecule.chains[chain].residues {
+        let r = &molecule.residues[id];
+        if !matches!(r.kind, MoleculeKind::Rna | MoleculeKind::Dna) {
+            continue;
+        }
+        let residue: BTreeMap<_, _> = r
+            .atoms
+            .iter()
+            .map(|&i| {
+                (
+                    &*molecule.atoms[i].name,
+                    molecule.atoms[i].p.sub(molecule.center),
+                )
+            })
+            .collect();
+        let selected = (id + 1) as f32;
         let purine = residue.contains_key("N9");
         let ring: &[&str] = if purine {
             &["N9", "C8", "N7", "C5", "C6", "N1", "C2", "N3", "C4"]
@@ -351,17 +366,20 @@ fn nucleic(molecule: &Molecule, chain: char, bases: bool) -> Mesh {
             .sub(points[0])
             .cross(points[2].sub(points[0]))
             .unit();
+        if n.length() < 0.9 {
+            continue;
+        }
         let center = points
             .iter()
             .fold(V3::default(), |s, &p| s.add(p))
             .mul(1. / points.len() as f32);
-        let c = color(chain).mul(0.82);
+        let c = color(molecule, chain).mul(0.82);
         for sign in [-1., 1.] {
             let normal = n.mul(sign);
-            let middle = mesh.vertex(center.add(normal.mul(0.11)), normal, c, -1.);
+            let middle = mesh.vertex(center.add(normal.mul(0.11)), normal, c, selected);
             let first = mesh.vertices.len() as u32;
             for &point in &points {
-                mesh.vertex(point.add(normal.mul(0.11)), normal, c, -1.);
+                mesh.vertex(point.add(normal.mul(0.11)), normal, c, selected);
             }
             for i in 0..points.len() {
                 let a = first + i as u32;
@@ -372,7 +390,7 @@ fn nucleic(molecule: &Molecule, chain: char, bases: bool) -> Mesh {
                     mesh.triangle(middle, b, a);
                 }
                 if sign > 0. {
-                    mesh.cylinder(points[i], points[(i + 1) % points.len()], 0.12, c, -1.);
+                    mesh.cylinder(points[i], points[(i + 1) % points.len()], 0.12, c, selected);
                 }
             }
         }
@@ -382,63 +400,81 @@ fn nucleic(molecule: &Molecule, chain: char, bases: bool) -> Mesh {
             ("C1'", if purine { "N9" } else { "N1" }),
         ] {
             if let Some((&a, &b)) = residue.get(a).zip(residue.get(b)) {
-                mesh.cylinder(a, b, 0.20, color(chain), -1.);
+                mesh.cylinder(a, b, 0.20, color(molecule, chain), selected);
             }
         }
     }
     mesh
 }
-pub(super) fn build(molecule: &Molecule) -> [Chain; 3] {
-    std::array::from_fn(|index| {
-        let chain = (b'A' + index as u8) as char;
-        let cartoon = if chain == 'A' {
-            protein(molecule, true)
-        } else {
-            nucleic(molecule, chain, true)
-        };
-        let trace = if chain == 'A' {
-            protein(molecule, false)
-        } else {
-            nucleic(molecule, chain, false)
-        };
-        let mut sticks = Mesh::default();
-        for &(a, b) in &molecule.bonds {
-            let a = &molecule.atoms[a];
-            let b = &molecule.atoms[b];
-            if a.chain != chain {
-                continue;
-            }
-            let pa = a.p.sub(molecule.center);
-            let pb = b.p.sub(molecule.center);
-            let mid = pa.add(pb).mul(0.5);
-            for (atom, p) in [(a, pa), (b, pb)] {
-                sticks.cylinder(
-                    p,
-                    mid,
-                    0.135,
-                    atom_color(atom),
-                    if chain == 'A' {
-                        atom.residue as f32
-                    } else {
-                        -1.
-                    },
-                );
+impl Mesh {
+    fn append(&mut self, other: Self) {
+        let offset = self.vertices.len() as u32;
+        self.vertices.extend(other.vertices);
+        self.indices
+            .extend(other.indices.into_iter().map(|i| i + offset));
+    }
+}
+pub(super) fn build(molecule: &Molecule) -> Vec<Chain> {
+    // All nonpolymers and incomplete/single-residue polymers remain visible in cartoon/trace.
+    let mut detail = vec![true; molecule.residues.len()];
+    for chain in &molecule.chains {
+        for pair in chain.residues.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if molecule.residues[b].connected_to_previous {
+                let valid = |r: usize| {
+                    molecule.residues[r].kind != MoleculeKind::Protein
+                        || atom_named(molecule, r, "CA").is_some()
+                };
+                if valid(a) && valid(b) {
+                    detail[a] = false;
+                    detail[b] = false;
+                }
             }
         }
-        let atoms = molecule
-            .atoms
-            .iter()
-            .filter(|a| a.chain == chain)
-            .map(|atom| {
+    }
+    molecule
+        .chains
+        .iter()
+        .enumerate()
+        .map(|(chain, _)| {
+            let mut cartoon = protein(molecule, chain, true);
+            cartoon.append(nucleic(molecule, chain, true));
+            let mut trace = protein(molecule, chain, false);
+            trace.append(nucleic(molecule, chain, false));
+            let mut sticks = Mesh::default();
+            for &(ai, bi) in &molecule.bonds {
+                let (a, b) = (&molecule.atoms[ai], &molecule.atoms[bi]);
+                let (pa, pb) = (a.p.sub(molecule.center), b.p.sub(molecule.center));
+                let mid = pa.add(pb).mul(0.5);
+                // A cross-chain explicit bond is split so each half follows its chain toggle.
+                for (atom, p) in [(a, pa), (b, pb)] {
+                    if atom.chain != chain {
+                        continue;
+                    }
+                    let c = atom_color(molecule, atom);
+                    let residue = (atom.residue + 1) as f32;
+                    sticks.cylinder(p, mid, 0.135, c, residue);
+                    if detail[atom.residue] {
+                        cartoon.cylinder(p, mid, 0.16, c, residue);
+                        trace.cylinder(p, mid, 0.16, c, residue);
+                    }
+                }
+            }
+            let mut atoms = Vec::new();
+            let mut details = Vec::new();
+            for atom in molecule.atoms.iter().filter(|a| a.chain == chain) {
                 let p = atom.p.sub(molecule.center);
-                let c = atom_color(atom);
+                let c = atom_color(molecule, atom);
                 let radius = match atom.element.as_str() {
+                    "H" | "D" => 1.20,
                     "O" => 1.52,
                     "N" => 1.55,
                     "S" | "P" => 1.80,
+                    "CL" => 1.75,
+                    "F" => 1.47,
                     _ => 1.70,
                 };
-                [
+                let data = [
                     p.0,
                     p.1,
                     p.2,
@@ -446,26 +482,41 @@ pub(super) fn build(molecule: &Molecule) -> [Chain; 3] {
                     c.0,
                     c.1,
                     c.2,
-                    if chain == 'A' {
-                        atom.residue as f32
-                    } else {
-                        -1.
-                    },
-                ]
-            })
-            .collect();
-        Chain {
-            cartoon,
-            trace,
-            sticks,
-            atoms,
-        }
-    })
+                    (atom.residue + 1) as f32,
+                ];
+                atoms.push(data);
+                if detail[atom.residue] {
+                    details.push(data);
+                }
+            }
+            Chain {
+                cartoon,
+                trace,
+                sticks,
+                atoms,
+                details,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ligands_and_isolated_polymer_residues_stay_visible_without_gap_ribbons() {
+        let bytes=b"data_test\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_seq_id\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\nATOM 1 C CA ALA protein_long 1 0 0 0\nATOM 2 C CA ALA protein_long 3 3.8 0 0\nHETATM 3 C C1 X12 ligand . 10 0 0\nHETATM 4 N N1 X12 ligand . 11.4 0 0\nHETATM 5 O O HOH water . 15 0 0\nATOM 6 C CA GLY fourth 1 20 0 0\n";
+        let molecule = Molecule::parse(bytes, "cif", "mixed").unwrap();
+        let chains = build(&molecule);
+        assert_eq!(chains.len(), 4);
+        assert!(chains[0].cartoon.indices.is_empty());
+        assert_eq!(chains[0].details.len(), 2);
+        assert!(!chains[1].cartoon.indices.is_empty());
+        assert_eq!(chains[1].details.len(), 2);
+        assert_eq!(chains[2].details.len(), 1);
+        assert_eq!(chains[3].details.len(), 1);
+        assert!(chains[1].cartoon.vertices.iter().all(|v| v[9] == 3.));
+    }
     #[test]
     fn cas9_meshes_have_finite_unit_normals_and_valid_indices() {
         let molecule = Molecule::reference();

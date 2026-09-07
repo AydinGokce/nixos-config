@@ -1,4 +1,10 @@
-# Bio Workbench
+# Bio Workbench — retained Electron client
+
+The main application is now the [native Rust Bio Workbench](../bio-workbench-rust/README.md).
+This Electron source and package remain available for rollback. On this workstation,
+`bio-workbench` starts the native app and `bio-workbench-electron` starts the retained
+Electron release. Both use the same head service; use one editor at a time for a
+shared annotation. The instructions below describe the retained Electron client.
 
 A dedicated Electron desktop app for the Bio cloud cluster. Paste sequences,
 import several files, compose a protein/DNA/RNA/ligand assembly, preview model

@@ -4,6 +4,9 @@ use std::sync::Arc;
 mod geometry;
 #[path = "scene_gpu.rs"]
 mod gpu;
+#[path = "structure.rs"]
+mod structure;
+pub use structure::{Atom, Molecule, MoleculeKind, ResidueKey, Secondary};
 
 pub struct Renderer(Arc<egui::mutex::Mutex<gpu::Renderer>>);
 impl Renderer {
@@ -11,11 +14,14 @@ impl Renderer {
         gpu::Renderer::new(gl, molecule)
             .map(|renderer| Self(Arc::new(egui::mutex::Mutex::new(renderer))))
     }
+    pub fn error(&self) -> Option<String> {
+        self.0.lock().error.clone()
+    }
     pub fn destroy(&self, gl: &eframe::glow::Context) {
         self.0.lock().destroy(gl);
     }
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct V3(pub f32, pub f32, pub f32);
 impl V3 {
     fn add(self, b: Self) -> Self {
@@ -44,158 +50,6 @@ impl V3 {
         )
     }
 }
-pub struct Atom {
-    pub p: V3,
-    pub name: String,
-    pub element: String,
-    pub chain: char,
-    pub residue: usize,
-}
-pub struct Molecule {
-    pub atoms: Vec<Atom>,
-    pub ca: Vec<V3>,
-    pub ca_ids: Vec<usize>,
-    pub sequence: Vec<char>,
-    pub bonds: Vec<(usize, usize)>,
-    pub center: V3,
-    pub helices: Vec<(usize, usize)>,
-    pub sheets: Vec<(usize, usize)>,
-}
-pub fn chain_color(chain: char) -> Color32 {
-    match chain {
-        'B' => Color32::from_rgb(231, 163, 62),
-        'C' => Color32::from_rgb(199, 114, 207),
-        _ => Color32::from_rgb(89, 176, 162),
-    }
-}
-fn residue_letter(name: &str) -> char {
-    match name {
-        "ALA" => 'A',
-        "ARG" => 'R',
-        "ASN" => 'N',
-        "ASP" => 'D',
-        "CYS" => 'C',
-        "GLN" => 'Q',
-        "GLU" => 'E',
-        "GLY" => 'G',
-        "HIS" => 'H',
-        "ILE" => 'I',
-        "LEU" => 'L',
-        "LYS" => 'K',
-        "MET" => 'M',
-        "PHE" => 'F',
-        "PRO" => 'P',
-        "SER" => 'S',
-        "THR" => 'T',
-        "TRP" => 'W',
-        "TYR" => 'Y',
-        "VAL" => 'V',
-        _ => 'X',
-    }
-}
-impl Molecule {
-    pub fn reference() -> Self {
-        // Fixed experimental 4OO8 reference, first complex only (chains A/B/C).
-        // This is not a general PDB importer or validated chemical bond parser.
-        let source = include_str!("../fixtures/4oo8.pdb");
-        let mut atoms = Vec::new();
-        let mut ca = Vec::new();
-        let mut ca_ids = Vec::new();
-        let mut sequence = Vec::new();
-        let mut helices = Vec::new();
-        let mut sheets = Vec::new();
-        for line in source.lines() {
-            if line.starts_with("HELIX ")
-                && &line[19..20] == "A"
-                && let (Ok(a), Ok(b)) = (line[21..25].trim().parse(), line[33..37].trim().parse())
-            {
-                helices.push((a, b));
-            }
-            if line.starts_with("SHEET ")
-                && &line[21..22] == "A"
-                && let (Ok(a), Ok(b)) = (line[22..26].trim().parse(), line[33..37].trim().parse())
-            {
-                sheets.push((a, b));
-            }
-            if !line.starts_with("ATOM ") || line.len() < 78 {
-                continue;
-            }
-            let chain = line.as_bytes()[21] as char;
-            if !['A', 'B', 'C'].contains(&chain) {
-                continue;
-            }
-            if let (Ok(x), Ok(y), Ok(z), Ok(residue)) = (
-                line[30..38].trim().parse(),
-                line[38..46].trim().parse(),
-                line[46..54].trim().parse(),
-                line[22..26].trim().parse(),
-            ) {
-                let atom = Atom {
-                    p: V3(x, y, z),
-                    name: line[12..16].trim().into(),
-                    element: line[76..78].trim().into(),
-                    chain,
-                    residue,
-                };
-                if chain == 'A' && atom.name == "CA" {
-                    ca.push(atom.p);
-                    ca_ids.push(residue);
-                    sequence.push(residue_letter(line[17..20].trim()));
-                }
-                atoms.push(atom);
-            }
-        }
-        let center = atoms
-            .iter()
-            .fold(V3::default(), |s, a| s.add(a.p))
-            .mul(1. / atoms.len() as f32);
-        // A spatial grid bounds the one-time illustrative bond construction.
-        let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<usize>> =
-            std::collections::HashMap::new();
-        let mut bonds = Vec::new();
-        for (i, atom) in atoms.iter().enumerate() {
-            let cell = (
-                (atom.p.0 / 2.).floor() as i32,
-                (atom.p.1 / 2.).floor() as i32,
-                (atom.p.2 / 2.).floor() as i32,
-            );
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        if let Some(neighbors) = grid.get(&(cell.0 + dx, cell.1 + dy, cell.2 + dz))
-                        {
-                            for &j in neighbors {
-                                if atom.chain != atoms[j].chain {
-                                    continue;
-                                }
-                                let d = atom.p.sub(atoms[j].p).length();
-                                let limit = if atom.element == "S" || atoms[j].element == "S" {
-                                    1.95
-                                } else {
-                                    1.8
-                                };
-                                if d > 0.5 && d < limit {
-                                    bonds.push((j, i));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            grid.entry(cell).or_default().push(i);
-        }
-        Self {
-            atoms,
-            ca,
-            ca_ids,
-            sequence,
-            bonds,
-            center,
-            helices,
-            sheets,
-        }
-    }
-}
 #[derive(Clone, Copy, PartialEq)]
 pub enum Representation {
     Cartoon,
@@ -209,7 +63,7 @@ impl Representation {
             Self::Cartoon => "cartoon",
             Self::Sticks => "sticks",
             Self::Spheres => "spheres",
-            Self::Trace => "C-alpha trace",
+            Self::Trace => "backbone trace",
         }
     }
 }
@@ -221,6 +75,8 @@ pub struct Camera {
     pub pan: Vec2,
     pub ambient: bool,
     pub bloom: bool,
+    pub distance: f32,
+    pub span: f32,
 }
 impl Default for Camera {
     fn default() -> Self {
@@ -231,10 +87,19 @@ impl Default for Camera {
             pan: Vec2::ZERO,
             ambient: true,
             bloom: true,
+            distance: 210.,
+            span: 135.,
         }
     }
 }
 impl Camera {
+    pub fn fit(molecule: &Molecule) -> Self {
+        Self {
+            distance: (molecule.radius * 3.2).max(12.),
+            span: (molecule.radius * 2.3).max(8.),
+            ..Self::default()
+        }
+    }
     fn rotate(self, p: V3) -> V3 {
         let x = p.0 * self.yaw.cos() + p.2 * self.yaw.sin();
         let z = -p.0 * self.yaw.sin() + p.2 * self.yaw.cos();
@@ -246,8 +111,8 @@ impl Camera {
     }
     fn project(self, p: V3, rect: Rect, center: V3) -> (Pos2, f32) {
         let p = self.rotate(p.sub(center));
-        let scale = rect.width().min(rect.height()) / 135. * self.zoom;
-        let perspective = 210. / (210. - p.2);
+        let scale = rect.width().min(rect.height()) / self.span * self.zoom;
+        let perspective = self.distance / (self.distance - p.2);
         (
             rect.center() + self.pan + Vec2::new(p.0, -p.1) * scale * perspective,
             p.2,
@@ -263,11 +128,11 @@ pub fn viewport(
     camera: &mut Camera,
     representation: Representation,
     index: usize,
-    selected: &mut usize,
+    selected: &mut Option<ResidueKey>,
     visible: bool,
     labels: bool,
     axes: bool,
-    chains: [bool; 3],
+    chains: &[bool],
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         ui.available_size().max(Vec2::splat(20.)),
@@ -294,7 +159,7 @@ pub fn viewport(
         }
     }
     if response.double_clicked() {
-        *camera = Camera::default();
+        *camera = Camera::fit(molecule);
         changed = true;
     }
     response.context_menu(|ui| {
@@ -307,7 +172,7 @@ pub fn viewport(
             .changed();
         ui.small("GPU rasterization / presentation effects");
         if ui.button("Reset camera").clicked() {
-            *camera = Camera::default();
+            *camera = Camera::fit(molecule);
             changed = true;
             ui.close();
         }
@@ -316,7 +181,11 @@ pub fn viewport(
     if draw.is_positive() && visible {
         let gpu = renderer.0.clone();
         let camera = *camera;
-        let selected = *selected;
+        let selected = selected
+            .as_ref()
+            .and_then(|key| molecule.residues.iter().position(|r| &r.key == key))
+            .map_or(0, |index| index + 1);
+        let chains = chains.to_vec();
         let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
             gpu.lock().paint(
                 painter.gl(),
@@ -326,7 +195,7 @@ pub fn viewport(
                 representation,
                 index,
                 selected,
-                chains,
+                &chains,
             );
         });
         painter.add(egui::PaintCallback {
@@ -334,39 +203,40 @@ pub fn viewport(
             callback: Arc::new(callback),
         });
     }
-    if visible && chains[0] {
+    if visible && draw.is_positive() {
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let nearest = molecule
-                .ca
+                .residues
                 .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        i,
-                        camera
-                            .project(*p, draw, molecule.center)
-                            .0
-                            .distance(pointer),
-                    )
+                .filter(|r| chains.get(r.chain).copied().unwrap_or(false))
+                .map(|r| {
+                    let (point, depth) =
+                        camera.project(molecule.atoms[r.anchor].p, draw, molecule.center);
+                    (r, point.distance(pointer), depth)
                 })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((i, distance)) = nearest
-                && distance < 24.
-            {
-                *selected = molecule.ca_ids[i];
+                .filter(|(_, distance, _)| *distance < 18.)
+                .min_by(|a, b| {
+                    if (a.1 - b.1).abs() < 2. {
+                        b.2.total_cmp(&a.2)
+                    } else {
+                        a.1.total_cmp(&b.1)
+                    }
+                });
+            if let Some((residue, _, _)) = nearest {
+                *selected = Some(residue.key.clone());
             }
         }
-        if labels || *selected > 0 {
-            let residue = if *selected > 0 { *selected } else { 840 };
-            if let Some(point) = molecule
-                .ca_ids
-                .iter()
-                .position(|id| *id == residue)
-                .map(|i| camera.project(molecule.ca[i], draw, molecule.center).0)
-                && draw.contains(point)
-            {
+        if (labels || selected.is_some())
+            && let Some(key) = selected.as_ref()
+            && let Some(residue) = molecule.residue(key)
+            && chains.get(residue.chain).copied().unwrap_or(false)
+        {
+            let point = camera
+                .project(molecule.atoms[residue.anchor].p, draw, molecule.center)
+                .0;
+            if draw.contains(point) {
                 let note = point + Vec2::new(26., -28.);
                 painter.circle_stroke(point, 6., Stroke::new(1., Color32::from_rgb(245, 208, 84)));
                 painter.line_segment(
@@ -376,28 +246,40 @@ pub fn viewport(
                 painter.text(
                     note,
                     Align2::LEFT_BOTTOM,
-                    format!("A/{residue}  [selection]"),
+                    format!("{key}  [selection]"),
                     FontId::monospace(11.),
                     Color32::from_rgb(230, 218, 153),
                 );
             }
         }
     }
-    painter.text(
-        rect.min + Vec2::new(12., 11.),
-        Align2::LEFT_TOP,
+    let mut title = egui::text::LayoutJob::simple(
         format!(
-            "{}  4OO8 / {}",
-            if index == 0 { "A" } else { "B" },
+            "{}  {} / {}",
+            index + 1,
+            molecule.name,
             representation.name()
         ),
         FontId::monospace(12.),
+        Color32::from_gray(225),
+        (rect.width() - 92.).max(1.),
+    );
+    title.wrap.max_rows = 1;
+    title.wrap.break_anywhere = true;
+    painter.galley(
+        rect.min + Vec2::new(12., 11.),
+        painter.layout_job(title),
         Color32::from_gray(225),
     );
     painter.text(
         rect.min + Vec2::new(12., 28.),
         Align2::LEFT_TOP,
-        "REFERENCE FIXTURE  /  NOT A PREDICTION",
+        format!(
+            "{} / {} chains / {} residues",
+            molecule.format.to_ascii_uppercase(),
+            molecule.chains.len(),
+            molecule.residues.len()
+        ),
         FontId::monospace(9.),
         Color32::from_gray(120),
     );
@@ -411,7 +293,21 @@ pub fn viewport(
     painter.text(
         rect.left_bottom() + Vec2::new(12., -12.),
         Align2::LEFT_BOTTOM,
-        format!("Cas9 + sgRNA + DNA   /   {} atoms", molecule.atoms.len()),
+        format!(
+            "{} atoms   /   {}",
+            molecule.atoms.len(),
+            if representation == Representation::Cartoon {
+                if molecule.secondary_source.starts_with("File annotations") {
+                    "file annotations + backbone approximation"
+                } else {
+                    "backbone approximation (not DSSP)"
+                }
+            } else if molecule.warnings.is_empty() {
+                "source coordinates"
+            } else {
+                "see structure notes"
+            }
+        ),
         FontId::monospace(10.),
         Color32::from_gray(135),
     );

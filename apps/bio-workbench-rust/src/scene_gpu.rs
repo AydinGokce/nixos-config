@@ -20,6 +20,7 @@ struct Chain {
     trace: Mesh,
     sticks: Mesh,
     atoms: Atoms,
+    details: Atoms,
 }
 struct Target {
     fbo: glow::Framebuffer,
@@ -33,18 +34,103 @@ pub(super) struct Renderer {
     atom_program: glow::Program,
     post_program: glow::Program,
     empty_vao: glow::VertexArray,
-    chains: [Chain; 3],
-    targets: [Option<Target>; 2],
+    chains: Vec<Chain>,
+    target: Option<Target>,
+    pub(super) error: Option<String>,
     destroyed: bool,
+}
+
+// Creation guards free partial allocations when a driver rejects a resource.
+#[derive(Default)]
+struct Allocations {
+    vaos: Vec<glow::VertexArray>,
+    buffers: Vec<glow::Buffer>,
+    textures: Vec<glow::Texture>,
+    fbos: Vec<glow::Framebuffer>,
+    renderbuffers: Vec<glow::Renderbuffer>,
+    programs: Vec<glow::Program>,
+}
+struct Pending<'a> {
+    gl: &'a glow::Context,
+    resources: Allocations,
+    committed: bool,
+}
+impl<'a> Pending<'a> {
+    fn new(gl: &'a glow::Context) -> Self {
+        Self {
+            gl,
+            resources: Allocations::default(),
+            committed: false,
+        }
+    }
+    fn vao(&mut self) -> Result<glow::VertexArray, String> {
+        let value = unsafe { self.gl.create_vertex_array()? };
+        self.resources.vaos.push(value);
+        Ok(value)
+    }
+    fn buffer(&mut self) -> Result<glow::Buffer, String> {
+        let value = unsafe { self.gl.create_buffer()? };
+        self.resources.buffers.push(value);
+        Ok(value)
+    }
+    fn texture(&mut self) -> Result<glow::Texture, String> {
+        let value = unsafe { self.gl.create_texture()? };
+        self.resources.textures.push(value);
+        Ok(value)
+    }
+    fn fbo(&mut self) -> Result<glow::Framebuffer, String> {
+        let value = unsafe { self.gl.create_framebuffer()? };
+        self.resources.fbos.push(value);
+        Ok(value)
+    }
+    fn renderbuffer(&mut self) -> Result<glow::Renderbuffer, String> {
+        let value = unsafe { self.gl.create_renderbuffer()? };
+        self.resources.renderbuffers.push(value);
+        Ok(value)
+    }
+    fn keep_program(&mut self, value: glow::Program) -> glow::Program {
+        self.resources.programs.push(value);
+        value
+    }
+}
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            unsafe {
+                for &value in &self.resources.vaos {
+                    self.gl.delete_vertex_array(value);
+                }
+                for &value in &self.resources.buffers {
+                    self.gl.delete_buffer(value);
+                }
+                for &value in &self.resources.textures {
+                    self.gl.delete_texture(value);
+                }
+                for &value in &self.resources.fbos {
+                    self.gl.delete_framebuffer(value);
+                }
+                for &value in &self.resources.renderbuffers {
+                    self.gl.delete_renderbuffer(value);
+                }
+                for &value in &self.resources.programs {
+                    self.gl.delete_program(value);
+                }
+            }
+        }
+    }
 }
 
 // All GL calls run on eframe's current GL context, including cleanup in on_exit.
 impl Mesh {
-    fn new(gl: &glow::Context, mesh: &geometry::Mesh) -> Result<Self, String> {
+    fn new(
+        gl: &glow::Context,
+        mesh: &geometry::Mesh,
+        pending: &mut Pending<'_>,
+    ) -> Result<Self, String> {
         unsafe {
-            let vao = gl.create_vertex_array()?;
-            let vertices = gl.create_buffer()?;
-            let indices = gl.create_buffer()?;
+            let vao = pending.vao()?;
+            let vertices = pending.buffer()?;
+            let indices = pending.buffer()?;
             gl.bind_vertex_array(Some(vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
             gl.buffer_data_u8_slice(
@@ -86,10 +172,14 @@ impl Mesh {
     }
 }
 impl Atoms {
-    fn new(gl: &glow::Context, data: &[[f32; 8]]) -> Result<Self, String> {
+    fn new(
+        gl: &glow::Context,
+        data: &[[f32; 8]],
+        pending: &mut Pending<'_>,
+    ) -> Result<Self, String> {
         unsafe {
-            let vao = gl.create_vertex_array()?;
-            let instances = gl.create_buffer()?;
+            let vao = pending.vao()?;
+            let instances = pending.buffer()?;
             gl.bind_vertex_array(Some(vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(instances));
             gl.buffer_data_u8_slice(
@@ -125,11 +215,12 @@ impl Atoms {
 }
 impl Target {
     fn new(gl: &glow::Context, size: [i32; 2]) -> Result<Self, String> {
+        let mut pending = Pending::new(gl);
         unsafe {
-            let fbo = gl.create_framebuffer()?;
+            let fbo = pending.fbo()?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            let color = gl.create_texture()?;
-            let normal_depth = gl.create_texture()?;
+            let color = pending.texture()?;
+            let normal_depth = pending.texture()?;
             for (texture, attachment, filter) in [
                 (color, glow::COLOR_ATTACHMENT0, glow::LINEAR),
                 (normal_depth, glow::COLOR_ATTACHMENT1, glow::NEAREST),
@@ -166,7 +257,7 @@ impl Target {
                     0,
                 );
             }
-            let depth = gl.create_renderbuffer()?;
+            let depth = pending.renderbuffer()?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
             gl.renderbuffer_storage(
                 glow::RENDERBUFFER,
@@ -189,12 +280,12 @@ impl Target {
                 size,
             };
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
-                result.destroy(gl);
                 return Err(
                     "OpenGL does not support the molecular renderer's HDR/depth framebuffer".into(),
                 );
             }
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            pending.committed = true;
             Ok(result)
         }
     }
@@ -256,13 +347,15 @@ fn program(
 impl Renderer {
     pub(super) fn new(gl: &glow::Context, molecule: &Molecule) -> Result<Self, String> {
         let geometry = geometry::build(molecule);
+        let mut pending = Pending::new(gl);
         let mut chains = Vec::new();
         for chain in &geometry {
             chains.push(Chain {
-                cartoon: Mesh::new(gl, &chain.cartoon)?,
-                trace: Mesh::new(gl, &chain.trace)?,
-                sticks: Mesh::new(gl, &chain.sticks)?,
-                atoms: Atoms::new(gl, &chain.atoms)?,
+                cartoon: Mesh::new(gl, &chain.cartoon, &mut pending)?,
+                trace: Mesh::new(gl, &chain.trace, &mut pending)?,
+                sticks: Mesh::new(gl, &chain.sticks, &mut pending)?,
+                atoms: Atoms::new(gl, &chain.atoms, &mut pending)?,
+                details: Atoms::new(gl, &chain.details, &mut pending)?,
             });
         }
         let mesh_program = program(
@@ -271,20 +364,26 @@ impl Renderer {
             &format!("{SURFACE}\n{MESH_FRAGMENT}"),
             &["a_position", "a_normal", "a_color", "a_residue"],
         )?;
+        pending.keep_program(mesh_program);
         let atom_program = program(
             gl,
             &format!("{CAMERA}\n{ATOM_VERTEX}"),
             &format!("{CAMERA}\n{SURFACE}\n{ATOM_FRAGMENT}"),
             &["a_center_radius", "a_color_residue"],
         )?;
+        pending.keep_program(atom_program);
         let post_program = program(gl, POST_VERTEX, POST_FRAGMENT, &[])?;
+        pending.keep_program(post_program);
+        let empty_vao = pending.vao()?;
+        pending.committed = true;
         Ok(Self {
             mesh_program,
             atom_program,
             post_program,
-            empty_vao: unsafe { gl.create_vertex_array()? },
-            chains: chains.try_into().ok().expect("three chains"),
-            targets: [None, None],
+            empty_vao,
+            chains,
+            target: None,
+            error: None,
             destroyed: false,
         })
     }
@@ -297,8 +396,9 @@ impl Renderer {
             chain.trace.destroy(gl);
             chain.sticks.destroy(gl);
             chain.atoms.destroy(gl);
+            chain.details.destroy(gl);
         }
-        for target in self.targets.iter().flatten() {
+        if let Some(target) = &self.target {
             target.destroy(gl);
         }
         unsafe {
@@ -317,11 +417,11 @@ impl Renderer {
         destination: Option<glow::Framebuffer>,
         camera: Camera,
         representation: Representation,
-        index: usize,
+        _index: usize,
         selected: usize,
-        chains: [bool; 3],
+        chains: &[bool],
     ) {
-        if self.destroyed {
+        if self.destroyed || self.error.is_some() {
             return;
         }
         let viewport = info.viewport_in_pixels();
@@ -335,22 +435,31 @@ impl Renderer {
             (viewport.width_px as f32 * scale).max(1.) as i32,
             (viewport.height_px as f32 * scale).max(1.) as i32,
         ];
-        if self.targets[index]
+        if self
+            .target
             .as_ref()
             .is_none_or(|target| target.size != size)
         {
-            if let Some(old) = self.targets[index].take() {
+            if let Some(old) = self.target.take() {
                 old.destroy(gl);
             }
-            self.targets[index] =
-                Some(Target::new(gl, size).expect("Cannot allocate molecular render target"));
+            match Target::new(gl, size) {
+                Ok(target) => self.target = Some(target),
+                Err(error) => {
+                    unsafe {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, destination);
+                    }
+                    self.error = Some(error);
+                    return;
+                }
+            }
         }
-        let target = self.targets[index].as_ref().expect("render target");
+        let target = self.target.as_ref().expect("render target");
         let rect = info.viewport;
-        let units = rect.width().min(rect.height()) / 135. * camera.zoom;
+        let units = rect.width().min(rect.height()) / camera.span * camera.zoom;
         let projection = [
-            420. * units / rect.width(),
-            420. * units / rect.height(),
+            2. * camera.distance * units / rect.width(),
+            2. * camera.distance * units / rect.height(),
             2. * camera.pan.x / rect.width(),
             -2. * camera.pan.y / rect.height(),
         ];
@@ -388,12 +497,27 @@ impl Renderer {
                     &projection,
                 );
                 gl.uniform_1_f32(
+                    gl.get_uniform_location(program, "u_distance").as_ref(),
+                    camera.distance,
+                );
+                gl.uniform_1_f32(
+                    gl.get_uniform_location(program, "u_atmosphere").as_ref(),
+                    camera.distance,
+                );
+                let near = (camera.distance * 0.005).max(0.02);
+                let far = camera.distance * 10.;
+                gl.uniform_2_f32(
+                    gl.get_uniform_location(program, "u_clip").as_ref(),
+                    (far + near) / (far - near),
+                    -2. * far * near / (far - near),
+                );
+                gl.uniform_1_f32(
                     gl.get_uniform_location(program, "u_selected").as_ref(),
                     selected as f32,
                 );
             }
             gl.use_program(Some(self.mesh_program));
-            for (chain, visible) in self.chains.iter().zip(chains) {
+            for (chain, visible) in self.chains.iter().zip(chains.iter().copied()) {
                 if !visible {
                     continue;
                 }
@@ -404,23 +528,21 @@ impl Renderer {
                     Representation::Spheres => {}
                 }
             }
-            if matches!(
-                representation,
-                Representation::Spheres | Representation::Sticks
-            ) {
-                gl.use_program(Some(self.atom_program));
-                gl.uniform_1_f32(
-                    gl.get_uniform_location(self.atom_program, "u_radius_scale")
-                        .as_ref(),
-                    if representation == Representation::Spheres {
-                        1.
-                    } else {
-                        0.14
-                    },
-                );
-                for (chain, visible) in self.chains.iter().zip(chains) {
-                    if visible {
-                        chain.atoms.draw(gl);
+            gl.use_program(Some(self.atom_program));
+            gl.uniform_1_f32(
+                gl.get_uniform_location(self.atom_program, "u_radius_scale")
+                    .as_ref(),
+                match representation {
+                    Representation::Spheres => 1.,
+                    Representation::Sticks => 0.14,
+                    _ => 0.24,
+                },
+            );
+            for (chain, visible) in self.chains.iter().zip(chains.iter().copied()) {
+                if visible {
+                    match representation {
+                        Representation::Spheres | Representation::Sticks => chain.atoms.draw(gl),
+                        _ => chain.details.draw(gl),
                     }
                 }
             }
@@ -444,6 +566,11 @@ impl Renderer {
             gl.disable(glow::DEPTH_TEST);
             gl.depth_mask(false);
             gl.use_program(Some(self.post_program));
+            gl.uniform_1_f32(
+                gl.get_uniform_location(self.post_program, "u_distance")
+                    .as_ref(),
+                camera.distance,
+            );
             gl.bind_vertex_array(Some(self.empty_vao));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(target.color));
@@ -494,22 +621,25 @@ impl Renderer {
 const CAMERA: &str = r#"
 uniform mat3 u_rotation;
 uniform vec4 u_projection;
+uniform float u_distance;
+uniform vec2 u_clip;
 vec4 project(vec3 p) {
     float w=-p.z;
-    return vec4(p.xy*u_projection.xy+u_projection.zw*w,1.01005025*w-10.050251,w);
+    return vec4(p.xy*u_projection.xy+u_projection.zw*w,u_clip.x*w+u_clip.y,w);
 }
 "#;
 const MESH_VERTEX: &str = r#"
 in vec3 a_position; in vec3 a_normal; in vec3 a_color; in float a_residue;
 out vec3 v_position; out vec3 v_normal; out vec3 v_color; out float v_residue;
 void main() {
-    v_position=u_rotation*a_position-vec3(0.,0.,210.);
+    v_position=u_rotation*a_position-vec3(0.,0.,u_distance);
     v_normal=u_rotation*a_normal;v_color=a_color;v_residue=a_residue;
     gl_Position=project(v_position);
 }
 "#;
 const SURFACE: &str = r#"
 uniform float u_selected;
+uniform float u_atmosphere;
 OUT0 out vec4 out_color;
 OUT1 out vec4 out_normal;
 void surface(vec3 p,vec3 normal,vec3 color,float residue) {
@@ -524,11 +654,11 @@ void surface(vec3 p,vec3 normal,vec3 color,float residue) {
     float fresnel=pow(1.-max(dot(n,view),0.),3.);
     vec3 lit=color*diffuse+vec3(1.,0.97,0.92)*specular;
     lit+=vec3(0.13,0.26,0.32)*max(dot(n,rim),0.)*fresnel;
-    float selected=1.-smoothstep(0.25,1.0,abs(residue-u_selected));
+    float selected=step(0.5,u_selected)*(1.-smoothstep(0.25,0.75,abs(residue-u_selected)));
     lit=mix(lit,lit*0.45+vec3(0.68,0.47,0.13),selected*0.55);
     // Mild atmospheric attenuation makes the interior less visually crowded.
-    lit*=mix(1.06,0.74,smoothstep(160.,265.,-p.z));
-    out_color=vec4(lit,1.);out_normal=vec4(n,-p.z);
+    lit*=mix(1.06,0.74,smoothstep(0.76*u_atmosphere,1.26*u_atmosphere,-p.z));
+    out_color=vec4(lit,1.);out_normal=vec4(n,-p.z/u_atmosphere);
 }
 "#;
 const MESH_FRAGMENT: &str = r#"
@@ -542,7 +672,7 @@ out vec3 v_plane;
 flat out vec3 v_center;flat out float v_radius;flat out vec4 v_color_residue;
 const vec2 corners[6]=vec2[6](vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,-1.),vec2(1.,1.),vec2(-1.,1.));
 void main() {
-    v_center=u_rotation*a_center_radius.xyz-vec3(0.,0.,210.);
+    v_center=u_rotation*a_center_radius.xyz-vec3(0.,0.,u_distance);
     v_radius=a_center_radius.w*u_radius_scale;v_color_residue=a_color_residue;
     v_plane=v_center+vec3(corners[gl_VertexID]*v_radius*1.12,0.);
     gl_Position=project(v_plane);
@@ -573,13 +703,13 @@ const POST_FRAGMENT: &str = r#"
 in vec2 uv;OUT0 out vec4 out_color;
 uniform sampler2D u_color;uniform sampler2D u_normal;
 uniform vec2 u_size;uniform vec4 u_projection;
-uniform float u_ambient;uniform float u_bloom;
+uniform float u_ambient;uniform float u_bloom;uniform float u_distance;
 vec3 position(vec2 at,float depth) {return vec3(((at*2.-1.)-u_projection.zw)*depth/u_projection.xy,-depth);}
 vec3 filmic(vec3 x) {return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.,1.);}
 void main() {
     vec2 pixel=1./u_size;
     vec4 c=(texture(u_color,uv+pixel*vec2(-0.25,-0.25))+texture(u_color,uv+pixel*vec2(0.25,-0.25))+texture(u_color,uv+pixel*vec2(-0.25,0.25))+texture(u_color,uv+pixel*vec2(0.25,0.25)))*0.25;
-    vec4 nd=texture(u_normal,uv);
+    vec4 nd=texture(u_normal,uv);nd.w*=u_distance;
     float occlusion=0.;
     if(nd.w>0. && u_ambient>0.) {
         vec3 p=position(uv,nd.w);
@@ -587,7 +717,7 @@ void main() {
         for(int i=0;i<16;i++) {
             float fi=float(i);float angle=fi*2.39996323;
             vec2 at=uv+vec2(cos(angle),sin(angle))*radius*sqrt((fi+0.5)/16.);
-            float d=texture(u_normal,at).w;
+            float d=texture(u_normal,at).w*u_distance;
             if(d>0.) {
                 vec3 delta=position(at,d)-p;float len=length(delta);
                 float horizon=max(dot(nd.xyz,delta/max(len,0.001))-0.13,0.);

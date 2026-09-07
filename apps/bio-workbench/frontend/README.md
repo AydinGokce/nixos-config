@@ -1,4 +1,4 @@
-This directory contains the React/TypeScript renderer for the **Bio Workbench
+This directory retains the React/TypeScript renderer for the **legacy Bio Workbench
 Electron desktop app**. The native launcher and Nix packages are described in
 [the app README](../README.md). The renderer is not offered as an external
 browser interface.

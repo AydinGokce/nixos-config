@@ -1,5 +1,4 @@
-//! Explicit, local PyMOL interop for the embedded experimental reference.
-//! No draft text, commands from the console, or cloud data enter this process.
+//! Explicit local PyMOL interop using immutable result bytes and fixed commands.
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -7,28 +6,22 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PDB: &[u8] = include_bytes!("../fixtures/4oo8.pdb");
-const READY: &str = "BIO_WORKBENCH_PYMOL_REFERENCE_READY";
-const SCRIPT: &str = r#"load reference.pdb, experimental_4oo8
-remove not (experimental_4oo8 and polymer and chain A+B+C)
-create Cas9_protein, experimental_4oo8 and chain A
-create guide_RNA, experimental_4oo8 and chain B
-create target_DNA, experimental_4oo8 and chain C
-delete experimental_4oo8
-hide everything, all
-show cartoon, all
-show sticks, guide_RNA or target_DNA
+const READY: &str = "BIO_WORKBENCH_PYMOL_STRUCTURE_READY";
+const SCRIPT: &str = r#"hide everything, all
+show cartoon, polymer
+show sticks, polymer.nucleic or organic
+show spheres, inorganic
 set_color bio_protein, [0.34902, 0.69020, 0.63529]
 set_color bio_RNA, [0.90588, 0.63922, 0.24314]
 set_color bio_DNA, [0.78039, 0.44706, 0.81176]
-color bio_protein, Cas9_protein
-color bio_RNA, guide_RNA
-color bio_DNA, target_DNA
+color bio_protein, polymer.protein
+color bio_RNA, polymer.nucleic
+color bio_DNA, polymer.nucleic and resn DA+DC+DG+DT+DI+DU
 bg_color black
 orient all
 zoom all, 3
 deselect
-print("BIO_WORKBENCH_PYMOL_REFERENCE_READY")
+print("BIO_WORKBENCH_PYMOL_STRUCTURE_READY")
 "#;
 
 struct Update {
@@ -50,7 +43,8 @@ impl Default for Launcher {
         Self {
             updates: None,
             status: "PyMOL: not opened",
-            detail: "Open experimental 4OO8 chains A/B/C in a separate local PyMOL window.".into(),
+            detail: "Open the selected coordinate artifact in a separate local PyMOL window."
+                .into(),
             failed: false,
         }
     }
@@ -61,20 +55,31 @@ impl Launcher {
         self.updates.is_some()
     }
 
-    pub fn launch(&mut self) {
+    pub fn launch_structure(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        format: &str,
+    ) -> Result<(), String> {
         if self.active() {
-            return;
+            return Err("The launched PyMOL process is still open; close it before opening another artifact.".into());
+        }
+        let extension = extension(format)?;
+        if bytes.is_empty() || bytes.len() > 32 * 1024 * 1024 {
+            return Err("PyMOL requires a coordinate artifact of 1 byte to 32 MiB.".into());
         }
         self.status = "PyMOL: starting";
-        self.detail = "Starting a separate local PyMOL process for experimental 4OO8.".into();
+        self.detail = format!("Starting a separate local PyMOL process for {name}.");
         self.failed = false;
         let (send, receive) = mpsc::channel();
         self.updates = Some(receive);
         let program = std::env::var_os("BIO_WORKBENCH_PYMOL")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("pymol"));
+        let bytes = bytes.to_vec();
+        let name = name.to_owned();
         std::thread::spawn(move || {
-            if let Err(error) = run(&program, &cache_root(), &send) {
+            if let Err(error) = run(&program, &cache_root(), &name, &bytes, extension, &send) {
                 let _ = send.send(Update {
                     status: "PyMOL: failed",
                     detail: error,
@@ -83,6 +88,7 @@ impl Launcher {
                 });
             }
         });
+        Ok(())
     }
 
     pub fn poll(&mut self) -> Vec<String> {
@@ -127,13 +133,20 @@ fn cache_root() -> PathBuf {
     std::env::temp_dir().join("bio-workbench-rust-pymol")
 }
 
-fn prepare(root: &Path) -> Result<PathBuf, String> {
+fn extension(format: &str) -> Result<&'static str, String> {
+    match format.to_ascii_lowercase().as_str() {
+        "pdb" => Ok("pdb"),
+        "cif" | "mmcif" => Ok("cif"),
+        _ => Err("PyMOL supports the selected PDB/mmCIF coordinate artifacts.".into()),
+    }
+}
+fn prepare(root: &Path, bytes: &[u8], extension: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(root).map_err(|error| format!("PyMOL cache unavailable: {error}"))?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let directory = root.join(format!("4oo8-{}-{stamp}", std::process::id()));
+    let directory = root.join(format!("structure-{}-{stamp}", std::process::id()));
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -142,21 +155,45 @@ fn prepare(root: &Path) -> Result<PathBuf, String> {
     }
     builder
         .create(&directory)
-        .map_err(|error| format!("Cannot create PyMOL reference directory: {error}"))?;
-    fs::write(directory.join("reference.pdb"), PDB)
-        .and_then(|()| fs::write(directory.join("reference.pml"), SCRIPT))
-        .map_err(|error| format!("Cannot write PyMOL reference: {error}"))?;
+        .map_err(|error| format!("Cannot create PyMOL artifact directory: {error}"))?;
+    // Only one of two fixed filenames can enter PML; names and user paths never do.
+    let filename = match extension {
+        "pdb" => "structure.pdb",
+        "cif" => "structure.cif",
+        _ => return Err("Unsupported coordinate format".into()),
+    };
+    let path = directory.join(filename);
+    fs::write(&path, bytes)
+        .and_then(|()| {
+            fs::write(
+                directory.join("structure.pml"),
+                format!("load {filename}, selected_structure\n{SCRIPT}"),
+            )
+        })
+        .map_err(|error| format!("Cannot write PyMOL artifact: {error}"))?;
+    let mut permissions = fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
     Ok(directory)
 }
 
-fn run(program: &OsString, root: &Path, send: &Sender<Update>) -> Result<(), String> {
-    let directory = prepare(root)?;
+fn run(
+    program: &OsString,
+    root: &Path,
+    name: &str,
+    bytes: &[u8],
+    extension: &str,
+    send: &Sender<Update>,
+) -> Result<(), String> {
+    let directory = prepare(root, bytes, extension)?;
     let log_path = directory.join("pymol.log");
     let log = File::create(&log_path).map_err(|error| error.to_string())?;
     // Fixed relative filenames keep user paths out of PyMOL command syntax.
     // -k ignores startup scripts/plugins; -y reports command failures as exits.
     let mut child = Command::new(program)
-        .args(["-k", "-q", "-y", "reference.pml"])
+        .args(["-k", "-q", "-y", "structure.pml"])
         .current_dir(&directory)
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
@@ -169,9 +206,9 @@ fn run(program: &OsString, root: &Path, send: &Sender<Update>) -> Result<(), Str
             )
         })?;
     let _ = send.send(Update {
-        status: "PyMOL: loading reference",
+        status: "PyMOL: loading artifact",
         detail: format!(
-            "PyMOL process {} started; loading experimental 4OO8. Log: {}",
+            "PyMOL process {} started; loading {name}. Log: {}",
             child.id(),
             log_path.display()
         ),
@@ -189,8 +226,8 @@ fn run(program: &OsString, root: &Path, send: &Sender<Update>) -> Result<(), Str
         {
             ready = true;
             let _ = send.send(Update {
-                status: "PyMOL: reference ready",
-                detail: "PyMOL loaded experimental 4OO8: Cas9 cartoon (teal), guide RNA (amber), target DNA (violet). This is the reference, not the edited draft or a prediction.".into(),
+                status: "PyMOL: structure ready",
+                detail: format!("PyMOL loaded {name} from its exact coordinate bytes. Protein cartoon, nucleic acids and ligands are visible. Snapshot: {}",directory.display()),
                 failed: false,
                 done: false,
             });
@@ -200,17 +237,18 @@ fn run(program: &OsString, root: &Path, send: &Sender<Update>) -> Result<(), Str
                 return Err(format!(
                     "PyMOL exited ({status}) {}. Inspect {}",
                     if ready {
-                        "after loading the reference"
+                        "after loading the artifact"
                     } else {
-                        "before confirming reference load"
+                        "before confirming artifact load"
                     },
                     log_path.display()
                 ));
             }
             let _ = send.send(Update {
                 status: "PyMOL: closed",
-                detail: "The launched PyMOL process has closed. You can open the reference again."
-                    .into(),
+                detail:
+                    "The launched PyMOL process has closed. You can open another selected artifact."
+                        .into(),
                 failed: false,
                 done: true,
             });
@@ -223,7 +261,6 @@ fn run(program: &OsString, root: &Path, send: &Sender<Update>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn missing_executable_is_an_error_without_success_event() {
         let root = std::env::temp_dir().join(format!("bio-pymol-missing-{}", std::process::id()));
@@ -231,6 +268,9 @@ mod tests {
         let error = run(
             &root.join("no-such-executable").into_os_string(),
             &root,
+            "named artifact",
+            b"data_actual\n",
+            "cif",
             &send,
         )
         .expect_err("an absent PyMOL cannot start");
@@ -238,28 +278,28 @@ mod tests {
         assert!(receive.try_recv().is_err());
         fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
-    fn separate_launches_preserve_existing_files_and_fixed_reference() {
+    fn snapshots_preserve_exact_selected_bytes_and_cannot_inject_commands() {
         let root = std::env::temp_dir().join(format!(
             "bio-pymol-fixture-{} spaces ; $literal",
             std::process::id()
         ));
-        let first = prepare(&root).unwrap();
-        fs::write(first.join("user-note.txt"), "keep this note").unwrap();
-        let second = prepare(&root).unwrap();
+        let bytes = b"data_actual\n# original payload remains unchanged\n";
+        let first = prepare(&root, bytes, "cif").unwrap();
+        fs::write(first.join("user-note.txt"), "keep").unwrap();
+        let second = prepare(&root, b"END\n", "pdb").unwrap();
         assert_ne!(first, second);
-        assert_eq!(fs::read(first.join("reference.pdb")).unwrap(), PDB);
-        assert_eq!(fs::read(second.join("reference.pdb")).unwrap(), PDB);
+        assert_eq!(fs::read(first.join("structure.cif")).unwrap(), bytes);
+        assert_eq!(fs::read(second.join("structure.pdb")).unwrap(), b"END\n");
         assert_eq!(
             fs::read_to_string(first.join("user-note.txt")).unwrap(),
-            "keep this note"
+            "keep"
         );
-        assert!(
-            !fs::read_to_string(second.join("reference.pml"))
-                .unwrap()
-                .contains("$literal")
-        );
+        let script = fs::read_to_string(first.join("structure.pml")).unwrap();
+        assert!(script.starts_with("load structure.cif, selected_structure\n"));
+        assert!(!script.contains("$literal"));
+        assert!(!script.contains("remove"));
+        assert!(extension("cif; quit").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

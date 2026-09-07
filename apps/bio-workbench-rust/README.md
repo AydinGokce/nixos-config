@@ -1,151 +1,169 @@
-# Bio Workbench — native Rust design prototype
+# Bio Workbench — native desktop
 
-This is an **offline design prototype for feedback**, implemented in Rust with
-native egui/eframe and OpenGL. It is a separate application from the working
-Electron client. It does not connect to the head, call an API, rent compute,
-import files, or submit predictions. The **Launch in PyMOL** button opens the
-embedded experimental reference in a separate local PyMOL application.
+Bio Workbench is a Rust desktop client for the existing cloud head. It replaces
+Electron as the main `bio-workbench` application while retaining the compact
+gray controls, black molecular viewports, object inspector, and console. The
+interface uses egui/eframe and native OpenGL; it has no browser or JavaScript
+runtime.
 
-The design uses a compact gray menu and toolbar, black molecular viewports,
-a right-side object tree and inspector, a submission draft/model panel, and a
-bottom command console. Panels resize. The emphasis is on dense technical
-controls and keeping structure manipulation visible alongside inputs.
-
-## Run
-
-From this directory on NixOS, Linux, macOS, or WSL with WSLg:
+## Run and connect
 
 ```sh
 nix run path:.
-```
-
-Or from anywhere:
-
-```sh
-nix run path:/home/aydin/nixos-config/apps/bio-workbench-rust
-```
-
-Build without launching:
-
-```sh
+# Or build once:
 nix build path:.
-./result/bin/bio-workbench-rust
+./result/bin/bio-workbench
 ```
 
-The standalone flake pins Nixpkgs and supports x86_64/aarch64 Linux and Darwin.
-Linux uses X11 or Wayland. macOS and WSLg require runtime verification on those
-hosts; Linux is the initial development target. Native Windows packaging is
-not included in this prototype. No modifications to the repository's root
-flake or the existing Electron application are needed.
+The standalone flake supports x86_64/aarch64 Linux and Darwin. NixOS/Linux native
+windows have been exercised; macOS code has been cross-checked, but macOS and
+WSLg still require runtime qualification on those systems. WSL needs WSLg or an
+X server. A separate native Windows installer is not provided. An OpenGL context
+with floating-point render targets is required; Mesa software rendering works,
+with lower performance than a graphics card.
 
-## Open the reference in PyMOL
+Open **Connection…** to set the SSH host, user, port, and optional key path.
+An empty key path uses the local SSH agent. The default profile follows the
+existing head configuration and uses `~/.ssh/datacrunch_ed25519` when present.
+Verify a new head's SSH host key through ordinary SSH first; unknown or changed
+keys are not silently accepted. The Nix package supplies OpenSSH and Linux file
+dialog/runtime dependencies. No API key is required for the desktop itself.
 
-Click **Launch in PyMOL** on the toolbar. It opens PDB 4OO8 chains A/B/C as
-separate objects: Cas9 in teal cartoon, guide RNA in amber, and target DNA in
-violet. The loaded coordinates are the experimental reference currently shown
-in the prototype; draft edits and illustrative prediction rows are not exported.
+The desktop invokes the existing SSH JSONL Workbench RPC. It does not add a web
+listener or a new cloud service. Existing head authorization, model adapters,
+worker scheduling, and accounting continue to apply.
 
-The Linux Nix package includes its pinned PyMOL executable. Cargo launches and
-other platforms look for `pymol` on PATH; set `BIO_WORKBENCH_PYMOL` to an executable
-path to select another installation. The value is one executable path, without
-extra command-line arguments. A missing application or startup failure appears
-in the status bar and console. macOS and WSLg launches still require verification
-on those hosts.
+## Submit and follow work
 
-The Rust launcher writes the embedded PDB, a fixed PML view script, and a process
-log into a unique local cache directory, then starts PyMOL directly without a
-shell. The cache uses XDG_CACHE_HOME when set, otherwise the platform user cache
-directory. Startup scripts and plugins are disabled for this reference launch.
-The status changes to ready only when PyMOL executes the final script marker.
-Closing the prototype leaves the separate PyMOL application open. Neither the
-button nor the local console can submit cloud work.
+1. Paste a sequence, FASTA, ligand/assembly description, or other supported input
+   format. **The active editor is included in Preview even before clicking Add
+   input.** Add input moves it into the list for composing larger batches. Paste
+   and library-reference editors retain separate drafts.
+2. Use **Files…**, drag files into the window, or browse the head construct
+   library. Multiple files are supported. Original file bytes are uploaded as
+   immutable inputs before validation. Library references are pinned to revisions
+   by the head. For `library-json` inputs, **Attach SDF…** supplies referenced
+   ligand files; EVOLVEpro settings include a CSV label upload.
+3. Select independent inputs or an assembly, then choose modalities and unique
+   assembly chain IDs. Select models and settings from the live head catalog.
+   Unchecked settings retain native defaults. The catalog includes folding,
+   sequence analysis, variant ranking, sequence design, and backbone design;
+   parked models remain visibly unavailable.
+4. Choose the public/private MSA backend and execution preference, then **Check
+   compatibility (CPU)**. This calls native input validation without inference.
+   Every input/model pair appears with its result and rejection reason. Select
+   the compatible pairs explicitly, then submit the reviewed selection.
+5. **Runs / results** follows real batch/job states, observed progress messages,
+   queue information when supplied by the head, and native logs. It supports
+   explicit job/batch cancellation and history navigation. Closing the desktop
+   does not cancel work on the head.
 
-## Try the design
+Preview and submission payloads are persisted before transmission. **Saved
+request receipts** and **Recover exact submission** recover the original
+operation and request key after a lost reply or restart. Recovery does not
+create another inference request. A changed input/settings draft requires a new
+compatibility preview. No prediction is automatically submitted on startup.
 
-- Rotate the sample with a left drag, pan with a right drag or Shift+drag,
-  zoom with the wheel, and reset with a double click. Right-click a viewport
-  to toggle contact shading or soft highlight glow.
-- Toggle linked cameras and single/comparison layout. Linking cameras does
-  not calculate alignment.
-- Choose cartoon, sticks, spheres, or a C-alpha trace from the Display menu,
-  toolbar, or object `S` menu. `A` contains local view actions, `H` toggles
-  visibility, and `L` toggles a selection label. `C` explains the chain palette.
-  Separate chain checkboxes control Cas9, sgRNA, and target DNA.
-- Pick a residue in the sequence strip or near its C-alpha coordinate in a
-  viewport; the local inspector and selection note show the choice.
-- Edit the draft, modality, model checkboxes, MSA option, and note text to try
-  the control layout. These edits are not saved and do not alter the structure.
-- Open the Run queue tab to see explicitly labeled illustrative rows.
-- The console accepts only built-in view commands: `help`, `reset`, `cartoon`,
-  `sticks`, `spheres`, `trace`, and `select N` (an actually modeled Cas9 residue ID). It is not a shell.
+A file upload whose initial receipt was lost cannot safely reuse an unknown
+upload ID; the client retains the uncertain operation and explains when a new
+explicit upload is required. Requests from a different head/user/port cannot be
+replayed against the current connection.
 
-Cloud submission, compatibility checking, file/library import, measurement,
-alignment, and export controls are disabled. Nothing displayed is a new model
-prediction. The startup labels and console keep this explicit.
+## Compare structures and inspect evidence
 
-## Reference data and rendering limits
+Each job lists its actual artifacts. Structure artifacts are shown first;
+additional logs, confidence/QA files, sequences, and other results remain under
+**Other artifacts**. Choose up to four structures and **Compare selected**, or
+load a structure into the selected pane with **View**. Text and CSV/TSV previews
+are bounded; **Export…** writes the complete original artifact.
 
-Both viewports show the **same experimentally determined Cas9–guide RNA–target
-DNA complex**, [PDB 4OO8](https://www.rcsb.org/structure/4OO8), at 2.50 Å resolution.
-The original PDB file is embedded; the renderer selects chains A/B/C (one complex)
-and excludes the second crystallographic copy and nonpolymer atoms.
+The native viewer reads PDB and mmCIF, including protein, nucleic acid, ligand,
+ion, modified residue, author/label chain IDs, insertion codes, and coordinate
+model identifiers. It shows the first coordinate model and one alternate
+conformer per residue with explicit warnings. Viewing is bounded to 32 MiB and
+100,000 displayed atoms; original exports and PyMOL retain all source bytes.
 
-| Chain | Molecule | Deposited sequence | Modeled residues | Displayed atoms |
-| --- | --- | ---: | ---: | ---: |
-| A | SpCas9 protein | 1,372 aa | 1,301 | 9,999 |
-| B | Guide RNA | 98 nt | 97 | 2,082 |
-| C | Target DNA | 23 nt | 21 | 404 |
+- Left drag rotates; right drag or Shift+drag pans; the wheel zooms; double-click
+  fits the structure. Each pane has its own camera, representation, selection,
+  visibility, and chain controls. Linked cameras synchronize manipulation while
+  preserving each molecule's fitted scale; they do not align structures.
+- Select cartoon, sticks, spheres, or backbone trace. Right-click the viewport
+  to toggle screen-space contact shading and soft glow. The polished GPU
+  lighting is rasterization, not RTX or ray tracing.
+- Pick a residue in the sequence strip or viewport. The inspector retains its
+  coordinate identifiers and can measure an actual anchor-to-anchor distance
+  within that structure. Picking uses projected residue anchors, not frontmost
+  atom occlusion or a binding-site analysis.
+- **Native confidence**, **Native chemistry / RF3 QA**, and **Run provenance**
+  display metadata supplied by the head. Missing metadata stays missing. The
+  coordinate B/temperature field is labeled as such, not assumed to be pLDDT.
 
-The source is [RCSB's original coordinate file](https://files.rcsb.org/download/4OO8.pdb).
-The left draft contains the deposited protein sequence. The sequence strip and
-selection use actual modeled residue numbers, including missing-residue gaps.
-The local rendering has 12,485 atoms; teal denotes protein, amber RNA, violet DNA.
+Cartoons use file secondary-structure annotations when available. Without them,
+backbone geometry provides a clearly labeled display approximation, not DSSP
+or experimental secondary-structure evidence. Cartoon widths, smoothed paths,
+atom radii, and inferred proximity bonds are visualization conventions, not
+chemical validation.
 
-The native OpenGL renderer builds static 3D meshes from the fixed fixture's ATOM,
-HELIX and SHEET records. Protein cartoons use continuous rounded ribbon/tube
-cross-sections, smoothly transported frames guided by carbonyl directions,
-shared vertices and continuous normals. Missing-residue gaps remain open.
-RNA/DNA show rounded phosphate backbones, coordinate-derived base plates and
-schematic connectors. The same coordinates drive sticks and depth-correct
-sphere impostors. Both views use perspective and a real depth buffer, so all
-visible chains occlude each other correctly.
+Until an actual result is selected, the panes show an explicitly labeled
+experimental reference: [RCSB PDB 4OO8](https://www.rcsb.org/structure/4OO8), a
+Cas9–guide RNA–target DNA complex at 2.50 Å. The local demo contains chains A/B/C
+only: 9,999 protein atoms, 2,082 RNA atoms, and 404 DNA atoms. It is never presented
+as a model prediction or used as a substitute for a failed result download.
 
-The studio look combines key/fill/rim lighting, polished material highlights,
-HDR tone mapping, bounded 2× supersampling, screen-space contact shading and
-optional soft highlight glow. Right-click a viewport to toggle the last two
-effects. This is GPU rasterization, not hardware RTX or ray tracing. Geometry
-is uploaded once and reused during rotation; idle windows do not animate.
-An OpenGL context with floating-point render targets is required. Software
-Mesa also runs the renderer, with lower performance than a graphics card.
+## Notes, persistence, and PyMOL
 
-Cartoon dimensions, smoothed backbone paths, base plates, atom radii and
-lighting are display conventions. Sticks use distance-based illustrative
-bonds built with a spatial grid, not validated chemistry. Picking selects a
-nearby projected protein C-alpha; it does not perform scientific feature
-analysis or restrict picks to the frontmost atom. This remains a fixed
-reference viewer and interface study, not a chemistry validator, confidence
-analysis or replacement for PyMOL. No confidence scores are fabricated.
+Research notes and residue annotations have automatically saved local drafts.
+**Save to head** explicitly publishes a note on the selected real artifact.
+Edits and deletion tombstones use the head revision check; a concurrent change
+leaves the local edit intact for review/export. The legacy residue annotation
+schema remains interoperable, with an additional native residue key for richer
+mmCIF identities. Notes on local files or the demo remain local. **Export notes…**
+includes shared records, the current local draft, retained edits, and imported
+Electron annotation documents.
+
+Native state lives under the platform configuration directory in
+`bio-workbench-native` (`~/.config` on Linux, `~/Library/Application Support` on
+macOS). `BIO_WORKBENCH_NATIVE_STATE_DIR` selects an isolated directory for tests.
+Connection settings, exact request receipts, input drafts, view references,
+selections, and notes survive restarts. Verified artifact downloads are cached
+locally and reauthorized against the head when opened again.
+
+On first launch, the client imports the previous Electron input draft and
+annotation documents, including
+`~/.config/bio-workbench-desktop/molecular-state.json`. The original files and
+unknown migration fields are retained. Existing Electron remains available
+through the separately packaged `bio-workbench-electron` rollback command;
+its state is not deleted by the native migration.
+
+**Launch in PyMOL** opens the selected pane's exact PDB/mmCIF bytes in a separate
+local process. Linux Nix packaging supplies a pinned PyMOL. Other installations
+may set `BIO_WORKBENCH_PYMOL` to one executable path or place `pymol` on PATH.
+Startup failure and the readiness marker appear in the status/console. Closing
+Bio Workbench leaves that external viewer open. A demo launch exports only the
+same experimental A/B/C coordinates displayed in the pane.
+
+`bio-workbench://batch/ID` opens a batch. A second launch forwards links or local
+input files to the existing native window through a private filesystem inbox;
+it does not open another writer for the same session. The bottom console
+accepts local view commands only: `help`, `reset`, `cartoon`, `sticks`, `spheres`,
+and `trace`.
 
 ## Development
 
 ```sh
 nix develop path:.
 export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bio-workbench-rust/target"
-cargo run --release
+cargo run --release --bin bio-workbench-rust
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
-The application and UI are Rust, with embedded native GLSL shaders; Nix and
-Cargo files provide packaging. Eframe's optional
-screenshot helper is enabled for capturing the native OpenGL window:
+Keep build outputs outside this source directory for clean Nix source copies.
+Native screenshot qualification can set `EFRAME_SCREENSHOT_TO=/absolute/path.png`;
+the helper captures its OpenGL window and exits. Use an isolated native state
+directory and display for testing so the current user window is not driven.
 
-```sh
-EFRAME_SCREENSHOT_TO="$PWD/prototype.png" nix run path:.
-```
-
-The helper writes a PNG and exits. Normal launches have no screenshot path.
-The API implementation follows the pinned
-[eframe 0.33.3 native App documentation](https://docs.rs/eframe/0.33.3/eframe/trait.App.html)
-and its [official native OpenGL callback example](https://github.com/emilk/egui/blob/0.33.3/crates/egui_demo_app/src/apps/custom3d_glow.rs).
+The companion `bio-render` executable and `bio-workbench --render --manifest
+request.json` entry point use the same parser and GPU renderer for one-shot
+structure PNGs. This rendering path does not submit predictions.
