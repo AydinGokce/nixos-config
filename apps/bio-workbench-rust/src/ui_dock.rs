@@ -284,8 +284,8 @@ struct StructureTabs<'a> {
     linked_camera: Option<scene::Camera>,
     focus: Option<usize>,
     closed: BTreeSet<usize>,
+    duplicate: Option<usize>,
     split: Option<(usize, Split)>,
-    group_sizes: BTreeMap<usize, usize>,
 }
 
 impl StructureTabs<'_> {
@@ -379,20 +379,24 @@ impl TabViewer for StructureTabs<'_> {
     }
 
     fn context_menu(&mut self, ui: &mut egui::Ui, slot: &mut usize, _: SurfaceIndex, _: NodeIndex) {
-        if ui.button("Close tab").clicked() {
-            self.closed.insert(*slot);
+        if ui.button("Duplicate tab").clicked() {
+            self.duplicate = Some(*slot);
             ui.close();
         }
-        let can_split = self.group_sizes.get(slot).copied().unwrap_or(0) > 1;
-        for (label, direction) in [("Split right", Split::Right), ("Split down", Split::Below)] {
+        for (label, direction) in [("Split down", Split::Below), ("Split right", Split::Right)] {
             if ui
-                .add_enabled(can_split, egui::Button::new(label))
-                .on_disabled_hover_text("Open another structure tab in this group first.")
+                .button(label)
+                .on_hover_text("Open an independent copy in a new viewer group.")
                 .clicked()
             {
                 self.split = Some((*slot, direction));
                 ui.close();
             }
+        }
+        ui.separator();
+        if ui.button("Close tab").clicked() {
+            self.closed.insert(*slot);
+            ui.close();
         }
     }
 
@@ -518,10 +522,19 @@ impl Workbench {
         self.state.selected_view = slot;
     }
 
-    pub(super) fn split_active(&mut self, direction: Split) {
-        if !move_to_split(&mut self.dock, self.state.selected_view, direction) {
-            self.log("Open another structure tab in this group first, then split or drag it to a viewer edge.");
-        }
+    pub(super) fn split_active(&mut self, direction: Split, ctx: &egui::Context) {
+        self.split_view(self.state.selected_view, direction, ctx);
+    }
+
+    fn split_view(
+        &mut self,
+        source: usize,
+        direction: Split,
+        ctx: &egui::Context,
+    ) -> Option<usize> {
+        let target = self.duplicate_view(source, ctx)?;
+        move_to_split(&mut self.dock, target, direction);
+        Some(target)
     }
 
     pub(super) fn viewports(&mut self, ui: &mut egui::Ui) {
@@ -539,11 +552,6 @@ impl Workbench {
             return;
         }
         let style = dock_style(ui);
-        let group_sizes = self
-            .dock
-            .iter_leaves()
-            .flat_map(|(_, leaf)| leaf.tabs.iter().map(|slot| (*slot, leaf.tabs.len())))
-            .collect();
         let selected_before = self.state.selected_view;
         let mut viewer = StructureTabs {
             views: &mut self.views,
@@ -556,8 +564,8 @@ impl Workbench {
             linked_camera: None,
             focus: None,
             closed: BTreeSet::new(),
+            duplicate: None,
             split: None,
-            group_sizes,
         };
         DockArea::new(&mut self.dock)
             .id(egui::Id::new("structure-editor-dock"))
@@ -568,17 +576,20 @@ impl Workbench {
             .show_secondary_button_hint(false)
             .show_inside(ui, &mut viewer);
         let StructureTabs {
-            focus,
+            mut focus,
             linked_camera: linked,
             closed,
+            duplicate,
             split,
             ..
         } = viewer;
         for &slot in &closed {
             self.close_view(slot);
         }
-        if let Some((slot, direction)) = split {
-            move_to_split(&mut self.dock, slot, direction);
+        if let Some(slot) = duplicate {
+            focus = self.duplicate_view(slot, ui.ctx());
+        } else if let Some((slot, direction)) = split {
+            focus = self.split_view(slot, direction, ui.ctx());
         }
         if let Some(slot) = settle_focus(&mut self.dock, selected_before, focus, &closed) {
             self.state.selected_view = slot;
@@ -733,8 +744,8 @@ mod tests {
                         linked_camera: None,
                         focus: None,
                         closed: BTreeSet::new(),
+                        duplicate: None,
                         split: None,
-                        group_sizes: BTreeMap::new(),
                     };
                     let style = dock_style(ui);
                     DockArea::new(&mut self.dock)

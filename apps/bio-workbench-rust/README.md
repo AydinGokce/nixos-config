@@ -75,13 +75,20 @@ Each job lists its actual artifacts. Structure artifacts are shown first;
 additional logs, confidence/QA files, sequences, and other results remain under
 **Other artifacts**. Click a run to open its preferred structure in a tab, or
 click individual artifacts and **Open selected** to compare any number of results.
+Clicking a run or artifact title focuses its existing tab. **Open tab** and
+**Open selected** always create a new tab, including for a result already open.
 A pending run opens a tab that follows its progress and displays the output when
 available, even if you select a different batch in the sidebar. Text and CSV/TSV previews
 are bounded; **Export…** writes the complete original artifact.
 
 Drag tabs to reorder them, drop at a viewer edge to split, or onto another tab
-bar to combine groups. **View → Split right / Split down** also moves the active
-tab into a new group when another tab remains in its current group. Close with
+bar to combine groups. Right-click a tab for **Duplicate tab**, **Split down**,
+or **Split right**. Duplicate opens a copy in the same group; the split commands
+open a copy in a new group and leave the original in place. These actions are
+also available under **View**. Copies start with the source tab's current camera
+and display settings and then keep separate view state. **Link cameras**, when
+enabled, synchronizes camera motion across views. Source annotations remain shared.
+Close with
 the tab's left **×**, middle-click, or Ctrl+W (Cmd+W on macOS). Closing a tab keeps
 the run, artifacts and annotations. Tabs, splits and each structure's camera and
 display settings survive restart. Closing every tab leaves an empty workspace.

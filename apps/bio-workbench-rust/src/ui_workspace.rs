@@ -103,6 +103,83 @@ impl Workbench {
         self.load_structure(path, metadata, slot, ctx);
     }
 
+    pub(super) fn duplicate_view(&mut self, source: usize, ctx: &egui::Context) -> Option<usize> {
+        let reference = self.view_reference(source)?;
+        let live = self.views.get(&source).filter(|_| {
+            !self.view_loading.contains_key(&source) && !self.view_errors.contains_key(&source)
+        });
+        let metadata = duplicate_reference(reference, live.map(ui_views::view_state));
+        // Reserve in the source's group even if its context menu was opened
+        // while another group was active. A copy always receives a fresh ID.
+        self.focus_view(source);
+        let target = self.reserve_view(metadata.clone());
+        if self.copy_loaded_view(source, target) {
+            return Some(target);
+        }
+        let artifact = text(&metadata, "artifact_id");
+        if !artifact.is_empty() {
+            self.request_artifact(artifact, ArtifactTarget::View(target));
+        } else {
+            match text(&metadata, "source_kind") {
+                "job" => {
+                    let job = text(&metadata, "job_id").to_owned();
+                    self.view_loading.insert(target, format!("job:{job}"));
+                    self.request("job.get", json!({"job_id":job}), Purpose::Job(job));
+                }
+                "local" => {
+                    let path = PathBuf::from(text(&metadata, "local_path"));
+                    self.load_structure(path, metadata, target, ctx);
+                }
+                "demo" => {
+                    let mut metadata = metadata;
+                    metadata["load_token"] = json!(uid());
+                    self.update_view_reference(target, metadata.clone());
+                    self.view_loading
+                        .insert(target, text(&metadata, "load_token").into());
+                    self.accept_molecule(
+                        target,
+                        metadata,
+                        Arc::new(scene::Molecule::reference_bytes()),
+                        Ok(scene::Molecule::reference()),
+                    );
+                }
+                _ => {
+                    let error = self.view_errors.get(&source).cloned().unwrap_or_else(|| {
+                        "This tab has no readable source. Reopen its file or run to load it.".into()
+                    });
+                    self.view_errors.insert(target, error);
+                }
+            }
+        }
+        Some(target)
+    }
+
+    pub(super) fn open_artifact_new_tab(&mut self, id: String, ctx: &egui::Context) {
+        if let Some(source) = matching_view(
+            &self.state.view_refs,
+            self.state.selected_view,
+            "artifact_id",
+            &id,
+        ) {
+            self.duplicate_view(source, ctx);
+        } else {
+            self.open_artifact_id(id);
+        }
+    }
+
+    pub(super) fn open_job_new_tab(&mut self, id: String, ctx: &egui::Context) {
+        if let Some(source) = matching_view(
+            &self.state.view_refs,
+            self.state.selected_view,
+            "job_id",
+            &id,
+        ) {
+            self.duplicate_view(source, ctx);
+        } else {
+            self.open_job_tab(id);
+        }
+    }
+
     pub(super) fn open_artifact_id(&mut self, id: String) {
         if let Some(slot) = self
             .state
@@ -272,6 +349,30 @@ impl Workbench {
     }
 }
 
+fn duplicate_reference(reference: &Value, live_view_state: Option<Value>) -> Value {
+    let mut metadata = reference.clone();
+    if let Some(object) = metadata.as_object_mut() {
+        for transient in ["slot", "load_token", "download_operation"] {
+            object.remove(transient);
+        }
+    }
+    if let Some(view_state) = live_view_state {
+        metadata["view_state"] = view_state;
+    }
+    metadata
+}
+
+fn matching_view(refs: &[Value], selected: usize, key: &str, id: &str) -> Option<usize> {
+    refs.iter()
+        .filter(|reference| text(reference, key) == id)
+        .filter_map(|reference| {
+            reference["slot"]
+                .as_u64()
+                .and_then(|id| usize::try_from(id).ok())
+        })
+        .min_by_key(|slot| (*slot != selected, *slot))
+}
+
 fn waiting_jobs(refs: &[Value]) -> BTreeSet<String> {
     refs.iter()
         .filter(|r| text(r, "source_kind") == "job" && !ui_state::terminal(text(r, "job_state")))
@@ -296,6 +397,49 @@ fn preferred_structure(artifacts: &[Value]) -> Option<&Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn duplicate_keeps_source_identity_and_live_preferences_without_request_tokens() {
+        let original = json!({"slot":7,"source_kind":"artifact","job_id":"j",
+            "artifact_id":"a","sha256":"retained-sha","load_token":"parse:old",
+            "download_operation":"old-download","view_state":{"style":"cartoon"}});
+        let live = json!({"style":"sticks","camera":{"yaw":1.2},"chains":[true,false]});
+        let mut copy = duplicate_reference(&original, Some(live.clone()));
+        assert_eq!(copy["artifact_id"], "a");
+        assert_eq!(copy["job_id"], "j");
+        assert_eq!(copy["sha256"], "retained-sha");
+        assert_eq!(copy["view_state"], live);
+        for key in ["slot", "load_token", "download_operation"] {
+            assert!(copy.get(key).is_none());
+        }
+        copy["view_state"]["camera"]["yaw"] = json!(9.);
+        assert_eq!(original["view_state"], json!({"style":"cartoon"}));
+    }
+
+    #[test]
+    fn pending_duplicate_retains_job_and_saved_preferences_for_independent_loading() {
+        let original = json!({"slot":12,"source_kind":"job","job_id":"queued-job",
+            "job_state":"running","job_phase":"predicting","load_token":"old",
+            "view_state":{"camera":{"yaw":0.3},"style":"spheres"}});
+        let copy = duplicate_reference(&original, None);
+        assert_eq!(copy["job_id"], "queued-job");
+        assert_eq!(copy["job_phase"], "predicting");
+        assert_eq!(copy["view_state"], original["view_state"]);
+        assert!(copy.get("slot").is_none() && copy.get("load_token").is_none());
+    }
+
+    #[test]
+    fn reopening_uses_selected_matching_copy_without_confusing_another_run() {
+        let refs = vec![
+            json!({"slot":7,"job_id":"j","artifact_id":"a"}),
+            json!({"slot":13,"job_id":"other","artifact_id":"b"}),
+            json!({"slot":21,"job_id":"j","artifact_id":"a"}),
+        ];
+        assert_eq!(matching_view(&refs, 21, "job_id", "j"), Some(21));
+        assert_eq!(matching_view(&refs, 13, "job_id", "j"), Some(7));
+        assert_eq!(matching_view(&refs, 7, "artifact_id", "b"), Some(13));
+        assert_eq!(matching_view(&refs, 7, "artifact_id", "missing"), None);
+    }
+
     #[test]
     fn selected_prediction_wins_and_input_coordinates_are_excluded() {
         let artifacts = vec![

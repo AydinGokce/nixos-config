@@ -50,7 +50,7 @@ pub(super) fn display_name(metadata: &Value) -> String {
 fn view_token(metadata: &Value) -> String {
     text(metadata, "load_token").into()
 }
-fn view_state(view: &View) -> Value {
+pub(super) fn view_state(view: &View) -> Value {
     json!({"camera":{"yaw":view.camera.yaw,"pitch":view.camera.pitch,"zoom":view.camera.zoom,"pan":[view.camera.pan.x,view.camera.pan.y],"ambient":view.camera.ambient,"bloom":view.camera.bloom},"style":view.style.name(),"selected":view.selected,"chains":view.chains,"labels":view.labels,"visible":view.visible})
 }
 fn restore_view(view: &mut View, value: &Value) {
@@ -102,6 +102,42 @@ fn restore_view(view: &mut View, value: &Value) {
     view.visible = value["visible"].as_bool().unwrap_or(true);
 }
 impl Workbench {
+    pub(super) fn copy_loaded_view(&mut self, source: usize, target: usize) -> bool {
+        if self.view_loading.contains_key(&source) || self.view_errors.contains_key(&source) {
+            return false;
+        }
+        let Some(original) = self.views.get(&source) else {
+            return false;
+        };
+        let Some(metadata) = self.view_reference(target).cloned() else {
+            return false;
+        };
+        let renderer = match scene::Renderer::new(&self.gl, &original.molecule) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                let message = format!("GPU renderer: {error}");
+                self.view_errors.insert(target, message.clone());
+                self.log(message);
+                return true;
+            }
+        };
+        let view = View {
+            molecule: original.molecule.clone(),
+            renderer,
+            camera: original.camera,
+            style: original.style,
+            selected: original.selected.clone(),
+            measurement: original.measurement.clone(),
+            chains: original.chains.clone(),
+            labels: original.labels,
+            visible: original.visible,
+            metadata,
+            bytes: original.bytes.clone(),
+        };
+        self.views.insert(target, view);
+        true
+    }
+
     pub(super) fn demo_views(&mut self) {
         let molecule = scene::Molecule::reference();
         let bytes = Arc::new(scene::Molecule::reference_bytes());

@@ -222,12 +222,16 @@ impl Workbench {
                         }
                     });
                     ui.menu_button("View", |ui| {
+                        if ui.button("Duplicate tab").clicked() {
+                            self.duplicate_view(self.state.selected_view, ctx);
+                            ui.close();
+                        }
                         if ui.button("Split right").clicked() {
-                            self.split_active(egui_dock::Split::Right);
+                            self.split_active(egui_dock::Split::Right, ctx);
                             ui.close();
                         }
                         if ui.button("Split down").clicked() {
-                            self.split_active(egui_dock::Split::Below);
+                            self.split_active(egui_dock::Split::Below, ctx);
                             ui.close();
                         }
                         if ui.button("Close selected tab").clicked() {
@@ -274,11 +278,23 @@ impl Workbench {
                         self.reset_view();
                     }
                     ui.separator();
-                    if ui.button("Split right").on_hover_text("Move the active tab into a group on the right; you can also drag a tab to an edge.").clicked() {
-                        self.split_active(egui_dock::Split::Right);
+                    if ui
+                        .button("Split right")
+                        .on_hover_text(
+                            "Open an independent copy of the active tab in a group on the right.",
+                        )
+                        .clicked()
+                    {
+                        self.split_active(egui_dock::Split::Right, ctx);
                     }
-                    if ui.button("Split down").on_hover_text("Move the active tab into a group below.").clicked() {
-                        self.split_active(egui_dock::Split::Below);
+                    if ui
+                        .button("Split down")
+                        .on_hover_text(
+                            "Open an independent copy of the active tab in a group below.",
+                        )
+                        .clicked()
+                    {
+                        self.split_active(egui_dock::Split::Below, ctx);
                     }
                     ui.checkbox(&mut self.state.link_views, "Link cameras");
                     ui.checkbox(&mut self.state.show_axes, "Axes");

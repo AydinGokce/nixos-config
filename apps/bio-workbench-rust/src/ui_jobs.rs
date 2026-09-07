@@ -149,7 +149,7 @@ impl Workbench {
                     {
                         let ids: Vec<_> = self.selected_artifacts.iter().cloned().collect();
                         for id in ids {
-                            self.open_artifact_id(id);
+                            self.open_artifact_new_tab(id, ctx);
                         }
                     }
                     if ui.small_button("Clear").clicked() {
@@ -238,7 +238,7 @@ impl Workbench {
                             }
                             ui.horizontal(|ui| {
                                 if ui.small_button("Open tab").clicked() {
-                                    self.open_job_tab(id.clone());
+                                    self.open_job_new_tab(id.clone(),ctx);
                                 }
                                 if ui.small_button("Log").clicked() {
                                     self.focused_job = id.clone();
@@ -349,7 +349,7 @@ impl Workbench {
             });
             ui.horizontal_wrapped(|ui| {
                 if structure && ui.small_button("Open tab").clicked() {
-                    self.open_artifact_id(artifact_id.clone());
+                    self.open_artifact_new_tab(artifact_id.clone(), ui.ctx());
                 }
                 if !structure && ui.small_button("Preview text / table").clicked() {
                     self.request_artifact(&artifact_id, ArtifactTarget::Text);
