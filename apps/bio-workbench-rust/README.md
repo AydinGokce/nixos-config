@@ -3,7 +3,8 @@
 This is an **offline design prototype for feedback**, implemented in Rust with
 native egui/eframe and OpenGL. It is a separate application from the working
 Electron client. It does not connect to the head, call an API, rent compute,
-execute programs, import files, or submit predictions.
+import files, or submit predictions. The **Launch in PyMOL** button opens the
+embedded experimental reference in a separate local PyMOL application.
 
 The design uses a compact gray menu and toolbar, black molecular viewports,
 a right-side object tree and inspector, a submission draft/model panel, and a
@@ -37,10 +38,33 @@ hosts; Linux is the initial development target. Native Windows packaging is
 not included in this prototype. No modifications to the repository's root
 flake or the existing Electron application are needed.
 
+## Open the reference in PyMOL
+
+Click **Launch in PyMOL** on the toolbar. It opens PDB 4OO8 chains A/B/C as
+separate objects: Cas9 in teal cartoon, guide RNA in amber, and target DNA in
+violet. The loaded coordinates are the experimental reference currently shown
+in the prototype; draft edits and illustrative prediction rows are not exported.
+
+The Linux Nix package includes its pinned PyMOL executable. Cargo launches and
+other platforms look for `pymol` on PATH; set `BIO_WORKBENCH_PYMOL` to an executable
+path to select another installation. The value is one executable path, without
+extra command-line arguments. A missing application or startup failure appears
+in the status bar and console. macOS and WSLg launches still require verification
+on those hosts.
+
+The Rust launcher writes the embedded PDB, a fixed PML view script, and a process
+log into a unique local cache directory, then starts PyMOL directly without a
+shell. The cache uses XDG_CACHE_HOME when set, otherwise the platform user cache
+directory. Startup scripts and plugins are disabled for this reference launch.
+The status changes to ready only when PyMOL executes the final script marker.
+Closing the prototype leaves the separate PyMOL application open. Neither the
+button nor the local console can submit cloud work.
+
 ## Try the design
 
 - Rotate the sample with a left drag, pan with a right drag or Shift+drag,
-  zoom with the wheel, and reset with a double click.
+  zoom with the wheel, and reset with a double click. Right-click a viewport
+  to toggle contact shading or soft highlight glow.
 - Toggle linked cameras and single/comparison layout. Linking cameras does
   not calculate alignment.
 - Choose cartoon, sticks, spheres, or a C-alpha trace from the Display menu,
@@ -77,13 +101,30 @@ The left draft contains the deposited protein sequence. The sequence strip and
 selection use actual modeled residue numbers, including missing-residue gaps.
 The local rendering has 12,485 atoms; teal denotes protein, amber RNA, violet DNA.
 
-The Rust renderer reads the fixed fixture's ATOM, HELIX and SHEET records. It
-makes a smoothed protein ribbon sketch, phosphate-backbone sketches for RNA/DNA,
-and distance-based illustrative bonds using a spatial grid. Ribbon widths,
-atom sizes and depth-sorted projections are presentation approximations; the
-nucleic-acid sketch can overlay the protein without full occlusion. This is an
-interactive interface study, not a scientific renderer, chemistry validator,
-confidence analysis, or replacement for PyMOL. No confidence scores are fabricated.
+The native OpenGL renderer builds static 3D meshes from the fixed fixture's ATOM,
+HELIX and SHEET records. Protein cartoons use continuous rounded ribbon/tube
+cross-sections, smoothly transported frames guided by carbonyl directions,
+shared vertices and continuous normals. Missing-residue gaps remain open.
+RNA/DNA show rounded phosphate backbones, coordinate-derived base plates and
+schematic connectors. The same coordinates drive sticks and depth-correct
+sphere impostors. Both views use perspective and a real depth buffer, so all
+visible chains occlude each other correctly.
+
+The studio look combines key/fill/rim lighting, polished material highlights,
+HDR tone mapping, bounded 2× supersampling, screen-space contact shading and
+optional soft highlight glow. Right-click a viewport to toggle the last two
+effects. This is GPU rasterization, not hardware RTX or ray tracing. Geometry
+is uploaded once and reused during rotation; idle windows do not animate.
+An OpenGL context with floating-point render targets is required. Software
+Mesa also runs the renderer, with lower performance than a graphics card.
+
+Cartoon dimensions, smoothed backbone paths, base plates, atom radii and
+lighting are display conventions. Sticks use distance-based illustrative
+bonds built with a spatial grid, not validated chemistry. Picking selects a
+nearby projected protein C-alpha; it does not perform scientific feature
+analysis or restrict picks to the frontmost atom. This remains a fixed
+reference viewer and interface study, not a chemistry validator, confidence
+analysis or replacement for PyMOL. No confidence scores are fabricated.
 
 ## Development
 
@@ -93,9 +134,11 @@ export CARGO_TARGET_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/bio-workbench-rust/targ
 cargo run --release
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo test --release
 ```
 
-Source and UI are Rust; Nix and Cargo files provide packaging. Eframe's optional
+The application and UI are Rust, with embedded native GLSL shaders; Nix and
+Cargo files provide packaging. Eframe's optional
 screenshot helper is enabled for capturing the native OpenGL window:
 
 ```sh
@@ -104,4 +147,5 @@ EFRAME_SCREENSHOT_TO="$PWD/prototype.png" nix run path:.
 
 The helper writes a PNG and exits. Normal launches have no screenshot path.
 The API implementation follows the pinned
-[eframe 0.33.3 native App documentation](https://docs.rs/eframe/0.33.3/eframe/trait.App.html).
+[eframe 0.33.3 native App documentation](https://docs.rs/eframe/0.33.3/eframe/trait.App.html)
+and its [official native OpenGL callback example](https://github.com/emilk/egui/blob/0.33.3/crates/egui_demo_app/src/apps/custom3d_glow.rs).

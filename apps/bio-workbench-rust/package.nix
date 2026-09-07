@@ -1,4 +1,4 @@
-{ lib, rustPlatform, makeWrapper, libGL, libxkbcommon, wayland, libX11, libXcursor, libXi, libXrandr, stdenv, makeDesktopItem }:
+{ lib, rustPlatform, makeWrapper, libGL, libxkbcommon, wayland, libX11, libXcursor, libXi, libXrandr, stdenv, makeDesktopItem, pymol }:
 let
   desktopItem = makeDesktopItem {
     name = "bio-workbench-rust";
@@ -10,7 +10,7 @@ let
   };
 in rustPlatform.buildRustPackage {
   pname = "bio-workbench-rust";
-  version = "0.1.0";
+  version = "0.2.0";
   src = lib.cleanSourceWith {
     src = ./.;
     filter = path: type: !(builtins.elem (baseNameOf path) [ "target" "result" ".git" ]) && !(lib.hasSuffix ".png" path);
@@ -19,6 +19,7 @@ in rustPlatform.buildRustPackage {
   nativeBuildInputs = [ makeWrapper ];
   postInstall = lib.optionalString stdenv.hostPlatform.isLinux ''
     wrapProgram $out/bin/bio-workbench-rust \
+      --set-default BIO_WORKBENCH_PYMOL ${lib.getExe pymol} \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ libGL libxkbcommon wayland libX11 libXcursor libXi libXrandr ]}
     mkdir -p $out/share/applications
     cp ${desktopItem}/share/applications/* $out/share/applications/

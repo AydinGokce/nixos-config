@@ -1,3 +1,4 @@
+mod pymol;
 mod scene;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use scene::{Camera, Molecule, Representation};
@@ -5,7 +6,9 @@ const SEQUENCE: &str = include_str!("../fixtures/cas9-sequence.txt");
 const AMBER: Color32 = Color32::from_rgb(214, 184, 109);
 const GREEN: Color32 = Color32::from_rgb(113, 174, 143);
 struct Workbench {
+    pymol: pymol::Launcher,
     molecule: Molecule,
+    renderer: scene::Renderer,
     cameras: [Camera; 2],
     styles: [Representation; 2],
     visible: [bool; 2],
@@ -76,7 +79,11 @@ impl Workbench {
         style.visuals.window_corner_radius = egui::CornerRadius::ZERO;
         style.visuals.menu_corner_radius = egui::CornerRadius::ZERO;
         ctx.set_style(style);
-        Self{molecule:Molecule::reference(),cameras:[Camera::default();2],styles:[Representation::Cartoon,Representation::Sticks],visible:[true;2],labels:[false;2],chains:[true;3],draft:SEQUENCE.into(),name:"Cas9_sgRNA_DNA_reference".into(),modality:0,models:[true;4],console_input:String::new(),console:vec!["Bio Workbench / native Rust interface study 0.1".into(),"OFFLINE DESIGN PROTOTYPE — cloud submission, imports and result analysis are disabled.".into(),"Loaded embedded reference: PDB 4OO8, chains A/B/C (Cas9 + sgRNA + target DNA). Both panes show the same experimental structure.".into(),"Mouse: left-drag rotate | right-drag pan | wheel zoom | double-click reset | click residue to select".into()],link_views:true,show_axes:true,comparison:true,selected:840,selected_object:0,sidebar_tab:0,show_help:false,msa:0,notes:"Selection note (local mockup): inspect this region in both views.".into()}
+        let molecule = Molecule::reference();
+        let renderer =
+            scene::Renderer::new(cc.gl.as_ref().expect("OpenGL renderer required"), &molecule)
+                .expect("Cannot initialize molecular GPU renderer");
+        Self{renderer,pymol:pymol::Launcher::default(),molecule,cameras:[Camera::default();2],styles:[Representation::Cartoon,Representation::Sticks],visible:[true;2],labels:[false;2],chains:[true;3],draft:SEQUENCE.into(),name:"Cas9_sgRNA_DNA_reference".into(),modality:0,models:[true;4],console_input:String::new(),console:vec!["Bio Workbench / native Rust interface study 0.2".into(),"OFFLINE DESIGN PROTOTYPE — cloud submission, imports and result analysis are disabled.".into(),"Loaded embedded reference: PDB 4OO8, chains A/B/C (Cas9 + sgRNA + target DNA). Both panes show the same experimental structure.".into(),"Mouse: left-drag rotate | right-drag pan | wheel zoom | double-click reset | click residue to select".into()],link_views:true,show_axes:true,comparison:true,selected:840,selected_object:0,sidebar_tab:0,show_help:false,msa:0,notes:"Selection note (local mockup): inspect this region in both views.".into()}
     }
     fn log(&mut self, text: impl Into<String>) {
         self.console.push(text.into());
@@ -201,6 +208,15 @@ impl Workbench {
                     ui.add_enabled(false, egui::Button::new("Align"));
                     ui.add_enabled(false, egui::Button::new("Measure"));
                     ui.add_enabled(false, egui::Button::new("Export"));
+                    if ui
+                        .add_enabled(!self.pymol.active(), egui::Button::new("Launch in PyMOL"))
+                        .on_hover_text(
+                            "Open experimental 4OO8 chains A/B/C in a separate local PyMOL window.",
+                        )
+                        .clicked()
+                    {
+                        self.pymol.launch();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("head: disconnected   |   sample: 4OO8")
@@ -267,8 +283,21 @@ if ui.small_button("L").on_hover_text("Toggle selection label").clicked(){self.l
                     ui.label("Native Rust / OpenGL");
                     ui.separator();
                     ui.label("1 reference · 2 views · 0 predictions");
+                    ui.separator();
+                    ui.colored_label(
+                        if self.pymol.failed {
+                            Color32::LIGHT_RED
+                        } else {
+                            Color32::from_gray(190)
+                        },
+                        self.pymol.status,
+                    )
+                    .on_hover_text(&self.pymol.detail);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label("Local design study   |   v0.1");
+                        ui.label(format!(
+                            "Local design study   |   v{}",
+                            env!("CARGO_PKG_VERSION")
+                        ));
                     });
                 });
             });
@@ -284,7 +313,18 @@ if ui.small_button("L").on_hover_text("Toggle selection label").clicked(){self.l
     }
 }
 impl eframe::App for Workbench {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.renderer.destroy(gl);
+        }
+    }
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        for message in self.pymol.poll() {
+            self.log(message);
+        }
+        if self.pymol.active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         self.top(ctx);
         self.bottom(ctx);
         self.left(ctx);
@@ -339,6 +379,7 @@ impl eframe::App for Workbench {
                             let changed = scene::viewport(
                                 column,
                                 &self.molecule,
+                                &self.renderer,
                                 &mut self.cameras[index],
                                 self.styles[index],
                                 index,
@@ -358,6 +399,7 @@ impl eframe::App for Workbench {
                     let changed = scene::viewport(
                         ui,
                         &self.molecule,
+                        &self.renderer,
                         &mut self.cameras[index],
                         self.styles[index],
                         index,
@@ -387,6 +429,7 @@ impl eframe::App for Workbench {
                     "No backend, SSH, APIs, submissions, imports, or scientific analysis.",
                 );
                 ui.label("Nothing here is a model output. All 3D views use embedded PDB 4OO8.");
+                ui.label("Launch in PyMOL opens that reference in a separate local viewer.");
             });
     }
 }
@@ -399,7 +442,10 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Bio Workbench — native Rust design prototype",
+        &format!(
+            "Bio Workbench {} — native Rust design prototype",
+            env!("CARGO_PKG_VERSION")
+        ),
         options,
         Box::new(|cc| Ok(Box::new(Workbench::new(cc)))),
     )

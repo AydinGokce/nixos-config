@@ -1,4 +1,20 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use std::sync::Arc;
+#[path = "scene_geometry.rs"]
+mod geometry;
+#[path = "scene_gpu.rs"]
+mod gpu;
+
+pub struct Renderer(Arc<egui::mutex::Mutex<gpu::Renderer>>);
+impl Renderer {
+    pub fn new(gl: &eframe::glow::Context, molecule: &Molecule) -> Result<Self, String> {
+        gpu::Renderer::new(gl, molecule)
+            .map(|renderer| Self(Arc::new(egui::mutex::Mutex::new(renderer))))
+    }
+    pub fn destroy(&self, gl: &eframe::glow::Context) {
+        self.0.lock().destroy(gl);
+    }
+}
 #[derive(Clone, Copy, Default)]
 pub struct V3(pub f32, pub f32, pub f32);
 impl V3 {
@@ -10,6 +26,9 @@ impl V3 {
     }
     fn mul(self, n: f32) -> Self {
         Self(self.0 * n, self.1 * n, self.2 * n)
+    }
+    fn dot(self, b: Self) -> f32 {
+        self.0 * b.0 + self.1 * b.1 + self.2 * b.2
     }
     fn length(self) -> f32 {
         (self.0 * self.0 + self.1 * self.1 + self.2 * self.2).sqrt()
@@ -30,6 +49,7 @@ pub struct Atom {
     pub name: String,
     pub element: String,
     pub chain: char,
+    pub residue: usize,
 }
 pub struct Molecule {
     pub atoms: Vec<Atom>,
@@ -115,6 +135,7 @@ impl Molecule {
                     name: line[12..16].trim().into(),
                     element: line[76..78].trim().into(),
                     chain,
+                    residue,
                 };
                 if chain == 'A' && atom.name == "CA" {
                     ca.push(atom.p);
@@ -198,14 +219,18 @@ pub struct Camera {
     pub pitch: f32,
     pub zoom: f32,
     pub pan: Vec2,
+    pub ambient: bool,
+    pub bloom: bool,
 }
 impl Default for Camera {
     fn default() -> Self {
         Self {
             yaw: -0.35,
             pitch: 0.15,
-            zoom: 1.1,
+            zoom: 0.98,
             pan: Vec2::ZERO,
+            ambient: true,
+            bloom: true,
         }
     }
 }
@@ -222,51 +247,19 @@ impl Camera {
     fn project(self, p: V3, rect: Rect, center: V3) -> (Pos2, f32) {
         let p = self.rotate(p.sub(center));
         let scale = rect.width().min(rect.height()) / 135. * self.zoom;
-        let perspective = 320. / (320. - p.2);
+        let perspective = 210. / (210. - p.2);
         (
             rect.center() + self.pan + Vec2::new(p.0, -p.1) * scale * perspective,
             p.2,
         )
     }
 }
-fn tint(c: Color32, s: f32) -> Color32 {
-    Color32::from_rgb(
-        (c.r() as f32 * s).min(255.) as u8,
-        (c.g() as f32 * s).min(255.) as u8,
-        (c.b() as f32 * s).min(255.) as u8,
-    )
-}
-fn residue_color(i: f32) -> Color32 {
-    tint(chain_color('A'), 0.86 + i / 1368. * 0.20)
-}
-fn atom_color(a: &Atom) -> Color32 {
-    if a.chain != 'A' {
-        return chain_color(a.chain);
-    }
-    match a.element.as_str() {
-        "N" => Color32::from_rgb(97, 132, 242),
-        "O" => Color32::from_rgb(234, 88, 80),
-        "S" => Color32::from_rgb(233, 205, 80),
-        _ => Color32::from_rgb(80, 183, 152),
-    }
-}
-fn spline(a: V3, b: V3, c: V3, d: V3, t: f32) -> V3 {
-    b.mul(2.)
-        .add(c.sub(a).mul(t))
-        .add(a.mul(2.).sub(b.mul(5.)).add(c.mul(4.)).sub(d).mul(t * t))
-        .add(
-            a.mul(-1.)
-                .add(b.mul(3.))
-                .sub(c.mul(3.))
-                .add(d)
-                .mul(t * t * t),
-        )
-        .mul(0.5)
-}
+
 #[allow(clippy::too_many_arguments)]
 pub fn viewport(
     ui: &mut egui::Ui,
     molecule: &Molecule,
+    renderer: &Renderer,
     camera: &mut Camera,
     representation: Representation,
     index: usize,
@@ -284,19 +277,19 @@ pub fn viewport(
     painter.rect_filled(rect, 0, Color32::from_rgb(3, 5, 7));
     let mut changed = false;
     if response.dragged() {
-        let d = ui.input(|i| i.pointer.delta());
+        let delta = ui.input(|i| i.pointer.delta());
         if response.dragged_by(egui::PointerButton::Secondary) || ui.input(|i| i.modifiers.shift) {
-            camera.pan += d;
+            camera.pan += delta;
         } else {
-            camera.yaw += d.x * 0.008;
-            camera.pitch += d.y * 0.008;
+            camera.yaw += delta.x * 0.008;
+            camera.pitch += delta.y * 0.008;
         }
         changed = true;
     }
     if response.hovered() {
-        let s = ui.input(|i| i.smooth_scroll_delta.y);
-        if s != 0. {
-            camera.zoom = (camera.zoom * (s * 0.002).exp()).clamp(0.25, 4.);
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0. {
+            camera.zoom = (camera.zoom * (scroll * 0.002).exp()).clamp(0.25, 4.);
             changed = true;
         }
     }
@@ -304,183 +297,44 @@ pub fn viewport(
         *camera = Camera::default();
         changed = true;
     }
+    response.context_menu(|ui| {
+        ui.strong("Studio rendering");
+        changed |= ui
+            .checkbox(&mut camera.ambient, "Contact shading")
+            .changed();
+        changed |= ui
+            .checkbox(&mut camera.bloom, "Soft highlight glow")
+            .changed();
+        ui.small("GPU rasterization / presentation effects");
+        if ui.button("Reset camera").clicked() {
+            *camera = Camera::default();
+            changed = true;
+            ui.close();
+        }
+    });
     let draw = Rect::from_min_max(rect.min + Vec2::new(8., 43.), rect.max - Vec2::new(8., 32.));
-    if visible {
-        match representation {
-            Representation::Cartoon => {
-                let mut faces = Vec::new();
-                for i in 0..molecule.ca.len() - 1 {
-                    if !chains[0] {
-                        continue;
-                    }
-                    let a = molecule.ca[i.saturating_sub(1)];
-                    let b = molecule.ca[i];
-                    let c = molecule.ca[i + 1];
-                    let d = molecule.ca[(i + 2).min(molecule.ca.len() - 1)];
-                    if b.sub(c).length() > 5.0 {
-                        continue;
-                    }
-                    for step in 0..7 {
-                        let t = step as f32 / 7.;
-                        let u = (step + 1) as f32 / 7.;
-                        let p = spline(a, b, c, d, t);
-                        let q = spline(a, b, c, d, u);
-                        let tangent = q.sub(p).unit();
-                        let normal = tangent.cross(V3(0.2, 0.7, 1.)).unit();
-                        let residue = molecule.ca_ids[i];
-                        let sheet = molecule
-                            .sheets
-                            .iter()
-                            .any(|(a, b)| (*a..=*b).contains(&residue));
-                        let width = if sheet {
-                            1.0
-                        } else if molecule
-                            .helices
-                            .iter()
-                            .any(|(a, b)| (*a..=*b).contains(&residue))
-                        {
-                            0.85
-                        } else {
-                            0.22
-                        };
-                        let points = [
-                            p.add(normal.mul(width)),
-                            q.add(normal.mul(width)),
-                            q.sub(normal.mul(width)),
-                            p.sub(normal.mul(width)),
-                        ];
-                        let projected: Vec<_> = points
-                            .iter()
-                            .map(|p| camera.project(*p, draw, molecule.center))
-                            .collect();
-                        let z = projected.iter().map(|p| p.1).sum::<f32>() / 4.;
-                        let nv = camera.rotate(normal.cross(tangent));
-                        let shade = (0.52 + nv.2.abs() * 0.35 + (z + 50.) / 450.).clamp(0.32, 1.10);
-                        faces.push((
-                            z,
-                            projected.into_iter().map(|p| p.0).collect::<Vec<_>>(),
-                            tint(residue_color(residue as f32), shade),
-                        ));
-                    }
-                }
-                faces.sort_by(|a, b| a.0.total_cmp(&b.0));
-                // Explicit triangles avoid antialiasing miter artifacts in
-                // very narrow projected ribbons. Depth ordering remains local.
-                let mut mesh = egui::Mesh::default();
-                for (_, points, color) in faces {
-                    let start = mesh.vertices.len() as u32;
-                    for pos in points {
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos,
-                            uv: egui::epaint::WHITE_UV,
-                            color,
-                        });
-                    }
-                    mesh.indices.extend_from_slice(&[
-                        start,
-                        start + 1,
-                        start + 2,
-                        start,
-                        start + 2,
-                        start + 3,
-                    ]);
-                }
-                painter.add(egui::Shape::mesh(mesh));
-            }
-            Representation::Trace => {
-                let mut segments: Vec<_> = molecule
-                    .ca
-                    .windows(2)
-                    .enumerate()
-                    .filter(|(_, w)| chains[0] && w[0].sub(w[1]).length() < 5.)
-                    .map(|(i, w)| {
-                        let (a, z) = camera.project(w[0], draw, molecule.center);
-                        let (b, v) = camera.project(w[1], draw, molecule.center);
-                        (z + v, [a, b], residue_color(i as f32))
-                    })
-                    .collect();
-                segments.sort_by(|a, b| a.0.total_cmp(&b.0));
-                for (_, line, color) in segments {
-                    painter.line_segment(line, Stroke::new(3.5 * camera.zoom, color));
-                }
-            }
-            Representation::Sticks | Representation::Spheres => {
-                let projected: Vec<_> = molecule
-                    .atoms
-                    .iter()
-                    .map(|a| camera.project(a.p, draw, molecule.center))
-                    .collect();
-                if representation == Representation::Sticks {
-                    let mut bonds = molecule.bonds.clone();
-                    bonds.sort_by(|(a, b), (c, d)| {
-                        (projected[*a].1 + projected[*b].1)
-                            .total_cmp(&(projected[*c].1 + projected[*d].1))
-                    });
-                    for (a, b) in bonds {
-                        if !chains[(molecule.atoms[a].chain as u8 - b'A') as usize] {
-                            continue;
-                        }
-                        let mid = projected[a].0.lerp(projected[b].0, 0.5);
-                        for (atom, line) in [(a, [projected[a].0, mid]), (b, [mid, projected[b].0])]
-                        {
-                            let shade = ((projected[atom].1 + 100.) / 150.).clamp(0.35, 1.);
-                            painter.line_segment(
-                                line,
-                                Stroke::new(
-                                    (0.9 * camera.zoom).max(0.5),
-                                    tint(atom_color(&molecule.atoms[atom]), shade),
-                                ),
-                            );
-                        }
-                    }
-                }
-                let mut atoms: Vec<_> = (0..molecule.atoms.len())
-                    .filter(|i| chains[(molecule.atoms[*i].chain as u8 - b'A') as usize])
-                    .collect();
-                atoms.sort_by(|a, b| projected[*a].1.total_cmp(&projected[*b].1));
-                for atom in atoms {
-                    let (p, z) = projected[atom];
-                    let r = if representation == Representation::Spheres {
-                        2.7 * camera.zoom
-                    } else {
-                        0.45 * camera.zoom
-                    };
-                    let c = tint(
-                        atom_color(&molecule.atoms[atom]),
-                        ((z + 100.) / 150.).clamp(0.35, 1.),
-                    );
-                    painter.circle_filled(p, r, c);
-                    if representation == Representation::Spheres {
-                        painter.circle_filled(p - Vec2::splat(r * 0.25), r * 0.42, tint(c, 1.3));
-                    }
-                }
-            }
-        }
-        if matches!(
-            representation,
-            Representation::Cartoon | Representation::Trace
-        ) {
-            for chain in ['B', 'C'] {
-                if !chains[(chain as u8 - b'A') as usize] {
-                    continue;
-                }
-                let points: Vec<_> = molecule
-                    .atoms
-                    .iter()
-                    .filter(|a| a.chain == chain && a.name == "P")
-                    .collect();
-                for segment in points.windows(2) {
-                    if segment[0].p.sub(segment[1].p).length() > 9. {
-                        continue;
-                    }
-                    let (a, z) = camera.project(segment[0].p, draw, molecule.center);
-                    let (b, _) = camera.project(segment[1].p, draw, molecule.center);
-                    let color = tint(chain_color(chain), ((z + 120.) / 170.).clamp(0.55, 1.));
-                    painter.line_segment([a, b], Stroke::new(3.0 * camera.zoom, color));
-                    painter.circle_filled(a, 1.8 * camera.zoom, color);
-                }
-            }
-        }
+    if draw.is_positive() && visible {
+        let gpu = renderer.0.clone();
+        let camera = *camera;
+        let selected = *selected;
+        let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+            gpu.lock().paint(
+                painter.gl(),
+                info,
+                painter.intermediate_fbo(),
+                camera,
+                representation,
+                index,
+                selected,
+                chains,
+            );
+        });
+        painter.add(egui::PaintCallback {
+            rect: draw,
+            callback: Arc::new(callback),
+        });
+    }
+    if visible && chains[0] {
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
@@ -498,21 +352,21 @@ pub fn viewport(
                     )
                 })
                 .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((i, d)) = nearest
-                && d < 24.
+            if let Some((i, distance)) = nearest
+                && distance < 24.
             {
                 *selected = molecule.ca_ids[i];
             }
         }
-        if chains[0] && (labels || *selected > 0) {
+        if labels || *selected > 0 {
             let residue = if *selected > 0 { *selected } else { 840 };
-            if let Some(p) = molecule
+            if let Some(point) = molecule
                 .ca_ids
                 .iter()
                 .position(|id| *id == residue)
-                .map(|i| &molecule.ca[i])
+                .map(|i| camera.project(molecule.ca[i], draw, molecule.center).0)
+                && draw.contains(point)
             {
-                let (point, _) = camera.project(*p, draw, molecule.center);
                 let note = point + Vec2::new(26., -28.);
                 painter.circle_stroke(point, 6., Stroke::new(1., Color32::from_rgb(245, 208, 84)));
                 painter.line_segment(
@@ -546,6 +400,13 @@ pub fn viewport(
         "REFERENCE FIXTURE  /  NOT A PREDICTION",
         FontId::monospace(9.),
         Color32::from_gray(120),
+    );
+    painter.text(
+        rect.right_top() + Vec2::new(-12., 12.),
+        Align2::RIGHT_TOP,
+        "STUDIO",
+        FontId::monospace(9.),
+        Color32::from_rgb(123, 158, 165),
     );
     painter.text(
         rect.left_bottom() + Vec2::new(12., -12.),
