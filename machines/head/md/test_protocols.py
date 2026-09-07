@@ -115,11 +115,28 @@ class ProtocolTests(unittest.TestCase):
 
     def test_metadynamics_is_structured_reweighted_and_not_affinity(self):
         plan=self.plan(plumed_request()); text=(self.root/'work/enhanced/production/plumed.dat').read_text()
-        self.assertIn('REWEIGHT_METAD',text); self.assertIn('LOGWEIGHTS=weights',text)
+        self.assertIn('REWEIGHT_METAD',text); self.assertIn('metad.bias,metad.rbias,metad.rct,weights FILE=COLVAR',text)
         self.assertNotIn('ENERGY',text); self.assertFalse(plan['analysis_inputs'][0]['affinity_claim'])
         production=next(x for x in plan['stages'] if x['id']=='enhanced_production')
         self.assertIn('-plumed',production['argv']); self.assertIn('-ntmpi',production['argv'])
         self.assertEqual(production['checkpoint'],'enhanced/production/run.cpt')
+
+    def test_metadynamics_fes_is_generated_after_sampling_without_periodic_backups(self):
+        value=plumed_request(); value['simulation']['production_steps']=2000
+        plan=self.plan(value); text=(self.root/'work/enhanced/production/plumed.dat').read_text()
+        # More than 101 output strides used to exhaust PLUMED's DUMPGRID backups.
+        for action in ('HISTOGRAM','CONVERT_TO_FES','DUMPGRID'):
+            self.assertNotIn(action,text)
+        production=next(x for x in plan['stages'] if x['id']=='enhanced_production')
+        analysis=next(x for x in plan['stages'] if x['id']=='metadynamics_analysis')
+        retained=['enhanced/production/HILLS','enhanced/production/COLVAR']
+        self.assertTrue(set(retained)<=set(production['outputs']))
+        self.assertEqual(production['restart_files'],retained)
+        self.assertNotIn('enhanced/production/fes.dat',production['outputs'])
+        self.assertNotIn('enhanced/production/reweighted-fes.dat',production['outputs'])
+        self.assertEqual(analysis['dependencies'],[production['id']])
+        self.assertIn('enhanced/production/COLVAR',analysis['inputs'])
+        self.assertIn('enhanced/production/reweighted-fes.dat',analysis['outputs'])
 
     def test_cv_injection_invalid_indices_and_unsupported_cv_reject(self):
         for key,value in [('name','x\nINCLUDE FILE=/etc/passwd'),('atoms',[{},2]),('type','energy')]:

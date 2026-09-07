@@ -275,7 +275,7 @@ def prepare(request,assets_dir,work_dir):
             if phase!='min': outputs+=[cwd+'/run.cpt',cwd+'/run.xtc']
             if state is not None and phase=='production': argv+=['-dhdl','dhdl.xvg']; outputs+=[cwd+'/dhdl.xvg']
             if plumed and phase=='production':
-                _write(root/cwd/'plumed.dat',plumed_input(request)); argv+=['-plumed','plumed.dat']; outputs+=[cwd+'/HILLS',cwd+'/COLVAR',cwd+'/fes.dat']
+                _write(root/cwd/'plumed.dat',plumed_input(request)); argv+=['-plumed','plumed.dat']; outputs+=[cwd+'/HILLS',cwd+'/COLVAR']
             done=stage(prefix.replace('/','_')+'_'+phase,argv,cwd,[valid],[cwd+'/run.tpr']+([cwd+'/plumed.dat'] if plumed and phase=='production' else []),outputs,None if phase=='min' else cwd+'/run.cpt')
             if plumed and phase=='production': stages[-1]['restart_files']=[cwd+'/HILLS',cwd+'/COLVAR']
             coord=cwd+'/run.gro'; checkpoint=cwd+'/run.cpt' if phase!='min' else None; previous=[done]
@@ -342,11 +342,10 @@ def plumed_input(request):
             'GRID_BIN':','.join(str(cv['grid_bins']) for cv in cvs),'TEMP':temperature,'BIASFACTOR':enhanced['biasfactor'],
             'HEIGHT':enhanced['height_kj_mol'],'PACE':enhanced['pace_steps'],'FILE':'HILLS'}
     lines.append('metad: METAD '+' '.join(f'{key}={value}' for key,value in fields.items())+' CALC_RCT')
+    # The canonical FES is computed once from every retained COLVAR sample after
+    # production. An unused online DUMPGRID creates backups at every write and
+    # eventually aborts long simulations at PLUMED's backup-count limit.
     lines+=['weights: REWEIGHT_METAD TEMP='+str(temperature),
-            'hist: HISTOGRAM ARG='+fields['ARG']+' GRID_MIN='+fields['GRID_MIN']+' GRID_MAX='+fields['GRID_MAX']+
-            ' GRID_BIN='+fields['GRID_BIN']+' BANDWIDTH='+fields['SIGMA']+' LOGWEIGHTS=weights NORMALIZATION=true STRIDE='+str(request['simulation']['output_stride']),
-            'fes: CONVERT_TO_FES GRID=hist TEMP='+str(temperature),
-            'DUMPGRID GRID=fes FILE=fes.dat STRIDE='+str(request['simulation']['output_stride']),
             'PRINT ARG='+fields['ARG']+',metad.bias,metad.rbias,metad.rct,weights FILE=COLVAR STRIDE='+str(request['simulation']['output_stride'])]
     return '\n'.join(lines)+'\n'
 
