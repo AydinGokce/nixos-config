@@ -21,13 +21,16 @@ def public(value):
 
 
 class API:
-    def __init__(self, store, actor):
+    def __init__(self, store, actor, *, library_config=None):
         self.store, self.actor = store, string(actor, 'trusted actor', 128)
+        self.library_config = library_config
 
     def call(self, method, params):
         require(isinstance(method, str), 'Method must be a string')
         function = {
             'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
+            'library.list': self.library_list, 'library.get': self.library_get,
+            'library.attachment': self.library_attachment,
             'md.catalog': self.md_catalog, 'md.validate': self.md_validate, 'md.plan': self.md_plan,
             'md.resume': self.md_resume,
             'md.compare': self.md_compare,
@@ -39,7 +42,25 @@ class API:
             'annotation.put': self.annotation_put, 'annotation.list': self.annotation_list,
         }.get(method)
         require(function is not None, 'Unknown method')
+        if method in {'library.list', 'library.get', 'library.attachment'}:
+            # The explorer returns published user records, including their
+            # exact identity/provenance keys and record hashes. These methods
+            # explicitly construct their public envelopes and have no private
+            # Workbench job fields to strip.
+            return function(params)
         return public(function(params))
+
+    def library_list(self, params):
+        from .library_api import list_records
+        return list_records(self, params)
+
+    def library_get(self, params):
+        from .library_api import get_record
+        return get_record(self, params)
+
+    def library_attachment(self, params):
+        from .library_api import attachment
+        return attachment(self, params)
 
     def catalog(self, params):
         keys(params)

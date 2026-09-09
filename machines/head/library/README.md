@@ -5,6 +5,13 @@ workstation use the existing cluster SSH key. Records live on the head's local
 disk at `/var/lib/bio-library`; database volumes and temporary GPU workers are
 independent of this directory. No new API key is required.
 
+The existing plasmid/product inventory is migrated under the single
+`gcc-germline-engineering` project. See [migration mapping and operator
+workflow](MIGRATION.md) for original-source archives, clone identities, context
+descriptions and the reviewed publication process. Protein products marked
+`review_required` remain visible but are rejected for model submission; whole
+double-stranded plasmids require selection of a separately defined product.
+
 ```bash
 bio-library import --fasta enzyme.fasta --type protein --id enzyme --alias target
 bio-library import --fasta probe.fasta --type dna --id probe

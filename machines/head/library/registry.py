@@ -122,6 +122,22 @@ def no_symlinks(path, *, regular=False):
     return path
 
 
+@contextmanager
+def publication_guard(root, *, exclusive=False):
+    """Stable parent lock: remains the same inode across whole-library swaps."""
+    root = Path(root).absolute()
+    no_symlinks(root.parent)
+    path = root.parent / ('.' + root.name + '.publication.lock')
+    no_symlinks(path)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        require(stat.S_ISREG(os.fstat(fd).st_mode), 'Publication guard must be a regular file')
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
+
+
 def file_digest(path):
     no_symlinks(path, regular=True)
     h = hashlib.sha256()
@@ -233,6 +249,28 @@ def validate_identity(record):
                     "structure_file must refer to an original attachment")
         if "circular" in identity:
             require(type(identity["circular"]) is bool, "circular must be boolean")
+        if 'strand_count' in identity:
+            require(molecule in {'dna', 'rna'} and type(identity['strand_count']) is int and
+                    identity['strand_count'] in {1, 2}, 'strand_count requires DNA/RNA and integer 1 or 2')
+        if 'molecular_form' in identity:
+            require(identity['molecular_form'] == 'plasmid' and molecule == 'dna' and
+                    identity.get('strand_count') == 2 and identity.get('circular') is True,
+                    'A plasmid requires explicitly circular double-stranded DNA')
+        if 'encoded_by' in identity:
+            encoded = identity['encoded_by']
+            require(molecule == 'protein' and isinstance(encoded, dict) and
+                    set(encoded) == {'construct_ref', 'sequence_sha256'},
+                    'encoded_by requires a protein and source construct_ref/sequence_sha256')
+            require(isinstance(encoded['sequence_sha256'], str) and
+                    re.fullmatch(r'[a-f0-9]{64}', encoded['sequence_sha256']),
+                    'encoded_by source sequence_sha256 must be a SHA-256 digest')
+        if 'product_review' in identity:
+            review = identity['product_review']
+            require(molecule == 'protein' and isinstance(review, dict) and
+                    set(review) == {'status', 'source', 'source_product_id', 'method_version'} and
+                    review['status'] in {'reference_matched', 'review_required'} and
+                    all(isinstance(review[key], str) and review[key] for key in review),
+                    'product_review requires a protein and explicit source review evidence')
         length = identity_length(record)
         for field in ("modifications", "linkages"):
             if field not in identity:
@@ -279,7 +317,9 @@ def validate_identity(record):
     for key, ref in reference_values(identity):
         ref_kind, _, _ = pinned_parts(ref)
         require(ref_kind == key.removesuffix("_ref"), f"Wrong reference kind for {key}: {ref}")
-        require(key != "construct_ref" or kind == "assembly", "construct_ref is only supported in assemblies")
+        require(key != "construct_ref" or kind == "assembly" or
+                kind == 'construct' and record['identity'].get('encoded_by', {}).get('construct_ref') == ref,
+                "construct_ref is only supported in assemblies or protein encoded_by")
 
 
 def validate_bond(bond, chains, *, internal=False):
@@ -316,6 +356,12 @@ class Registry:
 
     @contextmanager
     def _lock(self, *, exclusive=False):
+        with publication_guard(self.root):
+            with self._record_lock(exclusive=exclusive):
+                yield
+
+    @contextmanager
+    def _record_lock(self, *, exclusive=False):
         no_symlinks(self.root)
         require(self.root.is_dir(), f"Registry not initialized: {self.root}")
         path = self.root / ".registry.lock"
@@ -496,6 +542,12 @@ class Registry:
             require(parent in records, f"Missing parent revision: {parent}")
         for _, ref in reference_values(record["identity"]):
             require(ref in records, f"Missing referenced revision: {ref}")
+        encoded = record['identity'].get('encoded_by')
+        if encoded:
+            source = records[encoded['construct_ref']]
+            require(source['kind'] == 'construct' and source['identity'].get('molecule_type') in {'dna', 'rna'} and
+                    hashlib.sha256(source['identity'].get('sequence', '').encode()).hexdigest() == encoded['sequence_sha256'],
+                    'encoded_by must bind the exact source DNA/RNA sequence revision and digest')
         if record['kind'] == 'project':
             for member in record['identity']['members']:
                 ref = member['source_ref']

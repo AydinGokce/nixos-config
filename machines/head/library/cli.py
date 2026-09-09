@@ -11,6 +11,9 @@ import registry
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'migrate':
+        import migration
+        return migration.main(sys.argv[2:])
     if len(sys.argv) == 1 or sys.argv[1:] in (['--help'], ['-h']):
         print('Check model input compatibility: bio-library check REF --model MODEL\n'
               'Native folding inputs use the CPU parser; private RF3 supports native assemblies. Other private MSA inputs and ESM/EVOLVEpro use canonical FASTA checks.\n'

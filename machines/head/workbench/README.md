@@ -1,6 +1,6 @@
 # Head workbench service
 
-The Electron desktop and Harrison use the same actor-scoped JSON-line RPC over
+The native Rust desktop and Harrison use the same actor-scoped JSON-line RPC over
 SSH. The protocol is in [CONTRACT.md](CONTRACT.md). Nix installs `bio-workbench`
 and a dispatcher service. Desktop/Harrison RPC uses SSH and adds no head HTTP
 listener for those requests. The separate public MSA transport uses a
@@ -10,6 +10,14 @@ The shared operator workspace uses `BIO_WORKBENCH_ACTOR=harrison`. The dedicated
 Harrison key has a forced RPC command and OpenSSH `restrict`. Client JSON cannot
 choose an actor or a filesystem path. Desktop SSH may use the operator's existing
 key; the local transport still calls only the fixed RPC command.
+
+The desktop's Library explorer reads the shared head registry through
+`library.list`, `library.get` and `library.attachment`. It browses projects,
+pinned members, molecular identities, purpose documents, revision history,
+source relationships and original files. Adding a selected molecular record to
+Inputs preserves its exact revision and still requires the normal preview and
+submission steps. Whole plasmids and unresolved protein-product candidates stay
+visible with the reason they cannot be used as ordinary prediction inputs.
 
 State lives in `/var/lib/bio-workbench`: SQLite WAL, immutable upload and artifact
 bytes, isolated per-batch construct libraries, validation evidence, owned process

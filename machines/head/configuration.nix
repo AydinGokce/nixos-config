@@ -346,7 +346,7 @@ in
 
   systemd.services.bio-workbench = {
     description = "Durable desktop and Harrison molecular model jobs";
-    restartTriggers = [ ./workbench ./md ./recipes ./bio-submit.sh workbenchConfig ];
+    restartTriggers = [ ./workbench ./library ./md ./recipes ./bio-submit.sh workbenchConfig ];
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];

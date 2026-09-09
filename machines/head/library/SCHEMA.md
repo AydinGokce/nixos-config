@@ -44,6 +44,10 @@ private staging directories, file/directory fsyncs and an atomic directory
 rename. If index creation fails after publication, the revision remains valid;
 inspect the ID and use `reindex`. Do not retry by manually removing a revision.
 An abandoned `.staging` directory is never a published revision or backup input.
+Readers and writers also share a stable parent-directory publication guard
+(`.<library-directory-name>.publication.lock`). The migration publisher takes
+that guard exclusively before exchanging a verified whole registry, preventing
+queued readers from using a lock inode belonging to the previous root.
 
 ## Common record
 
@@ -230,6 +234,47 @@ choose stereoisomers, infer unspecified stereochemistry, or extract one member
 of a multirecord SDF. SDF/SMILES syntax and model compatibility are checked by an
 adapter before a prediction. Preserve separately supplied chemical forms as
 separate records or revisions.
+
+## Inventory plasmids and encoded products
+
+An inventory plasmid explicitly stores `molecule_type: dna`, `circular: true`,
+`strand_count: 2`, and `molecular_form: plasmid`. Its sequence retains the source
+reference strand, origin and orientation; a second strand is not silently
+emitted as a separate model chain. `strand_count` is valid only for DNA/RNA and
+must be integer 1 or 2. A plasmid requires all three double-stranded/circular/DNA
+conditions. Current prediction adapters reject whole plasmids and other
+double-stranded polymer records.
+
+A protein product can retain an exact source relationship and a separate source
+review status:
+
+```json
+{
+  "molecule_type": "protein",
+  "sequence": "MA",
+  "encoded_by": {
+    "construct_ref": "construct:pgc001-plasmid@1",
+    "sequence_sha256": "<SHA-256 of the exact DNA/RNA sequence>"
+  },
+  "product_review": {
+    "status": "reference_matched",
+    "source": "constructs.sqlite/protein_products",
+    "source_product_id": "pGC001:primary",
+    "method_version": "protein-audit-1.0"
+  }
+}
+```
+
+`encoded_by` is valid only for protein constructs and requires exactly the two
+shown fields. The registry pins its source and validates that it is a DNA/RNA
+construct with the declared sequence hash. This is a provenance dependency,
+not another molecular component or a newly derived translation. Research context
+exports and backups retain the source revision. `product_review` accepts only
+`reference_matched` or `review_required`, with the three nonempty source fields
+shown above. All current adapters reject `review_required`; purpose documents
+and molecular `status: defined` cannot bypass that gate. Reference matching is
+source annotation evidence, not experimental confirmation or validated stock
+identity. Resolving a product definition requires an explicit reviewed revision.
 
 ## Assemblies and bonds
 

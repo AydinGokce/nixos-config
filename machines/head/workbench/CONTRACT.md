@@ -1,8 +1,8 @@
 # Bio workbench RPC v1
 
-The local app and Harrison use the same JSON-line RPC on bio-head. The fixed SSH
-command is `/run/current-system/sw/bin/bio-workbench rpc`. The local app forwards
-`POST /api/v1/rpc` unchanged over SSH. Workbench RPC has no head HTTP listener;
+The native desktop and Harrison use the same JSON-line RPC on bio-head. The fixed SSH
+command is `/run/current-system/sw/bin/bio-workbench rpc`. The native app sends
+JSON lines directly over SSH. Workbench RPC has no head HTTP listener;
 the separate public MSA transport uses a loopback-only HTTP CONNECT proxy.
 Each request is
 `{"id":"client-id","method":"catalog","params":{}}`; each response is
@@ -11,12 +11,52 @@ Each request is
 The trusted SSH command sets `BIO_WORKBENCH_ACTOR`; client parameters cannot
 select an actor. Resources are scoped to that actor. The app and Slack share
 resources when their trusted commands use the same actor.
+The construct library is a shared read-only resource for authenticated library
+exploration; reading it does not grant access to another actor's jobs or uploads.
 
 Limits: 2 MiB per wire message, 512 KiB decoded upload/read chunks, 256 MiB per
 upload, 128 declared inputs, 512 expanded input/model pairs, 100 list entries.
 JSON numbers must be finite; duplicate keys and unknown method/parameter names
 are rejected. IDs are opaque strings. Times are UTC ISO 8601. Error codes include
 `invalid`, `not_found`, `conflict`, `limit`, `unavailable`, `integrity`, `internal`.
+
+## Construct library explorer
+
+The authoritative registry is the operator-configured `library_root` (normally
+`/var/lib/bio-library`). Clients cannot choose its path. These methods read
+published records and validate their JSON and attachment hashes; they do not
+publish revisions, change purpose documents, query MSA services or launch work.
+
+* `library.list {query?,kind?,molecule_type?,project_ref?,limit?,offset?}` returns
+  `{records,projects,counts,total_count,filtered_count,next_offset,truncated,project_ref}`.
+  Default limit is 100, maximum 500. `counts` uses singular kind keys. The ordinary
+  list contains latest revisions; a project filter returns its exact pinned
+  member revisions, including older revisions. Search matches all case-insensitive
+  words against IDs, names, aliases, tags, notes and provenance. Summary records
+  contain `ref,kind,id,name,revision,status,molecule_type,aliases,tags,sequence_length,
+  molecular_form,review_status,review_reason,submission_allowed,encoded_by_ref,member_count`.
+* `library.get {ref}` returns `{ref,record,description,members,relations,revisions,
+  submission,projects}`. Aliases resolve to an exact returned `ref`. `record` is
+  the complete published record without removing user-owned provenance keys.
+  `description` is null or `{text,path,sha256,incomplete}`; projects use their
+  `project.md`, molecular records use `description.md`. Member summaries also
+  contain `source_ref` and `role`; relations use `{relation,ref,label}`. Historical
+  revisions and containing projects are summaries. Containing projects include
+  historical project revisions that pin this exact member, even when the latest
+  project has moved on to a newer member revision. `submission:{allowed,reason}`
+  indicates whether the record may be added to the composer. Native model
+  compatibility remains a separate preview check. Unresolved product candidates
+  and whole double-stranded plasmids cannot be submitted as ordinary fold inputs.
+* `library.attachment {ref,name,offset?,length?}` returns
+  `{ref,name,data_b64,offset,next_offset,eof,size,sha256}`. Use a pinned reference
+  throughout a download. `name` can be the plain filename or its recorded
+  `attachments/filename` path. Length defaults to 131072 and is at most 262144
+  bytes. The size and SHA describe the complete original file; clients verify
+  both before publishing an export. Arbitrary filesystem paths are rejected.
+
+Projects and purpose documents provide research context. They do not constitute
+findings or authorize an engineering campaign. The original source database,
+context document and import evidence are retained as project attachments.
 
 ## Catalog and uploads
 

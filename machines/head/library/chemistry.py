@@ -40,8 +40,13 @@ def ccd(value):
 
 def polymer(component, snapshot):
     identity = component['record']['identity']
-    keys(identity, {'molecule_type', 'sequence', 'modifications', 'circular', 'termini', 'linkages', 'bonds', 'crosslinks'},
+    keys(identity, {'molecule_type', 'sequence', 'modifications', 'circular', 'termini', 'linkages', 'bonds', 'crosslinks',
+                    'encoded_by', 'product_review', 'strand_count', 'molecular_form'},
          f"Chain {component['chain_id']} identity")
+    require(identity.get('product_review', {}).get('status') != 'review_required',
+            'Protein product definition requires review; its candidate remains visible but is excluded from prediction')
+    require(identity.get('strand_count', 1) == 1 and identity.get('molecular_form') != 'plasmid',
+            'Whole double-stranded plasmids are not supported prediction inputs; select a defined molecular product')
     molecule = identity['molecule_type']
     require(molecule in ALPHABETS, 'Mixed/custom polymers need a model-specific representation; they cannot be flattened to FASTA')
     sequence = identity.get('sequence')
