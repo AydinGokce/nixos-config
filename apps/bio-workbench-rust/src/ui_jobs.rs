@@ -403,6 +403,10 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
     }
     fn recover_failure(&mut self, id: &str, purpose: Purpose, label: String) {
         match purpose.clone() {
+            Purpose::LibraryRuns(_) => self.library_runs_refresh(None),
+            Purpose::LibraryHistory => {
+                self.request("library.history", json!({}), Purpose::LibraryHistory);
+            }
             Purpose::Catalog => {
                 self.request("catalog", json!({}), purpose);
             }
@@ -467,6 +471,9 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                 Purpose::Preview
             }
             "batch.create" => Purpose::Commit,
+            "library.edit" | "library.undo" | "library.redo" => {
+                Purpose::LibraryWrite(params.clone())
+            }
             "batch.cancel" => Purpose::CancelBatch,
             "job.cancel" => Purpose::CancelJob,
             "annotation.put" => Purpose::SaveNote(

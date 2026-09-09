@@ -10,6 +10,7 @@ mod ui_dock;
 mod ui_inputs;
 mod ui_jobs;
 mod ui_library;
+mod ui_library_runs;
 mod ui_runtime;
 mod ui_state;
 mod ui_style;
@@ -54,6 +55,9 @@ enum Purpose {
     LibraryPage(u64),
     LibraryRecord(String),
     LibraryAttachment(String, String),
+    LibraryHistory,
+    LibraryWrite(Value),
+    LibraryRuns(String),
     Annotations(String),
     SaveNote(String, String),
 }
@@ -100,6 +104,7 @@ struct Workbench {
     pending: BTreeMap<String, Pending>,
     failures: Vec<Failure>,
     library: ui_library::Explorer,
+    library_runs: ui_library_runs::RunControls,
     connection_open: bool,
     preview_open: bool,
     help_open: bool,
@@ -154,7 +159,8 @@ impl Workbench {
             .unwrap_or_default();
         let (ui_tx, ui_rx) = mpsc::channel();
         let library = ui_library::Explorer::restore(&state.extra);
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let library_runs = ui_library_runs::RunControls::default();
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
@@ -205,6 +211,10 @@ impl Workbench {
                         }
                         if ui.button("Open local structure…").clicked() {
                             self.choose_files(Pick::Structure, ctx);
+                            ui.close();
+                        }
+                        if ui.button("Library archive").clicked() {
+                            self.open_library_archive();
                             ui.close();
                         }
                         if ui.button("Experimental Cas9 demo").clicked() {

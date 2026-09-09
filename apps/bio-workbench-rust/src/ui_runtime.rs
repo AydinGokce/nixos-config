@@ -89,6 +89,7 @@ impl Workbench {
             self.job_tab_error(job, &message);
         }
         self.library_failed(&pending.purpose, &message);
+        self.library_runs_failed(&pending.purpose, &message);
         self.log(format!("{}: {message}", pending.label));
         if pending.purpose == Purpose::Catalog {
             self.connected = false;
@@ -301,6 +302,9 @@ impl Workbench {
                 }
             }
             Purpose::Upload(target) => self.uploaded(target, value),
+            Purpose::LibraryHistory => self.library_received_history(value),
+            Purpose::LibraryWrite(sent) => self.library_received_write(value, &sent),
+            Purpose::LibraryRuns(reference) => self.library_runs_received(&reference, value),
             Purpose::Library => self.library_received_list(value, false),
             Purpose::LibraryPage(_) => self.library_received_list(value, true),
             Purpose::LibraryRecord(reference) => self.library_received_record(&reference, value),
@@ -357,6 +361,7 @@ impl Workbench {
         if self.last_poll.elapsed() > Duration::from_secs(4) {
             self.last_poll = Instant::now();
             self.poll_job_tabs();
+            self.library_runs_poll();
             if !self.state.active_batch.is_empty() {
                 let id = self.state.active_batch.clone();
                 self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
@@ -448,7 +453,7 @@ impl Workbench {
                 if let Some(session)=self.session.as_mut(){let old_endpoint=session.connection.identity();let changed=session.connection.host!=self.connection.host||session.connection.user!=self.connection.user||session.connection.port!=self.connection.port;
                     let mut next_state=self.state.clone();let detached=if changed { next_state.detach_library_sources(&old_endpoint) } else { 0 };
                     let saved=if changed { serde_json::to_value(&next_state).map_err(rpc::RpcError::from).and_then(|draft|session.save_connection_with_draft(self.connection.clone(),draft)) } else {session.save_connection(self.connection.clone())};match saved{
-                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.state.preview=None;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
+                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
                     if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before previewing."); }
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
                     self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before previewing.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),

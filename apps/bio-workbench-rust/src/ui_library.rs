@@ -1,4 +1,4 @@
-//! Read-only library navigation; adding an input preserves the selected revision.
+//! Project library curation with immutable revisions and durable head undo/redo.
 use super::*;
 
 #[derive(Default)]
@@ -15,6 +15,8 @@ pub(super) struct Explorer {
     project: String,
     review_only: bool,
     loaded: bool,
+    refresh_again: bool,
+    history_refresh_again: bool,
     scope: String,
     loading_scope: String,
     next_offset: Option<u64>,
@@ -22,19 +24,31 @@ pub(super) struct Explorer {
     total_count: u64,
     tab: usize,
     source_document: bool,
-    history: Vec<String>,
+    archive: bool,
+    loading_archive: bool,
+    scoped_archive: bool,
+    pub(super) undo_history: Value,
+    write_error: String,
+    edit: Option<Edit>,
     added: String,
+}
+
+#[derive(Clone)]
+struct Edit {
+    reference: String,
+    sha256: String,
+    field: String,
+    value: String,
+    original: String,
+    focus: bool,
 }
 
 impl Explorer {
     pub fn restore(extra: &BTreeMap<String, Value>) -> Self {
         let value = extra.get("library_explorer").unwrap_or(&Value::Null);
         Self {
-            selected: text(value, "selected").into(),
             query: text(value, "query").into(),
-            kind: text(value, "kind").into(),
             molecule: text(value, "molecule").into(),
-            project: text(value, "project").into(),
             review_only: value["review_only"].as_bool().unwrap_or(false),
             ..Default::default()
         }
@@ -59,6 +73,27 @@ impl Explorer {
             .all(|word| haystack.contains(word))
     }
 
+    fn reconcile_edit(&mut self, value: &Value, sent: &Value) {
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+        let Some(change) = rows(value, "changed_refs")
+            .iter()
+            .find(|change| text(change, "before_ref") == edit.reference)
+        else {
+            return;
+        };
+        if text(sent, "ref") == edit.reference
+            && sent["patch"][&edit.field].as_str() == Some(&edit.value)
+        {
+            self.edit = None;
+        } else {
+            // An unrelated write or a recovered older save must not discard new typing.
+            edit.reference = text(change, "after_ref").into();
+            edit.sha256.clear();
+        }
+    }
+
     fn accept_detail(&mut self, reference: &str, value: Value) -> bool {
         if self.selected != reference {
             return false;
@@ -67,6 +102,18 @@ impl Explorer {
             self.detail_error =
                 "The head returned a different or incomplete library record.".into();
             return false;
+        }
+        if let Some(edit) = self
+            .edit
+            .as_mut()
+            .filter(|edit| edit.reference == reference && edit.sha256.is_empty())
+        {
+            edit.sha256 = presentation(&value, "sha256").into();
+            edit.original = if edit.field == "sequence" {
+                text(&value["record"]["identity"], "sequence").into()
+            } else {
+                presentation(&value, &edit.field).into()
+            };
         }
         self.detail = value;
         self.detail_error.clear();
@@ -120,7 +167,11 @@ fn pinned_input(detail: &Value, chain: String) -> Result<Input, String> {
     };
     Ok(Input {
         id: uid(),
-        name: text(record, "name").into(),
+        name: if display_name(detail).is_empty() {
+            reference.into()
+        } else {
+            display_name(detail).into()
+        },
         molecule_type: molecule.into(),
         chain_id: chain,
         source: json!({"kind":"library","ref":reference}),
@@ -129,6 +180,12 @@ fn pinned_input(detail: &Value, chain: String) -> Result<Input, String> {
 }
 
 fn kind_label(record: &Value) -> &str {
+    if !text(record, "modality").is_empty() {
+        return text(record, "modality");
+    }
+    if text(record, "molecular_form") == "plasmid" {
+        return "plasmid";
+    }
     match text(record, "kind") {
         "project" => "PROJECT",
         "assembly" => "ASSEMBLY",
@@ -155,12 +212,159 @@ fn review_label(record: &Value) -> (&str, Color32) {
 
 impl Workbench {
     pub(super) fn open_library(&mut self) {
+        if self.sidebar_tab != 2 {
+            self.library_projects();
+        }
         self.sidebar_tab = 2;
         if !self.library.loaded {
             self.library_refresh();
         }
-        if !self.library.selected.is_empty() && self.library.detail.is_null() {
+        self.library_refresh_history();
+    }
+
+    pub(super) fn open_library_archive(&mut self) {
+        self.sidebar_tab = 2;
+        self.library.archive = true;
+        self.library.project.clear();
+        self.library.selected.clear();
+        self.library.detail = Value::Null;
+        self.library.query.clear();
+        self.library.kind.clear();
+        self.library.molecule.clear();
+        self.library.review_only = false;
+        self.library.edit = None;
+        self.library_refresh();
+        self.library_refresh_history();
+    }
+
+    fn library_projects(&mut self) {
+        self.library.archive = false;
+        self.library.project.clear();
+        self.library.selected.clear();
+        self.library.detail = Value::Null;
+        self.library.edit = None;
+        self.library.query.clear();
+        self.library_refresh();
+    }
+
+    fn library_refresh_history(&mut self) {
+        if self.busy(&Purpose::LibraryHistory) {
+            self.library.history_refresh_again = true;
+            return;
+        }
+        self.request("library.history", json!({}), Purpose::LibraryHistory);
+    }
+
+    pub(super) fn library_received_history(&mut self, value: Value) {
+        self.library.undo_history = value;
+        if self.library.history_refresh_again {
+            self.library.history_refresh_again = false;
+            self.library_refresh_history();
+        }
+    }
+
+    fn library_writing(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending.purpose, Purpose::LibraryWrite(_)))
+    }
+
+    fn library_write(&mut self, method: &str, mut params: Value) {
+        if self.library_writing() {
+            return;
+        }
+        params["request_key"] = json!(uid());
+        self.library.write_error.clear();
+        if self
+            .request(method, params.clone(), Purpose::LibraryWrite(params))
+            .is_none()
+        {
+            self.library.write_error =
+                "Could not send this edit. Check the connection and try again.".into();
+        }
+    }
+
+    fn library_archive_record(&mut self, record: &Value, archived: bool) {
+        let reference = text(record, "ref");
+        let sha256 = presentation(record, "sha256");
+        if reference.is_empty() || sha256.is_empty() {
+            self.library.write_error =
+                "This record needs a current revision receipt. Refresh the library before editing."
+                    .into();
+            return;
+        }
+        self.library_write(
+            "library.edit",
+            json!({"ref":reference,"expected_sha256":sha256,"patch":{"archived":archived}}),
+        );
+    }
+
+    pub(super) fn library_received_write(&mut self, value: Value, sent: &Value) {
+        self.library.reconcile_edit(&value, sent);
+        let selected = self.library.selected.clone();
+        for change in rows(&value, "changed_refs") {
+            if self.library.project == text(change, "before_ref") {
+                self.library.project = text(change, "after_ref").into();
+            }
+            if self.library.selected == text(change, "before_ref") {
+                self.library.selected = text(change, "after_ref").into();
+            }
+        }
+        if !selected.is_empty()
+            && self.library.selected == selected
+            && !text(&value, "ref").is_empty()
+        {
+            // Only follow a target when it was the record being inspected.
+            if selected.split('@').next() == text(&value, "ref").split('@').next() {
+                self.library.selected = text(&value, "ref").into();
+            }
+        }
+        self.library.write_error.clear();
+        self.library.undo_history = value["history"].clone();
+        self.library.detail = Value::Null;
+        self.library_refresh();
+        self.library_refresh_history();
+        if !self.library.selected.is_empty() {
             self.library_select(&self.library.selected.clone());
+        }
+        self.log("Library edit saved as a new revision on the head.");
+        self.persist();
+    }
+
+    fn library_begin_edit(&mut self, detail: &Value, field: &str) {
+        if self.library_writing() || detail["is_latest"] == false {
+            return;
+        }
+        let value = if field == "sequence" {
+            text(&detail["record"]["identity"], "sequence")
+        } else {
+            presentation(detail, field)
+        };
+        self.library.edit = Some(Edit {
+            reference: text(detail, "ref").into(),
+            sha256: presentation(detail, "sha256").into(),
+            field: field.into(),
+            value: value.into(),
+            original: value.into(),
+            focus: true,
+        });
+        self.library.write_error.clear();
+    }
+
+    fn library_save_edit(&mut self) {
+        if let Some(edit) = self.library.edit.clone() {
+            if edit.sha256.is_empty() {
+                return;
+            }
+            if edit.value == edit.original || (edit.field != "alt_name" && edit.value.is_empty()) {
+                return;
+            }
+            let mut patch = json!({});
+            patch[&edit.field] = json!(edit.value);
+            self.library_write(
+                "library.edit",
+                json!({"ref":edit.reference,"expected_sha256":edit.sha256,"patch":patch}),
+            );
         }
     }
 
@@ -171,11 +375,13 @@ impl Workbench {
                 .values()
                 .any(|pending| matches!(pending.purpose, Purpose::LibraryPage(_)))
         {
+            self.library.refresh_again = true;
             return;
         }
         self.library.error.clear();
         self.library.loading_scope = self.library.project.clone();
-        let mut params = json!({"limit":500});
+        self.library.loading_archive = self.library.archive;
+        let mut params = json!({"limit":500,"archived":self.library.archive});
         if !self.library.project.is_empty() {
             params["project_ref"] = json!(self.library.project);
         }
@@ -193,7 +399,8 @@ impl Workbench {
             return;
         }
         self.library.loading_scope = self.library.project.clone();
-        let mut params = json!({"limit":500,"offset":offset});
+        self.library.loading_archive = self.library.archive;
+        let mut params = json!({"limit":500,"offset":offset,"archived":self.library.archive});
         if !self.library.project.is_empty() {
             params["project_ref"] = json!(self.library.project);
         }
@@ -201,7 +408,9 @@ impl Workbench {
     }
 
     pub(super) fn library_received_list(&mut self, value: Value, append: bool) {
-        if self.library.loading_scope != self.library.project {
+        if self.library.loading_scope != self.library.project
+            || self.library.loading_archive != self.library.archive
+        {
             self.library_refresh();
             return;
         }
@@ -233,18 +442,12 @@ impl Workbench {
             .as_u64()
             .unwrap_or(self.library.filtered_count);
         self.library.scope = self.library.loading_scope.clone();
+        self.library.scoped_archive = self.library.loading_archive;
         self.library.loaded = true;
         self.library.error.clear();
-        if self.library.selected.is_empty() {
-            let reference = self
-                .library
-                .projects
-                .first()
-                .or_else(|| self.library.records.first())
-                .map(|record| text(record, "ref").to_owned());
-            if let Some(reference) = reference {
-                self.library_select(&reference);
-            }
+        if self.library.refresh_again {
+            self.library.refresh_again = false;
+            self.library_refresh();
         }
     }
 
@@ -253,12 +456,7 @@ impl Workbench {
             return;
         }
         if self.library.selected != reference {
-            if !self.library.selected.is_empty() {
-                self.library.history.push(self.library.selected.clone());
-                if self.library.history.len() > 100 {
-                    self.library.history.remove(0);
-                }
-            }
+            self.library.edit = None;
             self.library.selected = reference.into();
             self.library.detail = Value::Null;
             self.library.detail_error.clear();
@@ -279,12 +477,21 @@ impl Workbench {
     }
 
     pub(super) fn library_received_record(&mut self, reference: &str, value: Value) {
-        self.library.accept_detail(reference, value);
+        let archived_project = value["archived"] == true
+            && text(&value["record"], "kind") == "project"
+            && self.library.project == reference;
+        if self.library.accept_detail(reference, value) && archived_project {
+            self.library.project.clear();
+            self.library_refresh();
+        }
     }
 
     pub(super) fn library_failed(&mut self, purpose: &Purpose, message: &str) {
         match purpose {
             Purpose::Library | Purpose::LibraryPage(_) => self.library.error = message.into(),
+            Purpose::LibraryWrite(_) | Purpose::LibraryHistory => {
+                self.library.write_error = message.into()
+            }
             Purpose::LibraryRecord(reference) if reference == &self.library.selected => {
                 self.library.detail_error = message.into()
             }
@@ -294,29 +501,41 @@ impl Workbench {
 
     pub(super) fn library_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.library.history.is_empty(),
-                    egui::Button::new("< Back"),
-                )
-                .clicked()
-                && let Some(reference) = self.library.history.pop()
-            {
-                self.library.selected.clear();
-                self.library_select(&reference);
-            }
             if ui.button("Refresh library").clicked() {
                 self.library_refresh();
+                self.library_refresh_history();
             }
-            if ui.button("Molecular viewer").clicked() {
-                self.sidebar_tab = 1;
+            let writing = self.library_writing();
+            for (field, label, method) in [
+                ("undo", "Undo", "library.undo"),
+                ("redo", "Redo", "library.redo"),
+            ] {
+                let entry = self.library.undo_history[field].clone();
+                let operation = text(&entry, "operation_id");
+                if ui
+                    .add_enabled(!writing && !operation.is_empty(), egui::Button::new(label))
+                    .on_hover_text(text(&entry, "label"))
+                    .clicked()
+                {
+                    self.library_write(method, json!({"operation_id":operation}));
+                }
+            }
+            if writing {
+                ui.spinner();
             }
             ui.separator();
             ui.label(
-                RichText::new("HEAD / MOLECULAR LIBRARY")
-                    .strong()
-                    .color(AMBER),
+                RichText::new(if self.library.archive {
+                    "LIBRARY ARCHIVE"
+                } else {
+                    "HEAD / MOLECULAR LIBRARY"
+                })
+                .strong()
+                .color(AMBER),
             );
+            if ui.button("Molecular viewer").clicked() {
+                self.sidebar_tab = 1;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Connection…").clicked() {
                     self.connection_open = true;
@@ -327,96 +546,81 @@ impl Workbench {
     }
 
     pub(super) fn library_sidebar(&mut self, ui: &mut egui::Ui) {
-        Self::section(ui, "PROJECTS");
-        let mut project = None;
-        if ui
-            .selectable_label(self.library.project.is_empty(), "All library records")
-            .clicked()
-        {
-            project = Some(String::new());
+        let projects = self.library.project.is_empty() && !self.library.archive;
+        if !projects && ui.button("< Back to projects").clicked() {
+            self.library_projects();
+            return;
         }
-        for item in &self.library.projects {
-            let reference = text(item, "ref");
-            if ui
-                .selectable_label(self.library.project == reference, text(item, "name"))
-                .on_hover_text(reference)
-                .clicked()
-            {
-                project = Some(reference.to_owned());
+        Self::section(
+            ui,
+            if self.library.archive {
+                "ARCHIVE"
+            } else if projects {
+                "PROJECTS"
+            } else {
+                "CONSTRUCTS"
+            },
+        );
+        if !projects && !self.library.archive {
+            let project = self
+                .library
+                .projects
+                .iter()
+                .find(|item| text(item, "ref") == self.library.project);
+            let name = project
+                .map(|value| text(value, "name"))
+                .unwrap_or(&self.library.project)
+                .to_owned();
+            if ui.link(name).on_hover_text("Open project brief").clicked() {
+                self.library_select(&self.library.project.clone());
             }
         }
-        if let Some(reference) = project {
-            self.library.project = reference.clone();
-            if !reference.is_empty() {
-                self.library_select(&reference);
-            }
-            self.library_refresh();
-        }
-        Self::section(ui, "RECORDS");
         ui.add(
             egui::TextEdit::singleline(&mut self.library.query)
-                .hint_text("Search names, aliases, references…")
+                .hint_text(if projects {
+                    "Search projects…"
+                } else {
+                    "Search IDs, alt names, source names…"
+                })
                 .desired_width(f32::INFINITY),
         );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("library-kind")
-                .width(94.)
-                .selected_text(if self.library.kind.is_empty() {
-                    "All kinds"
-                } else {
-                    &self.library.kind
-                })
-                .show_ui(ui, |ui| {
-                    for kind in ["", "construct", "assembly", "monomer", "project"] {
-                        ui.selectable_value(
-                            &mut self.library.kind,
-                            kind.into(),
-                            if kind.is_empty() { "All kinds" } else { kind },
-                        );
-                    }
-                });
-            egui::ComboBox::from_id_salt("library-molecule")
-                .width(94.)
-                .selected_text(if self.library.molecule.is_empty() {
-                    "All molecules"
-                } else {
-                    &self.library.molecule
-                })
-                .show_ui(ui, |ui| {
-                    for molecule in [
-                        "",
-                        "protein",
-                        "dna",
-                        "rna",
-                        "small_molecule",
-                        "mixed_polymer",
-                    ] {
-                        ui.selectable_value(
-                            &mut self.library.molecule,
-                            molecule.into(),
-                            if molecule.is_empty() {
-                                "All molecules"
-                            } else {
-                                molecule
-                            },
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.library.review_only, "Needs review");
-            if ui.small_button("Clear filters").clicked() {
-                self.library.query.clear();
-                self.library.kind.clear();
-                self.library.molecule.clear();
-                self.library.review_only = false;
-            }
-        });
+        if !projects {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("library-molecule")
+                    .width(108.)
+                    .selected_text(if self.library.molecule.is_empty() {
+                        "All modalities"
+                    } else {
+                        &self.library.molecule
+                    })
+                    .show_ui(ui, |ui| {
+                        for molecule in [
+                            "",
+                            "protein",
+                            "dna",
+                            "rna",
+                            "small_molecule",
+                            "mixed_polymer",
+                        ] {
+                            ui.selectable_value(
+                                &mut self.library.molecule,
+                                molecule.into(),
+                                if molecule.is_empty() {
+                                    "All modalities"
+                                } else {
+                                    molecule
+                                },
+                            );
+                        }
+                    });
+                ui.checkbox(&mut self.library.review_only, "Needs review");
+            });
+        }
         if !self.library.error.is_empty() {
             ui.colored_label(RED, &self.library.error);
-            if ui.button("Retry library").clicked() {
-                self.library_refresh();
-            }
+        }
+        if !self.library.write_error.is_empty() {
+            ui.colored_label(RED, &self.library.write_error);
         }
         if self.busy(&Purpose::Library) {
             ui.horizontal(|ui| {
@@ -424,54 +628,109 @@ impl Workbench {
                 ui.small("Loading library…");
             });
         }
-        if self.library.scope != self.library.project {
+        if self.library.scope != self.library.project
+            || self.library.scoped_archive != self.library.archive
+        {
             return;
         }
-        let visible: Vec<_> = self
-            .library
-            .records
-            .iter()
-            .filter(|record| self.library.visible(record))
-            .cloned()
-            .collect();
+        let visible: Vec<_> = if projects {
+            self.library
+                .projects
+                .iter()
+                .filter(|item| {
+                    self.library
+                        .query
+                        .to_lowercase()
+                        .split_whitespace()
+                        .all(|word| item.to_string().to_lowercase().contains(word))
+                })
+                .cloned()
+                .collect()
+        } else {
+            self.library
+                .records
+                .iter()
+                .filter(|record| {
+                    (self.library.archive || text(record, "kind") != "project")
+                        && self.library.visible(record)
+                })
+                .cloned()
+                .collect()
+        };
         ui.weak(format!(
-            "{} shown · {} loaded / {} in scope",
+            "{} {}",
             visible.len(),
-            self.library.records.len(),
-            self.library.filtered_count
+            if projects { "projects" } else { "records" }
         ));
         let mut selected = None;
+        let mut archived = None;
+        let writing = self.library_writing();
         for record in &visible {
             let reference = text(record, "ref");
             let is_selected = self.library.selected == reference;
-            let (status, color) = review_label(record);
             egui::Frame::NONE
                 .fill(if is_selected {
                     Color32::from_rgb(53, 73, 87)
                 } else {
                     Color32::from_rgb(40, 42, 45)
                 })
-                .inner_margin(egui::Margin::symmetric(6, 4))
+                .inner_margin(egui::Margin::symmetric(6, 5))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    if ui
-                        .add(
-                            egui::Button::selectable(
-                                is_selected,
-                                RichText::new(text(record, "name")).strong(),
-                            )
-                            .min_size(Vec2::new(ui.available_width(), 20.)),
-                        )
-                        .on_hover_text(reference)
-                        .clicked()
-                    {
-                        selected = Some(reference.to_owned());
-                    }
                     ui.horizontal(|ui| {
-                        ui.small(
-                            RichText::new(kind_label(record))
-                                .color(Color32::from_rgb(145, 178, 198)),
+                        let reserved = if self.library.archive { 57. } else { 23. };
+                        let width = (ui.available_width() - reserved - ui.spacing().item_spacing.x)
+                            .max(24.);
+                        let name = display_name(record);
+                        let label = if name.is_empty() {
+                            RichText::new("no alt name").small().italics().weak()
+                        } else {
+                            RichText::new(name).strong()
+                        };
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(width, 24.), egui::Sense::click());
+                        let mut label_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(("library-row-label", reference))
+                                .max_rect(rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         );
+                        let label_response = label_ui.add(
+                            egui::Label::new(label)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        if response.on_hover_text(reference).clicked()
+                            || label_response.on_hover_text(reference).clicked()
+                        {
+                            selected =
+                                Some((reference.to_owned(), text(record, "kind") == "project"));
+                        }
+                        if self.library.archive {
+                            if ui
+                                .add_enabled(!writing, egui::Button::new("Restore").small())
+                                .on_hover_text("Restore to library")
+                                .clicked()
+                            {
+                                archived = Some((record.clone(), false));
+                            }
+                        } else if icon_button(
+                            ui,
+                            Icon::Trash,
+                            !writing,
+                            "Archive; Undo restores this entry",
+                        )
+                        .clicked()
+                        {
+                            archived = Some((record.clone(), true));
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let id = presentation(record, "inventory_id");
+                        if !id.is_empty() {
+                            chip(ui, id, AMBER);
+                        }
+                        chip(ui, kind_label(record), Color32::from_rgb(145, 178, 198));
                         if let Some(length) = record["sequence_length"].as_u64() {
                             ui.weak(format!(
                                 "{length} {}",
@@ -482,16 +741,33 @@ impl Workbench {
                                 }
                             ));
                         }
-                        ui.weak(format!("r{}", record["revision"].as_u64().unwrap_or(0)));
+                        if projects {
+                            ui.weak(format!(
+                                "{} members",
+                                record["member_count"].as_u64().unwrap_or(0)
+                            ));
+                        }
                     });
-                    if !status.is_empty() {
-                        ui.label(RichText::new(status.replace('_', " ")).small().color(color))
+                    let (status, color) = review_label(record);
+                    if status == "REVIEW REQUIRED" {
+                        ui.label(RichText::new(status).small().color(color))
                             .on_hover_text(text(record, "review_reason"));
                     }
                 });
+            ui.add_space(2.);
         }
-        if let Some(reference) = selected {
+        if let Some((reference, is_project)) = selected {
+            if is_project && !self.library.archive {
+                self.library.project = reference.clone();
+                self.library.query.clear();
+                self.library.molecule.clear();
+                self.library.review_only = false;
+                self.library_refresh();
+            }
             self.library_select(&reference);
+        }
+        if let Some((record, archive)) = archived {
+            self.library_archive_record(&record, archive);
         }
         if let Some(offset) = self.library.next_offset {
             if ui
@@ -503,12 +779,14 @@ impl Workbench {
             {
                 self.library_load_page(offset);
             }
-            ui.small("Filters apply to loaded records. Load more to search the remaining records.");
+            ui.small("Search includes loaded records; load more for the rest.");
         } else if visible.is_empty() && self.library.loaded {
-            ui.weak(if self.library.records.is_empty() {
-                "No records in this scope."
+            ui.weak(if projects {
+                "No projects match."
+            } else if self.library.archive {
+                "The archive is empty."
             } else {
-                "No records match these filters."
+                "No constructs match."
             });
         }
     }
@@ -533,25 +811,9 @@ impl Workbench {
             }
             let detail = self.library.detail.clone();
             let record = &detail["record"];
-            ui.horizontal_wrapped(|ui| {
-                ui.heading(RichText::new(text(record, "name")).size(18.));
-                let mut revision = text(&detail, "ref").to_owned();
-                egui::ComboBox::from_id_salt("library-revision").selected_text(format!("Revision {}", record["revision"]))
-                    .show_ui(ui, |ui| {
-                        for item in rows(&detail, "revisions") {
-                            let reference = item.as_str().unwrap_or_else(|| text(item, "ref"));
-                            ui.selectable_value(&mut revision, reference.to_owned(), reference);
-                        }
-                    });
-                if revision != text(&detail, "ref") { self.library_select(&revision); }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.monospace(text(&detail, "ref"));
-                if ui.small_button("Copy ref").clicked() { ctx.copy_text(text(&detail, "ref").into()); }
-                ui.separator();
-                ui.label(format!("{} · {}", text(record, "kind"), text(&record["identity"], "molecule_type")));
-                ui.weak(text(record, "status"));
-            });
+            self.library_detail_header(ui,&detail,ctx);
+            if !self.library.write_error.is_empty() { ui.colored_label(RED,&self.library.write_error); }
+            self.library_edit_sequence(ui);
             let review = &record["identity"]["product_review"];
             if !text(review, "status").is_empty() {
                 let color = if text(review, "status") == "review_required" { AMBER } else { GREEN };
@@ -560,10 +822,11 @@ impl Workbench {
             if matches!(text(record, "kind"), "construct" | "assembly") {
                 let input = pinned_input(&detail, self.state.next_chain());
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(input.is_ok(), egui::Button::new("+ Add this revision to Inputs")).clicked()
+                    if ui.add_enabled(input.is_ok(), egui::Button::new(RichText::new("▶ Prepare prediction").strong().color(GREEN)).min_size(Vec2::new(180.,30.))).clicked()
                         && let Ok(input) = input.clone()
                     {
                         self.state.inputs.push(input);
+                        self.sidebar_tab = 0;
                         self.library.added = format!("Added {} to the run composer.", text(&detail, "ref"));
                         self.log(self.library.added.clone());
                         self.persist();
@@ -572,7 +835,7 @@ impl Workbench {
                     if let Err(reason) = input { ui.colored_label(AMBER, reason); }
                 });
                 if !self.library.added.is_empty() { ui.colored_label(GREEN, &self.library.added); }
-                ui.weak("Adding an input does not launch a job. Model compatibility is checked in Preview.");
+                ui.weak("Prepare prediction adds this revision to Inputs, where you choose models and submit.");
             }
             ui.add_space(5.);
             ui.horizontal_wrapped(|ui| {
@@ -584,6 +847,7 @@ impl Workbench {
             egui::ScrollArea::both().id_salt(("library-detail", self.library.selected.clone(), self.library.tab))
                 .auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+                    self.library_run_controls(ui, &detail);
                     match self.library.tab {
                         0 => self.library_purpose(ui, &detail, ctx),
                         1 => self.library_identity(ui, &detail, ctx),
@@ -596,6 +860,176 @@ impl Workbench {
                     }
                 });
         });
+    }
+
+    fn library_detail_header(&mut self, ui: &mut egui::Ui, detail: &Value, ctx: &egui::Context) {
+        let record = &detail["record"];
+        let project = text(record, "kind") == "project";
+        let field = if project { "name" } else { "alt_name" };
+        let editable = detail["is_latest"] != false && !self.library_writing();
+        let name = display_name(detail);
+        let editing = self
+            .library
+            .edit
+            .as_ref()
+            .is_some_and(|edit| edit.field == field && edit.reference == text(detail, "ref"));
+        let mut save = false;
+        let mut cancel = false;
+        ui.horizontal_wrapped(|ui| {
+            if editing {
+                let edit = self.library.edit.as_mut().unwrap();
+                let response = ui.add_enabled(
+                    editable,
+                    egui::TextEdit::singleline(&mut edit.value)
+                        .desired_width((ui.available_width() - 320.).clamp(160., 500.))
+                        .hint_text(if project { "Project name" } else { "Alt name" }),
+                );
+                if edit.focus {
+                    response.request_focus();
+                    edit.focus = false;
+                }
+                save = ui
+                    .add_enabled(
+                        editable
+                            && edit.value != edit.original
+                            && (!project || !edit.value.trim().is_empty()),
+                        egui::Button::new("Save"),
+                    )
+                    .clicked()
+                    || (response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                cancel = ui
+                    .add_enabled(editable, egui::Button::new("Cancel"))
+                    .clicked()
+                    || (response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Escape)));
+            } else {
+                let label = if name.is_empty() {
+                    RichText::new("no alt name").size(13.).italics().weak()
+                } else {
+                    RichText::new(name).strong().size(20.)
+                };
+                if ui
+                    .add(egui::Label::new(label).sense(egui::Sense::click()))
+                    .on_hover_text(if editable {
+                        "Double-click to edit"
+                    } else {
+                        "Open the current revision to edit"
+                    })
+                    .double_clicked()
+                    && editable
+                {
+                    self.library_begin_edit(detail, field);
+                }
+            }
+            let id = presentation(detail, "inventory_id");
+            if !id.is_empty() {
+                chip(ui, id, AMBER);
+            }
+            let modality = presentation(detail, "modality");
+            if !modality.is_empty() {
+                chip(ui, modality, Color32::from_rgb(145, 178, 198));
+            }
+            if detail["archived"] == true {
+                chip(ui, "archived", AMBER);
+                if ui
+                    .add_enabled(editable, egui::Button::new("Restore"))
+                    .clicked()
+                {
+                    self.library_archive_record(detail, false);
+                }
+            } else if icon_button(
+                ui,
+                Icon::Trash,
+                editable,
+                "Archive; Undo restores this entry",
+            )
+            .clicked()
+            {
+                self.library_archive_record(detail, true);
+            }
+            if !text(&record["identity"], "sequence").is_empty()
+                && icon_button(
+                    ui,
+                    Icon::Pencil,
+                    editable,
+                    "Edit nucleotide or amino-acid sequence",
+                )
+                .clicked()
+            {
+                self.library_begin_edit(detail, "sequence");
+            }
+        });
+        if cancel {
+            self.library.edit = None;
+        } else if save {
+            self.library_save_edit();
+        }
+        let verbose = presentation(detail, "verbose_name");
+        if !project && !verbose.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                chip(ui, verbose, Color32::from_rgb(172, 182, 191));
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.monospace(text(detail, "ref"));
+            if ui.small_button("Copy ref").clicked() {
+                ctx.copy_text(text(detail, "ref").into());
+            }
+            let mut revision = text(detail, "ref").to_owned();
+            egui::ComboBox::from_id_salt("library-revision")
+                .selected_text(format!("Revision {}", record["revision"]))
+                .show_ui(ui, |ui| {
+                    for item in rows(detail, "revisions") {
+                        let reference = item.as_str().unwrap_or_else(|| text(item, "ref"));
+                        ui.selectable_value(&mut revision, reference.to_owned(), reference);
+                    }
+                });
+            if revision != text(detail, "ref") {
+                self.library_select(&revision);
+            }
+            if detail["is_latest"] == false && ui.link("Open current revision to edit").clicked() {
+                self.library_select(text(detail, "latest_ref"));
+            }
+        });
+        if !editing {
+            ui.weak(if project {
+                "Double-click the project name to edit."
+            } else {
+                "Double-click the alt name to edit."
+            });
+        }
+    }
+
+    fn library_edit_sequence(&mut self, ui: &mut egui::Ui) {
+        let writing = self.library_writing();
+        let Some(edit) = self
+            .library
+            .edit
+            .as_mut()
+            .filter(|edit| edit.field == "sequence")
+        else {
+            return;
+        };
+        let mut save = false;
+        let mut cancel = false;
+        egui::Frame::group(ui.style()).show(ui,|ui| {
+            Self::section(ui,"EDIT SEQUENCE");
+            ui.weak("Save creates a new revision. Previous annotations remain original source evidence, and existing runs retain their original input.");
+            ui.weak("Enter the exact uppercase sequence without spaces or line breaks. Modified polymers require a compatible residue mapping.");
+            let response=ui.add_enabled(!writing,egui::TextEdit::multiline(&mut edit.value).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(7));
+            if edit.focus { response.request_focus();edit.focus=false; }
+            ui.horizontal(|ui| {
+                save=ui.add_enabled(!writing && !edit.value.is_empty() && edit.value!=edit.original,egui::Button::new("Save sequence")).clicked();
+                cancel=ui.add_enabled(!writing,egui::Button::new("Cancel")).clicked();
+                ui.weak(format!("{} characters",edit.value.len()));
+            });
+        });
+        if cancel {
+            self.library.edit = None;
+        } else if save {
+            self.library_save_edit();
+        }
     }
 
     fn library_purpose(&mut self, ui: &mut egui::Ui, detail: &Value, ctx: &egui::Context) {
@@ -635,7 +1069,7 @@ impl Workbench {
         }
         if !rows(detail, "members").is_empty() {
             ui.add_space(10.);
-            Self::section(ui, "PROJECT MEMBERS — PINNED REVISIONS");
+            Self::section(ui, "PROJECT MEMBERS / PINNED REVISIONS");
             let mut selected = None;
             for member in rows(detail, "members") {
                 ui.horizontal_wrapped(|ui| {
@@ -643,7 +1077,8 @@ impl Workbench {
                     if ui.link(reference).clicked() {
                         selected = Some(reference.to_owned());
                     }
-                    ui.label(text(member, "name"));
+                    let name = display_name(member);
+                    ui.label(if name.is_empty() { "no alt name" } else { name });
                     let (label, color) = review_label(member);
                     if !label.is_empty() {
                         ui.colored_label(color, label.replace('_', " "));
@@ -685,6 +1120,16 @@ impl Workbench {
                 if !text(identity, "molecular_form").is_empty() {
                     ui.label(text(identity, "molecular_form"));
                 }
+                if icon_button(
+                    ui,
+                    Icon::Pencil,
+                    detail["is_latest"] != false && !self.library_writing(),
+                    "Edit sequence",
+                )
+                .clicked()
+                {
+                    self.library_begin_edit(detail, "sequence");
+                }
                 if ui.button("Copy sequence").clicked() {
                     ctx.copy_text(sequence.into());
                 }
@@ -692,7 +1137,7 @@ impl Workbench {
                     ctx.copy_text(format!(
                         ">{} {}\n{}\n",
                         text(detail, "ref"),
-                        text(record, "name"),
+                        display_name(detail),
                         wrapped_sequence(sequence)
                     ));
                 }
@@ -873,6 +1318,108 @@ impl Workbench {
             }
         });
     }
+}
+
+/// Presentation fields are distinct from immutable source identity. Empty alt names
+/// deliberately remain empty rather than falling back to a verbose source name.
+fn presentation<'a>(value: &'a Value, field: &str) -> &'a str {
+    if let Some(text) = value.get(field).and_then(Value::as_str) {
+        return text;
+    }
+    if let Some(text) = value["record"].get(field).and_then(Value::as_str) {
+        return text;
+    }
+    ""
+}
+
+fn display_name(value: &Value) -> &str {
+    let record = if value["record"].is_object() {
+        &value["record"]
+    } else {
+        value
+    };
+    if text(record, "kind") == "project" {
+        text(record, "name")
+    } else {
+        presentation(value, "alt_name")
+    }
+}
+
+fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
+    egui::Frame::NONE
+        .fill(Color32::from_rgb(31, 35, 39))
+        .stroke(egui::Stroke::new(1., Color32::from_rgb(70, 77, 84)))
+        .corner_radius(3)
+        .inner_margin(egui::Margin::symmetric(5, 2))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(label).small().color(color)).wrap_mode(
+                    if label.len() < 50 {
+                        egui::TextWrapMode::Extend
+                    } else {
+                        egui::TextWrapMode::Wrap
+                    },
+                ),
+            );
+        });
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Trash,
+    Pencil,
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
+    let response = ui
+        .add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(23.)))
+        .on_hover_text(tooltip);
+    let center = response.rect.center();
+    let stroke = egui::Stroke::new(
+        1.4,
+        if enabled {
+            Color32::from_gray(200)
+        } else {
+            Color32::from_gray(85)
+        },
+    );
+    let point = |x, y| center + Vec2::new(x, y);
+    match icon {
+        Icon::Trash => {
+            ui.painter()
+                .line_segment([point(-5., -4.), point(5., -4.)], stroke);
+            ui.painter()
+                .line_segment([point(-2., -6.), point(2., -6.)], stroke);
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    point(-4., -2.),
+                    point(-3., 6.),
+                    point(3., 6.),
+                    point(4., -2.),
+                ],
+                stroke,
+            ));
+            for x in [-1.3, 1.3] {
+                ui.painter()
+                    .line_segment([point(x, -1.), point(x, 4.)], stroke);
+            }
+        }
+        Icon::Pencil => {
+            ui.painter().add(egui::Shape::closed_line(
+                vec![
+                    point(-5., 3.),
+                    point(2., -4.),
+                    point(5., -1.),
+                    point(-2., 6.),
+                    point(-6., 7.),
+                ],
+                stroke,
+            ));
+            ui.painter()
+                .line_segment([point(0., -2.), point(3., 1.)], stroke);
+        }
+    }
+    response
 }
 
 fn readonly(ui: &mut egui::Ui, value: &str) {
@@ -1080,6 +1627,87 @@ mod tests {
 
     fn detail() -> Value {
         json!({"ref":"construct:protein@2","record":{"kind":"construct","id":"protein","revision":2,"name":"Protein", "identity":{"molecule_type":"protein","sequence":"ACDE"}},"submission":{"allowed":true}})
+    }
+
+    #[test]
+    fn curated_names_never_fall_back_to_verbose_names_or_ids() {
+        let mut value = json!({"ref":"construct:example@1","kind":"construct","alt_name":"","name":"pGC077 — long source name (protein product)","verbose_name":"Long source name","inventory_id":"pGC077","modality":"protein"});
+        assert_eq!(display_name(&value), "");
+        assert_eq!(presentation(&value, "inventory_id"), "pGC077");
+        assert_eq!(kind_label(&value), "protein");
+        value["alt_name"] = json!("Short name");
+        assert_eq!(display_name(&value), "Short name");
+        let detail = json!({"record":value,"alt_name":"","verbose_name":"Long source name"});
+        assert_eq!(display_name(&detail), "");
+        assert_eq!(presentation(&detail, "verbose_name"), "Long source name");
+        assert_eq!(
+            display_name(&json!({"record":{"kind":"project","name":"Shared objective"}})),
+            "Shared objective"
+        );
+    }
+
+    #[test]
+    fn unrelated_writes_and_recovered_older_saves_preserve_new_typing() {
+        let reference = "construct:example@1";
+        let edit = Edit {
+            reference: reference.into(),
+            sha256: "a".repeat(64),
+            field: "alt_name".into(),
+            value: "New typing".into(),
+            original: "Original".into(),
+            focus: false,
+        };
+        let mut explorer = Explorer {
+            selected: reference.into(),
+            edit: Some(edit.clone()),
+            ..Default::default()
+        };
+        let other = json!({"changed_refs":[{"before_ref":"construct:other@1","after_ref":"construct:other@2"}]});
+        explorer.reconcile_edit(
+            &other,
+            &json!({"ref":"construct:other@1","patch":{"archived":true}}),
+        );
+        assert_eq!(explorer.edit.as_ref().unwrap().value, "New typing");
+        assert_eq!(explorer.edit.as_ref().unwrap().sha256, "a".repeat(64));
+        let changed =
+            json!({"changed_refs":[{"before_ref":reference,"after_ref":"construct:example@2"}]});
+        explorer.reconcile_edit(
+            &changed,
+            &json!({"ref":reference,"patch":{"alt_name":"Older submitted value"}}),
+        );
+        assert_eq!(explorer.edit.as_ref().unwrap().value, "New typing");
+        assert_eq!(
+            explorer.edit.as_ref().unwrap().reference,
+            "construct:example@2"
+        );
+        assert!(explorer.edit.as_ref().unwrap().sha256.is_empty());
+        explorer.selected = "construct:example@2".into();
+        assert!(explorer.accept_detail("construct:example@2",json!({"ref":"construct:example@2","record":{},"alt_name":"Older submitted value","sha256":"b".repeat(64)})));
+        assert_eq!(
+            explorer.edit.as_ref().unwrap().original,
+            "Older submitted value"
+        );
+        assert_eq!(explorer.edit.as_ref().unwrap().value, "New typing");
+        assert_eq!(explorer.edit.as_ref().unwrap().sha256, "b".repeat(64));
+        explorer.edit = Some(edit);
+        explorer.reconcile_edit(
+            &changed,
+            &json!({"ref":reference,"patch":{"alt_name":"New typing"}}),
+        );
+        assert!(explorer.edit.is_none());
+    }
+
+    #[test]
+    fn opening_an_old_saved_explorer_starts_at_projects_without_stale_kind_filters() {
+        let extras = BTreeMap::from([(
+            "library_explorer".into(),
+            json!({"selected":"construct:old@1","project":"project:old@1","kind":"project"}),
+        )]);
+        let explorer = Explorer::restore(&extras);
+        assert!(explorer.project.is_empty());
+        assert!(explorer.selected.is_empty());
+        assert!(explorer.kind.is_empty());
+        assert!(!explorer.archive);
     }
 
     #[test]

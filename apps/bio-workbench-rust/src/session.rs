@@ -261,7 +261,10 @@ impl Session {
         }
         self.connection.validate()?;
         let endpoint = self.connection.identity();
-        if matches!(method, "batch.validate" | "batch.create") {
+        if matches!(
+            method,
+            "batch.validate" | "batch.create" | "library.edit" | "library.undo" | "library.redo"
+        ) {
             let explicit = params.get("request_key").is_some();
             if !explicit {
                 let journal = self.journal.lock().map_err(|_| poisoned())?;
@@ -1056,6 +1059,63 @@ mod tests {
         assert!(next_result(&mut session).1.is_ok());
         assert_eq!(mock.calls.lock().unwrap().len(), count);
     }
+    #[test]
+    fn library_writes_keep_exact_payload_and_key_across_lost_reply_restart() {
+        struct LibraryWrites(Mutex<Vec<(String, Value)>>, AtomicUsize);
+        impl Backend for LibraryWrites {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                self.0.lock().unwrap().push((method.into(), params.clone()));
+                if self.1.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(RpcError::new("ssh", "lost edit reply").uncertain(true))
+                } else {
+                    Ok(json!({"ref":"construct:example@2","request_key":params["request_key"]}))
+                }
+            }
+            fn library(&self) -> Result<Value, RpcError> {
+                unreachable!()
+            }
+        }
+        for method in ["library.edit", "library.undo", "library.redo"] {
+            let directory = tempfile::tempdir().unwrap();
+            let backend = Arc::new(LibraryWrites(Mutex::new(Vec::new()), AtomicUsize::new(0)));
+            let mut session = Session::open_internal(
+                egui::Context::default(),
+                directory.path().into(),
+                Some(backend.clone()),
+                false,
+            )
+            .unwrap();
+            let params = json!({"request_key":"exact-key","ref":"construct:example@1","expected_sha256":"a".repeat(64),"patch":{"alt_name":"","sequence":"ACGT"}});
+            let id = session.request(method, params.clone()).unwrap();
+            assert!(next_result(&mut session).1.unwrap_err().uncertain);
+            drop(session);
+            let mut session = Session::open_internal(
+                egui::Context::default(),
+                directory.path().into(),
+                Some(backend.clone()),
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend.0.lock().unwrap().len(), 1);
+            assert_eq!(session.retryable_operations()[0]["params"], params);
+            session.retry(&id).unwrap();
+            next_result(&mut session).1.unwrap();
+            {
+                let calls = backend.0.lock().unwrap();
+                assert_eq!(calls[0], calls[1]);
+            }
+            session.retry(&id).unwrap();
+            next_result(&mut session).1.unwrap();
+            assert_eq!(backend.0.lock().unwrap().len(), 2);
+            let mut changed = params.clone();
+            changed["patch"]["sequence"] = json!("ACGA");
+            assert_eq!(
+                session.request(method, changed).unwrap_err().code,
+                "conflict"
+            );
+        }
+    }
+
     #[test]
     fn old_operation_cannot_replay_to_new_head() {
         let dir = tempfile::tempdir().unwrap();

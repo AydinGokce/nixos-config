@@ -75,30 +75,42 @@ Open **Library** beside Inputs and Runs, or choose **Browse library** from the
 input editor. This native workspace reads the shared head library; switching
 back to **Molecular viewer** retains every structure tab and its display state.
 
-Choose a project to browse its exact member revisions, or **All library records**
-for the current inventory. Search names, aliases and references; filter by record
-kind, molecule type or **Needs review**. Lists show molecular type, sequence
-length, revision and product-review status. **Load more records** is explicit when
-the server returns multiple pages; local filters apply to records already loaded.
+The sidebar opens with projects. Select a project to expand its constructs and
+use **Back to projects** to return. Construct rows use the curated **Alt name**;
+missing names show a small italic *no alt name* placeholder. Inventory IDs and
+modalities are separate tags. The original verbose source name appears only as a
+tag in the selected detail pane. Search includes IDs, Alt names and source names;
+filter by modality or **Needs review**. **Load more records** is explicit when
+the server returns multiple pages.
 
-The selected record has a rendered **Purpose** document with an exact Markdown
-source view, **Sequence / identity**, clickable **Relationships**, **Attachments**
-and the authoritative **Record JSON**. Project briefs list pinned members and
-their roles. Relationships follow encoded proteins back to their source plasmids,
-assemblies to component constructs, and records to project membership. The
-revision menu opens historical records without changing the current project.
-Incomplete purpose scaffolds and unresolved protein candidates remain visible.
+Double-click an Alt name (or a project name) to edit it. The pencil button opens
+an exact nucleotide or amino-acid sequence editor. **Save** creates a new immutable
+revision; existing results keep their original input references. Previous source
+annotations remain retained evidence and are not silently remapped onto an edited
+sequence. Historical revisions are read-only, with a link to the current revision.
 
-**Add this revision to Inputs** adds a pinned reference to the composer and never
-starts a run. Whole plasmid inventory records and products requiring review are
-blocked with the head's reason. Model-specific compatibility is still checked in
-Preview. Sequences and FASTA can be copied without changing the stored identity.
+Trash buttons immediately archive a construct or project without deleting it or
+opening a confirmation dialog. **File → Library archive** shows hidden records;
+**Restore** returns them to the library. **Undo** and **Redo** use durable head
+history for this actor, including name, sequence, archive and restore operations.
+Concurrent edits are checked against the exact revision and preserved on conflict.
+Lost write replies can be recovered through the existing saved request receipts.
+
+The selected record includes a rendered **Purpose** document, exact Markdown
+source, **Sequence / identity**, clickable **Relationships**, **Attachments** and
+**Record JSON**. Project briefs retain pinned members and roles. Incomplete purpose
+scaffolds and unresolved protein candidates remain visible.
+
+**▶ Prepare prediction** adds the exact selected revision to the existing Inputs
+composer and opens it so you can select models and submit. It preserves current
+inputs and never validates or launches automatically. Whole plasmids and products
+requiring review are blocked with the head's reason. Protein **Run history** lists
+retained jobs explicitly submitted from that construct, with revision labels;
+select a result to open its structure in the molecular viewer.
 
 **Save…** under Attachments downloads the original retained file through bounded
 SSH RPC chunks, checks its size and SHA-256 against the selected record, then
-opens a native save dialog. Exports are limited to 256 MiB per attachment. The
-explorer is read-only; library editing and new revisions remain available through
-the `bio-library` command on the head.
+opens a native save dialog. Exports are limited to 256 MiB per attachment.
 
 Changing the SSH host, user or port detaches library references from the active
 composer. Their original inputs and Library-ref drafts remain in the local draft

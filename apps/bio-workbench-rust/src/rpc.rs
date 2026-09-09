@@ -52,6 +52,11 @@ const METHODS: &[&str] = &[
     "library.list",
     "library.get",
     "library.attachment",
+    "library.edit",
+    "library.history",
+    "library.undo",
+    "library.redo",
+    "library.runs",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -321,6 +326,9 @@ pub fn mutating(method: &str) -> bool {
             | "job.cancel"
             | "annotation.put"
             | "local.upload"
+            | "library.edit"
+            | "library.undo"
+            | "library.redo"
     )
 }
 pub fn allowed(method: &str) -> bool {
