@@ -12,7 +12,7 @@ import shutil
 import sys
 import tempfile
 
-from registry import Registry, digest_json, load_json, no_symlinks, reference, reference_values, safe_relative, verify_document
+from registry import Registry, digest_json, load_json, no_symlinks, reference, reference_values, safe_relative, verify_document, translation
 from chemistry import components, polymer, bonds, require, write_json
 
 MODELS = {'boltz2': 'boltz_adapter', 'openfold3': 'openfold3_adapter',
@@ -65,11 +65,26 @@ def verify_snapshot(snapshot):
     for component in snapshot['components']:
         visit(component['record'])
     require(needed == set(snapshot['monomers']), 'Snapshot monomer closure contains unrelated records')
+    derived = {component['construct_ref']: component['record'] for component in snapshot['components']
+               if translation.is_derived(component['record'])}
+    sources = snapshot.get('derivation_sources', {})
+    projections = snapshot.get('resolved_polymers', {})
+    require(isinstance(sources, dict) and isinstance(projections, dict), 'Derived snapshot projections must be objects')
+    require(set(sources) == {record['identity']['encoded_by']['construct_ref'] for record in derived.values()} and
+            set(projections) == set(derived), 'Derived snapshot source/projection closure mismatch')
+    for ref, record in sources.items():
+        verify_document(record)
+        require(reference(record) == ref and record['kind'] == 'construct' and
+                record['identity'].get('molecule_type') in {'dna', 'rna'}, 'Derived source record identity mismatch')
+    for ref, record in derived.items():
+        require(projections[ref] == translation.projection(record, sources),
+                'Derived sequence differs from its canonical source or translation definition')
 
 
 def copy_assets(registry, snapshot, destination):
     records = {c['construct_ref']: c['record'] for c in snapshot['components']}
     records.update(snapshot.get('monomers', {}))
+    records.update(snapshot.get('derivation_sources', {}))
     if 'assembly_record' in snapshot:
         records[snapshot['source_ref']] = snapshot['assembly_record']
     assets = {}

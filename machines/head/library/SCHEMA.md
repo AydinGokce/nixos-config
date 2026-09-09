@@ -1,5 +1,76 @@
 # Construct registry schema 1
 
+## Coordinate-derived protein definitions
+
+A derived product is an ordinary `construct` with `molecule_type: protein`.
+Its identity contains no `sequence` or `residues`. The nucleotide source remains
+an exact immutable reference and sequence digest:
+
+```json
+{
+  "molecule_type": "protein",
+  "encoded_by": {
+    "construct_ref": "construct:plasmid@2",
+    "sequence_sha256": "<source nucleotide SHA-256>",
+    "translation": {
+      "schema": 1,
+      "segments": [{"start": 0, "end": 300}],
+      "strand": 1,
+      "genetic_code": 1,
+      "codon_start": 1,
+      "initiation": "cds",
+      "residue_start": 0,
+      "residue_end": null
+    }
+  }
+}
+```
+
+Segments use zero-based, end-exclusive coordinates in biological traversal
+order. Each segment is reverse-complemented on strand `-1` before the segments
+are joined. Overlapping segments are unavailable. Linear sources require strand
+order; circular sources additionally permit one rotation across the origin.
+The interface displays one-based inclusive coordinates.
+
+`codon_start` skips zero, one or two bases from the joined coding span. Genetic
+codes 1 and 11 follow [NCBI's genetic-code tables](https://www.ncbi.nlm.nih.gov/Taxonomy/Utils/wprintgc.cgi).
+`cds` requires a supported initiator and terminal stop, and represents initiation
+as methionine. `literal` translates the selected codons without an initiation
+override or a requirement for a terminal stop. One terminal stop is removed;
+internal stops, incomplete or ambiguous codons produce an unavailable result.
+The residue range is zero-based and end-exclusive after translation, with a
+null end selecting the complete remaining product. No old or partial peptide
+is returned when the definition is unavailable.
+
+Invalid biological coordinates may be retained as `draft` so a nucleotide edit
+can publish without preserving an incorrect previous peptide. Malformed field
+types, missing source revisions or wrong source sequence digests are rejected.
+Explicit modified source chemistry cannot be translated without an interpretation.
+Existing explicit proteins, including legacy `encoded_by` records that contain
+a sequence, retain their original behavior and immutable record hashes.
+
+Source revisions atomically retarget current derived children to the new source
+revision, including metadata-only source changes. Explicit nucleotide splices
+are bound to unchanged prefix/suffix bytes. Substitutions preserve coordinates;
+insertions before a coding span move it, insertions strictly inside expand it,
+and insertions at a boundary remain outside the span. A length-changing
+replacement containing a boundary, or a coding insertion/deletion affecting a
+cropped protein, requires coordinate review: its remapped segments are empty and
+the product is unavailable. The prior definition remains in the prior revision.
+Unresolved source product-review flags remain effective. A sequence change drops
+an obsolete active reference-match claim while retaining its historical evidence.
+
+Resolved model snapshots retain unchanged canonical records and add
+`derivation_sources` (exact nucleotide records) and `resolved_polymers` (computed
+sequence, digest, availability, diagnostics and translation-engine receipt).
+The snapshot digest binds both. Verification recomputes the projection from
+the source and definition; every model adapter uses that same projection.
+Snapshots without derived products retain their existing schema-1 layout.
+
+Mixed revision transactions also support `{"create": <user document>,
+"attachments": <optional sources>}`. A new product and its project memberships
+can therefore publish under one durable journal without orphaned partial writes.
+
 The head is the authoritative writer for reusable molecular records. Model input
 files are exports of pinned records. A stored record does not imply that every
 model supports its chemistry.

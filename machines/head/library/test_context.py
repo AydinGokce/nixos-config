@@ -216,7 +216,7 @@ class ContextTests(unittest.TestCase):
 
     def test_dynamic_import_uses_adjacent_modules_without_pythonpath(self):
         folder=self.base/'isolated';folder.mkdir()
-        for name in ('context.py','registry.py','projects.py'):
+        for name in ('context.py','registry.py','projects.py','translation.py'):
             shutil.copyfile(Path(c.__file__).with_name(name),folder/name)
         code="import importlib.util; s=importlib.util.spec_from_file_location('isolated_context',"+repr(str(folder/'context.py'))+"); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.r.COLLECTIONS['project'])"
         result=subprocess.check_output([sys.executable,'-I','-c',code],text=True)

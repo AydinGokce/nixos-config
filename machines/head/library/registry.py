@@ -28,6 +28,11 @@ import tempfile
 _projects_spec = importlib.util.spec_from_file_location('_bio_library_projects', Path(__file__).with_name('projects.py'))
 projects = importlib.util.module_from_spec(_projects_spec)
 _projects_spec.loader.exec_module(projects)
+_translation_spec = importlib.util.spec_from_file_location('_bio_library_translation', Path(__file__).with_name('translation.py'))
+translation = importlib.util.module_from_spec(_translation_spec)
+_translation_spec.loader.exec_module(translation)
+effective_sequence = translation.effective_sequence
+remap_translation = translation.remap_translation
 
 SCHEMA = 1
 DEFAULT_ROOT = "/var/lib/bio-library"
@@ -268,11 +273,15 @@ def validate_identity(record):
         if 'encoded_by' in identity:
             encoded = identity['encoded_by']
             require(molecule == 'protein' and isinstance(encoded, dict) and
-                    set(encoded) == {'construct_ref', 'sequence_sha256'},
+                    set(encoded) in ({'construct_ref', 'sequence_sha256'}, {'construct_ref', 'sequence_sha256', 'translation'}),
                     'encoded_by requires a protein and source construct_ref/sequence_sha256')
             require(isinstance(encoded['sequence_sha256'], str) and
                     re.fullmatch(r'[a-f0-9]{64}', encoded['sequence_sha256']),
                     'encoded_by source sequence_sha256 must be a SHA-256 digest')
+            if 'translation' in encoded:
+                require('sequence' not in identity and 'residues' not in identity,
+                        'A coordinate-derived protein cannot also store a sequence or residues')
+                translation.validate_definition(encoded['translation'], require=require)
         if 'product_review' in identity:
             review = identity['product_review']
             require(molecule == 'protein' and isinstance(review, dict) and
@@ -548,6 +557,8 @@ class Registry:
         self._validate_metadata(output)
         validate_identity(output)
         self._validate_references(output, records)
+        if translation.is_derived(output) and not effective_sequence(output, records)['available']:
+            output['status'] = 'draft'
         candidates = dict(records)
         candidates[reference(output)] = output
         self._namespace(candidates)
@@ -734,6 +745,101 @@ class Registry:
             path.unlink()
             fsync_directory(path.parent)
 
+    def plan_derivations(self, changes, records, splices=None):
+        """Expand source revisions to their current coordinate-derived children.
+
+        No writes occur here. Passing its output back into this method is safe;
+        child source pins already point at the planned revision and are not
+        remapped twice. Project membership updates belong to the caller.
+        """
+        require(isinstance(changes, list), 'Revision changes must be a list')
+        changes = copy.deepcopy(changes)
+        splices = splices or {}
+        latest = {}
+        for item in records.values():
+            entity = (item['kind'], item['id'])
+            if entity not in latest or item['revision'] > latest[entity]['revision']:
+                latest[entity] = item
+        direct, planned, sources = {}, {}, {}
+        for change in changes:
+            require(isinstance(change, dict), 'Revision changes must be objects')
+            if 'create' in change:
+                require(set(change) <= {'create', 'attachments'} and isinstance(change['create'], dict), 'Invalid create change')
+                document = copy.deepcopy(change['create'])
+                entity = (document.get('kind'), document.get('id'))
+                require(entity not in latest and entity not in direct, 'New record ID already exists')
+                document['revision'] = 1
+                direct[entity] = change
+                planned[entity] = document
+                continue
+            require(set(change) <= {'ref', 'expected_sha256', 'patch', 'attachments'} and
+                    {'ref', 'expected_sha256', 'patch'} <= set(change), 'Invalid revision change')
+            old = records[self._resolve(change['ref'], records)]
+            entity = (old['kind'], old['id'])
+            require(entity not in direct, 'An entity may be revised once per transaction')
+            require(old['sha256'] == change['expected_sha256'] and old['revision'] == latest[entity]['revision'],
+                    'Revision SHA-256 conflict or stale revision')
+            document = copy.deepcopy(old)
+            document.update(copy.deepcopy(change['patch']))
+            document['revision'] = old['revision'] + 1
+            direct[entity], planned[entity] = change, document
+            if old['kind'] == 'construct' and old['identity'].get('molecule_type') in {'dna', 'rna'}:
+                sources[entity] = (old, document)
+        working = {**records, **{reference(document): document for document in planned.values()}}
+        for entity, old in latest.items():
+            document = planned.get(entity, old)
+            if not translation.is_derived(document):
+                continue
+            encoded = document['identity']['encoded_by']
+            parent_kind, parent_id, _ = pinned_parts(encoded['construct_ref'])
+            pair = sources.get((parent_kind, parent_id))
+            if pair is None or encoded['construct_ref'] == reference(pair[1]):
+                continue
+            source_before, source_after = pair
+            before_sequence, after_sequence = source_before['identity']['sequence'], source_after['identity']['sequence']
+            restored_after = (entity in direct and before_sequence != after_sequence and
+                              encoded['sequence_sha256'] == translation.digest(after_sequence))
+            require(restored_after or translation.digest(before_sequence) == encoded['sequence_sha256'],
+                    'A current derived protein points to an older source sequence. Reconcile its source before editing the parent.')
+            updated = copy.deepcopy(document)
+            encoded = updated['identity']['encoded_by']
+            if before_sequence != after_sequence and not restored_after:
+                splice = splices.get(reference(source_before))
+                if splice is None:
+                    splice = translation.infer_splice(before_sequence, after_sequence)
+                require(isinstance(splice, dict) and set(splice) == {'start', 'end', 'replacement_length'}, 'Invalid source splice')
+                require(all(type(value) is int and value >= 0 for value in splice.values()) and
+                        splice['start'] <= splice['end'] <= len(before_sequence), 'Invalid source splice coordinates')
+                require(len(after_sequence) == len(before_sequence) - (splice['end'] - splice['start']) + splice['replacement_length'] and
+                        before_sequence[:splice['start']] == after_sequence[:splice['start']] and
+                        before_sequence[splice['end']:] == after_sequence[splice['start'] + splice['replacement_length']:],
+                        'Source splice does not match the new nucleotide sequence')
+                encoded['translation'] = remap_translation(encoded['translation'], **splice)
+            encoded['construct_ref'] = reference(source_after)
+            encoded['sequence_sha256'] = translation.digest(after_sequence)
+            updated.pop('sha256', None)
+            updated['revision'] = old['revision'] + 1
+            if before_sequence != after_sequence and not restored_after:
+                updated['status'] = 'defined' if effective_sequence(updated, working)['available'] else 'draft'
+            before_result, after_result = effective_sequence(old, records), effective_sequence(updated, working)
+            if not restored_after and before_result['sequence_sha256'] != after_result['sequence_sha256'] and updated['identity'].get('product_review', {}).get('status') == 'reference_matched':
+                updated['provenance'].setdefault('translation_history', []).append({
+                    'source_ref': reference(old), 'product_review': updated['identity'].pop('product_review')})
+                updated['tags'] = [tag for tag in updated.get('tags', []) if tag != 'reference_matched']
+            patch = {key: value for key, value in updated.items() if key in USER_FIELDS}
+            if entity in direct:
+                direct[entity]['patch'] = patch
+            else:
+                change = {'ref': reference(old), 'expected_sha256': old['sha256'], 'patch': patch}
+                changes.append(change)
+                direct[entity] = change
+            planned[entity] = updated
+            working[reference(updated)] = updated
+        def priority(change):
+            item = change.get('create') or planned[(pinned_parts(change['ref'])[0], pinned_parts(change['ref'])[1])]
+            return 3 if item['kind'] == 'project' else 2 if item['kind'] == 'assembly' else 1 if translation.is_derived(item) else 0
+        return sorted(changes, key=priority)
+
     def _revise_many_locked(self, changes, records):
         """Publish ordered revisions together; caller must own the exclusive lock.
 
@@ -743,12 +849,27 @@ class Registry:
         """
         require(isinstance(changes, list) and 0 < len(changes) <= 1000,
                 'A transaction requires 1..1000 revision patches')
+        changes = self.plan_derivations(changes, records)
+        require(len(changes) <= 1000, 'Derived revision cascade exceeds 1000 records')
         working, outputs, prepared, entities = dict(records), [], [], set()
         journal_path = None
         committed = False
         try:
             for change in changes:
-                require(isinstance(change, dict) and set(change) == {'ref', 'expected_sha256', 'patch'},
+                if 'create' in change:
+                    require(set(change) <= {'create', 'attachments'}, 'Invalid create transaction fields')
+                    document = change['create']
+                    entity = (document['kind'], document['id'])
+                    require(entity not in entities and not any((r['kind'], r['id']) == entity for r in working.values()),
+                            'New record ID already exists')
+                    entities.add(entity)
+                    output = self._normalize(document, working, 1)
+                    temporary = self._prepare_publication(output, change.get('attachments', {}))
+                    prepared.append(temporary); outputs.append(output)
+                    working[reference(output)] = output
+                    continue
+                require(isinstance(change, dict) and set(change) <= {'ref', 'expected_sha256', 'patch', 'attachments'} and
+                        {'ref', 'expected_sha256', 'patch'} <= set(change),
                         'Revision transaction requires ref, expected_sha256 and patch')
                 old = working[self._resolve(change['ref'], working)]
                 entity = (old['kind'], old['id'])
@@ -769,6 +890,9 @@ class Registry:
                 sources = {Path(item['path']).name: self._path(reference(old)).parent / item['path']
                            for item in old['attachments']}
                 inherited = {Path(item['path']).name: item for item in old['attachments']}
+                for name, source in change.get('attachments', {}).items():
+                    sources[name] = source
+                    inherited.pop(name, None)
                 temporary = self._prepare_publication(output, sources, inherited=inherited)
                 prepared.append(temporary); outputs.append(output)
                 working[reference(output)] = output
@@ -824,12 +948,17 @@ class Registry:
             require(old["revision"] == latest, "Cannot revise a stale revision; start from the current revision")
             require(patch.get("kind", old["kind"]) == old["kind"] and patch.get("id", old["id"]) == old["id"],
                     "Revision cannot change kind/id; import a new record with a parent reference")
+            changes = [{'ref': reference(old), 'expected_sha256': old['sha256'], 'patch': patch,
+                        'attachments': attachments or {}}]
+            planned = self.plan_derivations(changes, records)
+            if len(planned) > 1:
+                outputs = self._revise_many_locked(planned, records)
+                return next(output for output in outputs if (output['kind'], output['id']) == (old['kind'], old['id']))
             document = {key: copy.deepcopy(value) for key, value in old.items() if key in USER_FIELDS}
             document.update(copy.deepcopy(patch))
-            document["parents"] = list(dict.fromkeys([*document.get("parents", []), reference(old)]))
+            document['parents'] = list(dict.fromkeys([*document.get('parents', []), reference(old)]))
             output = self._normalize(document, records, latest + 1)
-            sources = {Path(item["path"]).name: self._path(reference(old)).parent / item["path"]
-                       for item in old["attachments"]}
+            sources = {Path(item['path']).name: self._path(reference(old)).parent / item['path'] for item in old['attachments']}
             sources.update(attachments or {})
             return self._publish(output, sources, records)
 
@@ -878,13 +1007,17 @@ class Registry:
         else:
             components = source["identity"]["components"]
             bonds = source["identity"].get("bonds", [])
-        monomers, visiting = {}, set()
+        monomers, visiting, derivation_sources, resolved_polymers = {}, set(), {}, {}
         def visit(record):
             ref = reference(record)
             if ref in visiting:
                 return
             visiting.add(ref)
             self._validate_references(record, records)
+            if translation.is_derived(record):
+                parent = record['identity']['encoded_by']['construct_ref']
+                derivation_sources[parent] = copy.deepcopy(records[parent])
+                resolved_polymers[ref] = translation.projection(record, records)
             for kind, child_ref in reference_values(record["identity"]):
                 if kind == "monomer_ref":
                     monomers[child_ref] = copy.deepcopy(records[child_ref])
@@ -901,6 +1034,9 @@ class Registry:
                   "provenance": {"registry_source_ref": source_ref, "source_record_sha256": source["sha256"]}}
         if source["kind"] == "assembly":
             output["assembly_record"] = copy.deepcopy(source)
+        if resolved_polymers:
+            output['derivation_sources'] = dict(sorted(derivation_sources.items()))
+            output['resolved_polymers'] = dict(sorted(resolved_polymers.items()))
         output["sha256"] = digest_json(output)
         return output
 

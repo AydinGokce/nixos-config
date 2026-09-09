@@ -30,6 +30,16 @@ as historical provenance. `library.runs` associates actor-visible jobs using
 their original pinned library inputs; the explorer opens their retained results
 through the ordinary artifact viewer. See `CONTRACT.md` for the exact API.
 
+Plasmid-derived proteins use the same protein construct type as standalone
+proteins but store source coordinates rather than a duplicate peptide.
+`library.sequence` supplies bounded annotations, six-frame ORFs and exact-revision
+translations. `library.product_preview` resolves a proposed definition without
+writing; `library.product_create` adds a protein to its parent's projects.
+`library.create` adds a standalone protein to a selected project. Parent edits
+advance current derived products and project references atomically. Invalid
+translations remain visible with diagnostics and cannot be submitted. Undo/redo
+also covers coordinate edits and creation, with creation undone by archiving.
+
 State lives in `/var/lib/bio-workbench`: SQLite WAL, immutable upload and artifact
 bytes, isolated per-batch construct libraries, validation evidence, owned process
 logs and operation receipts. Input bytes and supported chemistry are preserved.

@@ -3,6 +3,7 @@ import copy
 import json
 from pathlib import Path
 import re
+from translation import materialized_identity
 
 ALPHABETS = {'protein': set('ACDEFGHIKLMNPQRSTVWY'), 'dna': set('ACGT'), 'rna': set('ACGU')}
 
@@ -39,7 +40,7 @@ def ccd(value):
 
 
 def polymer(component, snapshot):
-    identity = component['record']['identity']
+    identity = materialized_identity(component['record'], snapshot)
     keys(identity, {'molecule_type', 'sequence', 'modifications', 'circular', 'termini', 'linkages', 'bonds', 'crosslinks',
                     'encoded_by', 'product_review', 'strand_count', 'molecular_form'},
          f"Chain {component['chain_id']} identity")
@@ -149,7 +150,7 @@ def bonds(snapshot):
             keys(endpoint, {'chain_id', 'position', 'atom'}, 'Bond endpoint')
             require(endpoint.get('chain_id') in by_chain, 'Unknown bond chain')
             component = by_chain[endpoint['chain_id']]
-            identity = component['record']['identity']
+            identity = materialized_identity(component['record'], snapshot)
             length = len(identity.get('sequence', '')) or 1
             endpoint.setdefault('position', 1)
             require(type(endpoint['position']) is int and 1 <= endpoint['position'] <= length, 'Invalid bond residue position')

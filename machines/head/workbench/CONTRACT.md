@@ -38,7 +38,8 @@ work. Molecular model compatibility remains part of the existing run preview.
   words against IDs, names, aliases, tags, notes and provenance. Summary records
   contain `ref,kind,id,name,revision,sha256,status,molecule_type,aliases,tags,sequence_length,
   molecular_form,review_status,review_reason,submission_allowed,encoded_by_ref,member_count,
-  inventory_id,alt_name,verbose_name,modality,archived`. The boolean `archived`
+  inventory_id,alt_name,verbose_name,modality,archived,derivation_kind,parent_ref`.
+  Derived sequence lengths are computed from the pinned source. The boolean `archived`
   filter defaults to false; true returns archived entities. Visibility follows
   the latest archive state even when an older project pins the entity's earlier
   revision. Archiving a project does not archive its members.
@@ -55,6 +56,30 @@ work. Molecular model compatibility remains part of the existing run preview.
   indicates whether the record may be added to the composer. Native model
   compatibility remains a separate preview check. Unresolved product candidates
   and whole double-stranded plasmids cannot be submitted as ordinary fold inputs.
+  Molecular details also include `sequence_view`; it contains the translated
+  peptide for derived proteins but omits duplicate explicit sequences already
+  present in `record.identity.sequence`. The complete response is bounded below
+  the 2 MiB RPC limit; oversized details require sequence/attachment reads.
+* `library.sequence {ref,min_orf_aa?,genetic_code?}` returns an exact-revision
+  sequence view: `ref,molecule_type,sequence,length,available,issues,circular,
+  derivation_kind,parent_ref,translation,features,orfs` and truncation/count
+  metadata. Default minimum ORF length is 30 amino acids; genetic codes 1 and 11
+  are supported. It scans all six frames, including circular origin crossings.
+  Imported annotation segments retain strand, partial and stale-evidence flags.
+  Stored coordinates are zero-based half-open in biological traversal order;
+  user-facing coordinates are one-based inclusive. No model or registry write occurs.
+* `library.product_preview {parent_ref,translation}` returns the canonical
+  definition and `parent_ref,parent_sha256,available,sequence,length,issues`.
+  `parent_sha256` binds the parent record, not just its DNA sequence. This is
+  read-only and returns diagnostics for biologically unavailable definitions.
+* `library.product_create {parent_ref,expected_sha256,translation,alt_name?,request_key}`
+  creates a derived protein and adds it to the current parent's projects.
+  `library.create {project_ref,expected_sha256,sequence,alt_name?,request_key}`
+  creates a standalone protein in that project. Both require an exact current
+  parent/project record SHA and return the edit-response shape. New entities
+  have `before_ref:null`; clients must not match that value against an existing
+  selection. Retrying the same request is idempotent. Undo archives a creation;
+  Redo restores it.
 * `library.attachment {ref,name,offset?,length?}` returns
   `{ref,name,data_b64,offset,next_offset,eof,size,sha256}`. Use a pinned reference
   throughout a download. `name` can be the plain filename or its recorded
@@ -64,8 +89,13 @@ work. Molecular model compatibility remains part of the existing run preview.
 * `library.edit {ref,expected_sha256,request_key,patch}` publishes a new revision.
   The reference must be pinned and current, with its exact displayed SHA.
   Supported patch fields are `alt_name` for molecular records, `name` for
-  projects, `archived` (boolean), and `sequence` for ordinary protein/DNA/RNA
-  constructs. The response is `{operation_id,ref,changed_refs,changed,history}`;
+  projects, `archived` (boolean), and `sequence` for explicit protein/DNA/RNA
+  constructs. `sequence_edit:{start,end,replacement}` expresses an exact splice
+  instead of replacing the whole sequence. Derived proteins use `translation`
+  and optionally `parent_ref`; direct peptide editing is rejected. Parent edits
+  advance every current derived product in the same transaction. Ambiguous
+  remapping or an invalid coding region yields unavailable diagnostics rather
+  than retaining the old peptide. The response is `{operation_id,ref,changed_refs,changed,history}`;
   each changed-ref pair contains `before_ref,after_ref`. Reusing the same request
   key with identical parameters returns the durable receipt; changing parameters
   under the same key conflicts. Current projects pinning the predecessor advance

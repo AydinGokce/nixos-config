@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sys
+from translation import materialized_identity
 
 MODEL_VERSION = "2.0.0"
 POLYMERS = {"protein": "proteinChain", "dna": "dnaSequence", "rna": "rnaSequence"}
@@ -126,7 +127,7 @@ def _bond(bond, components, chain=None):
             chain_id = chain
         require(chain_id in components, "bond references an unknown chain")
         component = components[chain_id]
-        identity = component["record"]["identity"]
+        identity = component.get("resolved_identity", component["record"]["identity"])
         pos = endpoint.get("position", 1 if identity["molecule_type"] == "small_molecule" else None)
         limit = len(identity["sequence"]) if identity["molecule_type"] in POLYMERS else 1
         require(type(pos) is int and 1 <= pos <= limit, "bond residue position is out of range")
@@ -168,7 +169,7 @@ def build(snapshot: dict, destination: Path, assets: dict, options: dict) -> dic
         chain = component.get("chain_id")
         require(isinstance(chain, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_]{0,31}", chain), "invalid chain ID")
         require(chain not in mapping, "duplicate chain ID")
-        identity = component.get("record", {}).get("identity")
+        identity = materialized_identity(component.get("record", {}), snapshot)
         require(isinstance(identity, dict), "component identity is missing")
         molecule = identity.get("molecule_type")
         require(molecule in {*POLYMERS, "small_molecule"}, f"unsupported molecule type: {molecule}")
@@ -180,7 +181,7 @@ def build(snapshot: dict, destination: Path, assets: dict, options: dict) -> dic
             kind = "ligand"
         native.update(count=1, id=[chain])
         sequences.append({kind: native})
-        mapping[chain] = dict(component, entity_id=index)
+        mapping[chain] = dict(component, entity_id=index, resolved_identity=identity)
         if identity.get("circular"):
             # Registry circularity denotes canonical backbone closure. Use the
             # same C-N / O3'-P atoms that native _connect_inter_residue uses;

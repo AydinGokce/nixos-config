@@ -34,6 +34,10 @@ class API:
             'library.edit': self.library_edit, 'library.history': self.library_history,
             'library.undo': self.library_undo, 'library.redo': self.library_redo,
             'library.runs': self.library_runs,
+            'library.sequence': self.library_sequence,
+            'library.product_preview': self.library_product_preview,
+            'library.product_create': self.library_product_create,
+            'library.create': self.library_create,
             'md.catalog': self.md_catalog, 'md.validate': self.md_validate, 'md.plan': self.md_plan,
             'md.resume': self.md_resume,
             'md.compare': self.md_compare,
@@ -47,7 +51,8 @@ class API:
         require(function is not None, 'Unknown method')
         if method in {'library.list', 'library.get', 'library.attachment',
                       'library.edit', 'library.history', 'library.undo', 'library.redo',
-                      'library.runs'}:
+                      'library.runs', 'library.sequence', 'library.product_preview',
+                      'library.product_create', 'library.create'}:
             # The explorer returns published user records, including their
             # exact identity/provenance keys and record hashes. These methods
             # explicitly construct their public envelopes and have no private
@@ -62,6 +67,22 @@ class API:
     def library_get(self, params):
         from .library_api import get_record
         return get_record(self, params)
+
+    def library_sequence(self, params):
+        from .library_sequence import get_view
+        return get_view(self, params)
+
+    def library_product_preview(self, params):
+        from .library_sequence import preview
+        return preview(self, params)
+
+    def library_product_create(self, params):
+        from .library_edits import create_product
+        return create_product(self, params)
+
+    def library_create(self, params):
+        from .library_edits import create_protein
+        return create_protein(self, params)
 
     def library_attachment(self, params):
         from .library_api import attachment

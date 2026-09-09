@@ -77,3 +77,21 @@ Finally run `bio-library verify`, export and restore-check a backup, export the
 project research context, and verify that context. These checks launch no models.
 The migration is complete only after the head publication and local backup have
 been verified; generating a stage alone does not alter production.
+
+## Coordinate-derived protein revisions
+
+The existing 87 imported protein products have exact, independently audited
+coding footprints in their source plasmids. `migrate_derived.py` converts their
+current definitions to source coordinates without changing peptide bytes.
+Original immutable explicit-sequence revisions, source files, purpose documents,
+Alt names, and product-review findings remain available. The migration advances
+affected current project pins in the same durable transaction.
+
+The operator first takes a verified backup, then runs `plan --root ... --audit
+coordinate-audit.json --output migration-plan.json`. The plan binds every current
+parent/product/project revision and source audit. `apply --root ... --audit ...
+--plan ...` refuses stale or mismatching records and publishes the reviewed
+revisions atomically. Repeating an applied plan verifies its immutable receipts
+and makes no further revisions, including after subsequent unrelated edits.
+Neither operation runs predictions. Three origin-crossing coding footprints use
+ordered joined segments; all 87 translations were checked for exact equality.

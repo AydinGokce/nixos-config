@@ -15,6 +15,7 @@ import string
 import subprocess
 import sys
 from types import SimpleNamespace
+from translation import materialized_identity
 
 
 PIN = "d69ab3a73f8ede31a4cc005fbc076a341d848469"
@@ -130,7 +131,7 @@ def build(snapshot, destination, assets, options):
         seen.add(chain)
         require(isinstance(pin, str) and isinstance(record, dict) and isinstance(record.get("identity"), dict),
                 f"chain {chain}: missing pinned construct identity")
-        identity = dict(record["identity"])
+        identity = materialized_identity(record, snapshot)
         molecule = identity.get("molecule_type")
         require(isinstance(molecule, str) and molecule in GROUPS, f"chain {chain}: mixed/custom polymers are not representable by the pinned native polymer loaders")
         if "circular" in identity:

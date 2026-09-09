@@ -53,6 +53,12 @@ def submission(record, records):
     else:
         if identity.get('molecular_form') == 'plasmid' or identity.get('strand_count') == 2:
             return {'allowed': False, 'reason': 'Whole double-stranded plasmids are inventory records. Select a defined encoded protein or an explicitly prepared molecular input.'}
+        if identity.get('encoded_by', {}).get('translation'):
+            from registry import effective_sequence
+            resolved = effective_sequence(record, records)
+            if not resolved['available']:
+                return {'allowed': False, 'reason': 'This product needs valid plasmid coordinates: ' +
+                        '; '.join(item['message'] for item in resolved['issues'])}
         review = identity.get('product_review', {})
         if review and review.get('status') != 'reference_matched':
             return {'allowed': False, 'reason': 'This protein candidate has unresolved source product-review findings. Resolve its definition before prediction.'}
@@ -64,13 +70,20 @@ def summary(record, records):
     identity = record['identity']
     review = identity.get('product_review', {})
     admission = submission(record, records)
+    derived = bool(identity.get('encoded_by', {}).get('translation'))
+    length = len(identity.get('sequence', identity.get('residues', []))) or None
+    if derived:
+        from registry import effective_sequence
+        length = effective_sequence(record, records)['length']
     return {
         'ref': pin(record), 'kind': record['kind'], 'id': record['id'],
         'name': record['name'], 'revision': record['revision'],
         'sha256': record['sha256'], **presentation(record),
         'status': record['status'], 'molecule_type': identity.get('molecule_type'),
         'aliases': record['aliases'], 'tags': record['tags'],
-        'sequence_length': len(identity.get('sequence', identity.get('residues', []))) or None,
+        'sequence_length': length,
+        'derivation_kind': 'derived' if derived else 'explicit',
+        'parent_ref': identity.get('encoded_by', {}).get('construct_ref'),
         'molecular_form': identity.get('molecular_form'),
         'review_status': review.get('status'),
         'review_reason': admission['reason'] if review and not admission['allowed'] else '',
@@ -171,11 +184,19 @@ def get_record(api, params):
         revisions = sorted((r for r in records.values() if (r['kind'], r['id']) == (record['kind'], record['id'])),
                            key=lambda r: r['revision'], reverse=True)
         latest_ref = pin(revisions[0])
-        return {'ref': ref, 'record': record, 'sha256': record['sha256'], **presentation(record),
+        result = {'ref': ref, 'record': record, 'sha256': record['sha256'], **presentation(record),
                 'latest_ref': latest_ref, 'is_latest': ref == latest_ref,
                 'description': description, 'members': members,
                 'relations': relations, 'projects': projects,
                 'revisions': [summary(r, records) for r in revisions], 'submission': submission(record, records)}
+        if record['kind'] == 'construct' and record['identity'].get('molecule_type') in {'dna', 'rna', 'protein'}:
+            from .library_sequence import view
+            result['sequence_view'] = view(record, registry, records,
+                include_sequence=bool(record['identity'].get('encoded_by', {}).get('translation')))
+        from .common import WIRE, canonical
+        require(len(canonical(result)) <= WIRE - 4096,
+                'Library detail exceeds the display limit; use sequence and attachment reads or export this revision', 'limit')
+        return result
 
 
 def attachment(api, params):

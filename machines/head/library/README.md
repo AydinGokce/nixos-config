@@ -12,6 +12,26 @@ descriptions and the reviewed publication process. Protein products marked
 `review_required` remain visible but are rejected for model submission; whole
 double-stranded plasmids require selection of a separately defined product.
 
+The native explorer groups protein products beneath their source plasmid.
+New derived revisions store `identity.encoded_by.translation`: a strand, ordered
+DNA segments, genetic code and optional amino-acid range. Their sequence is
+computed from that exact source revision; no independent peptide is stored in
+the canonical identity. Standalone proteins use the same construct/protein type
+with an explicit sequence. The sequence viewer provides imported annotations,
+six-frame ORFs, circular/linear maps and base/codon zoom. Select an ORF or coding
+annotation, preview its translation, and create one or more named protein
+variants. Display coordinates are one-based inclusive; stored segments are
+zero-based half-open, in biological traversal order.
+
+Editing a plasmid advances its derived proteins in the same transaction.
+Substitutions preserve their coordinates; explicit splices move unaffected
+coordinates. Ambiguous remapping, interrupted coding regions or invalid crops
+make a product unavailable until its definition is repaired. The interface never
+continues using an old peptide for a changed plasmid. Existing prediction inputs
+and immutable revisions retain their original sequence and provenance. Undo
+restores the source and dependent definitions together and detects conflicting
+later product edits. Undoing product creation archives it; Redo restores it.
+
 ```bash
 bio-library import --fasta enzyme.fasta --type protein --id enzyme --alias target
 bio-library import --fasta probe.fasta --type dna --id probe
@@ -69,14 +89,16 @@ Transactions inherit validated immutable attachments by hardlink on the same
 filesystem; imports still copy source files. Backups explicitly store regular
 file bytes, and verification rechecks shared attachment content on each read.
 
-The simple sequence editor accepts exact canonical uppercase input. It rejects
+The direct sequence editor accepts exact canonical uppercase input. It rejects
 definitions with explicit modifications, linkages, residues, bonds, structural
 annotations or other chemistry needing remapping. A real sequence change keeps
 the original source files and review evidence as historical provenance, removes
 the old `encoded_by` and reference-match claims from the current identity, and
-records the input as user defined. It neither translates DNA nor creates a new
-protein product. Recheck inherited purpose and positional annotations against
-the edited sequence. Saving an unchanged sequence cannot clear product-review
+records the input as user defined. Derived proteins instead expose their source
+and coordinate definition for editing. Parent edits retranslate the current
+derived products, preserving unresolved review findings; a changed peptide loses
+any active claim that it matches the old reference. Recheck inherited purpose
+and positional annotations against the edited sequence. Saving an unchanged sequence cannot clear product-review
 findings. Native model compatibility remains a separate run-preview check.
 
 Synthetic amidites belong in the monomer library with the **final incorporated

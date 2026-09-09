@@ -164,7 +164,7 @@ class ProjectTests(unittest.TestCase):
     def test_dynamic_registry_import_uses_adjacent_projects_without_pythonpath(self):
         isolated = self.base/'isolated'; isolated.mkdir()
         source = Path(r.__file__).parent
-        for filename in ('registry.py', 'projects.py'):
+        for filename in ('registry.py', 'projects.py', 'translation.py'):
             shutil.copyfile(source/filename, isolated/filename)
         spec = importlib.util.spec_from_file_location('isolated_registry', isolated/'registry.py')
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
