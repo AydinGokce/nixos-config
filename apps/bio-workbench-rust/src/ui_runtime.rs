@@ -315,6 +315,10 @@ impl Workbench {
             Purpose::LibraryRuns(reference) => self.library_runs_received(&reference, value),
             Purpose::Library(request) => self.library_received_list(&request, value),
             Purpose::LibraryRecord(reference) => self.library_received_record(&reference, value),
+            Purpose::LibrarySequence(params) => self.library_received_sequence(&params, value),
+            Purpose::LibraryProductPreview(params) => {
+                self.library.sequence.received_preview(&params, value)
+            }
             Purpose::LibraryAttachment(reference, name) => {
                 self.library_received_attachment(&reference, &name, value, ctx);
             }

@@ -366,6 +366,8 @@ fn summary(value: &Value) -> Value {
         "review_reason",
         "submission_allowed",
         "encoded_by_ref",
+        "parent_ref",
+        "derivation_kind",
         "member_count",
     ];
     Value::Object(

@@ -13,6 +13,7 @@ mod ui_jobs;
 mod ui_library;
 mod ui_library_runs;
 mod ui_runtime;
+mod ui_sequence;
 mod ui_state;
 mod ui_style;
 mod ui_views;
@@ -54,6 +55,8 @@ enum Purpose {
     Artifact(ArtifactTarget),
     Library(library_cache::Request),
     LibraryRecord(String),
+    LibrarySequence(Value),
+    LibraryProductPreview(Value),
     LibraryAttachment(String, String),
     LibraryHistory,
     LibraryWrite(Value),

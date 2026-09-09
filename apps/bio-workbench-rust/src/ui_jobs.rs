@@ -445,6 +445,20 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
             }
             Purpose::Library(_) => self.library_refresh(),
             Purpose::LibraryRecord(reference) => self.library_select(&reference),
+            Purpose::LibrarySequence(params) => {
+                self.request(
+                    "library.sequence",
+                    params.clone(),
+                    Purpose::LibrarySequence(params),
+                );
+            }
+            Purpose::LibraryProductPreview(params) => {
+                self.request(
+                    "library.product_preview",
+                    params.clone(),
+                    Purpose::LibraryProductPreview(params),
+                );
+            }
             Purpose::LibraryAttachment(_, _) => {
                 self.log("Select the attachment again in Library to retry its verified download.");
             }
@@ -470,9 +484,11 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                 Purpose::Preview
             }
             "batch.create" => Purpose::Commit,
-            "library.edit" | "library.undo" | "library.redo" => {
-                Purpose::LibraryWrite(params.clone())
-            }
+            "library.edit"
+            | "library.undo"
+            | "library.redo"
+            | "library.product_create"
+            | "library.create" => Purpose::LibraryWrite(params.clone()),
             "batch.cancel" => Purpose::CancelBatch,
             "job.cancel" => Purpose::CancelJob,
             "annotation.put" => Purpose::SaveNote(

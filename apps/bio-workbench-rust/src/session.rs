@@ -267,7 +267,13 @@ impl Session {
         let endpoint = self.connection.identity();
         if matches!(
             method,
-            "batch.validate" | "batch.create" | "library.edit" | "library.undo" | "library.redo"
+            "batch.validate"
+                | "batch.create"
+                | "library.edit"
+                | "library.undo"
+                | "library.redo"
+                | "library.product_create"
+                | "library.create"
         ) {
             let explicit = params.get("request_key").is_some();
             if !explicit {
@@ -1079,7 +1085,13 @@ mod tests {
                 unreachable!()
             }
         }
-        for method in ["library.edit", "library.undo", "library.redo"] {
+        for method in [
+            "library.edit",
+            "library.undo",
+            "library.redo",
+            "library.product_create",
+            "library.create",
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let backend = Arc::new(LibraryWrites(Mutex::new(Vec::new()), AtomicUsize::new(0)));
             let mut session = Session::open_internal(

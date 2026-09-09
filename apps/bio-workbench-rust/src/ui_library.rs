@@ -7,6 +7,8 @@ pub(super) struct Explorer {
     pub projects: Vec<Value>,
     pub selected: String,
     pub detail: Value,
+    pub(super) sequence: ui_sequence::Viewer,
+    collapsed: BTreeSet<String>,
     pub error: String,
     pub detail_error: String,
     query: String,
@@ -45,6 +47,11 @@ impl Explorer {
     pub fn restore(extra: &BTreeMap<String, Value>) -> Self {
         let value = extra.get("library_explorer").unwrap_or(&Value::Null);
         Self {
+            collapsed: rows(value, "collapsed")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
             query: text(value, "query").into(),
             molecule: text(value, "molecule").into(),
             review_only: value["review_only"].as_bool().unwrap_or(false),
@@ -54,7 +61,7 @@ impl Explorer {
 
     pub fn preferences(&self) -> Value {
         json!({"selected":self.selected,"query":self.query,"kind":self.kind,
-            "molecule":self.molecule,"project":self.project,"review_only":self.review_only})
+            "molecule":self.molecule,"project":self.project,"review_only":self.review_only,"collapsed":self.collapsed})
     }
 
     fn visible(&self, record: &Value) -> bool {
@@ -113,10 +120,84 @@ impl Explorer {
                 presentation(&value, &edit.field).into()
             };
         }
+        let identity = &value["record"]["identity"];
+        let view = if value["sequence_view"].is_object() {
+            value["sequence_view"].clone()
+        } else {
+            json!({"ref":reference,"molecule_type":identity["molecule_type"],"length":text(identity,"sequence").len(),"circular":identity["circular"],"available":!text(identity,"sequence").is_empty(),"derivation_kind":"explicit"})
+        };
+        self.sequence
+            .accept(reference, view, text(identity, "sequence"));
+        self.sequence
+            .refresh_receipt(reference, text(&value, "sha256"));
         self.detail = value;
         self.detail_error.clear();
         true
     }
+}
+
+fn parent_reference(record: &Value) -> &str {
+    let parent = text(record, "parent_ref");
+    if parent.is_empty() {
+        text(record, "encoded_by_ref")
+    } else {
+        parent
+    }
+}
+
+fn hierarchy(
+    records: &[Value],
+    collapsed: &BTreeSet<String>,
+    filtering: bool,
+    visible: impl Fn(&Value) -> bool,
+) -> Vec<(Value, usize, usize)> {
+    let parents: BTreeSet<_> = records
+        .iter()
+        .filter(|r| text(r, "molecular_form") == "plasmid")
+        .map(|r| {
+            text(r, "ref")
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let mut children: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for record in records {
+        let parent = parent_reference(record)
+            .split('@')
+            .next()
+            .unwrap_or_default();
+        if text(record, "molecule_type") == "protein" && parents.contains(parent) {
+            children.entry(parent.into()).or_default().push(record);
+        }
+    }
+    let mut result = Vec::new();
+    for record in records {
+        if text(record, "kind") == "project" {
+            continue;
+        }
+        let parent = parent_reference(record)
+            .split('@')
+            .next()
+            .unwrap_or_default();
+        if text(record, "molecule_type") == "protein" && parents.contains(parent) {
+            continue;
+        }
+        let family = text(record, "ref").split('@').next().unwrap_or_default();
+        let child = children.get(family).cloned().unwrap_or_default();
+        let matches: Vec<_> = child.iter().filter(|r| visible(r)).collect();
+        if !visible(record) && matches.is_empty() {
+            continue;
+        }
+        result.push((record.clone(), 0, child.len()));
+        if filtering || !collapsed.contains(family) {
+            for child in matches {
+                result.push(((*child).clone(), 1, 0));
+            }
+        }
+    }
+    result
 }
 
 fn latest_project(current: &str, projects: &[Value]) -> Option<String> {
@@ -321,8 +402,12 @@ impl Workbench {
     pub(super) fn library_received_write(&mut self, value: Value, sent: &Value) {
         self.library_invalidate_lists();
         self.library.reconcile_edit(&value, sent);
+        self.library.sequence.write_received(&value, sent);
         let selected = self.library.selected.clone();
         for change in rows(&value, "changed_refs") {
+            if text(change, "before_ref").is_empty() {
+                continue;
+            }
             if self.library.project == text(change, "before_ref") {
                 self.library.project = text(change, "after_ref").into();
             }
@@ -338,6 +423,12 @@ impl Workbench {
             if selected.split('@').next() == text(&value, "ref").split('@').next() {
                 self.library.selected = text(&value, "ref").into();
             }
+        }
+        if (sent["parent_ref"].is_string() && sent["translation"].is_object())
+            || (sent["project_ref"].is_string() && sent["sequence"].is_string())
+        {
+            self.library.selected = text(&value, "ref").into();
+            self.library.tab = 1;
         }
         self.library.write_error.clear();
         self.library.undo_history = value["history"].clone();
@@ -355,6 +446,14 @@ impl Workbench {
     }
 
     fn library_begin_edit(&mut self, detail: &Value, field: &str) {
+        if field == "sequence"
+            && detail["record"]["identity"]["encoded_by"]["translation"].is_object()
+        {
+            if let Some(action) = self.library.sequence.definition_editor(detail) {
+                self.library_sequence_action(action);
+            }
+            return;
+        }
         if self.library_writing() || detail["is_latest"] == false {
             return;
         }
@@ -423,7 +522,23 @@ impl Workbench {
         listing: library_cache::Listing,
     ) {
         self.library.records = listing.records;
+        if let Some(record) = self
+            .library
+            .records
+            .iter()
+            .find(|r| text(r, "ref") == self.library.selected)
+        {
+            self.library.collapsed.remove(
+                parent_reference(record)
+                    .split('@')
+                    .next()
+                    .unwrap_or_default(),
+            );
+        }
         self.library.projects = listing.projects;
+        self.library
+            .sequence
+            .refresh_projects(&self.library.projects);
         self.library.next_offset = listing.next_offset;
         self.library.filtered_count = listing.filtered_count;
         self.library.total_count = listing.total_count;
@@ -587,6 +702,23 @@ impl Workbench {
         if self.library.selected != reference {
             self.library.edit = None;
             self.library.selected = reference.into();
+            if let Some(record) = self
+                .library
+                .records
+                .iter()
+                .find(|r| text(r, "ref") == reference)
+            {
+                let parent = parent_reference(record)
+                    .split('@')
+                    .next()
+                    .unwrap_or_default();
+                self.library.collapsed.remove(parent);
+                if text(record, "molecular_form") == "plasmid"
+                    || text(record, "molecule_type") == "protein"
+                {
+                    self.library.tab = 1;
+                }
+            }
             self.library.detail = Value::Null;
             self.library.detail_error.clear();
             self.library.added.clear();
@@ -633,10 +765,59 @@ impl Workbench {
                 self.library.write_error = message.into();
             }
             Purpose::LibraryHistory => self.library.write_error = message.into(),
+            Purpose::LibrarySequence(params) if text(params, "ref") == self.library.selected => {
+                self.library.sequence.error = message.into()
+            }
+            Purpose::LibraryProductPreview(params) => {
+                self.library.sequence.preview_failed(params, message)
+            }
             Purpose::LibraryRecord(reference) if reference == &self.library.selected => {
                 self.library.detail_error = message.into()
             }
             _ => {}
+        }
+    }
+
+    fn library_sequence_action(&mut self, action: ui_sequence::Action) {
+        match action {
+            ui_sequence::Action::Options(params) => {
+                self.request(
+                    "library.sequence",
+                    params.clone(),
+                    Purpose::LibrarySequence(params),
+                );
+            }
+            ui_sequence::Action::Preview(params) => {
+                if self
+                    .request(
+                        "library.product_preview",
+                        params.clone(),
+                        Purpose::LibraryProductPreview(params.clone()),
+                    )
+                    .is_none()
+                {
+                    self.library.sequence.preview_failed(&params,"Could not request a translation preview. Check the connection and try again.");
+                }
+            }
+            ui_sequence::Action::Write(method, params) => self.library_write(method, params),
+            ui_sequence::Action::Parent(reference) => {
+                self.library.tab = 1;
+                self.library_select(&reference);
+            }
+            ui_sequence::Action::EditSequence => {
+                self.library_begin_edit(&self.library.detail.clone(), "sequence")
+            }
+        }
+    }
+
+    pub(super) fn library_received_sequence(&mut self, params: &Value, value: Value) {
+        let reference = text(params, "ref");
+        if reference == self.library.selected {
+            self.library.sequence.received_options(
+                params,
+                value,
+                text(&self.library.detail["record"]["identity"], "sequence"),
+            );
         }
     }
 
@@ -674,6 +855,21 @@ impl Workbench {
                 .strong()
                 .color(AMBER),
             );
+            if !self.library.project.is_empty()
+                && !self.library.archive
+                && ui
+                    .add_enabled(!writing, egui::Button::new("+ Standalone protein"))
+                    .clicked()
+                && let Some(project) = self
+                    .library
+                    .projects
+                    .iter()
+                    .find(|p| text(p, "ref") == self.library.project)
+            {
+                self.library
+                    .sequence
+                    .open_standalone(text(project, "ref"), text(project, "sha256"));
+            }
             if ui.button("Molecular viewer").clicked() {
                 self.sidebar_tab = 1;
             }
@@ -778,7 +974,7 @@ impl Workbench {
         {
             return;
         }
-        let visible: Vec<_> = if projects {
+        let visible: Vec<(Value, usize, usize)> = if projects {
             self.library
                 .projects
                 .iter()
@@ -790,17 +986,23 @@ impl Workbench {
                         .all(|word| item.to_string().to_lowercase().contains(word))
                 })
                 .cloned()
+                .map(|r| (r, 0, 0))
                 .collect()
-        } else {
+        } else if self.library.archive {
             self.library
                 .records
                 .iter()
-                .filter(|record| {
-                    (self.library.archive || text(record, "kind") != "project")
-                        && self.library.visible(record)
-                })
+                .filter(|r| self.library.visible(r))
                 .cloned()
+                .map(|r| (r, 0, 0))
                 .collect()
+        } else {
+            hierarchy(
+                &self.library.records,
+                &self.library.collapsed,
+                !self.library.query.is_empty() || !self.library.molecule.is_empty(),
+                |r| self.library.visible(r),
+            )
         };
         ui.weak(format!(
             "{} {}",
@@ -810,7 +1012,7 @@ impl Workbench {
         let mut selected = None;
         let mut archived = None;
         let writing = self.library_writing();
-        for record in &visible {
+        for (record, depth, child_count) in &visible {
             let reference = text(record, "ref");
             let is_selected = self.library.selected == reference;
             egui::Frame::NONE
@@ -823,6 +1025,40 @@ impl Workbench {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
+                        if *depth > 0 {
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::new(16., 24.), egui::Sense::hover());
+                            ui.painter().line_segment(
+                                [
+                                    rect.left_top() + Vec2::new(5., 0.),
+                                    rect.left_top() + Vec2::new(5., 12.),
+                                ],
+                                egui::Stroke::new(1., Color32::GRAY),
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    rect.left_top() + Vec2::new(5., 12.),
+                                    rect.right_top() + Vec2::new(0., 12.),
+                                ],
+                                egui::Stroke::new(1., Color32::GRAY),
+                            );
+                        }
+                        if *child_count > 0 {
+                            let family =
+                                reference.split('@').next().unwrap_or(reference).to_owned();
+                            let collapsed = self.library.collapsed.contains(&family);
+                            if ui
+                                .small_button(if collapsed { "+" } else { "-" })
+                                .on_hover_text("Show or hide protein products")
+                                .clicked()
+                            {
+                                if collapsed {
+                                    self.library.collapsed.remove(&family);
+                                } else {
+                                    self.library.collapsed.insert(family);
+                                }
+                            }
+                        }
                         let reserved = if self.library.archive { 57. } else { 23. };
                         let width = (ui.available_width() - reserved - ui.spacing().item_spacing.x)
                             .max(24.);
@@ -876,6 +1112,16 @@ impl Workbench {
                             chip(ui, id, AMBER);
                         }
                         chip(ui, kind_label(record), Color32::from_rgb(145, 178, 198));
+                        if *child_count > 0 {
+                            ui.weak(format!(
+                                "{} protein{}",
+                                child_count,
+                                if *child_count == 1 { "" } else { "s" }
+                            ));
+                        }
+                        if text(record, "derivation_kind") == "derived" {
+                            ui.weak("derived");
+                        }
                         if let Some(length) = record["sequence_length"].as_u64() {
                             ui.weak(format!(
                                 "{length} {}",
@@ -893,6 +1139,18 @@ impl Workbench {
                             ));
                         }
                     });
+                    if *depth == 0 && !parent_reference(record).is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak("Parent outside this view");
+                            if ui
+                                .small_button("Open parent")
+                                .on_hover_text(parent_reference(record))
+                                .clicked()
+                            {
+                                selected = Some((parent_reference(record).to_owned(), false));
+                            }
+                        });
+                    }
                     let (status, color) = review_label(record);
                     if status == "REVIEW REQUIRED" {
                         ui.label(RichText::new(status).small().color(color))
@@ -940,6 +1198,8 @@ impl Workbench {
     pub(super) fn library_details(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Frame::NONE.inner_margin(12).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
+            let actions=self.library.sequence.show_dialogs(ui,self.library_writing(),&self.library.records);
+            for action in actions {self.library_sequence_action(action);}
             if self.library.selected.is_empty() {
                 ui.heading("Molecular library");
                 ui.label("Choose a project or construct on the left to inspect its identity, purpose, and retained source files.");
@@ -965,7 +1225,7 @@ impl Workbench {
                 let color = if text(review, "status") == "review_required" { AMBER } else { GREEN };
                 ui.colored_label(color, text(review, "status").replace('_', " ").to_uppercase());
             }
-            if matches!(text(record, "kind"), "construct" | "assembly") {
+            if matches!(text(record, "kind"), "construct" | "assembly") && text(&record["identity"],"molecular_form")!="plasmid" {
                 let input = pinned_input(&detail, self.state.next_chain());
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(input.is_ok(), egui::Button::new(RichText::new("▶ Prepare prediction").strong().color(GREEN)).min_size(Vec2::new(180.,30.))).clicked()
@@ -993,10 +1253,10 @@ impl Workbench {
             egui::ScrollArea::both().id_salt(("library-detail", self.library.selected.clone(), self.library.tab))
                 .auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    self.library_run_controls(ui, &detail);
+                    if self.library.tab==0 {self.library_run_controls(ui, &detail);}
                     match self.library.tab {
                         0 => self.library_purpose(ui, &detail, ctx),
-                        1 => self.library_identity(ui, &detail, ctx),
+                        1 => { self.library_identity(ui, &detail, ctx); self.library_run_controls(ui, &detail); },
                         2 => self.library_relations(ui, &detail),
                         3 => self.library_attachments(ui, &detail),
                         _ => {
@@ -1241,88 +1501,52 @@ impl Workbench {
         }
     }
 
-    fn library_identity(&mut self, ui: &mut egui::Ui, detail: &Value, ctx: &egui::Context) {
+    fn library_identity(&mut self, ui: &mut egui::Ui, detail: &Value, _ctx: &egui::Context) {
         let record = &detail["record"];
         let identity = &record["identity"];
-        let sequence = text(identity, "sequence");
+        let actions = self
+            .library
+            .sequence
+            .show(ui, detail, self.library_writing());
+        for action in actions {
+            self.library_sequence_action(action);
+        }
+        let sequence = text(&self.library.sequence.view, "sequence");
         if !sequence.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} {}",
-                        text(identity, "molecule_type"),
-                        sequence.len(),
-                        if text(identity, "molecule_type") == "protein" {
-                            "amino acids"
-                        } else {
-                            "nucleotides"
-                        }
-                    ))
-                    .strong(),
-                );
-                if identity["circular"] == true {
-                    ui.colored_label(AMBER, "CIRCULAR");
-                }
-                if !text(identity, "molecular_form").is_empty() {
-                    ui.label(text(identity, "molecular_form"));
-                }
-                if icon_button(
-                    ui,
-                    Icon::Pencil,
-                    detail["is_latest"] != false && !self.library_writing(),
-                    "Edit sequence",
-                )
-                .clicked()
-                {
-                    self.library_begin_edit(detail, "sequence");
-                }
-                if ui.button("Copy sequence").clicked() {
-                    ctx.copy_text(sequence.into());
-                }
-                if ui.button("Copy FASTA").clicked() {
-                    ctx.copy_text(format!(
-                        ">{} {}\n{}\n",
-                        text(detail, "ref"),
-                        display_name(detail),
-                        wrapped_sequence(sequence)
-                    ));
-                }
-            });
-            ui.weak(
-                "Coordinates are 1-based. Copied sequences contain letters only; library inputs retain the complete identity metadata.",
+            egui::CollapsingHeader::new("Raw sequence / numbered positions")
+                .show(ui, |ui| readonly(ui, &numbered_sequence(sequence)));
+        }
+        egui::CollapsingHeader::new("Identity, aliases and provenance").show(ui, |ui| {
+            Self::section(ui, "IDENTITY METADATA");
+            let mut metadata = identity.clone();
+            if let Some(object) = metadata.as_object_mut() {
+                object.remove("sequence");
+            }
+            readonly(
+                ui,
+                &serde_json::to_string_pretty(&metadata).unwrap_or_default(),
             );
-            readonly(ui, &numbered_sequence(sequence));
-            ui.add_space(8.);
-        }
-        Self::section(ui, "IDENTITY METADATA");
-        let mut metadata = identity.clone();
-        if let Some(object) = metadata.as_object_mut() {
-            object.remove("sequence");
-        }
-        readonly(
-            ui,
-            &serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        );
-        Self::section(ui, "ALIASES & TAGS");
-        for field in ["aliases", "tags"] {
-            ui.label(format!(
-                "{}: {}",
-                field,
-                rows(record, field)
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if !text(record, "notes").is_empty() {
-            ui.label(text(record, "notes"));
-        }
-        Self::section(ui, "PROVENANCE");
-        readonly(
-            ui,
-            &serde_json::to_string_pretty(&record["provenance"]).unwrap_or_default(),
-        );
+            Self::section(ui, "ALIASES & TAGS");
+            for field in ["aliases", "tags"] {
+                ui.label(format!(
+                    "{}: {}",
+                    field,
+                    rows(record, field)
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !text(record, "notes").is_empty() {
+                ui.label(text(record, "notes"));
+            }
+            Self::section(ui, "PROVENANCE");
+            readonly(
+                ui,
+                &serde_json::to_string_pretty(&record["provenance"]).unwrap_or_default(),
+            );
+        });
     }
 
     fn library_relations(&mut self, ui: &mut egui::Ui, detail: &Value) {
@@ -1578,7 +1802,7 @@ fn readonly(ui: &mut egui::Ui, value: &str) {
     );
 }
 
-fn wrapped_sequence(sequence: &str) -> String {
+pub(super) fn wrapped_sequence(sequence: &str) -> String {
     sequence
         .as_bytes()
         .chunks(80)
@@ -1980,5 +2204,22 @@ mod tests {
         );
         assert!(markdown_table(&["Not | a table", "Ordinary prose"], 0).is_none());
         assert!(markdown_table(&["A | B", "--- | invalid"], 0).is_none());
+    }
+    #[test]
+    fn hierarchy_retains_parent_context_for_matching_children_and_keeps_orphans() {
+        let parent = json!({"ref":"construct:parent@2","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"});
+        let child = json!({"ref":"construct:child@1","kind":"construct","molecule_type":"protein","parent_ref":"construct:parent@1"});
+        let list = vec![parent.clone(), child.clone()];
+        let collapsed = BTreeSet::from(["construct:parent".into()]);
+        let filtered = hierarchy(&list, &collapsed, true, |r| {
+            text(r, "molecule_type") == "protein"
+        });
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].1, 0);
+        assert_eq!(filtered[1].1, 1);
+        assert_eq!(hierarchy(&list, &collapsed, false, |_| true).len(), 1);
+        let orphan = hierarchy(&[child], &collapsed, false, |_| true);
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(orphan[0].1, 0);
     }
 }

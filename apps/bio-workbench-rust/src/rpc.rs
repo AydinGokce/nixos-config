@@ -57,6 +57,10 @@ const METHODS: &[&str] = &[
     "library.undo",
     "library.redo",
     "library.runs",
+    "library.sequence",
+    "library.product_preview",
+    "library.product_create",
+    "library.create",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -326,6 +330,8 @@ pub fn mutating(method: &str) -> bool {
             | "job.cancel"
             | "annotation.put"
             | "local.upload"
+            | "library.product_create"
+            | "library.create"
             | "library.edit"
             | "library.undo"
             | "library.redo"

@@ -76,7 +76,11 @@ input editor. This native workspace reads the shared head library; switching
 back to **Molecular viewer** retains every structure tab and its display state.
 
 The sidebar opens with projects. Select a project to expand its constructs and
-use **Back to projects** to return. Construct rows use the curated **Alt name**;
+use **Back to projects** to return. Plasmids are expandable parent rows with their
+derived proteins underneath. Standalone proteins stay at the project level.
+Filtering a child keeps its parent visible for context; a derived entry whose
+parent is outside the current view retains an **Open parent** link.
+Construct rows use the curated **Alt name**;
 missing names show a small italic *no alt name* placeholder. Inventory IDs and
 modalities are separate tags. The original verbose source name appears only as a
 tag in the selected detail pane. Search includes IDs, Alt names and source names;
@@ -93,7 +97,8 @@ The disposable `library-list-cache.json` is limited to 32 scopes and 8 MiB;
 invalid caches are ignored without affecting saved inputs or request receipts.
 
 Double-click an Alt name (or a project name) to edit it. The pencil button opens
-an exact nucleotide or amino-acid sequence editor. **Save** creates a new immutable
+an exact nucleotide editor or a standalone protein amino-acid editor. Derived
+proteins use **Edit definition** instead of a literal sequence editor. **Save** creates a new immutable
 revision; existing results keep their original input references. Previous source
 annotations remain retained evidence and are not silently remapped onto an edited
 sequence. Historical revisions are read-only, with a link to the current revision.
@@ -109,6 +114,34 @@ The selected record includes a rendered **Purpose** document, exact Markdown
 source, **Sequence / identity**, clickable **Relationships**, **Attachments** and
 **Record JSON**. Project briefs retain pinned members and roles. Incomplete purpose
 scaffolds and unresolved protein candidates remain visible.
+
+**Sequence / identity** is a native vector viewer. Circular plasmids open as an
+annotated ring; **Auto** zoom changes to a linear map and then individual bases,
+complementary bases and six translation frames. **Circular**, **Linear** and
+**Fit** provide explicit controls. Scroll over the map to zoom, right-drag to pan
+the linear view, and left-drag to select a range. Click an annotation or detected
+ORF to inspect its strand and ranges. Imported annotations carry historical,
+fuzzy or unsupported-coordinate flags; the original attachments remain intact.
+Annotated plasmids initially show their annotation tracks. **ORFs** and **Find
+ORFs** expose the six-frame detector, with minimum-length and genetic-code
+controls. ORFs are candidates, not confirmation of expression or function.
+
+**Create protein…** previews a selected ORF/range before creating a protein under
+its parent. The definition stores ordered nucleotide ranges, strand, genetic code,
+codon start and an optional amino-acid crop; the protein sequence is computed by
+the head. UI positions are 1-based inclusive; the backend stores zero-based
+half-open coordinates and preserves biological traversal order across joins.
+**New variant…** copies a derived definition for a separately named range variant,
+such as a tag-removed product. **Edit definition** changes the parent or ranges
+of the existing product. Preview must match the current definition before saving.
+Invalid translations show diagnostics and cannot be used as stale peptides.
+Parent edits update dependent product revisions and project references together;
+previous revisions and run inputs remain unchanged. Creation and definition edits
+participate in the same Undo/Redo history as other library writes.
+
+**+ Standalone protein** creates an independent protein in the current project
+from a literal amino-acid sequence. It uses the same construct/protein kind as a
+derived entry, and its sequence stays directly editable.
 
 **▶ Prepare prediction** adds the exact selected revision to the existing Inputs
 composer and opens it so you can select models and submit. It preserves current
