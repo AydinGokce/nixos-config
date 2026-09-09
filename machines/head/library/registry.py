@@ -138,13 +138,22 @@ def publication_guard(root, *, exclusive=False):
         os.close(fd)
 
 
-def file_digest(path):
+def file_digest(path, cache=None):
     no_symlinks(path, regular=True)
-    h = hashlib.sha256()
     with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        def identity(st):
+            return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+        before = identity(os.fstat(handle.fileno()))
+        result = cache.get(before) if cache is not None else None
+        if result is None:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                h.update(chunk)
+            result = h.hexdigest()
+        require(identity(os.fstat(handle.fileno())) == before, 'Attachment changed during verification')
+        if cache is not None:
+            cache[before] = result
+        return result
 
 
 def fsync_directory(path):
@@ -370,6 +379,14 @@ class Registry:
         try:
             require(stat.S_ISREG(os.fstat(fd).st_mode), "Registry lock must be a regular file")
             fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            # A durable multi-record intent is completed before any observer
+            # can see its partly published construct/project revisions.
+            while self._pending_transactions():
+                if not exclusive:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                self._recover_transactions_locked()
+                if not exclusive:
+                    fcntl.flock(fd, fcntl.LOCK_SH)
             yield
         finally:
             os.close(fd)
@@ -378,7 +395,7 @@ class Registry:
         kind, ident, rev = pinned_parts(ref)
         return self.root / COLLECTIONS[kind] / ident / str(rev) / "record.json"
 
-    def _read(self, path):
+    def _read(self, path, *, attachment_digests=None):
         no_symlinks(path, regular=True)
         document = verify_document(load_json(path))
         require(type(document.get("schema")) is int and document["schema"] == SCHEMA and document.get("kind") in COLLECTIONS,
@@ -399,7 +416,7 @@ class Registry:
             require(type(item["bytes"]) is int and item["bytes"] >= 0, "Invalid attachment size")
             target = path.parent / relative
             no_symlinks(target, regular=True)
-            require(target.stat().st_size == item["bytes"] and file_digest(target) == item["sha256"],
+            require(target.stat().st_size == item["bytes"] and file_digest(target, attachment_digests) == item["sha256"],
                     f"Attachment integrity failure: {reference(document)}/{relative}")
             names.append(item["path"])
         require(len(names) == len(set(names)), "Duplicate attachment path")
@@ -414,7 +431,7 @@ class Registry:
         return document
 
     def _records_locked(self):
-        result = {}
+        result, attachment_digests = {}, {}
         for kind, collection in COLLECTIONS.items():
             folder = self.root / collection
             no_symlinks(folder)
@@ -428,7 +445,7 @@ class Registry:
                     no_symlinks(version)
                     require(version.is_dir() and re.fullmatch(r"[1-9][0-9]*", version.name),
                             f"Invalid registry revision path: {version}")
-                    document = self._read(version / "record.json")
+                    document = self._read(version / "record.json", attachment_digests=attachment_digests)
                     result[reference(document)] = document
         self._namespace(result)
         for record in result.values():
@@ -578,6 +595,18 @@ class Registry:
         return {"path": "attachments/" + destination.name, "sha256": h.hexdigest(), "bytes": size}
 
     def _publish(self, output, attachments, records):
+        temporary = self._prepare_publication(output, attachments)
+        try:
+            self._install_publication(temporary, reference(output))
+            records[reference(output)] = output
+            self._reindex_locked(records)
+            return copy.deepcopy(output)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+    def _prepare_publication(self, output, attachments, *, inherited=None):
+        """Prepare and fsync immutable bytes without making a revision visible."""
         require(isinstance(attachments, dict), "attachments must map names to source paths")
         destination = self._path(reference(output)).parent
         no_symlinks(destination)
@@ -596,7 +625,22 @@ class Registry:
                     no_symlinks(source, regular=True)
                     require(Path(source).stat().st_size <= projects.MAX_MARKDOWN_BYTES,
                             'Purpose Markdown is larger than 1 MiB')
-                receipt = self._copy_attachment(Path(source), temporary / "attachments" / name)
+                destination_attachment = temporary / 'attachments' / name
+                if inherited and name in inherited:
+                    # Only transaction revisions supply previously validated
+                    # in-registry receipts. Immutable bytes may share an inode;
+                    # imports and replacement attachments continue to copy.
+                    source = no_symlinks(Path(source), regular=True)
+                    require(source.is_relative_to(self.root), 'Inherited attachment must belong to this registry')
+                    receipt = copy.deepcopy(inherited[name])
+                    require(receipt['path'] == 'attachments/' + name and
+                            source.stat().st_size == receipt['bytes'], 'Inherited attachment receipt mismatch')
+                    os.link(source, destination_attachment, follow_symlinks=False)
+                    require(os.stat(source).st_ino == os.stat(destination_attachment).st_ino and
+                            os.stat(source).st_dev == os.stat(destination_attachment).st_dev,
+                            'Inherited attachment inode mismatch')
+                else:
+                    receipt = self._copy_attachment(Path(source), destination_attachment)
                 output["attachments"].append(receipt)
             purpose_name = projects.filename(output['kind'])
             if purpose_name:
@@ -620,18 +664,144 @@ class Registry:
             write_json(temporary / "record.json", output)
             fsync_directory(temporary / "attachments")
             fsync_directory(temporary)
-            destination.parent.parent.mkdir(mode=0o700, exist_ok=True)
-            fsync_directory(self.root)
-            destination.parent.mkdir(mode=0o700, exist_ok=True)
-            fsync_directory(destination.parent.parent)
-            os.rename(temporary, destination)
-            fsync_directory(destination.parent)
-            records[reference(output)] = output
-            self._reindex_locked(records)
-            return copy.deepcopy(output)
-        finally:
+            fsync_directory(staging)
+            return temporary
+        except BaseException:
             if temporary.exists():
                 shutil.rmtree(temporary)
+            raise
+
+    def _install_publication(self, temporary, ref):
+        destination = self._path(ref).parent
+        no_symlinks(destination)
+        require(not destination.exists(), "Revision already exists")
+        destination.parent.parent.mkdir(mode=0o700, exist_ok=True)
+        fsync_directory(self.root)
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        fsync_directory(destination.parent.parent)
+        os.rename(temporary, destination)
+        fsync_directory(destination.parent)
+        fsync_directory(self.root / '.staging')
+
+    def _pending_transactions(self):
+        directory = self.root / '.transactions'
+        no_symlinks(directory)
+        if not directory.exists():
+            return []
+        require(directory.is_dir(), 'Transaction journal must be a directory')
+        entries = sorted(directory.iterdir())
+        require(all(re.fullmatch(r'[a-f0-9]{32}\.json', entry.name) or
+                    re.fullmatch(r'\.[a-f0-9]{32}\.json\.[a-zA-Z0-9_-]+', entry.name) for entry in entries),
+                'Unexpected transaction journal entry')
+        return [entry for entry in entries if not entry.name.startswith('.')]
+
+    def _recover_transactions_locked(self):
+        for path in self._pending_transactions():
+            no_symlinks(path, regular=True)
+            require(path.stat().st_size <= 4 * 1024 * 1024, 'Transaction journal is too large')
+            journal = verify_document(load_json(path))
+            require(set(journal) == {'schema', 'records', 'sha256'} and journal['schema'] == 1 and
+                    isinstance(journal['records'], list) and 0 < len(journal['records']) <= 1000,
+                    'Invalid multi-record transaction journal')
+            refs, attachment_digests = [], {}
+            for entry in journal['records']:
+                require(isinstance(entry, dict) and set(entry) == {'ref', 'sha256', 'staged'},
+                        'Invalid transaction revision')
+                pinned_parts(entry['ref']); refs.append(entry['ref'])
+                require(isinstance(entry['staged'], str) and
+                        re.fullmatch(r'record-[a-zA-Z0-9_-]+', entry['staged']), 'Invalid transaction staging path')
+                destination = self._path(entry['ref'])
+                staged = self.root / '.staging' / entry['staged']
+                source = destination if destination.exists() else staged / 'record.json'
+                no_symlinks(source, regular=True)
+                document = verify_document(load_json(source))
+                require(reference(document) == entry['ref'] and document['sha256'] == entry['sha256'],
+                        'Transaction revision integrity mismatch')
+                # Check every attachment before publishing any remaining item.
+                for receipt in document['attachments']:
+                    relative = safe_relative(receipt['path'])
+                    require(len(relative.parts) == 2 and relative.parts[0] == 'attachments',
+                            'Invalid transaction attachment')
+                    attachment = source.parent / relative
+                    no_symlinks(attachment, regular=True)
+                    require(attachment.stat().st_size == receipt['bytes'] and
+                            file_digest(attachment, attachment_digests) == receipt['sha256'], 'Transaction attachment integrity mismatch')
+            require(len(refs) == len(set(refs)), 'Duplicate transaction revision')
+            for entry in journal['records']:
+                if not self._path(entry['ref']).exists():
+                    self._install_publication(self.root / '.staging' / entry['staged'], entry['ref'])
+            self._reindex_locked(self._records_locked())
+            path.unlink()
+            fsync_directory(path.parent)
+
+    def _revise_many_locked(self, changes, records):
+        """Publish ordered revisions together; caller must own the exclusive lock.
+
+        Later patches may refer to earlier new revisions in the same operation.
+        The journal is a roll-forward intent, not a receipt: audit/undo receipts
+        belong in immutable record provenance and are therefore backed up.
+        """
+        require(isinstance(changes, list) and 0 < len(changes) <= 1000,
+                'A transaction requires 1..1000 revision patches')
+        working, outputs, prepared, entities = dict(records), [], [], set()
+        journal_path = None
+        committed = False
+        try:
+            for change in changes:
+                require(isinstance(change, dict) and set(change) == {'ref', 'expected_sha256', 'patch'},
+                        'Revision transaction requires ref, expected_sha256 and patch')
+                old = working[self._resolve(change['ref'], working)]
+                entity = (old['kind'], old['id'])
+                require(entity not in entities, 'An entity may be revised once per transaction')
+                entities.add(entity)
+                require(old['sha256'] == change['expected_sha256'], 'Revision SHA-256 conflict')
+                latest = max(r['revision'] for r in working.values() if (r['kind'], r['id']) == entity)
+                require(old['revision'] == latest, 'Cannot revise a stale revision; refresh the library')
+                patch = change['patch']
+                require(isinstance(patch, dict) and not set(patch) - USER_FIELDS,
+                        'Revision patch contains unknown/managed fields')
+                require(patch.get('kind', old['kind']) == old['kind'] and patch.get('id', old['id']) == old['id'],
+                        'Revision cannot change kind/id')
+                document = {k: copy.deepcopy(v) for k, v in old.items() if k in USER_FIELDS}
+                document.update(copy.deepcopy(patch))
+                document['parents'] = list(dict.fromkeys([*document.get('parents', []), reference(old)]))
+                output = self._normalize(document, working, latest + 1)
+                sources = {Path(item['path']).name: self._path(reference(old)).parent / item['path']
+                           for item in old['attachments']}
+                inherited = {Path(item['path']).name: item for item in old['attachments']}
+                temporary = self._prepare_publication(output, sources, inherited=inherited)
+                prepared.append(temporary); outputs.append(output)
+                working[reference(output)] = output
+            directory = self.root / '.transactions'
+            no_symlinks(directory)
+            directory.mkdir(mode=0o700, exist_ok=True)
+            fsync_directory(self.root)
+            # mkstemp provides an unpredictable name without an extra dependency.
+            import uuid
+            journal_path = directory / (uuid.uuid4().hex + '.json')
+            journal = {'schema': 1, 'records': [
+                {'ref': reference(out), 'sha256': out['sha256'], 'staged': stage.name}
+                for out, stage in zip(outputs, prepared)]}
+            journal['sha256'] = digest_json(journal)
+            atomic_json(journal_path, journal)
+            committed = True
+            self._recover_transactions_locked()
+            records.update({reference(out): out for out in outputs})
+            return copy.deepcopy(outputs)
+        finally:
+            # Once the journal is durable, staged bytes are required for crash
+            # recovery; never discard them merely because this process failed.
+            # atomic_json can publish the journal and then raise while fsyncing
+            # its directory. In that case it is already a visible recovery
+            # intent, even though the call did not return successfully.
+            if not committed and not (journal_path is not None and journal_path.exists()):
+                for temporary in prepared:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+
+    def revise_many(self, changes):
+        with self._lock(exclusive=True):
+            return self._revise_many_locked(changes, self._records_locked())
 
     def import_record(self, document, attachments=None):
         require(isinstance(document, dict), "Record must be a JSON object")

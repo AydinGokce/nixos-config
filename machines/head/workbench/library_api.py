@@ -1,4 +1,4 @@
-"""Read-only exploration of the shared, revision-bound molecular library."""
+"""Exploration of the shared, revision-bound molecular library."""
 from __future__ import annotations
 
 import base64
@@ -60,12 +60,14 @@ def submission(record, records):
 
 
 def summary(record, records):
+    from .library_edits import presentation
     identity = record['identity']
     review = identity.get('product_review', {})
     admission = submission(record, records)
     return {
         'ref': pin(record), 'kind': record['kind'], 'id': record['id'],
         'name': record['name'], 'revision': record['revision'],
+        'sha256': record['sha256'], **presentation(record),
         'status': record['status'], 'molecule_type': identity.get('molecule_type'),
         'aliases': record['aliases'], 'tags': record['tags'],
         'sequence_length': len(identity.get('sequence', identity.get('residues', []))) or None,
@@ -79,7 +81,8 @@ def summary(record, records):
 
 
 def list_records(api, params):
-    keys(params, optional=('query', 'kind', 'molecule_type', 'project_ref', 'limit', 'offset'))
+    from .library_edits import presentation
+    keys(params, optional=('query', 'kind', 'molecule_type', 'project_ref', 'limit', 'offset', 'archived'))
     query = params.get('query', '')
     require(isinstance(query, str) and len(query) <= 512 and not any(ord(c) < 32 for c in query), 'Invalid library search text')
     kind = params.get('kind')
@@ -88,11 +91,17 @@ def list_records(api, params):
     require(molecule_type is None or isinstance(molecule_type, str) and molecule_type in {'protein', 'dna', 'rna', 'small_molecule', 'mixed_polymer'}, 'Invalid molecule type')
     limit = number(params.get('limit', 100), 'limit', 1, 500)
     offset = number(params.get('offset', 0), 'offset', 0, 1_000_000)
+    archived = params.get('archived', False)
+    require(type(archived) is bool, 'archived must be a boolean')
     if 'project_ref' in params:
         string(params['project_ref'], 'project_ref', 256)
     with opened(api) as (module, registry, records):
         current = latest(records)
-        projects = sorted((r for r in current if r['kind'] == 'project'), key=lambda r: (r['name'].casefold(), r['id']))
+        current_entities = {(r['kind'], r['id']): r for r in current}
+        archived_entities = {key for key, record in current_entities.items() if presentation(record)['archived']}
+        projects = sorted((r for r in current if r['kind'] == 'project' and
+                           ((r['kind'], r['id']) in archived_entities) == archived),
+                          key=lambda r: (r['name'].casefold(), r['id']))
         counts = {k: sum(r['kind'] == k for r in current) for k in module.COLLECTIONS}
         candidates = current
         project_ref = None
@@ -102,11 +111,15 @@ def list_records(api, params):
         terms = query.casefold().split()
         filtered = []
         for record in candidates:
+            if ((record['kind'], record['id']) in archived_entities) != archived:
+                continue
             if kind is not None and record['kind'] != kind:
                 continue
             if molecule_type is not None and record['identity'].get('molecule_type') != molecule_type:
                 continue
-            haystack = ' '.join([pin(record), record['name'], *record['aliases'], *record['tags'], record['notes'],
+            display = presentation(record)
+            haystack = ' '.join([pin(record), record['name'], display['alt_name'], display['verbose_name'],
+                                 display['inventory_id'], *record['aliases'], *record['tags'], record['notes'],
                                  json.dumps(record['provenance'], ensure_ascii=False)]).casefold()
             if all(term in haystack for term in terms):
                 filtered.append(record)
@@ -117,10 +130,12 @@ def list_records(api, params):
                 'projects': [summary(r, records) for r in projects], 'counts': counts,
                 'total_count': len(current), 'filtered_count': len(filtered),
                 'next_offset': next_offset, 'truncated': next_offset is not None,
-                'project_ref': project_ref}
+                'project_ref': project_ref, 'archived': archived,
+                'archived_count': len(archived_entities)}
 
 
 def get_record(api, params):
+    from .library_edits import presentation
     keys(params, ('ref',)); string(params['ref'], 'ref', 256)
     with opened(api) as (module, registry, records):
         ref = registry._resolve(params['ref'], records)
@@ -155,7 +170,10 @@ def get_record(api, params):
                     if r['kind'] == 'project' and any(m['source_ref'] == ref for m in r['identity']['members'])]
         revisions = sorted((r for r in records.values() if (r['kind'], r['id']) == (record['kind'], record['id'])),
                            key=lambda r: r['revision'], reverse=True)
-        return {'ref': ref, 'record': record, 'description': description, 'members': members,
+        latest_ref = pin(revisions[0])
+        return {'ref': ref, 'record': record, 'sha256': record['sha256'], **presentation(record),
+                'latest_ref': latest_ref, 'is_latest': ref == latest_ref,
+                'description': description, 'members': members,
                 'relations': relations, 'projects': projects,
                 'revisions': [summary(r, records) for r in revisions], 'submission': submission(record, records)}
 

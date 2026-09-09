@@ -19,6 +19,17 @@ Inputs preserves its exact revision and still requires the normal preview and
 submission steps. Whole plasmids and unresolved protein-product candidates stay
 visible with the reason they cannot be used as ordinary prediction inputs.
 
+Library curation separates the editable Alt name from the original inventory
+label, ID and modality. `library.edit` creates revisions for names, archive state
+and ordinary polymer sequences; `library.history`, `library.undo` and
+`library.redo` provide durable actor-owned undo/redo. Archiving hides entries
+without deleting them. Current project memberships advance together with an
+edited member in a recoverable transaction, while every old snapshot remains
+intact. A changed sequence retains its old derivation and annotation evidence
+as historical provenance. `library.runs` associates actor-visible jobs using
+their original pinned library inputs; the explorer opens their retained results
+through the ordinary artifact viewer. See `CONTRACT.md` for the exact API.
+
 State lives in `/var/lib/bio-workbench`: SQLite WAL, immutable upload and artifact
 bytes, isolated per-batch construct libraries, validation evidence, owned process
 logs and operation receipts. Input bytes and supported chemistry are preserved.

@@ -130,6 +130,54 @@ class LibraryExplorerTests(unittest.TestCase):
         self.assertEqual(other.call('library.get', {'ref': 'editor'}), self.api.call('library.get', {'ref': 'editor'}))
         self.assertEqual(other.call('batch.list', {})['batches'], [])
 
+    def test_inventory_presentation_keeps_alt_name_separate_from_source_label(self):
+        self.protein(provenance={'source_inventory_identifier': 'pGC077',
+            'inventory': {'identifier': 'pGC077', 'verbose_name': 'Long inventory label',
+                          'alt_orf_name': 'Short alternative'}})
+        detail = self.api.call('library.get', {'ref': 'editor'})
+        self.assertEqual(detail['inventory_id'], 'pGC077')
+        self.assertEqual(detail['alt_name'], 'Short alternative')
+        self.assertEqual(detail['verbose_name'], 'Long inventory label')
+        self.assertEqual(detail['modality'], 'protein')
+        self.assertEqual(detail['sha256'], detail['record']['sha256'])
+        self.assertTrue(detail['is_latest'])
+        self.assertEqual(detail['latest_ref'], 'construct:editor@1')
+        provenance = dict(detail['record']['provenance'])
+        provenance['workbench'] = {'alt_name': ''}
+        self.registry.revise('editor', {'provenance': provenance})
+        self.assertEqual(self.api.call('library.get', {'ref': 'editor'})['alt_name'], '')
+        old = self.api.call('library.get', {'ref': 'construct:editor@1'})
+        self.assertFalse(old['is_latest'])
+        self.assertEqual(old['alt_name'], 'Short alternative')
+
+    def test_archive_filters_current_entity_without_deleting_pinned_history(self):
+        original = self.protein(); self.project()
+        self.registry.revise('editor', {'provenance': {'workbench': {'archived': True}}})
+        active = self.api.call('library.list', {'project_ref': 'study'})
+        self.assertEqual(active['records'], [])
+        self.assertEqual(active['archived_count'], 1)
+        archived = self.api.call('library.list', {'archived': True})
+        self.assertEqual([r['ref'] for r in archived['records']], ['construct:editor@2'])
+        self.assertEqual(self.api.call('library.get', {'ref': 'construct:editor@1'})['record'], original)
+        self.registry.revise('editor', {'provenance': {'workbench': {'archived': False}}})
+        restored = self.api.call('library.list', {'project_ref': 'study'})
+        self.assertEqual([r['ref'] for r in restored['records']], ['construct:editor@1'])
+        self.assertEqual(self.api.call('library.list', {'archived': True})['records'], [])
+        for value in ('true', 1, None):
+            with self.subTest(value=value), self.assertRaises(Error):
+                self.api.call('library.list', {'archived': value})
+
+    def test_archived_project_does_not_archive_its_molecular_members(self):
+        self.protein(); self.project()
+        self.registry.revise('study', {'provenance': {'workbench': {'archived': True}}})
+        active = self.api.call('library.list', {})
+        self.assertEqual(active['projects'], [])
+        self.assertEqual([r['kind'] for r in active['records']], ['construct'])
+        archived = self.api.call('library.list', {'archived': True})
+        self.assertEqual([r['kind'] for r in archived['records']], ['project'])
+        self.assertEqual(self.api.call('library.get', {'ref': 'study'})['members'][0]['ref'],
+                         'construct:editor@1')
+
     def test_unresolved_products_and_whole_plasmids_cannot_be_added_to_runs(self):
         plasmid = {'kind': 'construct', 'name': 'Plasmid', 'identity': {'molecule_type': 'dna', 'strand_count': 2, 'molecular_form': 'plasmid'}}
         candidate = {'kind': 'construct', 'name': 'Candidate', 'identity': {'molecule_type': 'protein', 'product_review': {'status': 'review_required'}}}

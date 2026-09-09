@@ -52,6 +52,33 @@ component, revise the assembly too. Aliases resolve to the current revision at
 submission; jobs then bind that exact revision and its complete chemical record.
 The [schema](SCHEMA.md) documents all fields and reference rules.
 
+The Workbench explorer exposes inventory IDs, original verbose names, editable
+Alt names and modality as separate fields. Its Alt-name/archive overrides and
+operation receipts live in `provenance.workbench`; an empty Alt name overrides a
+nonempty imported name. Archiving hides the current entry without deleting its
+revisions, source attachments, project memberships or run provenance.
+
+Workbench curation publishes a new molecular revision together with new current
+project snapshots that pin it. Historical projects and assembly components stay
+pinned. A durable `.transactions` intent completes interrupted publications before
+any registry reader proceeds. Actor-owned undo/redo creates further revisions;
+it checks for conflicting edits and never rewrites previous bytes. Receipts are
+part of immutable record provenance, so normal library backup/restore also
+preserves undo history and request-key idempotency without the Workbench database.
+Transactions inherit validated immutable attachments by hardlink on the same
+filesystem; imports still copy source files. Backups explicitly store regular
+file bytes, and verification rechecks shared attachment content on each read.
+
+The simple sequence editor accepts exact canonical uppercase input. It rejects
+definitions with explicit modifications, linkages, residues, bonds, structural
+annotations or other chemistry needing remapping. A real sequence change keeps
+the original source files and review evidence as historical provenance, removes
+the old `encoded_by` and reference-match claims from the current identity, and
+records the input as user defined. It neither translates DNA nor creates a new
+protein product. Recheck inherited purpose and positional annotations against
+the edited sequence. Saving an unchanged sequence cannot clear product-review
+findings. Native model compatibility remains a separate run-preview check.
+
 Synthetic amidites belong in the monomer library with the **final incorporated
 residue chemistry**, attachment atoms, supplier notation and original documents.
 A supplier code alone is insufficient to infer a modified polymer's chemistry.

@@ -11,8 +11,9 @@ Each request is
 The trusted SSH command sets `BIO_WORKBENCH_ACTOR`; client parameters cannot
 select an actor. Resources are scoped to that actor. The app and Slack share
 resources when their trusted commands use the same actor.
-The construct library is a shared read-only resource for authenticated library
-exploration; reading it does not grant access to another actor's jobs or uploads.
+The construct library is shared by authenticated operators. Its curation methods
+publish immutable revisions; reading or editing it does not grant access to
+another actor's jobs or uploads. Undo/redo history belongs to the trusted actor.
 
 Limits: 2 MiB per wire message, 512 KiB decoded upload/read chunks, 256 MiB per
 upload, 128 declared inputs, 512 expanded input/model pairs, 100 list entries.
@@ -24,19 +25,26 @@ are rejected. IDs are opaque strings. Times are UTC ISO 8601. Error codes includ
 
 The authoritative registry is the operator-configured `library_root` (normally
 `/var/lib/bio-library`). Clients cannot choose its path. These methods read
-published records and validate their JSON and attachment hashes; they do not
-publish revisions, change purpose documents, query MSA services or launch work.
+published records and validate their JSON and attachment hashes. Listing,
+reading, archiving and editing the library never query MSA services or launch
+work. Molecular model compatibility remains part of the existing run preview.
 
-* `library.list {query?,kind?,molecule_type?,project_ref?,limit?,offset?}` returns
-  `{records,projects,counts,total_count,filtered_count,next_offset,truncated,project_ref}`.
+* `library.list {query?,kind?,molecule_type?,project_ref?,limit?,offset?,archived?}` returns
+  `{records,projects,counts,total_count,filtered_count,next_offset,truncated,project_ref,
+  archived,archived_count}`.
   Default limit is 100, maximum 500. `counts` uses singular kind keys. The ordinary
   list contains latest revisions; a project filter returns its exact pinned
   member revisions, including older revisions. Search matches all case-insensitive
   words against IDs, names, aliases, tags, notes and provenance. Summary records
-  contain `ref,kind,id,name,revision,status,molecule_type,aliases,tags,sequence_length,
-  molecular_form,review_status,review_reason,submission_allowed,encoded_by_ref,member_count`.
+  contain `ref,kind,id,name,revision,sha256,status,molecule_type,aliases,tags,sequence_length,
+  molecular_form,review_status,review_reason,submission_allowed,encoded_by_ref,member_count,
+  inventory_id,alt_name,verbose_name,modality,archived`. The boolean `archived`
+  filter defaults to false; true returns archived entities. Visibility follows
+  the latest archive state even when an older project pins the entity's earlier
+  revision. Archiving a project does not archive its members.
 * `library.get {ref}` returns `{ref,record,description,members,relations,revisions,
-  submission,projects}`. Aliases resolve to an exact returned `ref`. `record` is
+  submission,projects,sha256,inventory_id,alt_name,verbose_name,modality,archived,
+  latest_ref,is_latest}`. Aliases resolve to an exact returned `ref`. `record` is
   the complete published record without removing user-owned provenance keys.
   `description` is null or `{text,path,sha256,incomplete}`; projects use their
   `project.md`, molecular records use `description.md`. Member summaries also
@@ -53,6 +61,46 @@ publish revisions, change purpose documents, query MSA services or launch work.
   `attachments/filename` path. Length defaults to 131072 and is at most 262144
   bytes. The size and SHA describe the complete original file; clients verify
   both before publishing an export. Arbitrary filesystem paths are rejected.
+* `library.edit {ref,expected_sha256,request_key,patch}` publishes a new revision.
+  The reference must be pinned and current, with its exact displayed SHA.
+  Supported patch fields are `alt_name` for molecular records, `name` for
+  projects, `archived` (boolean), and `sequence` for ordinary protein/DNA/RNA
+  constructs. The response is `{operation_id,ref,changed_refs,changed,history}`;
+  each changed-ref pair contains `before_ref,after_ref`. Reusing the same request
+  key with identical parameters returns the durable receipt; changing parameters
+  under the same key conflicts. Current projects pinning the predecessor advance
+  with the molecular edit in one recoverable registry transaction. Earlier
+  revisions and source attachments remain unchanged.
+* `library.history {}` returns `{undo,redo,undo_count,redo_count}` for this actor.
+  Each available operation contains `operation_id,label,before_ref,after_ref`.
+  `library.undo {operation_id,request_key}` and `library.redo` with the same
+  parameter shape publish compensating revisions and return the edit-response
+  shape. They require the applicable history entry and reject edits that would
+  overwrite an intervening incompatible change. Receipts are retained in
+  immutable provenance and survive ordinary library backup/restore.
+* `library.runs {ref,limit?,cursor?,include_revisions?}` returns
+  `{ref,records,next_cursor,include_revisions,scope,match}`. Default limit is 30,
+  maximum 100; `cursor` is the prior page's last job ID. It includes the construct's
+  other revisions by default. Each row has job/batch IDs, input and batch names,
+  model, state, timestamps, exact `source_refs`, `selected_revision`,
+  `artifact_count` and `structure_count`. Associations require an explicit pinned
+  library input or a pinned assembly containing the construct. Names, sequence
+  similarity and floating aliases are not used to assign old jobs. Both job and
+  batch must belong to the requesting actor. Existing job/artifact methods open
+  results with their existing access controls.
+
+Imported Alt names come from `provenance.inventory.alt_orf_name`; a curated
+`provenance.workbench.alt_name`, including an explicit empty string, overrides
+that display field. The verbose source name and inventory identifier remain
+separate. Archive state is retained in `provenance.workbench.archived` and never
+deletes data. Ordinary sequence edits require uppercase symbols in the declared
+alphabet, without whitespace or a FASTA header, and at most 1,000,000 symbols.
+Explicit modifications, linkages, bonds or structural chemistry require a
+complete remapped molecular definition and cannot be discarded by this editor.
+A changed sequence preserves prior derivation/reference claims as historical
+provenance and becomes an explicit user-defined input; its original source
+annotations and purpose text require reassessment. A no-op edit does not clear
+source review findings.
 
 Projects and purpose documents provide research context. They do not constitute
 findings or authorize an engineering campaign. The original source database,

@@ -31,6 +31,9 @@ class API:
             'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
             'library.list': self.library_list, 'library.get': self.library_get,
             'library.attachment': self.library_attachment,
+            'library.edit': self.library_edit, 'library.history': self.library_history,
+            'library.undo': self.library_undo, 'library.redo': self.library_redo,
+            'library.runs': self.library_runs,
             'md.catalog': self.md_catalog, 'md.validate': self.md_validate, 'md.plan': self.md_plan,
             'md.resume': self.md_resume,
             'md.compare': self.md_compare,
@@ -42,7 +45,9 @@ class API:
             'annotation.put': self.annotation_put, 'annotation.list': self.annotation_list,
         }.get(method)
         require(function is not None, 'Unknown method')
-        if method in {'library.list', 'library.get', 'library.attachment'}:
+        if method in {'library.list', 'library.get', 'library.attachment',
+                      'library.edit', 'library.history', 'library.undo', 'library.redo',
+                      'library.runs'}:
             # The explorer returns published user records, including their
             # exact identity/provenance keys and record hashes. These methods
             # explicitly construct their public envelopes and have no private
@@ -61,6 +66,26 @@ class API:
     def library_attachment(self, params):
         from .library_api import attachment
         return attachment(self, params)
+
+    def library_edit(self, params):
+        from .library_edits import edit
+        return edit(self, params)
+
+    def library_history(self, params):
+        from .library_edits import history
+        return history(self, params)
+
+    def library_undo(self, params):
+        from .library_edits import undo
+        return undo(self, params)
+
+    def library_redo(self, params):
+        from .library_edits import redo
+        return redo(self, params)
+
+    def library_runs(self, params):
+        from .library_history import list_runs
+        return list_runs(self, params)
 
     def catalog(self, params):
         keys(params)
