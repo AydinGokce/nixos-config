@@ -69,6 +69,42 @@ upload ID; the client retains the uncertain operation and explains when a new
 explicit upload is required. Requests from a different head/user/port cannot be
 replayed against the current connection.
 
+## Explore the molecular library
+
+Open **Library** beside Inputs and Runs, or choose **Browse library** from the
+input editor. This native workspace reads the shared head library; switching
+back to **Molecular viewer** retains every structure tab and its display state.
+
+Choose a project to browse its exact member revisions, or **All library records**
+for the current inventory. Search names, aliases and references; filter by record
+kind, molecule type or **Needs review**. Lists show molecular type, sequence
+length, revision and product-review status. **Load more records** is explicit when
+the server returns multiple pages; local filters apply to records already loaded.
+
+The selected record has a rendered **Purpose** document with an exact Markdown
+source view, **Sequence / identity**, clickable **Relationships**, **Attachments**
+and the authoritative **Record JSON**. Project briefs list pinned members and
+their roles. Relationships follow encoded proteins back to their source plasmids,
+assemblies to component constructs, and records to project membership. The
+revision menu opens historical records without changing the current project.
+Incomplete purpose scaffolds and unresolved protein candidates remain visible.
+
+**Add this revision to Inputs** adds a pinned reference to the composer and never
+starts a run. Whole plasmid inventory records and products requiring review are
+blocked with the head's reason. Model-specific compatibility is still checked in
+Preview. Sequences and FASTA can be copied without changing the stored identity.
+
+**Save…** under Attachments downloads the original retained file through bounded
+SSH RPC chunks, checks its size and SHA-256 against the selected record, then
+opens a native save dialog. Exports are limited to 256 MiB per attachment. The
+explorer is read-only; library editing and new revisions remain available through
+the `bio-library` command on the head.
+
+Changing the SSH host, user or port detaches library references from the active
+composer. Their original inputs and Library-ref drafts remain in the local draft
+archive; select records again from the new head to avoid reusing an identically
+named reference from a different library. Pasted molecular sequences are preserved.
+
 ## Compare structures and inspect evidence
 
 Each job lists its actual artifacts. Structure artifacts are shown first;

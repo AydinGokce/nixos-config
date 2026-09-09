@@ -439,7 +439,12 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                     self.log("Select the original artifact again to retry its verified download.");
                 }
             }
-            Purpose::Library => self.open_library(),
+            Purpose::Library => self.library_refresh(),
+            Purpose::LibraryPage(offset) => self.library_load_page(offset),
+            Purpose::LibraryRecord(reference) => self.library_select(&reference),
+            Purpose::LibraryAttachment(_, _) => {
+                self.log("Select the attachment again in Library to retry its verified download.");
+            }
             Purpose::Annotations(artifact) => {
                 self.request("annotation.list", json!({"artifact_id":artifact}), purpose);
             }

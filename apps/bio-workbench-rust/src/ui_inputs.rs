@@ -560,36 +560,6 @@ if ui.button("Clear selection").clicked() && let Some(preview)=self.state.previe
         });
         self.preview_open = open;
     }
-    pub(super) fn open_library(&mut self) {
-        self.library_open = true;
-        if let Some(session) = self.session.as_mut() {
-            match session.library() {
-                Ok(id) => {
-                    self.pending.insert(
-                        id,
-                        Pending {
-                            purpose: Purpose::Library,
-                            label: "Library".into(),
-                            done: 0,
-                            total: 0,
-                        },
-                    );
-                }
-                Err(error) => self.log(error.to_string()),
-            }
-        }
-    }
-    pub(super) fn library_dialog(&mut self, ctx: &egui::Context) {
-        let mut open = self.library_open;
-        egui::Window::new("Construct library on head").open(&mut open).default_size([720.,440.]).show(ctx,|ui|{
-            ui.horizontal(|ui|{ui.label("Filter");ui.text_edit_singleline(&mut self.library_filter);if ui.button("Refresh").clicked(){self.open_library();}});
-            ui.small("Library references are pinned to immutable revisions during compatibility validation.");let filter=self.library_filter.to_lowercase();let mut chosen=None;
-            egui::ScrollArea::both().show(ui,|ui|{for record in &self.library{let reference=text(record,"ref");if !filter.is_empty()&&!record.to_string().to_lowercase().contains(&filter){continue;}ui.horizontal(|ui|{if ui.button("Add").clicked(){chosen=Some(record.clone());}ui.monospace(reference);ui.label(text(record,"name"));ui.weak(text(record,"status"));});}});
-            if let Some(record)=chosen{let molecule=text(&record,"molecule_type");self.state.inputs.push(Input{id:uid(),name:text(&record,"name").into(),molecule_type:if molecule.is_empty(){if text(&record,"kind")=="assembly"{"assembly"}else{"protein"}}else{molecule}.into(),chain_id:self.state.next_chain(),source:json!({"kind":"library","ref":text(&record,"ref")}),..Default::default()});}
-            if self.library.is_empty(){ui.label("No records loaded. You can also paste a construct:name@revision reference in Inputs.");}
-        });
-        self.library_open = open;
-    }
     pub(super) fn settings_dialog(&mut self, ctx: &egui::Context) {
         let Some(id) = self.settings_model.clone() else {
             return;

@@ -223,6 +223,17 @@ impl Session {
         self.connection = connection;
         Ok(())
     }
+    /// Persist detached reference state before a new endpoint can become active,
+    /// including after a crash between the two atomic file replacements.
+    pub fn save_connection_with_draft(
+        &mut self,
+        connection: Connection,
+        draft: Value,
+    ) -> Result<(), RpcError> {
+        connection.validate()?;
+        self.save_draft(draft)?;
+        self.save_connection(connection)
+    }
     pub fn save_draft(&mut self, mut draft: Value) -> Result<(), RpcError> {
         if !draft.is_object() {
             return Err(RpcError::new("draft", "Draft must be an object."));
@@ -310,8 +321,17 @@ impl Session {
     pub fn artifact(&mut self, artifact_id: &str) -> Result<String, RpcError> {
         self.enqueue_new("local.artifact", json!({"artifact_id":artifact_id}), false)
     }
-    pub fn library(&mut self) -> Result<String, RpcError> {
-        self.enqueue_new("local.library", json!({}), false)
+    pub fn library_attachment(
+        &mut self,
+        reference: &str,
+        name: &str,
+        receipt: &Value,
+    ) -> Result<String, RpcError> {
+        self.enqueue_new(
+            "local.library_attachment",
+            json!({"ref":reference,"name":name,"receipt":receipt}),
+            false,
+        )
     }
     fn backend(&self) -> Result<Arc<dyn Backend>, RpcError> {
         if let Some(backend) = &self.backend_override {
@@ -506,6 +526,23 @@ fn run_task(
         }
         match method.as_str() {
             "local.library" => backend.library(),
+            "local.library_attachment" => {
+                let reference = operation.params["ref"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new("request", "Missing library reference."))?;
+                let name = operation.params["name"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new("request", "Missing attachment name."))?;
+                let (path, metadata) = rpc::download_library_attachment(
+                    backend.as_ref(),
+                    &directory.join("library-attachments"),
+                    reference,
+                    name,
+                    &operation.params["receipt"],
+                    progress,
+                )?;
+                Ok(json!({"local_path":path,"metadata":metadata}))
+            }
             "local.artifact" => {
                 let artifact_id = operation.params["artifact_id"]
                     .as_str()
@@ -933,6 +970,49 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5));
             thread::sleep(Duration::from_millis(10));
         }
+    }
+    #[test]
+    fn endpoint_change_requires_durable_detachment_before_profile_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::open_internal(
+            egui::Context::default(),
+            directory.path().into(),
+            Some(Arc::new(Mock::new())),
+            false,
+        )
+        .unwrap();
+        let original = session.connection.clone();
+        session.save_connection(original.clone()).unwrap();
+        let mut changed = original.clone();
+        changed.host = "another-head.example".into();
+        fs::create_dir(directory.path().join("draft.json")).unwrap();
+        assert!(
+            session
+                .save_connection_with_draft(changed.clone(), json!({"inputs":[]}))
+                .is_err()
+        );
+        assert_eq!(session.connection, original);
+        let persisted: Connection = serde_json::from_value(
+            rpc::read_json(&directory.path().join("connection.json"), 16384).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted, original);
+        fs::remove_dir(directory.path().join("draft.json")).unwrap();
+        let detached = json!({"inputs":[],"detached_library_sources":[{"endpoint":original.identity(),"input":{"source":{"kind":"library","ref":"construct:same-id@1"}}}]});
+        session
+            .save_connection_with_draft(changed.clone(), detached.clone())
+            .unwrap();
+        assert_eq!(session.connection, changed);
+        assert_eq!(
+            rpc::read_json(&directory.path().join("draft.json"), STATE_LIMIT).unwrap()["detached_library_sources"],
+            detached["detached_library_sources"]
+        );
+        assert!(
+            rpc::read_json(&directory.path().join("draft.json"), STATE_LIMIT).unwrap()["inputs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn durable_request_retry_keeps_key_across_restart_and_never_autoreplays() {

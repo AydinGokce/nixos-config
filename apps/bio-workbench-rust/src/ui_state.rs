@@ -214,6 +214,47 @@ impl UiState {
         }
         unreachable!()
     }
+    /// References have meaning only on their original head. Preserve detached
+    /// drafts locally, but require an explicit selection from the new library.
+    pub fn detach_library_sources(&mut self, endpoint: &str) -> usize {
+        let mut detached = Vec::new();
+        self.inputs.retain(|input| {
+            if text(&input.source, "kind") == "library" {
+                detached.push(json!({"endpoint":endpoint,"input":input}));
+                false
+            } else {
+                true
+            }
+        });
+        if self.editor.kind == "library" && !self.editor.text.trim().is_empty() {
+            detached.push(json!({"endpoint":endpoint,"editor":self.editor}));
+            self.editor = Editor {
+                kind: "library".into(),
+                ..Default::default()
+            };
+        }
+        if let Some(saved) = self
+            .extra
+            .get_mut("saved_editors")
+            .and_then(Value::as_object_mut)
+            && let Some(editor) = saved.remove("library")
+            && !text(&editor, "text").trim().is_empty()
+        {
+            detached.push(json!({"endpoint":endpoint,"editor":editor}));
+        }
+        let count = detached.len();
+        if count > 0 {
+            let archive = self
+                .extra
+                .entry("detached_library_sources".into())
+                .or_insert_with(|| json!([]));
+            if !archive.is_array() {
+                *archive = json!([archive.clone()]);
+            }
+            archive.as_array_mut().unwrap().extend(detached);
+        }
+        count
+    }
     pub fn active_input(&self) -> Option<Input> {
         if self.editor.text.trim().is_empty() {
             return None;
@@ -359,6 +400,49 @@ pub fn infer_file(path: &std::path::Path) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn changing_heads_detaches_equal_named_refs_but_preserves_molecular_text_and_archive() {
+        let mut state = UiState::default();
+        state.inputs.push(Input {
+            id: "library".into(),
+            name: "Stored protein".into(),
+            source: json!({"kind":"library","ref":"construct:same-id@1"}),
+            ..Default::default()
+        });
+        state.inputs.push(Input {
+            id: "pasted".into(),
+            name: "Pasted sequence".into(),
+            source: json!({"kind":"text","text":"ACDE","format":"sequence"}),
+            ..Default::default()
+        });
+        state.editor = Editor {
+            kind: "library".into(),
+            text: "construct:same-id@1".into(),
+            ..Default::default()
+        };
+        state.extra.insert("saved_editors".into(), json!({"library":{"kind":"library","text":"assembly:same-id@1"},"text":{"kind":"text","text":"ACGT"}}));
+        assert_eq!(
+            state.detach_library_sources("harrison@root:first-head:22"),
+            3
+        );
+        assert_eq!(state.inputs.len(), 1);
+        assert_eq!(state.inputs[0].id, "pasted");
+        assert_eq!(state.inputs[0].source["text"], "ACDE");
+        assert!(state.active_input().is_none());
+        assert!(state.extra["saved_editors"].get("library").is_none());
+        assert_eq!(state.extra["saved_editors"]["text"]["text"], "ACGT");
+        let archive = state.extra["detached_library_sources"].as_array().unwrap();
+        assert_eq!(archive[0]["input"]["source"]["ref"], "construct:same-id@1");
+        assert!(
+            archive
+                .iter()
+                .all(|item| item["endpoint"] == "harrison@root:first-head:22")
+        );
+        assert_eq!(
+            state.detach_library_sources("harrison@root:second-head:22"),
+            0
+        );
+    }
     #[test]
     fn preview_includes_uncommitted_paste_and_preserves_original_bytes() {
         let mut state = UiState::default();

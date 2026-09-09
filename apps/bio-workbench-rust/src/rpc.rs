@@ -31,8 +31,6 @@ const HEAD: &str = "31.56.109.100";
 const HOST_PIN: &str = "31.56.109.100 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAn+9pjF2dRZ5hDvjWrvht+Q+vfUTjyORY58GT3Su35Q\n";
 const REMOTE: &str =
     "env BIO_WORKBENCH_ACTOR=harrison /run/current-system/sw/bin/bio-workbench rpc";
-const LIBRARY: &str =
-    "env BIO_LIBRARY_ROOT=/var/lib/bio-library /run/current-system/sw/bin/bio-library list";
 const METHODS: &[&str] = &[
     "catalog",
     "upload.begin",
@@ -51,6 +49,9 @@ const METHODS: &[&str] = &[
     "artifact.read",
     "annotation.put",
     "annotation.list",
+    "library.list",
+    "library.get",
+    "library.attachment",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -599,15 +600,7 @@ impl Backend for Client {
         Ok(result)
     }
     fn library(&self) -> Result<Value, RpcError> {
-        let bytes = self.run(LIBRARY, Vec::new(), false)?;
-        let records = strict_json(&bytes)?;
-        if !records.is_array() {
-            return Err(RpcError::new(
-                "protocol",
-                "Library listing was not an array.",
-            ));
-        }
-        Ok(json!({"records":records}))
+        self.call("library.list", json!({"limit":500}))
     }
 }
 
@@ -764,6 +757,110 @@ pub fn download_artifact(
     Ok((destination, metadata))
 }
 
+/// Stream a pinned library attachment, checking the record receipt and every chunk.
+pub fn download_library_attachment(
+    backend: &dyn Backend,
+    cache: &Path,
+    reference: &str,
+    name: &str,
+    receipt: &Value,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<(PathBuf, Value), RpcError> {
+    const LIBRARY_CHUNK: usize = 262_144;
+    let size = field_u64(receipt, "bytes")?;
+    let sha = text_hash(receipt)?;
+    if size > MAX_UPLOAD
+        || reference.is_empty()
+        || !reference.contains('@')
+        || name.is_empty()
+        || name.len() > 255
+        || name.contains(['/', '\\'])
+        || matches!(name, "." | "..")
+        || name.chars().any(char::is_control)
+    {
+        return Err(RpcError::new(
+            "request",
+            "Choose a pinned library attachment no larger than 256 MiB.",
+        ));
+    }
+    private_dir(cache)?;
+    let destination = cache.join(sha);
+    if fs::symlink_metadata(&destination).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink())
+    {
+        return Err(RpcError::new(
+            "local_io",
+            "Library cache entry is not a regular file.",
+        ));
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(cache)?;
+    let mut hasher = Sha256::new();
+    let mut offset = 0;
+    loop {
+        let value = backend.call(
+            "library.attachment",
+            json!({
+                "ref":reference,"name":name,"offset":offset,"length":LIBRARY_CHUNK
+            }),
+        )?;
+        let raw = STANDARD
+            .decode(
+                value["data_b64"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new("integrity", "Missing attachment bytes."))?,
+            )
+            .map_err(|_| RpcError::new("integrity", "Invalid attachment encoding."))?;
+        let next = offset + raw.len() as u64;
+        if value["ref"].as_str() != Some(reference)
+            || value["name"].as_str() != Some(name)
+            || field_u64(&value, "offset")? != offset
+            || field_u64(&value, "next_offset")? != next
+            || field_u64(&value, "size")? != size
+            || value["sha256"].as_str() != Some(sha)
+            || value["eof"].as_bool() != Some(next == size)
+            || next > size
+            || raw.len() > LIBRARY_CHUNK
+            || (raw.is_empty() && next < size)
+        {
+            return Err(RpcError::new(
+                "integrity",
+                "Library attachment identity, size, or offset differs from its pinned record.",
+            ));
+        }
+        tmp.write_all(&raw)?;
+        hasher.update(&raw);
+        offset = next;
+        progress(offset, size);
+        if offset == size {
+            break;
+        }
+    }
+    if format!("{:x}", hasher.finalize()) != sha {
+        return Err(RpcError::new(
+            "integrity",
+            "Library attachment bytes do not match their pinned SHA-256.",
+        ));
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(&destination)
+        .map_err(|e| RpcError::from(e.error))?;
+    Ok((
+        destination,
+        json!({"ref":reference,"name":name,"size":size,"sha256":sha}),
+    ))
+}
+
+fn text_hash(receipt: &Value) -> Result<&str, RpcError> {
+    receipt["sha256"]
+        .as_str()
+        .filter(|sha| valid_hash(sha))
+        .ok_or_else(|| {
+            RpcError::new(
+                "integrity",
+                "Library attachment receipt has no valid SHA-256.",
+            )
+        })
+}
+
 /// Hydrate paginated results without silently omitting jobs or artifacts.
 pub fn workflow_call(
     backend: &dyn Backend,
@@ -867,6 +964,114 @@ fn collect_pages(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    struct LibraryMock {
+        data: Vec<u8>,
+        tamper: Option<&'static str>,
+    }
+    impl Backend for LibraryMock {
+        fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            assert_eq!(method, "library.attachment");
+            let offset = params["offset"].as_u64().unwrap() as usize;
+            let end = (offset + params["length"].as_u64().unwrap() as usize).min(self.data.len());
+            let mut result = json!({"ref":params["ref"],"name":params["name"],"offset":offset,"next_offset":end,
+                "size":self.data.len(),"sha256":format!("{:x}",Sha256::digest(&self.data)),
+                "eof":end==self.data.len(),"data_b64":STANDARD.encode(&self.data[offset..end])});
+            if offset > 0 {
+                match self.tamper {
+                    Some("ref") => result["ref"] = json!("construct:other@1"),
+                    Some("offset") => result["offset"] = json!(0),
+                    Some("bytes") => {
+                        result["data_b64"] = json!(STANDARD.encode(vec![99; end - offset]))
+                    }
+                    Some("sha256") => result["sha256"] = json!("0".repeat(64)),
+                    _ => {}
+                }
+            }
+            Ok(result)
+        }
+        fn library(&self) -> Result<Value, RpcError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn library_attachment_streams_exact_receipt_and_rejects_tampered_continuations() {
+        let data = vec![42; 262_144 + 17];
+        let receipt = json!({"bytes":data.len(),"sha256":format!("{:x}",Sha256::digest(&data))});
+        for tamper in [
+            None,
+            Some("ref"),
+            Some("offset"),
+            Some("bytes"),
+            Some("sha256"),
+        ] {
+            let cache = tempfile::tempdir().unwrap();
+            let backend = LibraryMock {
+                data: data.clone(),
+                tamper,
+            };
+            let mut progress = Vec::new();
+            let result = download_library_attachment(
+                &backend,
+                cache.path(),
+                "construct:example@3",
+                "source.dna",
+                &receipt,
+                |done, total| progress.push((done, total)),
+            );
+            if tamper.is_none() {
+                let (path, metadata) = result.unwrap();
+                assert_eq!(fs::read(path).unwrap(), data);
+                assert_eq!(metadata["ref"], "construct:example@3");
+                assert_eq!(
+                    progress.last(),
+                    Some(&(data.len() as u64, data.len() as u64))
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code, "integrity");
+                assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn library_attachment_rejects_floating_refs_paths_and_oversize_receipts() {
+        let backend = LibraryMock {
+            data: vec![],
+            tamper: None,
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let receipt = json!({"bytes":0,"sha256":format!("{:x}",Sha256::digest([]))});
+        for (reference, name) in [
+            ("construct:example", "source.dna"),
+            ("construct:example@1", "../source.dna"),
+            ("construct:example@1", "a\\b"),
+        ] {
+            assert!(
+                download_library_attachment(
+                    &backend,
+                    cache.path(),
+                    reference,
+                    name,
+                    &receipt,
+                    |_, _| {}
+                )
+                .is_err()
+            );
+        }
+        let big = json!({"bytes":MAX_UPLOAD+1,"sha256":receipt["sha256"]});
+        assert!(
+            download_library_attachment(
+                &backend,
+                cache.path(),
+                "construct:example@1",
+                "source.dna",
+                &big,
+                |_, _| {}
+            )
+            .is_err()
+        );
+    }
     struct Mock {
         calls: Mutex<Vec<(String, Value)>>,
         data: Vec<u8>,

@@ -9,6 +9,7 @@ mod ui_annotations;
 mod ui_dock;
 mod ui_inputs;
 mod ui_jobs;
+mod ui_library;
 mod ui_runtime;
 mod ui_state;
 mod ui_style;
@@ -50,6 +51,9 @@ enum Purpose {
     Upload(UploadTarget),
     Artifact(ArtifactTarget),
     Library,
+    LibraryPage(u64),
+    LibraryRecord(String),
+    LibraryAttachment(String, String),
     Annotations(String),
     SaveNote(String, String),
 }
@@ -95,9 +99,7 @@ struct Workbench {
     connected: bool,
     pending: BTreeMap<String, Pending>,
     failures: Vec<Failure>,
-    library: Vec<Value>,
-    library_filter: String,
-    library_open: bool,
+    library: ui_library::Explorer,
     connection_open: bool,
     preview_open: bool,
     help_open: bool,
@@ -151,7 +153,8 @@ impl Workbench {
             .map(|s| s.connection.clone())
             .unwrap_or_default();
         let (ui_tx, ui_rx) = mpsc::channel();
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library:Vec::new(),library_filter:String::new(),library_open:false,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let library = ui_library::Explorer::restore(&state.extra);
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,pending:BTreeMap::new(),failures:Vec::new(),library,connection_open:false,preview_open:false,help_open:false,settings_model:None,preview_after_uploads:false,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
@@ -273,6 +276,10 @@ impl Workbench {
         egui::TopBottomPanel::top("toolbar")
             .exact_height(33.)
             .show(ctx, |ui| {
+                if self.sidebar_tab == 2 {
+                    self.library_toolbar(ui);
+                    return;
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Reset view").clicked() {
                         self.reset_view();
@@ -476,7 +483,9 @@ impl eframe::App for Workbench {
         }
         self.events(ctx);
         self.poll();
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+        if self.sidebar_tab != 2
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
+        {
             self.close_view(self.state.selected_view);
         }
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
@@ -495,8 +504,14 @@ impl eframe::App for Workbench {
             .width_range(225.0..=500.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, 0, "Inputs / models");
-                    ui.selectable_value(&mut self.sidebar_tab, 1, "Runs / results");
+                    ui.selectable_value(&mut self.sidebar_tab, 0, "Inputs");
+                    ui.selectable_value(&mut self.sidebar_tab, 1, "Runs");
+                    if ui
+                        .selectable_label(self.sidebar_tab == 2, "Library")
+                        .clicked()
+                    {
+                        self.open_library();
+                    }
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -504,26 +519,39 @@ impl eframe::App for Workbench {
                     .show(ui, |ui| {
                         if self.sidebar_tab == 0 {
                             self.inputs_panel(ui, ctx);
-                        } else {
+                        } else if self.sidebar_tab == 1 {
                             self.jobs_panel(ui, ctx);
+                        } else {
+                            self.library_sidebar(ui);
                         }
                     });
             });
-        egui::SidePanel::right("inspector")
-            .resizable(true)
-            .default_width(285.)
-            .width_range(235.0..=520.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("right-scroll")
-                    .show(ui, |ui| self.inspector(ui, ctx));
-            });
+        if self.sidebar_tab != 2 {
+            egui::SidePanel::right("inspector")
+                .resizable(true)
+                .default_width(285.)
+                .width_range(235.0..=520.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("right-scroll")
+                        .show(ui, |ui| self.inspector(ui, ctx));
+                });
+        }
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(3, 5, 7)))
-            .show(ctx, |ui| self.viewports(ui));
+            .frame(egui::Frame::NONE.fill(if self.sidebar_tab == 2 {
+                Color32::from_rgb(33, 35, 38)
+            } else {
+                Color32::from_rgb(3, 5, 7)
+            }))
+            .show(ctx, |ui| {
+                if self.sidebar_tab == 2 {
+                    self.library_details(ui, ctx);
+                } else {
+                    self.viewports(ui);
+                }
+            });
         self.connection_dialog(ctx);
         self.preview_dialog(ctx);
-        self.library_dialog(ctx);
         self.settings_dialog(ctx);
         self.text_dialog(ctx);
         let mut help = self.help_open;
