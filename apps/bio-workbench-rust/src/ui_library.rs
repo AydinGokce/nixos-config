@@ -15,17 +15,15 @@ pub(super) struct Explorer {
     project: String,
     review_only: bool,
     loaded: bool,
-    refresh_again: bool,
     history_refresh_again: bool,
     scope: String,
-    loading_scope: String,
+    cache: Option<library_cache::Cache>,
     next_offset: Option<u64>,
     filtered_count: u64,
     total_count: u64,
     tab: usize,
     source_document: bool,
     archive: bool,
-    loading_archive: bool,
     scoped_archive: bool,
     pub(super) undo_history: Value,
     write_error: String,
@@ -119,6 +117,28 @@ impl Explorer {
         self.detail_error.clear();
         true
     }
+}
+
+fn latest_project(current: &str, projects: &[Value]) -> Option<String> {
+    let (family, revision) = current.rsplit_once('@')?;
+    let revision = revision.parse::<u64>().ok()?;
+    projects
+        .iter()
+        .filter_map(|project| {
+            let reference = text(project, "ref");
+            let (candidate, next) = reference.rsplit_once('@')?;
+            let next = next.parse::<u64>().ok()?;
+            (candidate == family && next > revision).then_some((next, reference))
+        })
+        .max_by_key(|(revision, _)| *revision)
+        .map(|(_, reference)| reference.into())
+}
+
+fn project_in_index(current: &str, projects: &[Value]) -> bool {
+    let family = current.split('@').next();
+    projects
+        .iter()
+        .any(|project| text(project, "ref").split('@').next() == family)
 }
 
 fn pinned_input(detail: &Value, chain: String) -> Result<Input, String> {
@@ -216,9 +236,7 @@ impl Workbench {
             self.library_projects();
         }
         self.sidebar_tab = 2;
-        if !self.library.loaded {
-            self.library_refresh();
-        }
+        self.library_navigate();
         self.library_refresh_history();
     }
 
@@ -233,7 +251,7 @@ impl Workbench {
         self.library.molecule.clear();
         self.library.review_only = false;
         self.library.edit = None;
-        self.library_refresh();
+        self.library_navigate();
         self.library_refresh_history();
     }
 
@@ -244,7 +262,7 @@ impl Workbench {
         self.library.detail = Value::Null;
         self.library.edit = None;
         self.library.query.clear();
-        self.library_refresh();
+        self.library_navigate();
     }
 
     fn library_refresh_history(&mut self) {
@@ -275,6 +293,7 @@ impl Workbench {
         }
         params["request_key"] = json!(uid());
         self.library.write_error.clear();
+        self.library_invalidate_lists();
         if self
             .request(method, params.clone(), Purpose::LibraryWrite(params))
             .is_none()
@@ -300,6 +319,7 @@ impl Workbench {
     }
 
     pub(super) fn library_received_write(&mut self, value: Value, sent: &Value) {
+        self.library_invalidate_lists();
         self.library.reconcile_edit(&value, sent);
         let selected = self.library.selected.clone();
         for change in rows(&value, "changed_refs") {
@@ -322,6 +342,9 @@ impl Workbench {
         self.library.write_error.clear();
         self.library.undo_history = value["history"].clone();
         self.library.detail = Value::Null;
+        self.library.records.clear();
+        self.library.projects.clear();
+        self.library.loaded = false;
         self.library_refresh();
         self.library_refresh_history();
         if !self.library.selected.is_empty() {
@@ -368,86 +391,192 @@ impl Workbench {
         }
     }
 
+    fn library_scope(&self) -> Option<library_cache::Scope> {
+        Some(library_cache::Scope {
+            endpoint: self.session.as_ref()?.connection.identity(),
+            project: self.library.project.clone(),
+            archived: self.library.archive,
+        })
+    }
+
+    fn library_cache(&mut self) -> Option<&mut library_cache::Cache> {
+        if self.library.cache.is_none() {
+            self.library.cache = Some(library_cache::Cache::open(
+                self.session.as_ref()?.library_cache_path(),
+            ));
+        }
+        self.library.cache.as_mut()
+    }
+
+    fn library_list_busy(&self) -> bool {
+        self.library_scope().is_some_and(|scope| {
+            self.library
+                .cache
+                .as_ref()
+                .is_some_and(|cache| cache.busy(&scope))
+        })
+    }
+
+    fn library_show_listing(
+        &mut self,
+        scope: &library_cache::Scope,
+        listing: library_cache::Listing,
+    ) {
+        self.library.records = listing.records;
+        self.library.projects = listing.projects;
+        self.library.next_offset = listing.next_offset;
+        self.library.filtered_count = listing.filtered_count;
+        self.library.total_count = listing.total_count;
+        self.library.scope = scope.project.clone();
+        self.library.scoped_archive = scope.archived;
+        self.library.loaded = true;
+    }
+
+    /// Sidebar navigation follows the current project revision; deliberately opened
+    /// historical record details retain their own independent pinned reference.
+    fn library_reconcile_project(&mut self, projects: &[Value]) -> bool {
+        if let Some(reference) = latest_project(&self.library.project, projects) {
+            let follow_detail =
+                self.library.selected == self.library.project && self.library.edit.is_none();
+            self.library.project = reference.clone();
+            if follow_detail {
+                self.library_select(&reference);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Navigation uses cached rows immediately; manual Refresh bypasses the TTL.
+    fn library_navigate(&mut self) {
+        self.library_fetch(false, 0);
+    }
+
     pub(super) fn library_refresh(&mut self) {
-        if self.busy(&Purpose::Library)
-            || self
-                .pending
-                .values()
-                .any(|pending| matches!(pending.purpose, Purpose::LibraryPage(_)))
-        {
-            self.library.refresh_again = true;
+        self.library_fetch(true, 0);
+    }
+
+    fn library_fetch(&mut self, force: bool, offset: u64) {
+        let Some(mut scope) = self.library_scope() else {
+            self.library.error =
+                "Library connection unavailable. Check the connection and refresh.".into();
             return;
+        };
+        let now = library_cache::now_ms();
+        if offset == 0 {
+            let cached = self
+                .library_cache()
+                .and_then(|cache| cache.get(&scope, now));
+            if let Some(listing) = cached {
+                if self.library_reconcile_project(&listing.projects) {
+                    scope = self.library_scope().expect("existing session");
+                    if let Some(listing) = self
+                        .library_cache()
+                        .and_then(|cache| cache.get(&scope, now))
+                    {
+                        self.library_show_listing(&scope, listing);
+                    }
+                } else {
+                    self.library_show_listing(&scope, listing);
+                }
+            }
+            if self.library.scope != scope.project || self.library.scoped_archive != scope.archived
+            {
+                self.library.records.clear();
+                self.library.projects.clear();
+                self.library.next_offset = None;
+                self.library.loaded = false;
+            }
         }
         self.library.error.clear();
-        self.library.loading_scope = self.library.project.clone();
-        self.library.loading_archive = self.library.archive;
-        let mut params = json!({"limit":500,"archived":self.library.archive});
-        if !self.library.project.is_empty() {
-            params["project_ref"] = json!(self.library.project);
+        // Its completion starts a fresh generation, so navigation never fills
+        // the cache while a mutation may still be publishing new revisions.
+        if self.library_writing() {
+            return;
+        }
+        let Some(request) = self
+            .library_cache()
+            .and_then(|cache| cache.begin(scope, offset, force, now))
+        else {
+            return;
+        };
+        let mut params = json!({"limit":500,"offset":offset,"archived":request.scope.archived});
+        if !request.scope.project.is_empty() {
+            params["project_ref"] = json!(request.scope.project);
         }
         if self
-            .request("library.list", params, Purpose::Library)
+            .request("library.list", params, Purpose::Library(request.clone()))
             .is_none()
         {
+            if let Some(cache) = self.library.cache.as_mut() {
+                cache.failed(&request);
+            }
             self.library.error =
                 "Library connection unavailable. Check the connection and refresh.".into();
         }
     }
 
     pub(super) fn library_load_page(&mut self, offset: u64) {
-        if self.busy(&Purpose::Library) || self.library.scope != self.library.project {
-            return;
+        if self.library.scope == self.library.project
+            && self.library.scoped_archive == self.library.archive
+            && self.library.next_offset == Some(offset)
+        {
+            self.library_fetch(false, offset);
         }
-        self.library.loading_scope = self.library.project.clone();
-        self.library.loading_archive = self.library.archive;
-        let mut params = json!({"limit":500,"offset":offset,"archived":self.library.archive});
-        if !self.library.project.is_empty() {
-            params["project_ref"] = json!(self.library.project);
-        }
-        self.request("library.list", params, Purpose::LibraryPage(offset));
     }
 
-    pub(super) fn library_received_list(&mut self, value: Value, append: bool) {
-        if self.library.loading_scope != self.library.project
-            || self.library.loading_archive != self.library.archive
+    pub(super) fn library_received_list(&mut self, request: &library_cache::Request, value: Value) {
+        let previous_records = (request.offset != 0
+            && self.library_scope().as_ref() == Some(&request.scope)
+            && self.library.next_offset == Some(request.offset))
+        .then_some(self.library.records.as_slice());
+        let Some(cache) = self.library.cache.as_mut() else {
+            return;
+        };
+        match cache.accept_with_previous(request, &value, library_cache::now_ms(), previous_records)
         {
-            self.library_refresh();
-            return;
-        }
-        if !value["records"].is_array() {
-            self.library.error = "The head returned an incomplete library listing.".into();
-            return;
-        }
-        if !append {
-            self.library.records.clear();
-        }
-        for record in rows(&value, "records") {
-            let reference = text(record, "ref");
-            if !reference.is_empty()
-                && !self
-                    .library
-                    .records
-                    .iter()
-                    .any(|r| text(r, "ref") == reference)
-            {
-                self.library.records.push(record.clone());
+            Ok(Some(listing)) => {
+                // A fresh index can advance a cached project even if that index
+                // request finished after the user already opened the project.
+                let same_endpoint = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.connection.identity() == request.scope.endpoint);
+                if same_endpoint
+                    && !request.scope.archived
+                    && !self.library.archive
+                    && !self.library.project.is_empty()
+                    && !project_in_index(&self.library.project, &listing.projects)
+                {
+                    // Only a freshly accepted complete index establishes that
+                    // the active project was archived by another client.
+                    self.library.project.clear();
+                    if self.library.edit.is_none() {
+                        self.library.selected.clear();
+                        self.library.detail = Value::Null;
+                    }
+                    self.library_navigate();
+                } else if same_endpoint
+                    && !request.scope.archived
+                    && self.library_reconcile_project(&listing.projects)
+                {
+                    self.library_navigate();
+                } else if self.library_scope().as_ref() == Some(&request.scope) {
+                    self.library_show_listing(&request.scope, listing);
+                    self.library.error.clear();
+                }
             }
+            Err(error) if self.library_scope().as_ref() == Some(&request.scope) => {
+                self.library.error = error
+            }
+            _ => {}
         }
-        self.library.projects = rows(&value, "projects").to_vec();
-        self.library.next_offset = value["next_offset"].as_u64();
-        self.library.filtered_count = value["filtered_count"]
-            .as_u64()
-            .unwrap_or(self.library.records.len() as u64);
-        self.library.total_count = value["total_count"]
-            .as_u64()
-            .unwrap_or(self.library.filtered_count);
-        self.library.scope = self.library.loading_scope.clone();
-        self.library.scoped_archive = self.library.loading_archive;
-        self.library.loaded = true;
-        self.library.error.clear();
-        if self.library.refresh_again {
-            self.library.refresh_again = false;
-            self.library_refresh();
+    }
+
+    pub(super) fn library_invalidate_lists(&mut self) {
+        if let Some(cache) = self.library_cache() {
+            cache.invalidate();
         }
     }
 
@@ -488,10 +617,22 @@ impl Workbench {
 
     pub(super) fn library_failed(&mut self, purpose: &Purpose, message: &str) {
         match purpose {
-            Purpose::Library | Purpose::LibraryPage(_) => self.library.error = message.into(),
-            Purpose::LibraryWrite(_) | Purpose::LibraryHistory => {
-                self.library.write_error = message.into()
+            Purpose::Library(request) => {
+                let active = self
+                    .library
+                    .cache
+                    .as_mut()
+                    .is_some_and(|cache| cache.failed(request));
+                if active && self.library_scope().as_ref() == Some(&request.scope) {
+                    self.library.error = message.into();
+                }
             }
+            Purpose::LibraryWrite(_) => {
+                self.library_invalidate_lists();
+                self.library_refresh();
+                self.library.write_error = message.into();
+            }
+            Purpose::LibraryHistory => self.library.write_error = message.into(),
             Purpose::LibraryRecord(reference) if reference == &self.library.selected => {
                 self.library.detail_error = message.into()
             }
@@ -622,10 +763,14 @@ impl Workbench {
         if !self.library.write_error.is_empty() {
             ui.colored_label(RED, &self.library.write_error);
         }
-        if self.busy(&Purpose::Library) {
+        if self.library_list_busy() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.small("Loading library…");
+                ui.small(if self.library.loaded {
+                    "Refreshing library…"
+                } else {
+                    "Loading library…"
+                });
             });
         }
         if self.library.scope != self.library.project
@@ -756,13 +901,14 @@ impl Workbench {
                 });
             ui.add_space(2.);
         }
-        if let Some((reference, is_project)) = selected {
+        if let Some((mut reference, is_project)) = selected {
             if is_project && !self.library.archive {
                 self.library.project = reference.clone();
                 self.library.query.clear();
                 self.library.molecule.clear();
                 self.library.review_only = false;
-                self.library_refresh();
+                self.library_navigate();
+                reference = self.library.project.clone();
             }
             self.library_select(&reference);
         }
@@ -772,7 +918,7 @@ impl Workbench {
         if let Some(offset) = self.library.next_offset {
             if ui
                 .add_enabled(
-                    !self.busy(&Purpose::LibraryPage(offset)),
+                    !self.library_list_busy(),
                     egui::Button::new("Load more records"),
                 )
                 .clicked()
@@ -1624,6 +1770,34 @@ fn inline_markdown(value: &str) -> egui::text::LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_project_index_advances_navigation_only_within_the_same_family() {
+        assert!(project_in_index(
+            "project:example@1",
+            &[json!({"ref":"project:example@2"})]
+        ));
+        assert!(!project_in_index("project:example@1", &[]));
+        assert!(!project_in_index(
+            "project:example@1",
+            &[json!({"ref":"project:other@1"})]
+        ));
+        assert_eq!(
+            latest_project(
+                "project:example@1",
+                &[
+                    json!({"ref":"project:other@99"}),
+                    json!({"ref":"project:example@2"}),
+                    json!({"ref":"project:example@10"}),
+                ]
+            ),
+            Some("project:example@10".into())
+        );
+        assert!(
+            latest_project("project:example@10", &[json!({"ref":"project:example@2"})]).is_none()
+        );
+        assert!(latest_project("", &[json!({"ref":"project:example@2"})]).is_none());
+    }
 
     fn detail() -> Value {
         json!({"ref":"construct:protein@2","record":{"kind":"construct","id":"protein","revision":2,"name":"Protein", "identity":{"molecule_type":"protein","sequence":"ACDE"}},"submission":{"allowed":true}})

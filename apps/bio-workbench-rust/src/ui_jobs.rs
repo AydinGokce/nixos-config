@@ -443,8 +443,7 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                     self.log("Select the original artifact again to retry its verified download.");
                 }
             }
-            Purpose::Library => self.library_refresh(),
-            Purpose::LibraryPage(offset) => self.library_load_page(offset),
+            Purpose::Library(_) => self.library_refresh(),
             Purpose::LibraryRecord(reference) => self.library_select(&reference),
             Purpose::LibraryAttachment(_, _) => {
                 self.log("Select the attachment again in Library to retry its verified download.");

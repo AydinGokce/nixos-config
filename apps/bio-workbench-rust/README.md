@@ -83,6 +83,15 @@ tag in the selected detail pane. Search includes IDs, Alt names and source names
 filter by modality or **Needs review**. **Load more records** is explicit when
 the server returns multiple pages.
 
+Project, construct and archive lists are cached locally, including loaded pages,
+so returning to them is immediate. Navigation reuses a list for 30 seconds; older
+lists remain visible while a background refresh runs. **Refresh library** always
+checks the head. Cached summaries survive restart (with a background refresh on
+first use), are isolated by SSH endpoint and actor, and contain no full sequences
+or attachments. Edits, archive/restore and Undo/Redo invalidate all list caches.
+The disposable `library-list-cache.json` is limited to 32 scopes and 8 MiB;
+invalid caches are ignored without affecting saved inputs or request receipts.
+
 Double-click an Alt name (or a project name) to edit it. The pencil button opens
 an exact nucleotide or amino-acid sequence editor. **Save** creates a new immutable
 revision; existing results keep their original input references. Previous source

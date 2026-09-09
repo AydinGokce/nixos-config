@@ -1,4 +1,5 @@
 mod alignment;
+mod library_cache;
 mod navigation;
 mod pymol;
 mod render;
@@ -51,8 +52,7 @@ enum Purpose {
     Logs(String, u64),
     Upload(UploadTarget),
     Artifact(ArtifactTarget),
-    Library,
-    LibraryPage(u64),
+    Library(library_cache::Request),
     LibraryRecord(String),
     LibraryAttachment(String, String),
     LibraryHistory,

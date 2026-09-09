@@ -124,6 +124,10 @@ pub struct Session {
     backend_override: Option<Arc<dyn Backend>>,
 }
 impl Session {
+    pub fn library_cache_path(&self) -> PathBuf {
+        self.directory.join("library-list-cache.json")
+    }
+
     pub fn open(ctx: egui::Context) -> Result<Self, RpcError> {
         Self::open_in(ctx, state_directory()?)
     }

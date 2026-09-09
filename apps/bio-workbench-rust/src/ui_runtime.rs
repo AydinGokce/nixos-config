@@ -45,6 +45,11 @@ impl Workbench {
         }
     }
     pub(super) fn retry(&mut self, id: &str, purpose: Purpose, label: String) {
+        if matches!(purpose, Purpose::Library(_)) {
+            self.failures.retain(|failure| failure.id != id);
+            self.library_refresh();
+            return;
+        }
         if let Purpose::Artifact(ArtifactTarget::View(slot)) = &purpose
             && !self.has_view(*slot)
         {
@@ -52,6 +57,9 @@ impl Workbench {
         }
         if self.pending.contains_key(id) {
             return;
+        }
+        if matches!(purpose, Purpose::LibraryWrite(_)) {
+            self.library_invalidate_lists();
         }
         if let Some(session) = self.session.as_mut() {
             match session.retry(id) {
@@ -305,8 +313,7 @@ impl Workbench {
             Purpose::LibraryHistory => self.library_received_history(value),
             Purpose::LibraryWrite(sent) => self.library_received_write(value, &sent),
             Purpose::LibraryRuns(reference) => self.library_runs_received(&reference, value),
-            Purpose::Library => self.library_received_list(value, false),
-            Purpose::LibraryPage(_) => self.library_received_list(value, true),
+            Purpose::Library(request) => self.library_received_list(&request, value),
             Purpose::LibraryRecord(reference) => self.library_received_record(&reference, value),
             Purpose::LibraryAttachment(reference, name) => {
                 self.library_received_attachment(&reference, &name, value, ctx);
