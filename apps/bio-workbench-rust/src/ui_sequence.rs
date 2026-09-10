@@ -423,9 +423,9 @@ impl Viewer {
         if derived {
             if ui
                 .button(if self.variant_open {
-                    "▾ New variant"
+                    "[-] New variant"
                 } else {
-                    "▸ New variant"
+                    "[+] New variant"
                 })
                 .clicked()
             {
@@ -1651,9 +1651,9 @@ fn protein_lines(
     if let Some(alignment) = &alignment {
         ui.horizontal_wrapped(|ui| {
             ui.weak(if alignment.reverse {
-                "Source 5′ → 3′ · reverse complement"
+                "Source 5' -> 3' · reverse complement"
             } else {
-                "Source 5′ → 3′ · forward strand"
+                "Source 5' -> 3' · forward strand"
             });
             ui.weak("Each amino-acid block spans its three source bases.");
         });
