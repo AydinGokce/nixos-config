@@ -105,6 +105,38 @@ class RequestTests(unittest.TestCase):
             self.assertEqual(mincore.call_count, 1)
         finally: cache.close()
 
+    def test_prefetch_checks_expiry_and_cancellation_between_read_chunks(self):
+        path = self.root/"index.idx"
+        with path.open("wb") as stream: stream.truncate(16*1024**2+4096)
+        cache = session.IndexCache([path])
+        resident = dict(total_bytes=path.stat().st_size, indexes=[])
+        try:
+            with mock.patch.object(cache, "residency", return_value=resident) as residency, \
+                 mock.patch.object(session.time, "time", side_effect=[100, 102]) as clock, \
+                 self.assertRaisesRegex(ValueError, "Index warm-up interrupted or timed out"):
+                cache.warm("prefetch", 101, 0)
+            self.assertEqual(clock.call_count, 2)
+            residency.assert_called_once_with(101)  # No final success/residency receipt.
+            def cancel():
+                session.STOP = signal.SIGTERM
+                return 100
+            with mock.patch.object(session, "STOP", None), \
+                 mock.patch.object(cache, "residency", return_value=resident) as residency, \
+                 mock.patch.object(session.time, "time", side_effect=cancel) as clock, \
+                 self.assertRaisesRegex(ValueError, "Index warm-up interrupted or timed out"):
+                cache.warm("prefetch", 101, 0)
+            self.assertEqual(clock.call_count, 1)
+            residency.assert_called_once_with(101)
+        finally: cache.close()
+
+    def test_default_cli_warm_limit_uses_session_lifetime(self):
+        with mock.patch.object(session, "serve", return_value=0) as serve:
+            self.assertEqual(session.main(["serve", "--state", str(self.root)]), 0)
+        self.assertIsNone(serve.call_args.args[0].warm_seconds)
+        with mock.patch.object(session, "serve", return_value=0) as serve:
+            session.main(["serve", "--state", str(self.root), "--warm-seconds", "1800"])
+        self.assertEqual(serve.call_args.args[0].warm_seconds, 1800)
+
 
 class ServiceTests(unittest.TestCase):
     """Actual owned API process cleanup, without model/search execution."""
@@ -128,6 +160,35 @@ class ServiceTests(unittest.TestCase):
             tools_root=self.root/"tools", database=self.database, results=self.root/"results")
 
     def tearDown(self): session.STOP = None; self.tmp.cleanup()
+
+    def assert_warm_deadline(self, seconds, expected):
+        self.args.deadline = 8200  # Existing reservation; startup has already consumed 1800s.
+        self.args.warm_seconds = seconds
+        self.args.warm = "prefetch"
+        cache = mock.Mock()
+        cache.warm.side_effect = ValueError("fixture interrupted during warm-up")
+        with mock.patch.object(session.time, "time", return_value=2800), \
+             mock.patch.object(session, "API_LOCK", self.root/"api.lock"), \
+             mock.patch.object(session.server, "configuration", return_value=({}, self.provenance)), \
+             mock.patch.object(session, "IndexCache", return_value=cache), \
+             mock.patch.object(session.subprocess, "Popen") as launch, \
+             self.assertRaisesRegex(ValueError, "fixture interrupted"):
+            session.serve(self.args)
+        cache.warm.assert_called_once_with("prefetch", expected, 16*1024**3)
+        cache.close.assert_called_once_with()
+        launch.assert_not_called()
+        self.assertFalse((self.args.out/"warm-index.json").exists())
+        self.assertFalse((self.args.out/"session-ready.json").exists())
+        self.assertEqual(session.load(self.args.out/"session-closed.json")["reason"], "failed")
+
+    def test_default_warm_deadline_preserves_original_session_lifetime_and_reserve(self):
+        self.assert_warm_deadline(None, 8200-session.RESERVE)
+
+    def test_explicit_warm_deadline_can_be_shorter(self):
+        self.assert_warm_deadline(1800, 2800+1800)
+
+    def test_explicit_warm_deadline_cannot_extend_session_lifetime(self):
+        self.assert_warm_deadline(85500, 8200-session.RESERVE)
 
     def test_cancellation_closes_owned_api_and_records_original_deadline(self):
         timer = threading.Timer(1, os.kill, args=(os.getpid(), signal.SIGTERM))

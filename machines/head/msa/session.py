@@ -337,7 +337,8 @@ def serve(args):
     finite(args.deadline, "session deadline", time.time()+RESERVE, time.time()+85500)
     finite(args.idle_seconds, "idle timeout", 60, 86400)
     finite(args.headroom_gib, "RAM headroom", 16, 1024)
-    finite(args.warm_seconds, "warm-up timeout", 1, 85500)
+    if args.warm_seconds is not None:
+        finite(args.warm_seconds, "warm-up timeout", 1, 85500)
     state = args.state.resolve(); output = args.out.resolve(); tools = args.tools.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=False)
     output.mkdir(parents=True, exist_ok=True)
@@ -361,7 +362,10 @@ def serve(args):
         atomic(output/"msa-server.json", config, exclusive=True)
         atomic(output/"msa-server.provenance.json", provenance, exclusive=True)
         cache = IndexCache(index_paths(args.database, provenance))
-        warm = cache.warm(args.warm, min(args.deadline-RESERVE, time.time()+args.warm_seconds), int(args.headroom_gib*1024**3))
+        warm_deadline = args.deadline-RESERVE
+        if args.warm_seconds is not None:
+            warm_deadline = min(warm_deadline, time.time()+args.warm_seconds)
+        warm = cache.warm(args.warm, warm_deadline, int(args.headroom_gib*1024**3))
         atomic(output/"warm-index.json", warm, exclusive=True)
         if not adoption:
             log = (output/"msa-server.log").open("ab")
@@ -461,7 +465,8 @@ def main(argv=None):
     p.add_argument("--results", type=Path); p.add_argument("--deadline", type=float)
     p.add_argument("--idle-seconds", type=float, default=900)
     p.add_argument("--warm", choices=["report", "prefetch", "lock"], default="prefetch")
-    p.add_argument("--warm-seconds", type=float, default=1800)
+    p.add_argument("--warm-seconds", type=float, default=None,
+                   help="Optional shorter warm-up timeout; default uses remaining session lifetime minus cleanup reserve")
     p.add_argument("--headroom-gib", type=float, default=64)
     p.add_argument("--adopt", type=Path, help="Explicit operational binding to an existing API; never owns its shutdown")
     p.add_argument("--wait-seconds", type=float, default=7200)

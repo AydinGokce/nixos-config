@@ -74,7 +74,11 @@ preparers and RF3's per-chain TaxID search adapter are reused unchanged.
 
 The three full CPU indexes occupy about 700 GB. `--warm prefetch` is the default
 and reads all existing index pages, with a memory-headroom preflight and a
-bounded warm-up timeout. `--warm report` performs Linux `mincore` residency
+deadline bounded by the existing session lifetime minus its cleanup reserve.
+Runtime setup and index warm-up consume that lifetime; they never extend it.
+An explicit worker `--warm-seconds` can impose a shorter warm-up cap. The
+default no longer imposes an independent 30-minute limit on the full indexes.
+`--warm report` performs Linux `mincore` residency
 measurement without loading missing pages. `--warm lock` additionally uses
 `mlock` and fails if the worker lacks sufficient RAM or memory-lock allowance.
 
