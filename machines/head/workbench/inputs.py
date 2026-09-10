@@ -300,7 +300,12 @@ def prepare_pair(store, batch, pair, config, compiler=native_compile):
     item = pair['_input']; require('error' not in item, item.get('error', 'Invalid input'))
     settings = document['settings'].get(model, {})
     backend, execution = document['msa_backend'], document['execution']
-    require(backend == 'public' or model in FOLDING, 'This workflow does not use the shared private MSA backend')
+    msa_applicable = model in FOLDING
+    if not msa_applicable:
+        # Sequence scoring/design performs no MSA. Its existing bio-submit
+        # transport uses "public" for the branch without a private-MSA setup.
+        # Keep the requested choice separately; this invokes no public search.
+        backend = 'public'
     require(execution != 'resident' or model in FOLDING, 'This workflow does not support resident execution')
     actor = store.actor(batch['batch_id'])
     path = store.directory('batches', batch['batch_id']) / 'pairs' / pair['pair_id']
@@ -393,6 +398,8 @@ def prepare_pair(store, batch, pair, config, compiler=native_compile):
     files = {name: value for name, value in inventory(path).items()
              if not (name.startswith('registry/') and (name.endswith(('.sqlite', '.sqlite-wal', '.sqlite-shm')) or '/.registry.lock' in name))}
     return {'argv': [config['bio_submit'], model, *arguments], 'tools_dir': config['tools_dir'],
+            'msa_applicable': msa_applicable,
+            'msa_backend': backend if msa_applicable else 'not_applicable',
             'environment': {'BIO_LIBRARY_ROOT': registry_path} if registry_path else {},
             'input_root': str(path), 'input_files': files, 'source_pins': pins,
             'native_validation': native, 'timeout': settings.get('timeout', 7200), 'settings': settings}

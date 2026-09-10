@@ -15,8 +15,9 @@ The desktop's Library explorer reads the shared head registry through
 `library.list`, `library.get` and `library.attachment`. It browses projects,
 pinned members, molecular identities, purpose documents, revision history,
 source relationships and original files. Adding a selected molecular record to
-Inputs preserves its exact revision and still requires the normal preview and
-submission steps. Whole plasmids and unresolved protein-product candidates stay
+Inputs preserves its exact revision. The desktop Run action then records a
+durable validation-and-execution request on the head. Whole plasmids and
+unresolved protein-product candidates stay
 visible with the reason they cannot be used as ordinary prediction inputs.
 
 Library curation separates the editable Alt name from the original inventory
@@ -49,9 +50,17 @@ State lives in `/var/lib/bio-workbench`: SQLite WAL, immutable upload and artifa
 bytes, isolated per-batch construct libraries, validation evidence, owned process
 logs and operation receipts. Input bytes and supported chemistry are preserved.
 CPU previews invoke existing native parsers without MSA searches or inference.
-A separate idempotent commit selects exactly the compatible pairs to submit.
+`batch.run` validates and automatically queues every compatible pair while
+retaining rejected pairs and their reasons. It uses private MSA by default for
+folding; scoring/design workflows perform no MSA. The run request, validation
+receipt and atomic queue publication survive disconnects and daemon restarts.
+Resending the same request key and payload returns the same run and jobs.
+All-rejected runs stop visibly without submitting anything. Cancellation during
+validation prevents later automatic submission.
+The older `batch.validate`/`batch.create` pair remains available for clients that
+need a separate preview and explicit subset selection.
 The existing `bio-submit` and `dc` budget guard remain authoritative for all
-paid work. RFAA is parked and AF3 is absent from the catalog.
+paid work. RFAA remains unavailable and AF3 is absent from the catalog.
 
 The dispatcher retains launch intent before creating an exact owned systemd
 unit. Command identity, InvocationID and terminal receipts govern recovery; an

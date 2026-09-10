@@ -177,10 +177,46 @@ actual native CPU validation decides every submitted pair.
   returns `{upload_id,name,size,sha256,state:"complete"}`. Completed bytes are
   immutable. Filenames are display labels, never paths.
 
-## Preview, select, then submit
+## One-click runs and optional manual previews
+
+`batch.run` accepts the same parameters as `batch.validate` below and records a
+durable request to validate and execute all compatible input/model pairs. It
+returns Batch immediately with `auto_run:true` and `state:"validating"`. No
+subsequent `batch.create` call or confirmation is needed. The head completes
+native CPU checks, retains each rejected pair and its reasons, then atomically
+queues every compatible pair after successful validation completion is recorded.
+Closing or reconnecting the GUI does not interrupt this continuation.
+
+The `request_key` is actor-scoped. Resending the same normalized request returns
+the original batch at its current state; changing its payload conflicts. After
+an uncertain or lost response, retry the identical request and key rather than
+creating a new key. Daemon restart recovers the recorded validation receipt and
+continues the same run; queue publication and pair/job links commit together, so
+recovery cannot duplicate jobs. Native input/source checks and the existing
+execution, chemistry and budget gates remain in force; failed or ambiguous model
+executions are never automatically retried.
+
+An omitted `msa_backend` defaults to `private` for `batch.run`; explicit `public`
+and `private` selections are honored. Workflows without MSA (ESM, EVOLVEpro,
+ProteinMPNN and RFdiffusion) treat that selection as inapplicable and perform no
+public or private search. Their job provenance records `msa_applicable:false`,
+`msa_backend:"not_applicable"` and the original `msa_backend_requested`; folding
+models retain the selected backend and its compatibility checks.
+
+All-rejected runs finish as `validation_failed` with no jobs. Mixed runs keep
+rejected pairs visible while compatible jobs execute; if those jobs succeed,
+the final batch state is `partial`. `batch.cancel` also applies during validation
+or while awaiting automatic queue publication. Its transaction either prevents
+publication or cancels the newly queued jobs through the existing job controls.
+A known disabled model is rejected per pair and cannot block supported models;
+unknown model IDs or malformed requests/settings remain request errors.
+
+The manual preview flow remains available for clients that explicitly need to
+choose a subset:
 
 Validation is asynchronous CPU work and does not launch paid inference.
-`batch.validate` creates a durable preview and returns the Batch below. Poll
+`batch.validate` creates a durable preview and returns the Batch below. Its
+omitted MSA default remains `public`. Poll
 `batch.get {batch_id}` until its state is `validated` or `validation_failed`.
 Every expanded input/model pair appears in `pairs`, including rejected pairs
 with specific reasons. Nothing silently drops an incompatible selection.
@@ -230,10 +266,13 @@ creation keys are independent and actor-scoped: identical requests return the
 same resource, changed payloads with the same key conflict. A preview can be
 committed once; retries never create extra jobs. To change inputs/settings or
 retry a failed inference, create an explicit new preview/batch.
+`batch.create` rejects batches created by `batch.run`, whose compatible pairs
+are already owned by the automatic continuation.
 
 `batch.list {limit?:50,cursor?:string}` returns `{batches:[BatchSummary],next_cursor}`.
 BatchSummary includes identifiers, name, mode, state, timestamps, models,
-backend/execution, and counts; it omits inputs, pairs, and jobs.
+backend/execution, `auto_run:true` for automatic runs, and counts; it omits
+inputs, pairs, and jobs.
 `batch.get {batch_id}` returns Batch. `batch.cancel {batch_id}` requests
 cancellation and returns Batch. Completed jobs and artifacts are retained.
 

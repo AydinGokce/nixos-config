@@ -61,6 +61,8 @@ def validation(store, batch_id, config, compiler=inputs.native_compile):
             outcome = {'state': 'rejected', 'reasons': [reason]}
         with store.transaction() as db:
             current = store.get(db, 'batch', batch_id)
+            if current['state'] != 'validating':
+                return
             entry = next(p for p in current['pairs'] if p['pair_id'] == pair['pair_id'])
             entry.update(outcome)
             store.put(db, 'batch', current)

@@ -13,7 +13,7 @@ MODEL_NAMES = ['esm2_t6_8M_UR50D', 'esm2_t12_35M_UR50D', 'esm2_t30_150M_UR50D',
 
 def model(ident, name, workflow, molecules, formats, settings=None, description='', enabled=True):
     return {'id': ident, 'name': name, 'workflow': workflow, 'enabled': enabled,
-            'disabled_reason': None if enabled else 'RFAA is parked; use a supported folding model.',
+            'disabled_reason': None if enabled else 'This model is not available on this head.',
             'molecule_types': molecules, 'input_formats': formats,
             'settings': {'timeout': TIMEOUT, **(settings or {})}, 'description': description}
 
@@ -50,7 +50,7 @@ MODELS = [
           {'num': {'type': 'integer', 'minimum': 1, 'maximum': 1000, 'default': 2},
            'contigs': {'type': 'string', 'description': 'Native contig ranges, e.g. [50-50] or [A1-20/30-30].'}},
           'Backbone generation or motif-conditioned design. Explicit contig ranges are required.'),
-    model('rfaa', 'RoseTTAFold All-Atom (parked)', 'folding', MOLECULES[:-1], [], enabled=False),
+    model('rfaa', 'RoseTTAFold All-Atom', 'folding', MOLECULES[:-1], [], enabled=False),
 ]
 
 

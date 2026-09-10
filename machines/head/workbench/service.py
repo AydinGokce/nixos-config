@@ -220,6 +220,15 @@ class Daemon:
                 self.reconcile(row)
             except (ValueError, OSError, subprocess.SubprocessError) as exc:
                 errors.append({'id': row['object_id'], 'error': str(exc)})
+        # Run intent belongs to the head. A disconnected client is never needed
+        # to turn completed validation into a single atomic set of queued jobs.
+        from .api import API
+        for batch in self.store.listing('batch', states=['validated']):
+            if batch.get('auto_run'):
+                try:
+                    API(self.store, self.store.actor(batch['batch_id']))._automatic_run(batch['batch_id'])
+                except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                    errors.append({'id': batch['batch_id'], 'error': str(exc)})
         # Reconciliation may release operations or finish an orphaned native
         # request. Refresh all slot evidence before admitting the next work.
         operations, known, active_jobs = self.snapshot()

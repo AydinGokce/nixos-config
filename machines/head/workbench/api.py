@@ -43,6 +43,7 @@ class API:
             'md.compare': self.md_compare,
             'upload.chunk': self.upload_chunk, 'upload.finish': self.upload_finish,
             'batch.validate': self.batch_validate, 'batch.create': self.batch_create,
+            'batch.run': self.batch_run,
             'batch.get': self.batch_get, 'batch.list': self.batch_list, 'batch.cancel': self.batch_cancel,
             'job.get': self.job_get, 'job.logs': self.job_logs, 'job.artifacts': self.job_artifacts,
             'job.cancel': self.job_cancel, 'artifact.read': self.artifact_read,
@@ -195,7 +196,18 @@ class API:
         return data
 
     def batch_validate(self, params):
+        return self._batch_request(params)
+
+    def batch_run(self, params):
+        # This endpoint records execution intent before returning. The daemon,
+        # rather than a connected client, commits the compatible results.
+        if isinstance(params, dict):
+            params = {**params, 'msa_backend': params.get('msa_backend', 'private')}
+        return self._batch_request(params, auto_run=True)
+
+    def _batch_request(self, params, auto_run=False):
         document = inputs.request(params)
+        method = 'batch.run' if auto_run else 'batch.validate'
         # Ownership and completeness are checked before a preview can refer to
         # any upload. Expensive chemistry and FASTA expansion run asynchronously.
         for item in document['inputs']:
@@ -211,7 +223,7 @@ class API:
                 data = self.store.read('upload', settings['labels_upload_id'], self.actor)
                 require(data['state'] == 'complete', 'Labels upload is incomplete', 'conflict')
         with self.store.transaction() as db:
-            old = self.store.idem(db, self.actor, 'batch.validate', document['request_key'], document)
+            old = self.store.idem(db, self.actor, method, document['request_key'], document)
             if old:
                 return self._batch(old, db)
             ident = uid()
@@ -219,14 +231,18 @@ class API:
                     'state': 'validating', 'msa_backend': document['msa_backend'], 'execution': document['execution'],
                     'inputs': [{k: v for k, v in item.items() if k != 'source'} for item in document['inputs']],
                     'models': document['models'], 'pairs': [], 'errors': [], '_request': document, '_committed': False}
+            if auto_run:
+                data['auto_run'] = True
             base = [{'id': 'assembly', 'name': document['name']}] if document['mode'] == 'assembly' else document['inputs']
             data['pairs'] = [{'pair_id': uid(), 'input_id': item['id'], 'input_name': item['name'],
                               'model': model, 'state': 'pending', 'reasons': [], 'job_id': None}
                              for item in base for model in document['models']]
             require(len(data['pairs']) <= 512, 'Too many input/model combinations', 'limit')
             self.store.put(db, 'batch', data, self.actor)
-            self.store.idem(db, self.actor, 'batch.validate', document['request_key'], document, ident)
+            self.store.idem(db, self.actor, method, document['request_key'], document, ident)
             self.store.event(db, ident, 'validation_requested', {'models': document['models']})
+            if auto_run:
+                self.store.event(db, ident, 'run_requested', {'models': document['models'], 'msa_backend': document['msa_backend']})
             return self._batch(ident, db)
 
     def batch_create(self, params):
@@ -239,28 +255,66 @@ class API:
             if old:
                 return self._batch(old, db)
             batch = self.store.get(db, 'batch', params['batch_id'], self.actor)
+            require(not batch.get('auto_run'), 'This run automatically submits its compatible pairs', 'conflict')
             require(batch['state'] == 'validated' and not batch['_committed'], 'Preview is not ready or already submitted', 'conflict')
             selected = {p['pair_id']: p for p in batch['pairs']}
             require(all(ident in selected and selected[ident]['state'] == 'compatible' for ident in params['pair_ids']),
                     'Every selected pair must have completed compatible validation', 'conflict')
             require(all(selected[ident]['_prepared'].get('tools_dir') for ident in params['pair_ids']),
                     'This preview predates the current execution contract; validate a new preview before submitting', 'conflict')
-            for ident in params['pair_ids']:
-                pair = selected[ident]
-                job_id = uid(); pair['job_id'] = job_id
-                job = {'job_id': job_id, 'batch_id': batch['batch_id'], 'pair_id': ident,
-                       'input_id': pair['input_id'], 'input_name': pair['input_name'], 'model': pair['model'],
-                       'state': 'queued', 'phase': 'queued', 'started_at': None, 'finished_at': None,
-                       'exit_code': None, 'error': None, 'progress': {'message': 'Waiting for the head dispatcher', 'observed_at': now()},
-                       'provenance': {'settings': pair['_prepared']['settings'], 'msa_backend': batch['msa_backend'],
-                                      'execution_requested': batch['execution'], 'automatic_retry': False},
-                       '_prepared': pair['_prepared']}
-                self.store.put(db, 'job', job, self.actor)
-                self.store.event(db, job_id, 'enqueued', {'batch_id': batch['batch_id'], 'pair_id': ident})
-            batch.update(state='queued', _committed=True)
-            self.store.put(db, 'batch', batch)
+            self._enqueue_pairs(db, batch, [selected[ident] for ident in params['pair_ids']])
             self.store.idem(db, self.actor, 'batch.create', params['request_key'], params, batch['batch_id'])
             return self._batch(batch['batch_id'], db)
+
+    def _enqueue_pairs(self, db, batch, pairs):
+        """Publish jobs and their batch links in the caller's one transaction."""
+        for pair in pairs:
+            ident = pair['pair_id']
+            job_id = uid(); pair['job_id'] = job_id
+            job = {'job_id': job_id, 'batch_id': batch['batch_id'], 'pair_id': ident,
+                   'input_id': pair['input_id'], 'input_name': pair['input_name'], 'model': pair['model'],
+                   'state': 'queued', 'phase': 'queued', 'started_at': None, 'finished_at': None,
+                   'exit_code': None, 'error': None, 'progress': {'message': 'Waiting for the head dispatcher', 'observed_at': now()},
+                   'provenance': {'settings': pair['_prepared']['settings'],
+                                  'msa_backend': pair['_prepared'].get('msa_backend', batch['msa_backend']),
+                                  'execution_requested': batch['execution'], 'automatic_retry': False},
+                   '_prepared': pair['_prepared']}
+            if 'msa_applicable' in pair['_prepared']:
+                job['provenance'].update(msa_applicable=pair['_prepared']['msa_applicable'],
+                                         msa_backend_requested=batch['msa_backend'])
+            self.store.put(db, 'job', job, self.actor)
+            self.store.event(db, job_id, 'enqueued', {'batch_id': batch['batch_id'], 'pair_id': ident})
+        batch.update(state='queued', _committed=True)
+        self.store.put(db, 'batch', batch)
+
+    def _automatic_run(self, batch_id):
+        """Daemon-only continuation; cancellation and retries share this CAS."""
+        with self.store.transaction() as db:
+            batch = self.store.get(db, 'batch', batch_id, self.actor)
+            if not batch.get('auto_run') or batch['_committed'] or batch['state'] != 'validated':
+                return False
+            operation = db.execute('SELECT kind,state FROM operations WHERE object_id=?', (batch_id,)).fetchone()
+            if operation and operation['kind'] == 'validation' and operation['state'] in {'intent', 'running'}:
+                return False  # The runner has not durably completed its receipt yet.
+            compatible = [pair for pair in batch['pairs'] if pair['state'] == 'compatible']
+            failure = None
+            if not operation or operation['kind'] != 'validation' or operation['state'] != 'complete':
+                failure = 'Validation did not retain successful completion evidence; no model jobs were queued.'
+            elif any(pair['state'] not in {'compatible', 'rejected'} for pair in batch['pairs']):
+                failure = 'Validation ended before every input/model pair was checked; no model jobs were queued.'
+            elif any(not pair.get('_prepared', {}).get('tools_dir') for pair in compatible):
+                failure = 'Validation results do not match the current execution contract; start a new run.'
+            elif not compatible:
+                failure = 'No compatible input/model pairs; see each pair\'s rejection reasons.'
+            if failure:
+                batch['state'] = 'validation_failed'
+                batch['errors'].append(failure)
+                self.store.put(db, 'batch', batch)
+                self.store.event(db, batch_id, 'run_not_queued', {'message': failure})
+                return False
+            self._enqueue_pairs(db, batch, compatible)
+            self.store.event(db, batch_id, 'run_queued', {'pairs': len(compatible), 'rejected': len(batch['pairs']) - len(compatible)})
+            return True
 
     def _job(self, job, db, with_artifacts=True):
         result = deepcopy(job)
@@ -276,7 +330,7 @@ class API:
         jobs = [self._job(self.store.get(db, 'job', p['job_id'], self.actor), db, False) for p in batch['pairs'] if p.get('job_id')]
         for job in jobs:
             job.pop('_prepared', None)
-            job['provenance'] = {k: v for k, v in job['provenance'].items() if k in {'msa_backend', 'execution_requested', 'automatic_retry', 'resident_job_id'}}
+            job['provenance'] = {k: v for k, v in job['provenance'].items() if k in {'msa_backend', 'msa_applicable', 'msa_backend_requested', 'execution_requested', 'automatic_retry', 'resident_job_id'}}
             if job.get('error'):
                 job['error'] = {'message': job['error'].get('message', '')[:500]}
         for pair in batch['pairs']:
@@ -293,6 +347,8 @@ class API:
             states = {j['state'] for j in jobs}
             if states <= TERMINAL:
                 batch['state'] = 'complete' if states == {'complete'} else 'cancelled' if states == {'cancelled'} else 'failed' if not counts['complete'] else 'partial'
+                if batch.get('auto_run') and counts['rejected'] and batch['state'] == 'complete':
+                    batch['state'] = 'partial'
             elif 'cancel_requested' in states:
                 batch['state'] = 'cancel_requested'
             elif states & {'running', 'starting'}:
@@ -320,7 +376,7 @@ class API:
         page = all_items[:limit]
         with self.store.connection() as db:
             batches = [{k: v for k, v in self._batch(item['batch_id'], db).items()
-                        if k in {'batch_id', 'name', 'mode', 'state', 'created_at', 'updated_at', 'msa_backend', 'execution', 'models', 'counts'}} for item in page]
+                        if k in {'batch_id', 'name', 'mode', 'state', 'created_at', 'updated_at', 'msa_backend', 'execution', 'models', 'counts', 'auto_run'}} for item in page]
         return {'batches': batches, 'next_cursor': page[-1]['batch_id'] if len(all_items) > limit else None}
 
     def job_get(self, params):
