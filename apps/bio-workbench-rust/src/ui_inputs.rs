@@ -677,22 +677,17 @@ impl Workbench {
         });
         ui.separator();
         let preparing = self.run_pending();
+        let run_label = if preparing { "Run status" } else { "Run" };
         let response = ui.add(
-            egui::Button::new(
-                // Reserve the leading icon area in this left-aligned sidebar.
-                RichText::new(if preparing {
-                    "    Run status"
-                } else {
-                    "    Run"
-                })
-                .strong()
-                .size(16.)
-                .color(Color32::WHITE),
-            )
-            .fill(Color32::from_rgb(28, 116, 66))
-            .min_size(Vec2::new(ui.available_width(), 36.)),
+            egui::Button::new("")
+                .fill(Color32::from_rgb(28, 116, 66))
+                .min_size(Vec2::new(ui.available_width(), 36.)),
         );
-        // A drawn triangle uses the same native palette and works with every font.
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), run_label)
+        });
+        // Reserve fixed coordinates for the icon and label independently of
+        // font space widths, while retaining a real accessible button.
         let center = egui::pos2(response.rect.left() + 18., response.rect.center().y);
         ui.painter().add(egui::Shape::convex_polygon(
             vec![
@@ -703,6 +698,22 @@ impl Workbench {
             Color32::WHITE,
             egui::Stroke::NONE,
         ));
+        let label: egui::WidgetText = RichText::new(run_label)
+            .strong()
+            .size(16.)
+            .color(Color32::WHITE)
+            .into();
+        let galley = label.into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        );
+        ui.painter().galley(
+            egui::pos2(response.rect.left() + 34., center.y - galley.size().y * 0.5),
+            galley,
+            Color32::WHITE,
+        );
         if response.clicked() {
             self.begin_run();
         }
