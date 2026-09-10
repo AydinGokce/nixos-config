@@ -123,7 +123,8 @@ class HeadControlTests(unittest.TestCase):
         self.ready=self.fixture.ready;self.digest=self.fixture.digest
         self.ready['tools']=str(self.fixture.root/'tools')
         self.state=self.root/('a'*32);self.state.mkdir()
-        self.intent={'session_id':'a'*32,'unit':'bio-msa-session-'+('a'*32)+'.service','tools':str(self.state/'tools')}
+        self.intent={'session_id':'a'*32,'unit':'bio-msa-session-'+('a'*32)+'.service','tools':str(self.state/'tools'),
+                     'created_epoch':self.fixture.now-10}
         session.atomic(self.state/'intent.json',self.intent)
         self.launch={'session_id':'a'*32,'invocation_id':'d'*32,'unit':self.intent['unit'],
             'remote_out':self.ready['output'],'instance':'fixture-worker','ip':'192.0.2.1','boot_id':'fixture',
@@ -148,6 +149,70 @@ class HeadControlTests(unittest.TestCase):
         status=head.worker_status(self.root)
         self.assertEqual(status['state'],'ready');self.assertFalse(status['can_extend'])
         self.assertIsNone(status['idle_deadline_epoch'])
+
+    def test_normal_terminal_closures_are_offline_without_stale_timers_or_progress(self):
+        output=Path(self.ready['output'])
+        session.atomic(output/'startup-progress.json',dict(schema=1,stage='index_warm',scope='msa',state='running',
+            message='Old index loading',timestamp_ns=time.time_ns()))
+        target=head.target(self.state,self.intent,self.launch)
+        for reason in ('graceful_shutdown','idle_timeout','maximum_lifetime'):
+            session.atomic(output/'session-closed.json',dict(schema=1,session_id=self.intent['session_id'],
+                reason=reason,closed_epoch=time.time(),request_id=None,borrowed_api_preserved=False,
+                provider_cleanup_owner='enclosing managed bio-submit'))
+            before={path:session.sha(path) for path in (self.root/'active.json',self.state/'intent.json',self.state/'launch.json')}
+            with mock.patch.object(client,'unit_state',return_value={'LoadState':'not-found'}), \
+                    mock.patch.object(client.subprocess,'run') as remote:
+                status=head.worker_status(self.root)
+            remote.assert_not_called()
+            self.assertEqual(status['state'],'absent');self.assertIn('stopped',status['message'])
+            self.assertEqual(status['shutdown_reason'],reason)
+            self.assertEqual({key:status[key] for key in head.PINS},target)
+            self.assertFalse(status['can_extend']);self.assertFalse(status['can_shutdown'])
+            for key in ('shutdown_epoch','hard_deadline_epoch','idle_deadline_epoch','startup_progress'):
+                self.assertIsNone(status[key])
+            self.assertEqual(status['startup_history'],[])
+            self.assertEqual(before,{path:session.sha(path) for path in before})
+            sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+            try:
+                from workbench.worker_api import normalize_status
+                public=normalize_status(status)
+                self.assertEqual(public['state'],'absent');self.assertEqual(public['target'],target)
+                self.assertNotIn('progress',public)
+                self.assertIsNone(public['hard_deadline_epoch'])
+                self.assertFalse(public['controls']['extend']['enabled'])
+            finally:sys.path.pop(0)
+        self.assertFalse((self.root/'worker-control-commands').exists())
+
+    def test_missing_or_failed_terminal_closure_stays_failed(self):
+        with mock.patch.object(client,'unit_state',return_value={'LoadState':'loaded','ActiveState':'failed',
+                'MainPID':'0','ControlPID':'0','InvocationID':self.launch['invocation_id']}):
+            for reason in (None,'failed','cancelled'):
+                if reason:
+                    session.atomic(Path(self.ready['output'])/'session-closed.json',dict(schema=1,
+                        session_id=self.intent['session_id'],reason=reason,closed_epoch=time.time()))
+                status=head.worker_status(self.root)
+                self.assertEqual(status['state'],'failed')
+                self.assertFalse(status['can_shutdown']);self.assertIsNone(status['hard_deadline_epoch'])
+
+    def test_malformed_or_foreign_terminal_closure_is_uncertain(self):
+        valid=dict(schema=1,session_id=self.intent['session_id'],reason='idle_timeout',closed_epoch=time.time())
+        invalid=[None,[],dict(valid,schema=True),dict(valid,session_id='f'*32),dict(valid,reason=[]),
+                 dict(valid,reason='unrecognized'),dict(valid,closed_epoch=True),dict(valid,closed_epoch=float('nan')),
+                 dict(valid,closed_epoch=time.time()+60),dict(valid,closed_epoch=self.intent['created_epoch']-60)]
+        with mock.patch.object(client,'unit_state',return_value={'LoadState':'not-found'}), \
+                mock.patch.object(client.subprocess,'run') as remote:
+            for value in invalid:
+                (Path(self.ready['output'])/'session-closed.json').write_text(json.dumps(value))
+                status=head.worker_status(self.root)
+                self.assertEqual(status['state'],'uncertain',value)
+                self.assertFalse(status['can_extend']);self.assertIsNone(status['hard_deadline_epoch'])
+                self.assertEqual(status['startup_history'],[])
+            remote.assert_not_called()
+
+    def test_normal_closure_while_unit_is_live_still_waits_for_cleanup(self):
+        session.atomic(Path(self.ready['output'])/'session-closed.json',dict(schema=1,
+            session_id=self.intent['session_id'],reason='graceful_shutdown',closed_epoch=time.time()))
+        self.assertEqual(head.worker_status(self.root)['state'],'closing')
 
     def test_stale_target_returns_bound_rejection_without_remote_action(self):
         self.params['launch_sha256']='0'*64

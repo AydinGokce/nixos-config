@@ -117,7 +117,34 @@ def worker_status(root, deadline=None):
             session.require(live['InvocationID'] == launch['invocation_id'], 'Shared worker invocation changed')
         value['hard_deadline_epoch'] = launch['provider']['reservation_deadline']
         if client._terminal_unit(live):
-            value.update(state='failed', control_reason='Shared worker has stopped; cleanup registration is retained'); return value
+            value.update(state='failed', message='Shared MSA worker stopped without a verified normal closure',
+                         control_reason='This worker has stopped; its registration is retained for receipt recovery',
+                         can_extend=False, can_shutdown=False, shutdown_epoch=None, hard_deadline_epoch=None,
+                         idle_deadline_epoch=None, active_request_id=None, queued_requests=0,
+                         startup_progress=None, startup_history=[])
+            path = Path(launch['remote_out'])/'session-closed.json'
+            closed = lifecycle.document(path, optional=True)
+            if closed is None and not os.path.lexists(path): return value
+            session.require(isinstance(closed, dict) and type(closed.get('schema')) is int
+                and closed['schema'] == 1 and closed.get('session_id') == intent['session_id'],
+                'Worker closure schema or session identity differs')
+            reason = closed.get('reason')
+            session.require(isinstance(reason, str) and reason in
+                {'graceful_shutdown', 'idle_timeout', 'maximum_lifetime', 'failed', 'cancelled'},
+                'Worker closure reason is invalid')
+            closed_epoch = session.finite(closed.get('closed_epoch'), 'worker closure time', 1, time.time()+5)
+            if 'created_epoch' in intent:
+                created = session.finite(intent['created_epoch'], 'session creation time', 1, time.time()+5)
+                session.require(closed_epoch >= created-5, 'Worker closure predates this session')
+            value['shutdown_reason'] = reason
+            normal = {'graceful_shutdown': 'Shared MSA worker stopped after the requested shutdown',
+                      'idle_timeout': 'Shared MSA worker stopped after its idle timeout',
+                      'maximum_lifetime': 'Shared MSA worker stopped at its maximum lifetime'}
+            if reason in normal:
+                value.update(state='absent', message=normal[reason])
+            else:
+                value['message'] = 'Shared MSA worker stopped: '+reason
+            return value
         if live.get('ActiveState') == 'deactivating' or (Path(launch['remote_out'])/'session-closed.json').exists():
             value.update(state='closing', control_reason='Shared worker cleanup is in progress'); return value
         session.require(live.get('ActiveState') == 'active', 'Shared worker is not active')
