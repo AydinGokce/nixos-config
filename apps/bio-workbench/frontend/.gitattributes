@@ -1,2 +1,0 @@
-# Preserve exact upstream scientific reference bytes, including CIF spacing.
-public/fixtures/1ubq.cif -whitespace

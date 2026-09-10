@@ -1,8 +1,0 @@
-result
-result-*
-node_modules/
-dist/
-__pycache__/
-.pytest_cache/
-test-results/
-playwright-report/
