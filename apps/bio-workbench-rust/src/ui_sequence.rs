@@ -32,6 +32,13 @@ pub(super) struct Viewer {
     mode: usize,
     selection: Option<Selection>,
     anchor: Option<usize>,
+    protein_anchor: Option<usize>,
+    focus_residue: Option<usize>,
+    translation_frame: i64,
+    frame_drag: Option<FrameDrag>,
+    variant_open: bool,
+    rebase_variant: Option<String>,
+    pending_preview: Option<Value>,
     show_features: bool,
     show_orfs: bool,
     min_orf: usize,
@@ -51,6 +58,8 @@ struct ProteinEditor {
     code: u64,
     codon_start: u64,
     initiation: String,
+    schema: u64,
+    stop_policy: Option<String>,
     first_residue: usize,
     last_residue: String,
     preview: Value,
@@ -82,14 +91,38 @@ impl Viewer {
             self.mode = 0;
             self.selection = None;
             self.anchor = None;
+            self.protein_anchor = None;
+            self.focus_residue = None;
+            self.translation_frame = 1;
+            self.frame_drag = None;
             if !same_family {
                 self.editor = None;
+                self.variant_open = false;
+                self.rebase_variant = None;
+                self.pending_preview = None;
             }
             self.requested_options = Value::Null;
             self.show_features = true;
             self.show_orfs = rows(&view, "features").is_empty();
             self.min_orf = 30;
             self.genetic_code = 1;
+        }
+        if self.rebase_variant.as_deref() == Some(reference) {
+            self.rebase_variant = None;
+            if let Some(old) = self.editor.take() {
+                if old.target.is_none() {
+                    let mut editor =
+                        ProteinEditor::new(text(&view, "parent_ref"), &view["translation"]);
+                    editor.alt_name = old.alt_name;
+                    if let Ok(params) = editor.params() {
+                        editor.requested = params.clone();
+                        self.pending_preview = Some(params);
+                    }
+                    self.editor = Some(editor);
+                } else {
+                    self.variant_open = false;
+                }
+            }
         }
         self.view = view;
         self.error.clear();
@@ -139,6 +172,21 @@ impl Viewer {
     }
 
     pub fn write_received(&mut self, result: &Value, sent: &Value) {
+        if sent["patch"]["frame_offset"].is_u64()
+            && text(sent, "ref") == self.reference
+            && let Some(change) = rows(result, "changed_refs")
+                .iter()
+                .find(|change| text(change, "before_ref") == self.reference)
+        {
+            self.rebase_variant = Some(text(change, "after_ref").into());
+            self.selection = None;
+            self.focus_residue = None;
+            if let Some(editor) = &mut self.editor {
+                editor.preview = Value::Null;
+                editor.preview_for = Value::Null;
+                editor.requested = Value::Null;
+            }
+        }
         let saved = self.editor.as_ref().is_some_and(|editor| {
             let correct_target = if let Some((reference, _)) = &editor.target {
                 text(sent, "ref") == reference
@@ -153,6 +201,7 @@ impl Viewer {
         });
         if saved {
             self.editor = None;
+            self.variant_open = false;
         }
         if let Some(editor) = &mut self.editor
             && let Some((target, sha)) = &mut editor.target
@@ -205,6 +254,7 @@ impl Viewer {
         let params = editor.params().ok()?;
         editor.requested = params.clone();
         self.editor = Some(editor);
+        self.variant_open = true;
         Some(Action::Preview(params))
     }
 
@@ -216,7 +266,34 @@ impl Viewer {
             .flatten()
     }
 
-    pub fn show_dialogs(
+    fn select_variant_span(&mut self, detail: &Value, selection: Selection) -> Option<Action> {
+        self.focus_residue = selection.segments.first().map(|span| span.0);
+        self.selection = Some(selection.clone());
+        let editor = self.editor.as_ref()?;
+        if !self.variant_open
+            || editor.target.is_some()
+            || !selection.warning.is_empty()
+            || selection.segments.len() != 1
+            || self.rebase_variant.is_some()
+        {
+            return None;
+        }
+        let definition = cropped_variant(&self.view["translation"], selection.segments[0]);
+        if editor
+            .definition()
+            .is_ok_and(|current| current == definition)
+        {
+            return None;
+        }
+        let alt_name = editor.alt_name.clone();
+        let action = self.begin_definition(detail, definition, false);
+        if let Some(editor) = &mut self.editor {
+            editor.alt_name = alt_name;
+        }
+        action
+    }
+
+    fn show_definition_form(
         &mut self,
         ui: &mut egui::Ui,
         writing: bool,
@@ -232,9 +309,11 @@ impl Viewer {
                     ui.horizontal(|ui| {
                         ui.label("Parent");
                         ui.add(egui::TextEdit::singleline(&mut editor.parent).desired_width(310.));
-                        egui::ComboBox::from_id_salt("product-parent").selected_text("Choose plasmid…").show_ui(ui, |ui| {
-                            for record in parents.iter().filter(|r| text(r,"molecular_form") == "plasmid") {
-                                let label = format!("{} {}", text(record,"inventory_id"), text(record,"alt_name"));
+                        egui::ComboBox::from_id_salt("product-parent").selected_text("Choose DNA / RNA…").show_ui(ui, |ui| {
+                            for record in parents.iter().filter(|r| text(r,"kind") == "construct" && matches!(text(r,"molecule_type"), "dna" | "rna")) {
+                                let id = if text(record,"inventory_id").is_empty() { text(record,"ref") } else { text(record,"inventory_id") };
+                                let name = if text(record,"alt_name").is_empty() { text(record,"name") } else { text(record,"alt_name") };
+                                let label = format!("{id} {name}");
                                 ui.selectable_value(&mut editor.parent, text(record,"ref").into(), label);
                             }
                         });
@@ -247,6 +326,12 @@ impl Viewer {
                         egui::ComboBox::from_id_salt("product-code").selected_text(format!("Genetic code {}",editor.code)).show_ui(ui,|ui| { ui.selectable_value(&mut editor.code,1,"1 · Standard");ui.selectable_value(&mut editor.code,11,"11 · Bacterial"); });
                         ui.label("First codon starts at");ui.add(egui::DragValue::new(&mut editor.codon_start).range(1..=3));
                         egui::ComboBox::from_id_salt("product-initiation").selected_text(&editor.initiation).show_ui(ui,|ui| { ui.selectable_value(&mut editor.initiation,"cds".into(),"CDS initiation");ui.selectable_value(&mut editor.initiation,"literal".into(),"Literal translation"); });
+                        if let Some(policy) = &mut editor.stop_policy {
+                            egui::ComboBox::from_id_salt("product-stop-policy").selected_text(if policy == "first_stop" { "First stop" } else { "Strict stops" }).show_ui(ui, |ui| {
+                                ui.selectable_value(policy, "first_stop".into(), "First stop");
+                                ui.selectable_value(policy, "strict".into(), "Strict stops");
+                            });
+                        }
                     });
                     let mut remove=None;
                     for (i,(start,end)) in editor.segments.iter_mut().enumerate() {
@@ -288,6 +373,16 @@ impl Viewer {
                 self.editor = None;
             }
         }
+        actions
+    }
+
+    pub fn show_dialogs(
+        &mut self,
+        ui: &mut egui::Ui,
+        writing: bool,
+        _parents: &[Value],
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
         if let Some(form) = &mut self.standalone {
             let mut close = false;
             egui::Frame::group(ui.style()).show(ui,|ui| {
@@ -310,12 +405,55 @@ impl Viewer {
         actions
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, detail: &Value, writing: bool) -> Vec<Action> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        detail: &Value,
+        writing: bool,
+        parents: &[Value],
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let sequence = text(&self.view, "sequence").to_owned();
         let molecule = text(&self.view, "molecule_type").to_owned();
         let derived = text(&self.view, "derivation_kind") == "derived";
         let editable = detail["is_latest"] != false && !writing;
+        if let Some(params) = self.pending_preview.take() {
+            actions.push(Action::Preview(params));
+        }
+        if derived {
+            if ui
+                .button(if self.variant_open {
+                    "▾ New variant"
+                } else {
+                    "▸ New variant"
+                })
+                .clicked()
+            {
+                if self.variant_open {
+                    self.variant_open = false;
+                } else if self.editor.is_some() {
+                    self.variant_open = true;
+                } else if let Some(action) =
+                    self.begin_definition(detail, self.view["translation"].clone(), false)
+                {
+                    actions.push(action);
+                }
+            }
+            if !self.variant_open {
+                return actions;
+            }
+        }
+        if self.editor.is_some() {
+            actions.extend(self.show_definition_form(
+                ui,
+                !editable || self.rebase_variant.is_some(),
+                parents,
+            ));
+            if self.editor.is_none() && derived {
+                self.variant_open = false;
+                return actions;
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!(
                 "{} · {} {}",
@@ -324,7 +462,7 @@ impl Viewer {
                 if molecule == "protein" { "aa" } else { "nt" }
             ));
             if derived {
-                ui.colored_label(AMBER, "DERIVED · READ ONLY");
+                ui.colored_label(AMBER, "DERIVED");
                 if ui.button("Open parent").clicked() {
                     actions.push(Action::Parent(text(&self.view, "parent_ref").into()));
                 }
@@ -363,13 +501,44 @@ impl Viewer {
         if !self.error.is_empty() {
             ui.colored_label(RED, &self.error);
         }
-        if sequence.is_empty() {
+        if sequence.is_empty() && molecule != "protein" {
             ui.weak("No available sequence for this revision.");
             return actions;
         }
         if molecule == "protein" {
             if derived {
                 ui.weak("This peptide is computed from the pinned parent and definition. Editing the parent or definition creates coordinated new revisions; previous runs keep their original inputs.");
+                let original = frame_offset(&self.view["translation"]);
+                let mut offset = original;
+                let strand = if self.view["translation"]["strand"].as_i64() == Some(-1) {
+                    "−"
+                } else {
+                    "+"
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Current protein frame");
+                    ui.add_enabled_ui(editable && self.frame_drag.is_none(), |ui| {
+                        egui::ComboBox::from_id_salt("protein-reading-frame")
+                            .selected_text(format!("{strand}{}", offset + 1))
+                            .show_ui(ui, |ui| {
+                                for choice in 0..3 {
+                                    ui.selectable_value(
+                                        &mut offset,
+                                        choice,
+                                        format!("{strand}{}", choice + 1),
+                                    );
+                                }
+                            });
+                    });
+                    ui.weak("Offset within the saved coding footprint; strand is preserved.");
+                });
+                if offset != original {
+                    actions.push(frame_action(
+                        text(detail, "ref"),
+                        text(detail, "sha256"),
+                        offset,
+                    ));
+                }
             }
             let features = track_items(&self.view, true, false);
             if !features.is_empty() {
@@ -409,8 +578,9 @@ impl Viewer {
                             && response
                                 .interact_pointer_pos()
                                 .is_some_and(|pos| span.contains(pos))
+                            && let Some(action) = self.select_variant_span(detail, item.clone())
                         {
-                            self.selection = Some(item.clone());
+                            actions.push(action);
                         }
                     }
                 }
@@ -424,8 +594,9 @@ impl Viewer {
                                 &item.label,
                             )
                             .clicked()
+                            && let Some(action) = self.select_variant_span(detail, item.clone())
                         {
-                            self.selection = Some(item.clone());
+                            actions.push(action);
                         }
                         ui.monospace(range_label(&item.segments));
                         if !item.warning.is_empty() {
@@ -434,23 +605,41 @@ impl Viewer {
                     });
                 }
             }
-            if derived
-                && ui
-                    .add_enabled(editable, egui::Button::new("New variant…"))
-                    .clicked()
-            {
-                let mut definition = self.view["translation"].clone();
-                if let Some(selection) = &self.selection
-                    && selection.warning.is_empty()
-                    && selection.segments.len() == 1
-                {
-                    definition = cropped_variant(&definition, selection.segments[0]);
-                }
-                if let Some(action) = self.begin_definition(detail, definition, false) {
-                    actions.push(action);
+            if let Some(selection) = self.selection.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&selection.label).color(AMBER));
+                    ui.monospace(format!("residues {}", range_label(&selection.segments)));
+                    if ui.small_button("Clear selection").clicked() {
+                        self.selection = None;
+                    }
+                });
+            }
+            let outcome = protein_lines(
+                ui,
+                ProteinBlockInput {
+                    sequence: &sequence,
+                    view: &self.view,
+                    selected: self.selection.as_ref(),
+                    focus: self.focus_residue.take(),
+                    editable,
+                    reference: text(detail, "ref"),
+                    sha256: text(detail, "sha256"),
+                },
+                &mut self.protein_anchor,
+                &mut self.frame_drag,
+            );
+            if let Some(selection) = outcome.selection {
+                if outcome.apply_selection {
+                    if let Some(action) = self.select_variant_span(detail, selection) {
+                        actions.push(action);
+                    }
+                } else {
+                    self.selection = Some(selection);
                 }
             }
-            protein_lines(ui, &sequence);
+            if let Some(action) = outcome.action {
+                actions.push(action);
+            }
             return actions;
         }
         if !matches!(molecule.as_str(), "dna" | "rna") {
@@ -467,14 +656,19 @@ impl Viewer {
             ui.checkbox(&mut self.show_features,"Annotations");ui.checkbox(&mut self.show_orfs,"ORFs");
             ui.label("Min ORF");ui.add(egui::DragValue::new(&mut self.min_orf).range(1..=10000));ui.weak("aa");
             egui::ComboBox::from_id_salt("map-code").selected_text(format!("Code {}",self.genetic_code)).show_ui(ui,|ui|{ui.selectable_value(&mut self.genetic_code,1,"1 · Standard");ui.selectable_value(&mut self.genetic_code,11,"11 · Bacterial");});
+            egui::ComboBox::from_id_salt("map-reading-frame").selected_text(format!("Preview frame {:+}", self.translation_frame)).show_ui(ui, |ui| {
+                for frame in [1, 2, 3, -1, -2, -3] {
+                    ui.selectable_value(&mut self.translation_frame, frame, format!("{frame:+}"));
+                }
+            });
             if ui.button("Find ORFs").clicked(){self.show_orfs=true;let params=json!({"ref":self.reference,"min_orf_aa":self.min_orf,"genetic_code":self.genetic_code});self.requested_options=params.clone();actions.push(Action::Options(params));}
         });
         let circular =
             self.mode == 1 || self.mode == 0 && self.view["circular"] == true && self.zoom < 1.6;
-        ui.weak(if circular{"Scroll to zoom into the linear sequence; click a feature or drag a range. Coordinates are 1-based."}else{"Scroll to zoom; right-drag to pan; left-drag to select bases. Translation tracks use the displayed genetic code."});
+        ui.weak(if circular{"Scroll to zoom into the linear sequence; click a feature or drag a range. Coordinates are 1-based."}else{"Scroll to zoom; right-drag to pan; left-drag to select bases. One preview translation follows the selected reading frame."});
         let size = Vec2::new(
             ui.available_width().max(300.),
-            if circular { 420. } else { 460. },
+            if circular { 420. } else { 400. },
         );
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -550,7 +744,7 @@ impl Viewer {
                 &items,
                 self.selection.as_ref(),
                 &sequence,
-                (left, visible, molecule == "rna"),
+                (left, visible, molecule == "rna", self.translation_frame),
                 pointer,
             )
         };
@@ -637,6 +831,8 @@ impl ProteinEditor {
             code: t["genetic_code"].as_u64().unwrap_or(1),
             codon_start: t["codon_start"].as_u64().unwrap_or(1),
             initiation: text(t, "initiation").to_owned(),
+            schema: t["schema"].as_u64().unwrap_or(1),
+            stop_policy: t["stop_policy"].as_str().map(str::to_owned),
             first_residue: t["residue_start"].as_u64().unwrap_or(0) as usize + 1,
             last_residue: t["residue_end"]
                 .as_u64()
@@ -666,9 +862,11 @@ impl ProteinEditor {
         if self.first_residue == 0 || end.is_some_and(|e| e < self.first_residue) {
             return Err("The amino-acid range must contain at least one residue.".into());
         }
-        Ok(
-            json!({"schema":1,"segments":self.segments.iter().map(|(s,e)|json!({"start":s-1,"end":e})).collect::<Vec<_>>(),"strand":self.strand,"genetic_code":self.code,"codon_start":self.codon_start,"initiation":self.initiation,"residue_start":self.first_residue-1,"residue_end":end}),
-        )
+        let mut definition = json!({"schema":self.schema,"segments":self.segments.iter().map(|(s,e)|json!({"start":s-1,"end":e})).collect::<Vec<_>>(),"strand":self.strand,"genetic_code":self.code,"codon_start":self.codon_start,"initiation":self.initiation,"residue_start":self.first_residue-1,"residue_end":end});
+        if let Some(policy) = &self.stop_policy {
+            definition["stop_policy"] = json!(policy);
+        }
+        Ok(definition)
     }
     fn params(&self) -> Result<Value, String> {
         if !self.parent.starts_with("construct:")
@@ -966,10 +1164,10 @@ fn draw_linear(
     items: &[Selection],
     selected: Option<&Selection>,
     sequence: &str,
-    window: (f32, f32, bool),
+    window: (f32, f32, bool, i64),
     pointer: Option<Pos2>,
 ) -> Option<Selection> {
-    let (left, visible, rna) = window;
+    let (left, visible, rna, reading_frame) = window;
     let px = plot.width() / visible;
     let x = |base: f32| plot.left() + (base - left) * px;
     let axis = plot.top() + 16.;
@@ -1071,79 +1269,83 @@ fn draw_linear(
             }
         }
     }
-    if px >= 9. {
-        let y = axis + 220.;
+    if px >= 3. {
+        let y = axis + 214.;
         let bytes = sequence.as_bytes();
         let start = left.floor() as usize;
         let end = (right.ceil() as usize).min(bytes.len());
         p.text(
-            Pos2::new(plot.left() - 8., y),
+            Pos2::new(plot.left() - 8., y + 12.),
             Align2::RIGHT_CENTER,
             "5′",
             FontId::monospace(11.),
             Color32::GRAY,
         );
+        p.text(
+            Pos2::new(plot.left() - 8., y + 38.),
+            Align2::RIGHT_CENTER,
+            "3′",
+            FontId::monospace(11.),
+            Color32::GRAY,
+        );
+        let tracks = p.with_clip_rect(plot);
         for (i, &b) in bytes.iter().enumerate().take(end).skip(start) {
-            let xx = x(i as f32 + 0.5);
-            p.text(
-                Pos2::new(xx, y),
-                Align2::CENTER_CENTER,
-                (b as char).to_string(),
-                FontId::monospace(13.),
+            letter_block(
+                &tracks,
+                Rect::from_min_size(Pos2::new(x(i as f32), y), Vec2::new(px, 25.)),
+                b,
                 base_color(b),
+                false,
             );
-            p.text(
-                Pos2::new(xx, y + 18.),
-                Align2::CENTER_CENTER,
-                (if rna && b == b'A' {
-                    b'U'
-                } else {
-                    complement(b)
-                } as char)
-                    .to_string(),
-                FontId::monospace(12.),
-                base_color(complement(b)).gamma_multiply(0.8),
+            let complementary = if rna && b == b'A' {
+                b'U'
+            } else {
+                complement(b)
+            };
+            letter_block(
+                &tracks,
+                Rect::from_min_size(Pos2::new(x(i as f32), y + 26.), Vec2::new(px, 25.)),
+                complementary,
+                base_color(complementary),
+                false,
             );
         }
-        for track in 0..6 {
-            let frame = track % 3;
-            let reverse = track >= 3;
-            let yy = y + 40. + track as f32 * 17.;
-            p.text(
-                Pos2::new(plot.left() - 8., yy),
-                Align2::RIGHT_CENTER,
-                format!("{}{}", if reverse { "−" } else { "+" }, frame + 1),
-                FontId::monospace(10.),
-                Color32::GRAY,
-            );
-            let mut i = start.saturating_sub(2);
-            while i < end {
-                if i + 3 <= bytes.len()
-                    && if reverse {
-                        (bytes.len() - i - 3) % 3 == frame
-                    } else {
-                        i % 3 == frame
-                    }
-                {
-                    p.text(
-                        Pos2::new(x(i as f32 + 1.5), yy),
-                        Align2::CENTER_CENTER,
-                        (if reverse {
-                            codon(&[
-                                complement(bytes[i + 2]),
-                                complement(bytes[i + 1]),
-                                complement(bytes[i]),
-                            ])
-                        } else {
-                            codon(&bytes[i..i + 3])
-                        } as char)
-                            .to_string(),
-                        FontId::monospace(12.),
-                        Color32::from_rgb(145, 198, 201),
-                    );
+        let frame = reading_frame.unsigned_abs().clamp(1, 3) as usize - 1;
+        let reverse = reading_frame < 0;
+        p.text(
+            Pos2::new(plot.left() - 8., y + 67.),
+            Align2::RIGHT_CENTER,
+            format!("{reading_frame:+}"),
+            FontId::monospace(11.),
+            Color32::LIGHT_GRAY,
+        );
+        let mut i = start.saturating_sub(2);
+        while i < end {
+            if i + 3 <= bytes.len()
+                && if reverse {
+                    (bytes.len() - i - 3) % 3 == frame
+                } else {
+                    i % 3 == frame
                 }
-                i += 1;
+            {
+                let amino = if reverse {
+                    codon(&[
+                        complement(bytes[i + 2]),
+                        complement(bytes[i + 1]),
+                        complement(bytes[i]),
+                    ])
+                } else {
+                    codon(&bytes[i..i + 3])
+                };
+                letter_block(
+                    &tracks,
+                    Rect::from_min_size(Pos2::new(x(i as f32), y + 54.), Vec2::new(px * 3., 27.)),
+                    amino,
+                    amino_color(amino),
+                    false,
+                );
             }
+            i += 1;
         }
     } else {
         p.text(
@@ -1165,12 +1367,65 @@ fn base_color(b: u8) -> Color32 {
         _ => Color32::GRAY,
     }
 }
+fn amino_color(b: u8) -> Color32 {
+    match b {
+        b'D' | b'E' => Color32::from_rgb(222, 136, 121),
+        b'K' | b'R' | b'H' => Color32::from_rgb(127, 170, 226),
+        b'S' | b'T' | b'N' | b'Q' => Color32::from_rgb(130, 204, 181),
+        b'A' | b'V' | b'L' | b'I' | b'M' | b'F' | b'W' | b'Y' => Color32::from_rgb(213, 185, 128),
+        b'G' | b'P' => Color32::from_rgb(182, 156, 211),
+        b'C' => Color32::from_rgb(219, 205, 112),
+        b'*' => Color32::from_rgb(236, 118, 118),
+        _ => Color32::from_rgb(153, 166, 174),
+    }
+}
+
+fn letter_block(p: &egui::Painter, rect: Rect, letter: u8, color: Color32, selected: bool) {
+    if rect.width() < 1. || rect.height() < 1. {
+        return;
+    }
+    let color = if selected { AMBER } else { color };
+    let cell = rect.shrink2(Vec2::new(0.5, 1.));
+    p.rect_filled(
+        cell,
+        1.,
+        color.gamma_multiply(if selected { 0.52 } else { 0.24 }),
+    );
+    p.rect_filled(
+        Rect::from_min_max(cell.min, Pos2::new(cell.right(), cell.top() + 2.)),
+        0.,
+        color,
+    );
+    if selected {
+        p.rect_stroke(cell, 1., Stroke::new(1., AMBER), egui::StrokeKind::Inside);
+    }
+    if cell.width() >= 8. {
+        p.text(
+            cell.center() + Vec2::new(0., 1.),
+            Align2::CENTER_CENTER,
+            (letter as char).to_string(),
+            FontId::monospace((cell.height() * 0.6).clamp(10., 15.)),
+            Color32::from_rgb(230, 236, 237),
+        );
+    }
+}
+
 fn complement(b: u8) -> u8 {
     match b {
         b'A' => b'T',
         b'T' | b'U' => b'A',
         b'C' => b'G',
         b'G' => b'C',
+        b'R' => b'Y',
+        b'Y' => b'R',
+        b'S' => b'S',
+        b'W' => b'W',
+        b'K' => b'M',
+        b'M' => b'K',
+        b'B' => b'V',
+        b'V' => b'B',
+        b'D' => b'H',
+        b'H' => b'D',
         _ => b'N',
     }
 }
@@ -1189,30 +1444,431 @@ fn codon(bytes: &[u8]) -> u8 {
     }
     if bytes.len() == 3 { TABLE[index] } else { b'X' }
 }
-fn protein_lines(ui: &mut egui::Ui, sequence: &str) {
-    let width = ((ui.available_width() - 70.) / 10.).floor().max(10.) as usize;
+struct CodonAlignment<'a> {
+    source: &'a str,
+    positions: Vec<[usize; 3]>,
+    reverse: bool,
+    rna: bool,
+}
+
+#[derive(Clone)]
+struct FrameDrag {
+    reference: String,
+    sha256: String,
+    original: usize,
+    candidate: usize,
+    dragged_bases: i64,
+    origin_x: f32,
+}
+
+fn frame_offset(definition: &Value) -> usize {
+    definition["codon_start"].as_u64().unwrap_or(1).clamp(1, 3) as usize - 1
+}
+
+fn dragged_frame(original: usize, horizontal_pixels: f32) -> usize {
+    (original as i64 + (horizontal_pixels / 18.).round() as i64).rem_euclid(3) as usize
+}
+
+fn frame_action(reference: &str, sha256: &str, offset: usize) -> Action {
+    Action::Write(
+        "library.edit",
+        json!({"ref":reference,"expected_sha256":sha256,"patch":{"frame_offset":offset}}),
+    )
+}
+
+fn finish_frame(drag: FrameDrag) -> Option<Action> {
+    (drag.candidate != drag.original)
+        .then(|| frame_action(&drag.reference, &drag.sha256, drag.candidate))
+}
+
+struct ProteinBlockInput<'a> {
+    sequence: &'a str,
+    view: &'a Value,
+    selected: Option<&'a Selection>,
+    focus: Option<usize>,
+    editable: bool,
+    reference: &'a str,
+    sha256: &'a str,
+}
+
+#[derive(Default)]
+struct ProteinBlockOutcome {
+    selection: Option<Selection>,
+    apply_selection: bool,
+    action: Option<Action>,
+}
+
+fn codon_alignment<'a>(view: &'a Value, sequence: &str) -> Option<CodonAlignment<'a>> {
+    let source = &view["source"];
+    let bases = source["sequence"].as_str()?;
+    if source["complete"] != true
+        || view["codon_positions_complete"] != true
+        || text(source, "ref") != text(view, "parent_ref")
+        || bases.is_empty()
+        || !bases.is_ascii()
+    {
+        return None;
+    }
+    let positions: Option<Vec<_>> = view["codon_positions"]
+        .as_array()?
+        .iter()
+        .map(|row| {
+            let row = row.as_array()?;
+            if row.len() != 3 {
+                return None;
+            }
+            let positions = [
+                row[0].as_u64()? as usize,
+                row[1].as_u64()? as usize,
+                row[2].as_u64()? as usize,
+            ];
+            positions
+                .iter()
+                .all(|&p| p < bases.len())
+                .then_some(positions)
+        })
+        .collect();
+    let positions = positions?;
+    if positions.len() != sequence.len() {
+        return None;
+    }
+    Some(CodonAlignment {
+        source: bases,
+        positions,
+        reverse: view["translation"]["strand"].as_i64() == Some(-1),
+        rna: text(source, "molecule_type") == "rna",
+    })
+}
+
+fn source_footprint(view: &Value) -> Option<CodonAlignment<'_>> {
+    let source = &view["source"];
+    let bases = source["sequence"].as_str()?;
+    if source["complete"] != true
+        || bases.is_empty()
+        || !bases.is_ascii()
+        || text(source, "ref") != text(view, "parent_ref")
+    {
+        return None;
+    }
+    let definition = &view["translation"];
+    let reverse = definition["strand"].as_i64() == Some(-1);
+    let mut positions = Vec::new();
+    for segment in rows(definition, "segments") {
+        let start = segment["start"].as_u64()? as usize;
+        let end = segment["end"].as_u64()? as usize;
+        if start >= end || end > bases.len() {
+            return None;
+        }
+        if reverse {
+            positions.extend((start..end).rev());
+        } else {
+            positions.extend(start..end);
+        }
+        if positions.len() > 1_000_000 {
+            return None;
+        }
+    }
+    let skip = frame_offset(definition);
+    let positions = positions
+        .get(skip..)?
+        .chunks_exact(3)
+        .take(16_384)
+        .map(|p| [p[0], p[1], p[2]])
+        .collect::<Vec<_>>();
+    (!positions.is_empty()).then_some(CodonAlignment {
+        source: bases,
+        positions,
+        reverse,
+        rna: text(source, "molecule_type") == "rna",
+    })
+}
+
+fn aligned_bases(alignment: &CodonAlignment<'_>, index: usize) -> [u8; 3] {
+    alignment.positions[index].map(|position| {
+        let base = alignment.source.as_bytes()[position];
+        if alignment.reverse {
+            let base = complement(base);
+            if alignment.rna && base == b'T' {
+                b'U'
+            } else {
+                base
+            }
+        } else {
+            base
+        }
+    })
+}
+
+fn selected_residue(selection: Option<&Selection>, index: usize) -> bool {
+    selection.is_some_and(|s| {
+        s.segments
+            .iter()
+            .any(|&(start, end)| start <= index && index < end)
+    })
+}
+
+fn protein_lines(
+    ui: &mut egui::Ui,
+    input: ProteinBlockInput<'_>,
+    anchor: &mut Option<usize>,
+    frame_drag: &mut Option<FrameDrag>,
+) -> ProteinBlockOutcome {
+    let ProteinBlockInput {
+        sequence,
+        view,
+        selected,
+        focus,
+        editable,
+        reference,
+        sha256,
+    } = input;
+    let mut alignment = codon_alignment(view, sequence);
+    let mut placeholder = String::new();
+    let unavailable = sequence.is_empty();
+    if unavailable {
+        alignment = source_footprint(view);
+        if let Some(alignment) = &alignment {
+            placeholder = "?".repeat(alignment.positions.len());
+            ui.colored_label(
+                AMBER,
+                "Translation unavailable · showing the uncropped source footprint.",
+            );
+        } else {
+            ui.weak("No available sequence or source footprint for this revision.");
+            return ProteinBlockOutcome::default();
+        }
+    }
+    let sequence = if unavailable {
+        placeholder.as_str()
+    } else {
+        sequence
+    };
+    let cell_width = if alignment.is_some() { 54. } else { 18. };
+    let row_height = if alignment.is_some() { 76. } else { 33. };
+    let width = ((ui.available_width() - 65.) / cell_width).floor().max(1.) as usize;
     let count = sequence.len().div_ceil(width);
-    egui::ScrollArea::vertical()
+    let mut outcome = ProteinBlockOutcome::default();
+    if let Some(alignment) = &alignment {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(if alignment.reverse {
+                "Source 5′ → 3′ · reverse complement"
+            } else {
+                "Source 5′ → 3′ · forward strand"
+            });
+            ui.weak("Each amino-acid block spans its three source bases.");
+        });
+    } else if text(view, "derivation_kind") == "derived" {
+        ui.weak("Source codon alignment is unavailable for this revision.");
+    }
+    let can_drag_frame = text(view, "derivation_kind") == "derived"
+        && alignment.is_some()
+        && editable
+        && !sha256.is_empty();
+    if can_drag_frame {
+        ui.weak("Drag the amino-acid row left or right to change the protein frame. Shift-drag selects a variant span.");
+    } else {
+        ui.weak("Click or drag residue blocks to select a variant span.");
+    }
+    if let Some(drag) = frame_drag.as_ref() {
+        ui.colored_label(
+            AMBER,
+            format!(
+                "Frame {}{} · release to translate and save",
+                if view["translation"]["strand"].as_i64() == Some(-1) {
+                    "−"
+                } else {
+                    "+"
+                },
+                drag.candidate + 1
+            ),
+        );
+    }
+    let mut scroll = egui::ScrollArea::vertical()
         .id_salt("protein-sequence")
-        .max_height(360.)
-        .show_rows(ui, 19., count, |ui, range| {
-            for row in range {
-                let start = row * width;
-                let end = (start + width).min(sequence.len());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("{:>6}", start + 1))
-                            .monospace()
-                            .weak(),
+        .max_height(410.);
+    if let Some(focus) = focus {
+        scroll = scroll.vertical_scroll_offset(
+            (focus.min(sequence.len().saturating_sub(1)) / width).saturating_sub(1) as f32
+                * row_height,
+        );
+    }
+    scroll.show_rows(ui, row_height, count, |ui, range| {
+        for row in range {
+            let start = row * width;
+            let end = (start + width).min(sequence.len());
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), row_height),
+                Sense::click_and_drag(),
+            );
+            let painter = ui.painter_at(rect);
+            let left = rect.left() + 55.;
+            let aa_y = rect.top() + if alignment.is_some() { 39. } else { 3. };
+            painter.text(
+                Pos2::new(left - 9., aa_y + 13.),
+                Align2::RIGHT_CENTER,
+                (start + 1).to_string(),
+                FontId::monospace(11.),
+                Color32::GRAY,
+            );
+            for index in start..end {
+                let x = left + (index - start) as f32 * cell_width;
+                let active = !unavailable && selected_residue(selected, index);
+                if let Some(alignment) = &alignment {
+                    let positions = alignment.positions[index];
+                    painter.text(
+                        Pos2::new(x + 2., rect.top() + 8.),
+                        Align2::LEFT_CENTER,
+                        (positions[0] + 1).to_string(),
+                        FontId::monospace(9.),
+                        Color32::GRAY,
                     );
-                    ui.label(
-                        RichText::new(&sequence[start..end])
-                            .monospace()
-                            .color(Color32::from_rgb(141, 207, 193)),
-                    );
+                    for (offset, base) in aligned_bases(alignment, index).into_iter().enumerate() {
+                        letter_block(
+                            &painter,
+                            Rect::from_min_size(
+                                Pos2::new(x + offset as f32 * 18., rect.top() + 14.),
+                                Vec2::new(18., 23.),
+                            ),
+                            base,
+                            base_color(base),
+                            active,
+                        );
+                    }
+                    if index > 0 {
+                        let previous = alignment.positions[index - 1][2] as i64;
+                        let step = if alignment.reverse { -1 } else { 1 };
+                        if positions[0] as i64 != previous + step {
+                            painter.line_segment(
+                                [
+                                    Pos2::new(x, rect.top() + 10.),
+                                    Pos2::new(x, rect.bottom() - 4.),
+                                ],
+                                Stroke::new(2., AMBER),
+                            );
+                        }
+                    }
+                }
+                let pending = frame_drag
+                    .as_ref()
+                    .filter(|drag| drag.candidate != drag.original);
+                let shift = pending.map_or(0., |drag| drag.dragged_bases as f32 * 18.);
+                let amino = if pending.is_some() {
+                    b'?'
+                } else {
+                    sequence.as_bytes()[index]
+                };
+                letter_block(
+                    &painter,
+                    Rect::from_min_size(Pos2::new(x + shift, aa_y), Vec2::new(cell_width, 27.)),
+                    amino,
+                    amino_color(amino),
+                    active,
+                );
+            }
+            let residue_at = |position: Pos2| {
+                let column = ((position.x - left) / cell_width)
+                    .floor()
+                    .clamp(0., width.saturating_sub(1) as f32) as i64;
+                let row_offset = ((position.y - rect.top()) / row_height).floor() as i64;
+                (start as i64 + row_offset * width as i64 + column)
+                    .clamp(0, sequence.len().saturating_sub(1) as i64) as usize
+            };
+            if response.drag_started_by(egui::PointerButton::Primary)
+                && let Some(position) = response.interact_pointer_pos()
+            {
+                let start_position = position - response.total_drag_delta().unwrap_or_default();
+                if can_drag_frame && start_position.y >= aa_y && !ui.input(|i| i.modifiers.shift) {
+                    let original = frame_offset(&view["translation"]);
+                    *frame_drag = Some(FrameDrag {
+                        reference: reference.into(),
+                        sha256: sha256.into(),
+                        original,
+                        candidate: original,
+                        dragged_bases: 0,
+                        origin_x: start_position.x,
+                    });
+                    *anchor = None;
+                } else if !unavailable {
+                    *anchor = Some(residue_at(start_position));
+                }
+            }
+            if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(drag) = frame_drag.as_mut()
+            {
+                let delta = response.total_drag_delta().unwrap_or_default().x;
+                drag.candidate = dragged_frame(drag.original, delta);
+                drag.dragged_bases = (delta / 18.).round() as i64;
+            }
+            if !unavailable
+                && response.clicked()
+                && let Some(position) = response.interact_pointer_pos()
+            {
+                let index = residue_at(position);
+                outcome.selection = Some(Selection {
+                    segments: vec![(index, index + 1)],
+                    strand: 1,
+                    label: "Selected residue".into(),
+                    ..Default::default()
+                });
+                outcome.apply_selection = true;
+            } else if frame_drag.is_none()
+                && response.dragged_by(egui::PointerButton::Primary)
+                && let (Some(first), Some(position)) = (*anchor, response.interact_pointer_pos())
+            {
+                let last = residue_at(position);
+                outcome.selection = Some(Selection {
+                    segments: vec![(first.min(last), first.max(last) + 1)],
+                    strand: 1,
+                    label: "Selected residues".into(),
+                    ..Default::default()
                 });
             }
-        });
+            if let Some(position) = response.hover_pos() {
+                let index = residue_at(position);
+                let mut tooltip = format!(
+                    "Residue {} · {}",
+                    index + 1,
+                    sequence.as_bytes()[index] as char
+                );
+                if let Some(alignment) = &alignment {
+                    let p = alignment.positions[index];
+                    tooltip.push_str(&format!(
+                        "\nSource bases {}, {}, {}",
+                        p[0] + 1,
+                        p[1] + 1,
+                        p[2] + 1
+                    ));
+                }
+                response.on_hover_text(tooltip);
+            }
+        }
+    });
+    if !ui.input(|input| input.pointer.primary_down()) {
+        if let Some(drag) = frame_drag.as_mut()
+            && let Some(position) = ui.input(|input| input.pointer.interact_pos())
+        {
+            let delta = position.x - drag.origin_x;
+            drag.candidate = dragged_frame(drag.original, delta);
+            drag.dragged_bases = (delta / 18.).round() as i64;
+        }
+        if anchor.is_some()
+            && frame_drag.is_none()
+            && ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+        {
+            outcome.selection = selected.cloned();
+            outcome.apply_selection = true;
+        }
+        *anchor = None;
+        if let Some(drag) = frame_drag.take()
+            && editable
+            && reference == drag.reference
+            && sha256 == drag.sha256
+            && ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+        {
+            outcome.action = finish_frame(drag);
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -1283,5 +1939,219 @@ mod tests {
             editor.target,
             Some(("construct:child@2".into(), "newsha".into()))
         );
+    }
+
+    fn aligned_view(sequence: &str, peptide: &str, positions: Value, strand: i64) -> Value {
+        json!({"parent_ref":"construct:p@1","derivation_kind":"derived","sequence":peptide,
+            "translation":{"schema":1,"segments":[{"start":0,"end":sequence.len()}],"strand":strand,"genetic_code":1,"codon_start":1,"initiation":"cds","residue_start":0,"residue_end":null},
+            "source":{"ref":"construct:p@1","sequence":sequence,"molecule_type":"dna","complete":true},
+            "codon_positions":positions,"codon_positions_complete":true})
+    }
+
+    #[test]
+    fn initial_codon_alignment_preserves_authoritative_cds_initiation() {
+        let view = aligned_view("TTGGCCTAA", "MA", json!([[0, 1, 2], [3, 4, 5]]), 1);
+        let alignment = codon_alignment(&view, text(&view, "sequence")).unwrap();
+        assert_eq!(aligned_bases(&alignment, 0), *b"TTG");
+        assert_eq!(codon(&aligned_bases(&alignment, 0)), b'L');
+        assert_eq!(text(&view, "sequence"), "MA");
+        assert_eq!(aligned_bases(&alignment, 1), *b"GCC");
+    }
+
+    #[test]
+    fn reverse_join_origin_and_cropped_codon_positions_stay_exact() {
+        let reverse = aligned_view("CATGGCTAA", "ML", json!([[2, 1, 0], [8, 7, 6]]), -1);
+        let alignment = codon_alignment(&reverse, "ML").unwrap();
+        assert_eq!(aligned_bases(&alignment, 0), *b"ATG");
+        assert_eq!(aligned_bases(&alignment, 1), *b"TTA");
+        let origin = aligned_view("CATGGCTAA", "T", json!([[8, 0, 1]]), 1);
+        assert_eq!(
+            aligned_bases(&codon_alignment(&origin, "T").unwrap(), 0),
+            *b"ACA"
+        );
+        let mut crop = aligned_view("ATGGCCTAA", "A", json!([[3, 4, 5]]), 1);
+        crop["translation"]["residue_start"] = json!(1);
+        assert_eq!(
+            aligned_bases(&codon_alignment(&crop, "A").unwrap(), 0),
+            *b"GCC"
+        );
+    }
+
+    #[test]
+    fn missing_mismatched_or_partial_source_never_invents_codon_alignment() {
+        let view = aligned_view("ATGTAA", "M", json!([[0, 1, 2]]), 1);
+        for change in [
+            json!({"field":"source", "value":{"ref":"construct:p@2","sequence":"ATGTAA","complete":true}}),
+            json!({"field":"source", "value":{"ref":"construct:p@1","sequence":"ATGTAA","complete":false}}),
+            json!({"field":"codon_positions", "value":[[0,1,6]]}),
+            json!({"field":"codon_positions", "value":[]}),
+            json!({"field":"codon_positions_complete", "value":false}),
+        ] {
+            let mut changed = view.clone();
+            changed[text(&change, "field")] = change["value"].clone();
+            assert!(codon_alignment(&changed, "M").is_none());
+        }
+        assert!(
+            codon_alignment(&json!({"sequence":"M","derivation_kind":"explicit"}), "M").is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_product_can_still_show_exact_uncropped_source_footprint() {
+        let mut view = aligned_view("ATGAATAAATAA", "", json!([]), 1);
+        view["translation"]["codon_start"] = json!(3);
+        view["translation"]["residue_start"] = json!(900);
+        let footprint = source_footprint(&view).unwrap();
+        assert_eq!(footprint.positions[0], [2, 3, 4]);
+        assert_eq!(aligned_bases(&footprint, 0), *b"GAA");
+        assert_eq!(text(&view, "sequence"), "");
+    }
+
+    #[test]
+    fn first_stop_definition_and_variant_keep_the_saved_policy() {
+        let definition = json!({"schema":2,"segments":[{"start":10,"end":40}],"strand":-1,"genetic_code":11,"codon_start":2,"initiation":"literal","stop_policy":"first_stop","residue_start":1,"residue_end":7});
+        assert_eq!(
+            ProteinEditor::new("construct:p@1", &definition)
+                .definition()
+                .unwrap(),
+            definition
+        );
+        let variant = cropped_variant(&definition, (1, 4));
+        assert_eq!(variant["stop_policy"], "first_stop");
+        assert_eq!(variant["schema"], 2);
+        assert_eq!(variant["residue_start"], 2);
+        assert_eq!(variant["residue_end"], 5);
+    }
+
+    #[test]
+    fn frame_drag_wraps_in_biological_direction_and_same_frame_is_a_noop() {
+        assert_eq!(dragged_frame(0, 18.), 1);
+        assert_eq!(dragged_frame(0, -18.), 2);
+        assert_eq!(dragged_frame(2, 18.), 0);
+        assert_eq!(dragged_frame(1, 54.), 1);
+        let drag = FrameDrag {
+            reference: "construct:protein@3".into(),
+            sha256: "pinned-digest".into(),
+            original: 1,
+            candidate: 1,
+            dragged_bases: 0,
+            origin_x: 0.,
+        };
+        assert!(finish_frame(drag.clone()).is_none());
+        assert_eq!(
+            finish_frame(FrameDrag {
+                candidate: 2,
+                ..drag
+            }),
+            Some(Action::Write(
+                "library.edit",
+                json!({"ref":"construct:protein@3","expected_sha256":"pinned-digest","patch":{"frame_offset":2}})
+            ))
+        );
+    }
+
+    #[test]
+    fn new_revision_cancels_a_drag_that_began_on_old_source() {
+        let mut viewer = Viewer {
+            reference: "construct:protein@1".into(),
+            frame_drag: Some(FrameDrag {
+                reference: "construct:protein@1".into(),
+                sha256: "old".into(),
+                original: 0,
+                candidate: 1,
+                dragged_bases: 1,
+                origin_x: 0.,
+            }),
+            ..Default::default()
+        };
+        viewer.accept("construct:protein@2", json!({"ref":"construct:protein@2","sequence":"M","length":1,"derivation_kind":"derived"}), "");
+        assert!(viewer.frame_drag.is_none());
+    }
+
+    #[test]
+    fn changing_selected_cds_updates_only_the_open_variant_form_and_preview() {
+        let mut view = aligned_view(
+            "ATGATGATGATGATGATGTAA",
+            "MMMMMM",
+            json!([
+                [0, 1, 2],
+                [3, 4, 5],
+                [6, 7, 8],
+                [9, 10, 11],
+                [12, 13, 14],
+                [15, 16, 17]
+            ]),
+            1,
+        );
+        view["ref"] = json!("construct:protein@1");
+        let detail = json!({"ref":"construct:protein@1","sha256":"source-digest"});
+        let mut viewer = Viewer::default();
+        viewer.accept("construct:protein@1", view.clone(), "");
+        viewer.begin_definition(&detail, view["translation"].clone(), false);
+        viewer.editor.as_mut().unwrap().alt_name = "Chosen variant name".into();
+        let first = Selection {
+            label: "CDS A".into(),
+            segments: vec![(0, 2)],
+            ..Default::default()
+        };
+        let second = Selection {
+            label: "CDS B".into(),
+            segments: vec![(3, 6)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            viewer.select_variant_span(&detail, first),
+            Some(Action::Preview(_))
+        ));
+        let first_request = viewer.editor.as_ref().unwrap().requested.clone();
+        assert!(matches!(
+            viewer.select_variant_span(&detail, second),
+            Some(Action::Preview(_))
+        ));
+        let editor = viewer.editor.as_ref().unwrap();
+        assert_eq!(editor.first_residue, 4);
+        assert_eq!(editor.last_residue, "6");
+        assert_eq!(editor.alt_name, "Chosen variant name");
+        assert_ne!(editor.requested, first_request);
+        assert_eq!(viewer.focus_residue, Some(3));
+        assert!(selected_residue(viewer.selection.as_ref(), 4));
+        assert!(!selected_residue(viewer.selection.as_ref(), 0));
+        assert_eq!(viewer.view, view);
+    }
+
+    #[test]
+    fn saved_frame_refreshes_variant_definition_and_rejects_old_preview() {
+        let mut old_view = aligned_view(
+            "ATGAATAAATAA",
+            "MNK",
+            json!([[0, 1, 2], [3, 4, 5], [6, 7, 8]]),
+            1,
+        );
+        old_view["ref"] = json!("construct:protein@1");
+        let mut viewer = Viewer::default();
+        viewer.accept("construct:protein@1", old_view.clone(), "");
+        let detail = json!({"ref":"construct:protein@1","sha256":"old-digest"});
+        viewer.begin_definition(&detail, old_view["translation"].clone(), false);
+        let editor = viewer.editor.as_mut().unwrap();
+        editor.alt_name = "Keep this variant name".into();
+        let old_params = editor.requested.clone();
+        editor.preview = json!({"available":true,"sequence":"MNK"});
+        editor.preview_for = old_params.clone();
+        viewer.write_received(&json!({"changed_refs":[{"before_ref":"construct:protein@1","after_ref":"construct:protein@2"}]}), &json!({"ref":"construct:protein@1","patch":{"frame_offset":2}}));
+        assert!(viewer.editor.as_ref().unwrap().preview.is_null());
+        let mut next = aligned_view("ATGAATAAATAA", "E", json!([[2, 3, 4]]), 1);
+        next["ref"] = json!("construct:protein@2");
+        next["translation"]["schema"] = json!(2);
+        next["translation"]["codon_start"] = json!(3);
+        next["translation"]["initiation"] = json!("literal");
+        next["translation"]["stop_policy"] = json!("first_stop");
+        viewer.accept("construct:protein@2", next.clone(), "");
+        viewer.received_preview(&old_params, json!({"available":true,"sequence":"MNK"}));
+        let editor = viewer.editor.as_ref().unwrap();
+        assert_eq!(editor.definition().unwrap(), next["translation"]);
+        assert_eq!(editor.alt_name, "Keep this variant name");
+        assert!(editor.preview.is_null());
+        assert!(viewer.pending_preview.is_some());
+        assert!(viewer.variant_open);
     }
 }

@@ -115,9 +115,14 @@ source, **Sequence / identity**, clickable **Relationships**, **Attachments** an
 **Record JSON**. Project briefs retain pinned members and roles. Incomplete purpose
 scaffolds and unresolved protein candidates remain visible.
 
+Project hierarchies open collapsed, including when returning to a cached project.
+**Expand all**, beside the modalities dropdown, switches to **Collapse all** as
+soon as any parent is expanded. Derived proteins are indented under their DNA/RNA
+parent; standalone proteins remain independent entries.
+
 **Sequence / identity** is a native vector viewer. Circular plasmids open as an
 annotated ring; **Auto** zoom changes to a linear map and then individual bases,
-complementary bases and six translation frames. **Circular**, **Linear** and
+complementary bases and one selectable translation track. **Circular**, **Linear** and
 **Fit** provide explicit controls. Scroll over the map to zoom, right-drag to pan
 the linear view, and left-drag to select a range. Click an annotation or detected
 ORF to inspect its strand and ranges. Imported annotations carry historical,
@@ -131,13 +136,28 @@ its parent. The definition stores ordered nucleotide ranges, strand, genetic cod
 codon start and an optional amino-acid crop; the protein sequence is computed by
 the head. UI positions are 1-based inclusive; the backend stores zero-based
 half-open coordinates and preserves biological traversal order across joins.
-**New variant…** copies a derived definition for a separately named range variant,
-such as a tag-removed product. **Edit definition** changes the parent or ranges
-of the existing product. Preview must match the current definition before saving.
+For derived proteins, identity, aliases and provenance appear first in a dropdown.
+**New variant…** opens its form immediately below the button, followed by the
+CDS viewer and annotation selector. Selecting another annotated residue range
+immediately updates the form's crop and invalidates any older preview. The form
+creates a separately named product, such as a tag-removed variant. Closing it
+hides these selection controls. Run history follows the sequence workspace.
+**Edit definition** changes the parent or ranges of the existing product.
+Preview must match the current definition before saving.
 Invalid translations show diagnostics and cannot be used as stale peptides.
 Parent edits update dependent product revisions and project references together;
 previous revisions and run inputs remain unchanged. Creation and definition edits
 participate in the same Undo/Redo history as other library writes.
+
+Nucleotides and amino acids use colored letter blocks. A derived protein's single
+translation row starts aligned to its current peptide, with each amino-acid block
+spanning its exact three source bases, including reverse strands and joined
+ranges. Dragging that row left/right changes the **current protein frame** on
+release and saves an undoable revision. Strand, coding footprint and residue crop
+stay fixed; the new frame translates complete codons to its first in-frame stop.
+An unchanged phase does not write. Shift-drag selects a residue range for the
+variant form; standalone proteins use ordinary residue selection and have no
+invented nucleotide source or frame control. Historical revisions remain read-only.
 
 **+ Standalone protein** creates an independent protein in the current project
 from a literal amino-acid sequence. It uses the same construct/protein kind as a

@@ -8,7 +8,7 @@ pub(super) struct Explorer {
     pub selected: String,
     pub detail: Value,
     pub(super) sequence: ui_sequence::Viewer,
-    collapsed: BTreeSet<String>,
+    expanded: BTreeSet<String>,
     pub error: String,
     pub detail_error: String,
     query: String,
@@ -47,11 +47,6 @@ impl Explorer {
     pub fn restore(extra: &BTreeMap<String, Value>) -> Self {
         let value = extra.get("library_explorer").unwrap_or(&Value::Null);
         Self {
-            collapsed: rows(value, "collapsed")
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect(),
             query: text(value, "query").into(),
             molecule: text(value, "molecule").into(),
             review_only: value["review_only"].as_bool().unwrap_or(false),
@@ -61,7 +56,24 @@ impl Explorer {
 
     pub fn preferences(&self) -> Value {
         json!({"selected":self.selected,"query":self.query,"kind":self.kind,
-            "molecule":self.molecule,"project":self.project,"review_only":self.review_only,"collapsed":self.collapsed})
+            "molecule":self.molecule,"project":self.project,"review_only":self.review_only})
+    }
+
+    fn open_project(&mut self, reference: &str) {
+        self.project = reference.into();
+        self.expanded.clear();
+        self.query.clear();
+        self.molecule.clear();
+        self.review_only = false;
+    }
+
+    fn toggle_all_parents(&mut self) {
+        let parents = expandable_parents(&self.records);
+        if parents.iter().any(|parent| self.expanded.contains(parent)) {
+            self.expanded.clear();
+        } else {
+            self.expanded.extend(parents);
+        }
     }
 
     fn visible(&self, record: &Value) -> bool {
@@ -145,15 +157,38 @@ fn parent_reference(record: &Value) -> &str {
     }
 }
 
+fn nucleotide_parent(record: &Value) -> bool {
+    text(record, "kind") == "construct" && matches!(text(record, "molecule_type"), "dna" | "rna")
+}
+
+fn expandable_parents(records: &[Value]) -> BTreeSet<String> {
+    let linked: BTreeSet<_> = records
+        .iter()
+        .filter(|record| text(record, "molecule_type") == "protein")
+        .map(|record| {
+            parent_reference(record)
+                .split('@')
+                .next()
+                .unwrap_or_default()
+        })
+        .collect();
+    records
+        .iter()
+        .filter(|record| nucleotide_parent(record))
+        .map(|record| text(record, "ref").split('@').next().unwrap_or_default())
+        .filter(|family| linked.contains(family))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn hierarchy(
     records: &[Value],
-    collapsed: &BTreeSet<String>,
-    filtering: bool,
+    expanded: &BTreeSet<String>,
     visible: impl Fn(&Value) -> bool,
 ) -> Vec<(Value, usize, usize)> {
     let parents: BTreeSet<_> = records
         .iter()
-        .filter(|r| text(r, "molecular_form") == "plasmid")
+        .filter(|r| nucleotide_parent(r))
         .map(|r| {
             text(r, "ref")
                 .split('@')
@@ -191,7 +226,7 @@ fn hierarchy(
             continue;
         }
         result.push((record.clone(), 0, child.len()));
-        if filtering || !collapsed.contains(family) {
+        if expanded.contains(family) {
             for child in matches {
                 result.push(((*child).clone(), 1, 0));
             }
@@ -325,6 +360,7 @@ impl Workbench {
         self.sidebar_tab = 2;
         self.library.archive = true;
         self.library.project.clear();
+        self.library.expanded.clear();
         self.library.selected.clear();
         self.library.detail = Value::Null;
         self.library.query.clear();
@@ -339,6 +375,7 @@ impl Workbench {
     fn library_projects(&mut self) {
         self.library.archive = false;
         self.library.project.clear();
+        self.library.expanded.clear();
         self.library.selected.clear();
         self.library.detail = Value::Null;
         self.library.edit = None;
@@ -522,19 +559,6 @@ impl Workbench {
         listing: library_cache::Listing,
     ) {
         self.library.records = listing.records;
-        if let Some(record) = self
-            .library
-            .records
-            .iter()
-            .find(|r| text(r, "ref") == self.library.selected)
-        {
-            self.library.collapsed.remove(
-                parent_reference(record)
-                    .split('@')
-                    .next()
-                    .unwrap_or_default(),
-            );
-        }
         self.library.projects = listing.projects;
         self.library
             .sequence
@@ -712,7 +736,9 @@ impl Workbench {
                     .split('@')
                     .next()
                     .unwrap_or_default();
-                self.library.collapsed.remove(parent);
+                if !parent.is_empty() {
+                    self.library.expanded.insert(parent.into());
+                }
                 if text(record, "molecular_form") == "plasmid"
                     || text(record, "molecule_type") == "protein"
                 {
@@ -922,7 +948,7 @@ impl Workbench {
                 .desired_width(f32::INFINITY),
         );
         if !projects {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("library-molecule")
                     .width(108.)
                     .selected_text(if self.library.molecule.is_empty() {
@@ -950,6 +976,25 @@ impl Workbench {
                             );
                         }
                     });
+                if !self.library.archive {
+                    let parents = expandable_parents(&self.library.records);
+                    let any_expanded = parents
+                        .iter()
+                        .any(|parent| self.library.expanded.contains(parent));
+                    if ui
+                        .add_enabled(
+                            !parents.is_empty(),
+                            egui::Button::new(if any_expanded {
+                                "Collapse all"
+                            } else {
+                                "Expand all"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.library.toggle_all_parents();
+                    }
+                }
                 ui.checkbox(&mut self.library.review_only, "Needs review");
             });
         }
@@ -997,12 +1042,9 @@ impl Workbench {
                 .map(|r| (r, 0, 0))
                 .collect()
         } else {
-            hierarchy(
-                &self.library.records,
-                &self.library.collapsed,
-                !self.library.query.is_empty() || !self.library.molecule.is_empty(),
-                |r| self.library.visible(r),
-            )
+            hierarchy(&self.library.records, &self.library.expanded, |r| {
+                self.library.visible(r)
+            })
         };
         ui.weak(format!(
             "{} {}",
@@ -1016,6 +1058,10 @@ impl Workbench {
             let reference = text(record, "ref");
             let is_selected = self.library.selected == reference;
             egui::Frame::NONE
+                .outer_margin(egui::Margin {
+                    left: (*depth as i8).saturating_mul(18),
+                    ..Default::default()
+                })
                 .fill(if is_selected {
                     Color32::from_rgb(53, 73, 87)
                 } else {
@@ -1025,37 +1071,19 @@ impl Workbench {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        if *depth > 0 {
-                            let (rect, _) =
-                                ui.allocate_exact_size(Vec2::new(16., 24.), egui::Sense::hover());
-                            ui.painter().line_segment(
-                                [
-                                    rect.left_top() + Vec2::new(5., 0.),
-                                    rect.left_top() + Vec2::new(5., 12.),
-                                ],
-                                egui::Stroke::new(1., Color32::GRAY),
-                            );
-                            ui.painter().line_segment(
-                                [
-                                    rect.left_top() + Vec2::new(5., 12.),
-                                    rect.right_top() + Vec2::new(0., 12.),
-                                ],
-                                egui::Stroke::new(1., Color32::GRAY),
-                            );
-                        }
                         if *child_count > 0 {
                             let family =
                                 reference.split('@').next().unwrap_or(reference).to_owned();
-                            let collapsed = self.library.collapsed.contains(&family);
+                            let expanded = self.library.expanded.contains(&family);
                             if ui
-                                .small_button(if collapsed { "+" } else { "-" })
+                                .small_button(if expanded { "-" } else { "+" })
                                 .on_hover_text("Show or hide protein products")
                                 .clicked()
                             {
-                                if collapsed {
-                                    self.library.collapsed.remove(&family);
+                                if expanded {
+                                    self.library.expanded.remove(&family);
                                 } else {
-                                    self.library.collapsed.insert(family);
+                                    self.library.expanded.insert(family);
                                 }
                             }
                         }
@@ -1161,10 +1189,7 @@ impl Workbench {
         }
         if let Some((mut reference, is_project)) = selected {
             if is_project && !self.library.archive {
-                self.library.project = reference.clone();
-                self.library.query.clear();
-                self.library.molecule.clear();
-                self.library.review_only = false;
+                self.library.open_project(&reference);
                 self.library_navigate();
                 reference = self.library.project.clone();
             }
@@ -1237,11 +1262,9 @@ impl Workbench {
                         self.log(self.library.added.clone());
                         self.persist();
                     }
-                    if ui.button(format!("Open Inputs ({})", self.state.inputs.len())).clicked() { self.sidebar_tab = 0; }
                     if let Err(reason) = input { ui.colored_label(AMBER, reason); }
                 });
                 if !self.library.added.is_empty() { ui.colored_label(GREEN, &self.library.added); }
-                ui.weak("Prepare prediction adds this revision to Inputs, where you choose models and submit.");
             }
             ui.add_space(5.);
             ui.horizontal_wrapped(|ui| {
@@ -1379,7 +1402,7 @@ impl Workbench {
         }
         ui.horizontal_wrapped(|ui| {
             ui.monospace(text(detail, "ref"));
-            if ui.small_button("Copy ref").clicked() {
+            if ui.button("Copy ref").clicked() {
                 ctx.copy_text(text(detail, "ref").into());
             }
             let mut revision = text(detail, "ref").to_owned();
@@ -1398,13 +1421,6 @@ impl Workbench {
                 self.library_select(text(detail, "latest_ref"));
             }
         });
-        if !editing {
-            ui.weak(if project {
-                "Double-click the project name to edit."
-            } else {
-                "Double-click the alt name to edit."
-            });
-        }
     }
 
     fn library_edit_sequence(&mut self, ui: &mut egui::Ui) {
@@ -1504,18 +1520,6 @@ impl Workbench {
     fn library_identity(&mut self, ui: &mut egui::Ui, detail: &Value, _ctx: &egui::Context) {
         let record = &detail["record"];
         let identity = &record["identity"];
-        let actions = self
-            .library
-            .sequence
-            .show(ui, detail, self.library_writing());
-        for action in actions {
-            self.library_sequence_action(action);
-        }
-        let sequence = text(&self.library.sequence.view, "sequence");
-        if !sequence.is_empty() {
-            egui::CollapsingHeader::new("Raw sequence / numbered positions")
-                .show(ui, |ui| readonly(ui, &numbered_sequence(sequence)));
-        }
         egui::CollapsingHeader::new("Identity, aliases and provenance").show(ui, |ui| {
             Self::section(ui, "IDENTITY METADATA");
             let mut metadata = identity.clone();
@@ -1547,6 +1551,18 @@ impl Workbench {
                 &serde_json::to_string_pretty(&record["provenance"]).unwrap_or_default(),
             );
         });
+        let actions =
+            self.library
+                .sequence
+                .show(ui, detail, self.library_writing(), &self.library.records);
+        for action in actions {
+            self.library_sequence_action(action);
+        }
+        let sequence = text(&self.library.sequence.view, "sequence");
+        if !sequence.is_empty() && text(identity, "molecule_type") != "protein" {
+            egui::CollapsingHeader::new("Raw sequence / numbered positions")
+                .show(ui, |ui| readonly(ui, &numbered_sequence(sequence)));
+        }
     }
 
     fn library_relations(&mut self, ui: &mut egui::Ui, detail: &Value) {
@@ -2210,16 +2226,113 @@ mod tests {
         let parent = json!({"ref":"construct:parent@2","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"});
         let child = json!({"ref":"construct:child@1","kind":"construct","molecule_type":"protein","parent_ref":"construct:parent@1"});
         let list = vec![parent.clone(), child.clone()];
-        let collapsed = BTreeSet::from(["construct:parent".into()]);
-        let filtered = hierarchy(&list, &collapsed, true, |r| {
-            text(r, "molecule_type") == "protein"
-        });
+        let expanded = BTreeSet::from(["construct:parent".into()]);
+        let filtered = hierarchy(&list, &expanded, |r| text(r, "molecule_type") == "protein");
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].1, 0);
         assert_eq!(filtered[1].1, 1);
-        assert_eq!(hierarchy(&list, &collapsed, false, |_| true).len(), 1);
-        let orphan = hierarchy(&[child], &collapsed, false, |_| true);
+        let collapsed = BTreeSet::new();
+        assert_eq!(hierarchy(&list, &collapsed, |_| true).len(), 1);
+        let filtered_collapsed =
+            hierarchy(&list, &collapsed, |r| text(r, "molecule_type") == "protein");
+        assert_eq!(filtered_collapsed.len(), 1);
+        assert_eq!(text(&filtered_collapsed[0].0, "ref"), "construct:parent@2");
+        let orphan = hierarchy(&[child], &collapsed, |_| true);
         assert_eq!(orphan.len(), 1);
         assert_eq!(orphan[0].1, 0);
+    }
+
+    #[test]
+    fn reopening_a_project_collapses_even_cached_hierarchy_and_ignores_saved_expansion() {
+        let preferences = BTreeMap::from([(
+            "library_explorer".into(),
+            json!({"expanded":["construct:parent"], "query":"old search"}),
+        )]);
+        let mut explorer = Explorer::restore(&preferences);
+        explorer.records = vec![
+            json!({"ref":"construct:parent@2","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"}),
+            json!({"ref":"construct:child@1","kind":"construct","molecule_type":"protein","parent_ref":"construct:parent@1"}),
+        ];
+        assert!(explorer.expanded.is_empty());
+        explorer.open_project("project:first@1");
+        explorer.toggle_all_parents();
+        assert_eq!(
+            hierarchy(&explorer.records, &explorer.expanded, |_| true).len(),
+            2
+        );
+        explorer.open_project("project:first@1");
+        assert_eq!(
+            hierarchy(&explorer.records, &explorer.expanded, |_| true).len(),
+            1
+        );
+        assert!(explorer.query.is_empty());
+        assert!(explorer.preferences().get("expanded").is_none());
+    }
+
+    #[test]
+    fn toggle_all_collapses_partial_expansion_and_expands_only_linked_parents() {
+        let records = vec![
+            json!({"ref":"construct:first@2","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"}),
+            json!({"ref":"construct:first-child@1","kind":"construct","molecule_type":"protein","parent_ref":"construct:first@1"}),
+            json!({"ref":"construct:second@1","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"}),
+            json!({"ref":"construct:second-child@1","kind":"construct","molecule_type":"protein","encoded_by_ref":"construct:second@1"}),
+            json!({"ref":"construct:empty@1","kind":"construct","molecule_type":"dna","molecular_form":"plasmid"}),
+            json!({"ref":"construct:standalone@1","kind":"construct","molecule_type":"protein"}),
+        ];
+        let parents = expandable_parents(&records);
+        assert_eq!(
+            parents,
+            BTreeSet::from(["construct:first".into(), "construct:second".into()])
+        );
+        let mut explorer = Explorer {
+            records,
+            expanded: BTreeSet::from(["construct:first".into()]),
+            ..Default::default()
+        };
+        explorer.toggle_all_parents();
+        assert!(explorer.expanded.is_empty());
+        explorer.toggle_all_parents();
+        assert_eq!(explorer.expanded, parents);
+        assert_eq!(
+            hierarchy(&explorer.records, &explorer.expanded, |_| true).len(),
+            6
+        );
+        explorer.open_project("project:another@1");
+        assert!(explorer.expanded.is_empty());
+    }
+
+    #[test]
+    fn plain_dna_and_rna_parents_keep_their_children_collapsed_until_expanded() {
+        for molecule in ["dna", "rna"] {
+            let parent =
+                json!({"ref":"construct:source@3","kind":"construct","molecule_type":molecule});
+            let child = json!({"ref":"construct:product@2","kind":"construct","molecule_type":"protein","parent_ref":"construct:source@2","derivation_kind":"derived"});
+            let standalone = json!({"ref":"construct:standalone@1","kind":"construct","molecule_type":"protein"});
+            let mut explorer = Explorer {
+                records: vec![parent, child, standalone],
+                ..Default::default()
+            };
+            explorer.open_project("project:sequences@1");
+            assert_eq!(
+                expandable_parents(&explorer.records),
+                BTreeSet::from(["construct:source".into()])
+            );
+            let collapsed = hierarchy(&explorer.records, &explorer.expanded, |_| true);
+            assert_eq!(collapsed.len(), 2);
+            assert_eq!(collapsed[0].2, 1);
+            assert_eq!(text(&collapsed[1].0, "ref"), "construct:standalone@1");
+            explorer.toggle_all_parents();
+            let expanded = hierarchy(&explorer.records, &explorer.expanded, |_| true);
+            assert_eq!(expanded.len(), 3);
+            assert_eq!(text(&expanded[1].0, "ref"), "construct:product@2");
+            assert_eq!(expanded[1].1, 1);
+            let filtered = hierarchy(&explorer.records, &explorer.expanded, |record| {
+                text(record, "ref") == "construct:product@2"
+            });
+            assert_eq!(filtered.len(), 2);
+            assert_eq!(text(&filtered[0].0, "ref"), "construct:source@3");
+            explorer.open_project("project:sequences@1");
+            assert!(explorer.expanded.is_empty());
+        }
     }
 }

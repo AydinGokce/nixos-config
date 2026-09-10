@@ -45,11 +45,11 @@ The installer may request your Ubuntu password when creating `/nix`.
 
 ## 3. Copy the source archive and build
 
-Copy `bio-workbench-rust-0.3.0-plasmid-products-source.tar.gz` from the existing workstation to
+Copy `bio-workbench-rust-0.3.0-sequence-workbench-source.tar.gz` from the existing workstation to
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/plasmid-derived-proteins-20260910/bio-workbench-rust-0.3.0-plasmid-products-source.tar.gz
+/home/aydin/bio-runs/sequence-workbench-polish-20260910/bio-workbench-rust-0.3.0-sequence-workbench-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -57,7 +57,7 @@ folder name:
 
 ```sh
 mkdir -p ~/bio-workbench-rust
-tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/bio-workbench-rust-0.3.0-plasmid-products-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
+tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/bio-workbench-rust-0.3.0-sequence-workbench-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
 cd ~/bio-workbench-rust
 nix --extra-experimental-features 'nix-command flakes' build path:.
 ./result/bin/bio-workbench
@@ -68,6 +68,9 @@ editable Alt names and sequences, reversible archiving, undo/redo, protein run
 history, pinned input selection and verified original-file downloads. Project and
 construct lists are cached locally for immediate return visits and refreshed in
 the background.
+The sequence workspace includes collapsed parent/product hierarchies, aligned
+base and amino-acid blocks, saved translation-frame edits and inline variant
+creation with annotation selection.
 It also includes draggable viewer tabs, independent duplicate tabs, right-click
 Duplicate tab / Split down / Split right, persistent splits, working quick controls
 and the console resize fix. To update an existing installation, close the app,
