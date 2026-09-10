@@ -234,7 +234,8 @@ class JobProgress:
         downstream = native_phase(''.join(lines[after:]), generic_msa=False)
         if downstream and self.native_modified > event['timestamp_ns'] and event['state'] != 'failed':
             return downstream[0], {'message': downstream[1], 'eta': telemetry.unknown()}
-        phase = ('private MSA ' if event['scope'] == 'msa' else '') + event['stage'].replace('_', ' ')
+        stage = 'waiting for capacity' if event['stage'] == 'waiting_capacity' else event['stage'].replace('_', ' ')
+        phase = ('private MSA ' if event['scope'] == 'msa' else '') + stage
         return phase, telemetry.view(event, history)
 
     def forward(self):

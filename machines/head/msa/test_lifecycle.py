@@ -16,6 +16,7 @@ from unittest.mock import patch
 import lifecycle
 import session
 import session_client as client
+import startup
 
 
 def silent(*args):
@@ -202,6 +203,83 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(provider.call_count,1)
         self.assertFalse((self.sessions/'active.json').exists())
         self.assertEqual(session.load(state/'closed.json')['proof'],good)
+
+    def unallocated(self):
+        (self.tools/'msa/startup.py').write_text('pinned startup fixture')
+        self.start()
+        state, intent = client.active(self.sessions)
+        live = self.units[intent['unit']]
+        with patch.object(client, 'unit_state', side_effect=self.unit):
+            client.observe_session(self.sessions)
+        run = self.root/'msa-20260910-230000-1'; run.mkdir()
+        binding = session.load(state/'observed-start.json')
+        with patch.object(startup, '_running_context', return_value=(state, intent, live, binding)):
+            startup.begin(state, run)
+            startup.finish(state, 4)
+        live.update(ActiveState='failed', MainPID='0', ControlPID='0')
+        return state, intent, live
+
+    def test_proven_no_allocation_recovers_without_provider_or_resource_mutation(self):
+        state, intent, _ = self.unallocated()
+        with patch.object(client, 'unit_state', side_effect=self.unit), \
+             patch.object(client, 'provider_check') as provider:
+            observed = client.observe_session(self.sessions)
+            self.assertEqual(observed['state'], 'terminal')
+            self.assertEqual(observed['code'], 'capacity_timeout')
+            self.assertIn('no worker was rented', observed['message'])
+            with lifecycle.registration_lock(self.sessions, time.monotonic()+5):
+                client._retire_locked(self.sessions, observed)
+        provider.assert_not_called()
+        self.assertFalse((self.sessions/'active.json').exists())
+        self.assertEqual(session.load(state/'closed.json')['proof']['reason'], 'capacity_timeout')
+        self.assertEqual(len(self.run_calls), 1)
+
+    def test_no_allocation_recovery_refuses_marker_published_after_observation(self):
+        state, _, _ = self.unallocated()
+        with patch.object(client, 'unit_state', side_effect=self.unit):
+            observed = client.observe_session(self.sessions)
+            session.atomic(state/'closed.json', {'earlier_receipt': True})
+            session.atomic(state/'allocation-started.json', {'ambiguous_allocation': True})
+            with self.assertRaisesRegex(ValueError, 'Allocation may have started'):
+                client._retire_locked(self.sessions, observed)
+        self.assertTrue((self.sessions/'active.json').exists())
+
+    def test_no_allocation_receipt_must_match_exact_invocation(self):
+        state, _, live = self.unallocated()
+        live['InvocationID'] = 'c'*32
+        with patch.object(client, 'unit_state', side_effect=self.unit), self.assertRaises(lifecycle.SessionError):
+            client.observe_session(self.sessions)
+        self.assertTrue((self.sessions/'active.json').exists())
+
+    def test_explicit_stop_retires_proven_preallocation_failure(self):
+        state, intent, _ = self.unallocated()
+        with patch.object(client, 'unit_state', side_effect=self.unit), \
+             patch.object(client.subprocess, 'run') as run:
+            result = client.stop(self.sessions)
+        run.assert_not_called()
+        self.assertEqual(result, {'status': 'closed', 'session_id': intent['session_id'], 'no_allocation': True})
+        self.assertTrue((state/'closed.json').exists())
+
+    def test_worker_status_reports_proven_failure_without_stale_startup_eta(self):
+        self.unallocated()
+        with patch.object(client, 'unit_state', side_effect=self.unit):
+            value = client.worker_status(self.sessions)
+        self.assertEqual(value['state'], 'failed')
+        self.assertEqual(value['message'], 'Capacity selection ended; no worker was rented')
+        self.assertFalse(value['can_shutdown'])
+        self.assertIsNone(value['startup_progress'])
+        self.assertIn('safely retry', value['control_reason'])
+
+    def test_joined_capacity_timeout_keeps_reason_and_does_not_reallocate(self):
+        values = iter([{'state': 'starting', 'session_id': 'a'*32, 'message': 'waiting'},
+                       {'state': 'terminal', 'session_id': 'a'*32, 'code': 'capacity_timeout',
+                        'message': 'No capacity became available; later requests can retry'}])
+        with patch.object(client, '_start_locked') as start, self.assertRaises(lifecycle.SessionError) as caught:
+            lifecycle.ensure(self.sessions, time.monotonic()+10, observe=lambda: next(values),
+                start=start, retire=lambda _: None, progress=silent, sleep=lambda _: None)
+        self.assertEqual(caught.exception.code, 'capacity_timeout')
+        self.assertIn('later requests can retry', str(caught.exception))
+        start.assert_not_called()
 
     def test_closed_receipt_alone_cannot_bypass_new_provider_check(self):
         state,_,_=self.registered()

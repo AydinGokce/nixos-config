@@ -86,6 +86,24 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(result['progress']['eta']['seconds'], 90)
         self.assertNotIn('startup_progress', result)
 
+    def test_capacity_wait_snapshot_remains_starting_without_controls_or_countdown(self):
+        from workbench.test_worker_progress import event
+        snapshot = event(1000, stage='waiting_capacity', stage_id='capacity-wait',
+                         message='Waiting for capacity; retry window remaining 30:00',
+                         eta={'state': 'unknown', 'scope': 'stage',
+                              'basis': 'Worker availability has no reliable estimate'})
+        value = {'schema': 1, 'state': 'starting', 'checked_epoch': 1000, 'startup_progress': snapshot}
+        result = worker_api.normalize_status(value, current=1005)
+        self.assertEqual(result['state'], 'starting')
+        self.assertEqual(result['progress']['stage'], 'waiting_capacity')
+        self.assertEqual(result['progress']['eta']['state'], 'unknown')
+        self.assertFalse(result['stale'])
+        self.assertFalse(result['progress']['stale'])
+        self.assertIsNone(result['target'])
+        self.assertIsNone(result['shutdown_epoch'])
+        self.assertFalse(result['controls']['extend']['enabled'])
+        self.assertFalse(result['controls']['shutdown']['enabled'])
+
     def test_status_uses_validated_bounded_history_without_exposing_raw_events(self):
         from workbench.test_worker_progress import event
         samples = [event(996 + second, stage='runtime_download', completed=second * 10,

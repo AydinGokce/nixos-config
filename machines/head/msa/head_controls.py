@@ -109,8 +109,17 @@ def worker_status(root, deadline=None):
         value['startup_history'] = history
         live = client.unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
         if launch is None:
-            session.require(live.get('Description') == 'Managed private MSA session '+intent['session_id'], 'Startup unit identity changed')
-            if client._terminal_unit(live): value.update(state='failed', control_reason='Shared worker startup ended')
+            if live.get('LoadState') != 'not-found':
+                session.require(live.get('Description') == 'Managed private MSA session '+intent['session_id'], 'Startup unit identity changed')
+            if client._terminal_unit(live):
+                value.update(state='failed', control_reason='Shared worker startup ended; allocation records require recovery',
+                             startup_progress=None, startup_history=[])
+                if lifecycle.document(state/'no-allocation.json', optional=True) is not None:
+                    import startup
+                    proof = startup.validate_no_allocation(state, intent, live)
+                    value.update(message=('Capacity selection ended; no worker was rented' if proof['reason'] == 'capacity_timeout'
+                                          else 'Startup ended before any worker allocation'),
+                                 control_reason='A new request can safely retry this pre-allocation failure')
             return value
         value.update(target(state, intent, launch))
         if live.get('LoadState') != 'not-found':

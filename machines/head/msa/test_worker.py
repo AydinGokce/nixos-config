@@ -5,7 +5,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +24,128 @@ def row(kind='CPU.360V.1440G', gb=1440, price=4.32, spot=1.728):
 
 def avail(*names):
     return [{'location_code': 'FIN-02', 'availabilities': list(names)}]
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class RoundsAPI:
+    def __init__(self, rounds):
+        self.rounds = rounds
+        self.calls = []
+
+    def request(self, method, endpoint):
+        index = len(self.calls)
+        self.calls.append((method, endpoint))
+        if method != 'GET':
+            raise AssertionError('Mutation attempted')
+        return self.rounds[min(index // len(worker.ENDPOINTS), len(self.rounds)-1)][index % len(worker.ENDPOINTS)]
+
+
+class WaitingTests(unittest.TestCase):
+    def test_shortage_then_capacity_returns_one_choice_after_read_only_retry(self):
+        item = row()
+        api = RoundsAPI([([item], avail(), avail()), ([item], avail(), avail(item['instance_type']))])
+        clock = Clock()
+        shortages = []
+        selected = worker.wait_for_capacity(api, wait_seconds=90, poll_seconds=30,
+            clock=clock, sleep=clock.sleep, unavailable=lambda: shortages.append(clock()))
+        self.assertEqual(selected['instance_type'], item['instance_type'])
+        self.assertTrue(selected['spot'])
+        self.assertEqual(api.calls, [('GET', endpoint) for endpoint in worker.ENDPOINTS] * 2)
+        self.assertEqual(clock.sleeps, [30])
+        self.assertEqual(shortages, [0])
+
+    def test_deadline_does_not_start_an_attempt_at_or_after_expiry(self):
+        api = RoundsAPI([([row()], avail(), avail())])
+        clock = Clock()
+        with self.assertRaisesRegex(worker.Unavailable, '65-second capacity wait window'):
+            worker.wait_for_capacity(api, wait_seconds=65, poll_seconds=30, clock=clock, sleep=clock.sleep)
+        self.assertEqual(clock.sleeps, [30, 30, 5])
+        self.assertEqual(len(api.calls), 9)
+        self.assertEqual(clock(), 65)
+
+    def test_result_returning_after_deadline_is_not_accepted(self):
+        clock = Clock()
+        item = row()
+        class SlowAPI(RoundsAPI):
+            def request(self, method, endpoint):
+                clock.now += 11
+                return super().request(method, endpoint)
+        api = SlowAPI([([item], avail(item['instance_type']), avail())])
+        with self.assertRaises(worker.Unavailable):
+            worker.wait_for_capacity(api, wait_seconds=30, clock=clock, sleep=clock.sleep)
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(clock.sleeps, [])
+
+    def test_malformed_evidence_or_api_error_is_never_retried(self):
+        broken = RoundsAPI([([row()], [], avail())])
+        class APIError:
+            def __init__(self): self.calls = []
+            def request(self, method, endpoint):
+                self.calls.append((method, endpoint))
+                raise RuntimeError('PRIVATE_CREDENTIAL')
+        for api in (broken, APIError()):
+            clock = Clock()
+            with self.subTest(api=type(api).__name__), self.assertRaises(worker.Error) as context:
+                worker.wait_for_capacity(api, wait_seconds=90, clock=clock, sleep=clock.sleep)
+            self.assertNotIsInstance(context.exception, worker.Unavailable)
+            self.assertNotIn('PRIVATE_CREDENTIAL', str(context.exception))
+            self.assertLessEqual(len(api.calls), 3)
+            self.assertEqual(clock.sleeps, [])
+
+    def test_cancellation_stops_without_another_capacity_query(self):
+        api = RoundsAPI([([row()], avail(), avail())])
+        def cancel(seconds):
+            raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            worker.wait_for_capacity(api, wait_seconds=90, sleep=cancel)
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
+
+    def test_deadline_interrupts_inflight_io_and_restores_previous_handler(self):
+        previous = signal.getsignal(signal.SIGALRM)
+        class API:
+            calls = []
+            def request(self, method, endpoint):
+                self.calls.append((method, endpoint))
+                time.sleep(10)
+                raise AssertionError('Deadline failed to interrupt the provider request')
+        api = API()
+        started = time.monotonic()
+        with self.assertRaises(worker.Unavailable):
+            worker.wait_for_capacity(api, wait_seconds=.05)
+        self.assertLess(time.monotonic()-started, 2)
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0, 0))
+
+    def test_durations_require_finite_bounded_numbers_before_provider_access(self):
+        for wait, poll in [(-1, 30), (7201, 30), ('nan', 30), ('inf', 30), (True, 30),
+                           (30, 0), (30, .5), (30, 301), (30, 'nan'), (30, 'inf'), (30, True)]:
+            api = RoundsAPI([([row()], avail(), avail())])
+            with self.subTest(wait=wait, poll=poll), self.assertRaises(worker.Error):
+                worker.wait_for_capacity(api, wait_seconds=wait, poll_seconds=poll)
+            self.assertEqual(api.calls, [])
+
+    def test_zero_wait_preserves_one_check_without_retry_or_progress(self):
+        api = RoundsAPI([([row()], avail(), avail())])
+        clock = Clock()
+        with self.assertRaisesRegex(worker.Unavailable, 'No available FIN-02'):
+            worker.wait_for_capacity(api, clock=clock, sleep=clock.sleep,
+                unavailable=lambda: self.fail('single check must not emit waiting progress'))
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(clock.sleeps, [])
 
 
 class SelectionTests(unittest.TestCase):
@@ -116,6 +242,9 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/'dc-budget.py').write_text(body)
+            (root/'py').mkdir()
+            (root/'py/worker_progress.py').write_bytes(
+                (Path(__file__).resolve().parents[3]/'modules/bio/py/worker_progress.py').read_bytes())
             stdout, stderr = io.StringIO(), io.StringIO()
             env = {'DATACRUNCH_CLIENT_ID': 'fixture', 'DATACRUNCH_CLIENT_SECRET': 'fixture'} if credentials else {}
             with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -154,6 +283,66 @@ class CLITests(unittest.TestCase):
             self.assertEqual(status, 2)
             self.assertEqual(out, '')
             self.assertNotIn('PRIVATE_CREDENTIAL', err)
+
+    def test_waiting_cli_progress_has_unknown_availability_eta_and_no_extra_stdout(self):
+        body = ('class API:\n def request(self,method,path):\n  assert method=="GET"\n'
+                +'  return '+repr([row()])+' if path.startswith("/instance-types") else '+repr(avail())+'\n')
+        status, out, err = self.invoke(body, extra=['--wait-seconds', '.05'])
+        self.assertEqual(status, 4)
+        self.assertEqual(out, '')
+        events = [json.loads(line.removeprefix('BIO_WORKER_STAGE ')) for line in err.splitlines()
+                  if line.startswith('BIO_WORKER_STAGE ')]
+        self.assertGreaterEqual(len(events), 3)
+        self.assertEqual({event['stage'] for event in events}, {'waiting_capacity'})
+        self.assertEqual(events[0]['state'], 'running')
+        self.assertEqual(events[-1]['state'], 'failed')
+        self.assertEqual(len({event['stage_id'] for event in events}), 1)
+        self.assertTrue(all(event['eta']['state'] == 'unknown' for event in events))
+        self.assertTrue(all('seconds' not in event['eta'] and 'completed' not in event for event in events))
+        self.assertIn('left in the retry window', events[0]['message'])
+        self.assertIn('0.05-second capacity wait window', err)
+
+    def test_invalid_wait_configuration_does_not_import_provider_helper(self):
+        for extra in [['--wait-seconds', 'nan'], ['--wait-seconds', '7201'], ['--poll-seconds', '0']]:
+            status, out, err = self.invoke('raise AssertionError("PRIVATE_CREDENTIAL")\n', extra=extra)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, '')
+            self.assertNotIn('PRIVATE_CREDENTIAL', err)
+
+    def test_sigterm_during_wait_exits_without_another_query_or_json_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'py').mkdir()
+            (root/'py/worker_progress.py').write_bytes(
+                (Path(__file__).resolve().parents[3]/'modules/bio/py/worker_progress.py').read_bytes())
+            (root/'dc-budget.py').write_text('from pathlib import Path\nclass API:\n'
+                +' def request(self,method,path):\n  assert method=="GET"\n'
+                +'  with Path('+repr(str(root/'calls'))+').open("a") as stream: stream.write(path+"\\n")\n'
+                +'  return '+repr([row()])+' if path.startswith("/instance-types") else '+repr(avail())+'\n')
+            child = subprocess.Popen([sys.executable, str(Path(worker.__file__).resolve()),
+                'select', '--tools-root', str(root), '--wait-seconds', '90'],
+                env={**os.environ, 'DATACRUNCH_CLIENT_ID': 'fixture', 'DATACRUNCH_CLIENT_SECRET': 'fixture'},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic()+5
+                while time.monotonic() < deadline:
+                    if (root/'calls').exists() and len((root/'calls').read_text().splitlines()) == 3:
+                        break
+                    if child.poll() is not None:
+                        self.fail('Selector exited before waiting for capacity')
+                    time.sleep(.01)
+                else:
+                    self.fail('Selector did not reach the first capacity check')
+                child.terminate()
+                out, err = child.communicate(timeout=3)
+                self.assertEqual(child.returncode, -signal.SIGTERM)
+                self.assertEqual(out, '')
+                self.assertEqual(len((root/'calls').read_text().splitlines()), 3)
+                self.assertNotIn('PRIVATE_CREDENTIAL', err)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
 
 
 if __name__ == '__main__':

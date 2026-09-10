@@ -4,13 +4,20 @@
 The caller exports the same private credentials used by dc, then runs:
   worker.py select --tools-root /etc/bio-tools
 
+Use --wait-seconds to retry confirmed capacity shortages for a bounded period;
+the default is a single check. Only valid empty capacity results are retried,
+including regular and spot capacity on every attempt. A deadline also bounds
+in-flight provider requests. Progress reports the retry window, never an ETA
+for hardware availability. The wait happens before any paid worker is rented.
+
 Stdout is one JSON choice (type/spot/image/price), never a reservation. Exit 4
-means no qualifying capacity; exit 2 means malformed/unavailable evidence. The
+means no qualifying capacity before the deadline; exit 2 means invalid evidence. The
 caller must still use dc's fresh launch quote, $13/hour ceiling, lifetime budget,
 and normal owned-resource cleanup. An explicit --worker bypasses this selector
 at the caller; this helper never changes an explicit worker preference.
 """
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
@@ -19,7 +26,9 @@ import os
 from pathlib import Path
 import re
 import runpy
+import signal
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 LOCATION = 'FIN-02'
@@ -36,6 +45,10 @@ class Error(RuntimeError):
 
 class Unavailable(Error):
     pass
+
+
+class CapacityDeadline(BaseException):
+    """Bypass API exception handlers when the selection deadline interrupts I/O."""
 
 
 def require(condition, message):
@@ -121,20 +134,126 @@ def preview(api, *, observed=None, spot_only=False):
     return choose(*rows, observed=observed, spot_only=spot_only)
 
 
+def durations(wait_seconds, poll_seconds):
+    wait_seconds = numeric(wait_seconds, 'capacity wait duration')
+    poll_seconds = numeric(poll_seconds, 'capacity poll interval', positive=True)
+    require(wait_seconds <= 7200, 'Capacity wait duration must be between 0 and 7200 seconds')
+    require(1 <= poll_seconds <= 300, 'Capacity poll interval must be between 1 and 300 seconds')
+    return wait_seconds, poll_seconds
+
+
+@contextlib.contextmanager
+def deadline_alarm(seconds):
+    """Linux head helper: cancel even a provider response stuck in a read.
+
+    The dc API has per-request timeouts, but its sequential token/catalog/
+    availability reads otherwise could outlive the selection deadline. The
+    signal uses BaseException so transport error fences cannot swallow it.
+    This standalone CLI must not borrow an alarm belonging to another caller.
+    """
+    require(not any(signal.getitimer(signal.ITIMER_REAL)), 'Capacity selector already has an active deadline')
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def expired(signum, frame):
+        raise CapacityDeadline()
+
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def wait_for_capacity(api, *, wait_seconds=0, poll_seconds=30, spot_only=False,
+                      clock=time.monotonic, sleep=time.sleep, unavailable=None):
+    """Retry trustworthy shortages only; expiry/cancellation cannot select a worker."""
+    wait_seconds, poll_seconds = durations(wait_seconds, poll_seconds)
+    if not wait_seconds:
+        return preview(api, spot_only=spot_only)
+    deadline = clock() + wait_seconds
+    timed_out = Unavailable(f'The {wait_seconds:g}-second capacity wait window expired; '
+                            'no worker was selected')
+    try:
+        with deadline_alarm(wait_seconds):
+            while clock() < deadline:
+                try:
+                    selected = preview(api, spot_only=spot_only)
+                except Unavailable:
+                    remaining = deadline - clock()
+                    if remaining <= 0:
+                        break
+                    if unavailable:
+                        unavailable()
+                    sleep(min(poll_seconds, remaining))
+                    continue
+                # An in-flight result completing after expiry cannot authorize
+                # a subsequent allocation even if it reports available hardware.
+                if clock() >= deadline:
+                    break
+                return selected
+    except CapacityDeadline:
+        pass
+    raise timed_out
+
+
+def capacity_activity(tools_root, wait_seconds):
+    """Use the normal bounded progress sink and a fresh ten-second heartbeat."""
+    progress = runpy.run_path(str(tools_root/'py/worker_progress.py'))
+
+    class CapacityActivity(progress['Activity']):
+        def __init__(self):
+            self.deadline = time.monotonic() + wait_seconds
+            self.waiting = False
+            super().__init__('waiting_capacity', interval=10, scope='msa',
+                eta=dict(state='unknown', scope='stage', basis='Worker availability has no reliable estimate'))
+
+        def unavailable(self):
+            with self.lock:
+                self.waiting = True
+                self._emit()
+
+        def _emit(self, state='running'):
+            if state == 'running':
+                remaining = max(0, math.ceil(self.deadline - time.monotonic()))
+                action = 'Waiting for' if self.waiting else 'Checking'
+                self.fields['message'] = (f'{action} cloud capacity; {remaining // 60}m {remaining % 60:02d}s '
+                                          'left in the retry window. No worker has been rented.')
+            elif state == 'complete':
+                self.fields['message'] = 'Compatible cloud capacity found; worker allocation is next.'
+            else:
+                self.fields['message'] = 'Capacity selection ended; no worker was selected.'
+            return super()._emit(state)
+
+    return CapacityActivity()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['select'])
     parser.add_argument('--tools-root', type=Path,
                         default=Path(os.environ.get('BIO_TOOLS_SRC', '/etc/bio-tools')))
     parser.add_argument('--spot-only', action='store_true', help='Honor an explicit spot-only request; never choose regular capacity')
+    parser.add_argument('--wait-seconds', default=0,
+                        help='Retry confirmed capacity shortages for up to this many seconds (0..7200; default: one check)')
+    parser.add_argument('--poll-seconds', default=30,
+                        help='Delay between confirmed capacity shortages (1..300 seconds; default: 30)')
     args = parser.parse_args(argv)
     try:
+        wait_seconds, poll_seconds = durations(args.wait_seconds, args.poll_seconds)
         require(bool(os.environ.get('DATACRUNCH_CLIENT_ID')) and bool(os.environ.get('DATACRUNCH_CLIENT_SECRET')),
                 'Provider credentials must be supplied by the existing private dc wrapper')
         budget = runpy.run_path(str(args.tools_root/'dc-budget.py'))
-        selected = preview(budget['API'](), spot_only=args.spot_only)
+        api = budget['API']()
+        with capacity_activity(args.tools_root, wait_seconds) if wait_seconds else contextlib.nullcontext() as activity:
+            selected = wait_for_capacity(api, wait_seconds=wait_seconds, poll_seconds=poll_seconds,
+                spot_only=args.spot_only, unavailable=activity.unavailable if activity else None)
         print(json.dumps(selected, sort_keys=True, allow_nan=False))
         return 0
+    except KeyboardInterrupt:
+        print('msa-worker: capacity selection cancelled; no worker was selected', file=sys.stderr)
+        return 130
     except Unavailable as error:
         print('msa-worker: '+str(error), file=sys.stderr)
         return 4

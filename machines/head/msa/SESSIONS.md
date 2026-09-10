@@ -35,11 +35,32 @@ before asking systemd to launch anything. All starters share the existing
 registration lock; readers wait out incomplete publication. A lost startup reply
 can join its exact saved unit command/invocation, but never issues another launch.
 A caller that starts or joins a starting generation does not replace it if startup
-fails. Later requests may retire an already-ended generation only after fresh
-provider evidence proves the exact worker and temporary OS disk are absent.
+fails. Later requests may retire an already-ended generation after a verified
+pre-allocation failure receipt, or after fresh provider evidence proves the
+exact allocated worker and temporary OS disk are absent.
 Replaced units, missing worker identity, unknown startup outcomes and uncertain
 cleanup keep registration intact for inspection. An old closure receipt alone
 never authorizes replacement. No search request is silently replayed.
+
+Automatic capacity selection waits up to 1,800 seconds, pausing 30 seconds after
+each confirmed shortage before checking regular and spot offers again. Set
+`--capacity-wait-seconds 0..7200` on `session start` or `prepare` (or
+`BIO_MSA_CAPACITY_WAIT_SECONDS`) to change the window; zero checks once.
+`BIO_MSA_CAPACITY_POLL_SECONDS` changes the 1–300 second polling pause for direct
+launches. Capacity checks do not rent compute. Invalid/provider-error responses
+fail closed without retrying. The GUI shows `waiting_capacity` with a retry
+window and unknown availability ETA. The request deadline still bounds waiting;
+the paid worker lifetime starts with its normal allocation reservation.
+
+Before selecting a managed session worker, `startup.py` records `attempt.json`
+bound to the exact session intent, systemd invocation, frozen tools and launcher.
+It fsyncs `allocation-started.json` before any `dc launch`. A failure before that
+marker can publish `no-allocation.json`; after the exact unit stops, the next
+request (or explicit `session stop`) revalidates that proof under the registry
+lock, retains `closed.json`, and removes the active pointer. A possibly submitted
+allocation or unknown old startup cannot use this path. Existing waiting callers
+receive `capacity_timeout`, `preallocation_failed`, or `cancelled` without starting
+a replacement in the same request.
 
 Startup, readiness checks, queued search and execution consume the same request
 `--timeout`. Each provider/systemd/SSH readiness wait is bounded by the remaining

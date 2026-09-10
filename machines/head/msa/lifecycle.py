@@ -176,7 +176,8 @@ def ensure(root, deadline, *, observe, start, retire, progress=emit,
             continue
         if phase == 'terminal':
             if joined == ident:
-                raise SessionError('session_failed', 'The shared MSA startup ended before it became ready; its records were retained and this request will not allocate a replacement', ident)
+                raise SessionError(state.get('code', 'session_failed'), state.get('message',
+                    'The shared MSA startup ended before it became ready; its records were retained and this request will not allocate a replacement'), ident)
             if retired:
                 raise SessionError('session_failed', 'A replacement session also ended; no further startup will be attempted for this request', ident)
             progress('waiting', 'Confirming cleanup of the previous private MSA session before replacement', ident)

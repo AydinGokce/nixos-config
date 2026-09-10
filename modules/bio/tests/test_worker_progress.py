@@ -74,6 +74,27 @@ class ProgressTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             progress.emit("allocating", eta=dict(state="estimate", scope="stage", basis="bad", seconds=float("inf")))
 
+    def test_capacity_wait_never_turns_retry_window_into_completion_estimate(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with progress.Activity("waiting_capacity", interval=60,
+                                   message="Waiting for capacity; retry window remaining 30:00"):
+                pass
+            with progress.Activity("allocating", interval=60, eta=dict(state="range", scope="stage",
+                                   basis="Prior startup observations", lower_seconds=60, upper_seconds=180)):
+                pass
+        events = [json.loads(line.removeprefix(progress.PREFIX)) for line in stderr.getvalue().splitlines()]
+        self.assertEqual([(v['stage'], v['state']) for v in events], [
+            ('waiting_capacity', 'running'), ('waiting_capacity', 'complete'),
+            ('allocating', 'running'), ('allocating', 'complete')])
+        self.assertNotEqual(events[0]['stage_id'], events[2]['stage_id'])
+        self.assertTrue(all(v['eta']['state'] == 'unknown' for v in events[:2]))
+        self.assertEqual(events[2]['eta']['lower_seconds'], 60)
+        self.assertEqual(events[2]['eta']['upper_seconds'], 180)
+        for fields in [dict(completed=0, total=1800, unit='steps'),
+                       dict(eta=dict(state='estimate', scope='stage', basis='Retry deadline', seconds=1800))]:
+            with self.assertRaises(ValueError):
+                progress.emit('waiting_capacity', **fields)
+
     def test_child_output_and_failure_code_preserved_separately_from_progress(self):
         result = subprocess.run([sys.executable, str(SOURCE / "worker_progress.py"), "run",
             "--stage", "allocating", "--", sys.executable, "-c",

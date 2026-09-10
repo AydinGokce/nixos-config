@@ -16,7 +16,7 @@ import uuid
 
 PREFIX = "BIO_WORKER_STAGE "
 LIMIT = 4096
-STAGES = {"allocating", "base_setup", "runtime_package", "runtime_download", "runtime_extract",
+STAGES = {"waiting_capacity", "allocating", "base_setup", "runtime_package", "runtime_download", "runtime_extract",
           "database_check", "index_warm", "ready", "search", "gpu_allocation", "model_setup",
           "inference", "result_transfer", "cleanup"}
 WRITE_LOCK = threading.RLock()
@@ -26,6 +26,15 @@ def emit(stage, *, scope="msa", state="running", message="", stage_id=None,
          completed=None, total=None, unit=None, eta=None):
     if stage not in STAGES or scope not in {"msa", "gpu"} or state not in {"running", "complete", "failed"}:
         raise ValueError("Invalid worker progress stage")
+    if stage == "waiting_capacity":
+        # A retry deadline bounds how long we wait; it does not predict when
+        # provider capacity becomes available or represent completed work.
+        if any(value is not None for value in (completed, total, unit)):
+            raise ValueError("Capacity waiting has no measurable completion counter")
+        if eta is not None and (not isinstance(eta, dict) or eta.get("state") != "unknown"):
+            raise ValueError("Worker availability has no reliable estimate")
+        if eta is None:
+            eta = dict(state="unknown", scope="stage", basis="Worker availability has no reliable estimate")
     value = dict(schema=1, stage=stage, scope=scope, state=state,
                  message=str(message)[:1000], timestamp_ns=time.time_ns())
     if stage_id is not None:

@@ -9,6 +9,26 @@ The immutable candidate pins are ColabFold `c35de0221f4d297a39edf4cf292ba2832e32
 
 Run installation on a preparation worker with the dedicated database volume mounted read/write. The 16 GB head is unsuitable. The installer rejects less than 120 GiB **available** RAM; this is a minimum preflight, not a guarantee that every index fits. Managed installation, preparation and serving automatically select available FIN-02 x86 compute with at least 768 GiB RAM and an instance-price ceiling of $13/hour; spot offers are eligible. `--spot` restricts selection to spot offers, and `--worker TYPE` overrides automatic selection. The launch rechecks the price and project budget. Full API preparation also checks available RAM on the worker because upstream's much smaller batch-RAM guidance does not describe this API's complete `.idx`/mmap execution. A cold-disk, lower-RAM API deployment requires separate measurement without changing the search. Source archives total about 242 GB before extraction. Serial working allowances are conservative planning estimates, not measured final footprints; actual free-space checks stop before exhaustion and require additional storage rather than reduced datasets. [Official MSA server](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/README.md).
 
+Automatic worker selection waits up to **30 minutes** for qualifying capacity,
+rechecking regular and spot offers after each **30-second** pause. Provider query
+latency adds to the interval. `BIO_MSA_CAPACITY_WAIT_SECONDS` accepts 0–7200 seconds
+(0 checks once); `BIO_MSA_CAPACITY_POLL_SECONDS` accepts 1–300 seconds. For a shared
+session, `bio-msa session start --capacity-wait-seconds N` or
+`bio-msa prepare --capacity-wait-seconds N ...` overrides the
+wait setting. Invalid evidence and API errors fail immediately. The Console shows
+the remaining retry window separately from an unknown availability ETA. Waiting
+does not rent compute or increase the paid worker lifetime; preparation's overall
+request timeout still includes startup and bounds its capacity wait.
+
+Managed shared sessions retain an immutable startup attempt and write an
+allocation marker before calling `dc launch`. A terminal failure with a verified
+`no-allocation.json` receipt can be retired by the next request or by
+`bio-msa session stop`; callers already waiting on that failed generation receive
+the original failure without starting another worker. Recovery retains the audit
+records. Missing receipts, changed identities, or a possibly submitted allocation
+remain fenced for inspection. Historical failures predating this protocol require
+an explicit audit of their original launcher, unit, logs, and provider inventory.
+
 ```sh
 # Application code comes from the orchestrator's verified worker-local bundle.
 export MSA_TOOLS_ROOT=/mnt/bio-shared/envs/msa-tools-v1

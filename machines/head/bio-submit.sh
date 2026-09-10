@@ -654,7 +654,7 @@ REMOTE
   fi
   printf 'sync\n'
 } > "$remote_file"
-id=""; ip=""
+id=""; ip=""; msa_startup_attempt=0
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
@@ -702,18 +702,48 @@ PY
       [ "$status" -ne 0 ] || status=1
     }
   fi
+  if [ "${msa_startup_attempt:-0}" = 1 ]; then
+    python3 "$TOOLS_SRC/msa/startup.py" finish --state "$BIO_MSA_SESSION_STATE" --exit-status "$status" || \
+      echo 'bio-submit: startup outcome could not be certified; registration retained for inspection' >&2
+  fi
   exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+if [ "$recipe" = msa ] && [ "$sub" = session ]; then
+  python3 "$TOOLS_SRC/msa/startup.py" begin --state "$BIO_MSA_SESSION_STATE" --run-dir "$LOCALOUT"
+  msa_startup_attempt=1
+fi
 if [ -n "$db_nfs" ]; then
   "$storage_tool" track --volume "$db_volume" --job-dir "$LOCALOUT" --pid "$$"
 fi
 msa_worker_image=""; launch_environment=()
 if [ "$recipe" = msa ] && [ "$sub" != convert ] && [ -z "$gpu" ]; then
-  selection_args=(select --tools-root "$TOOLS_SRC")
+  msa_capacity_wait=$(python3 - <<'MSACAPACITY'
+import math, os, sys, time
+try:
+    wait = float(os.environ.get('BIO_MSA_CAPACITY_WAIT_SECONDS', '1800'))
+    if not math.isfinite(wait) or not 0 <= wait <= 7200:
+        raise ValueError('invalid capacity wait')
+    deadline = os.environ.get('BIO_MSA_CAPACITY_DEADLINE_EPOCH')
+    if deadline:
+        remaining = float(deadline) - time.time()
+        if not math.isfinite(remaining):
+            raise ValueError('invalid capacity deadline')
+        if remaining <= 0:
+            print('bio-submit: capacity wait reached the request deadline before allocation', file=sys.stderr)
+            sys.exit(4)
+        wait = min(wait, remaining)
+    print(wait)
+except ValueError:
+    print('bio-submit: invalid MSA capacity wait limit or request deadline', file=sys.stderr)
+    sys.exit(2)
+MSACAPACITY
+  )
+  selection_args=(select --tools-root "$TOOLS_SRC" --wait-seconds "$msa_capacity_wait"
+    --poll-seconds "${BIO_MSA_CAPACITY_POLL_SECONDS:-30}")
   [ -z "$spot" ] || selection_args+=(--spot-only)
   bio-msa-worker "${selection_args[@]}" > "$LOCALOUT/worker-choice.json"
   selection=$(python3 - "$LOCALOUT/worker-choice.json" <<'MSAWORKER'
@@ -760,6 +790,9 @@ for g in "${candidates[@]}"; do
   [ -z "$msa_worker_image" ] || image_args=(--image "$msa_worker_image")
   # Preserve dc's captured READY/error response while emitting live stage
   # heartbeats on stderr and the exact shared-session progress snapshot.
+  if [ "$msa_startup_attempt" = 1 ]; then
+    python3 "$TOOLS_SRC/msa/startup.py" mark-allocation --state "$BIO_MSA_SESSION_STATE"
+  fi
   if out=$(python3 "$TOOLS_SRC/py/worker_progress.py" run --stage allocating --scope "$worker_scope" \
       --message "Allocating $g and starting the operating system" --eta-lower 60 --eta-upper 180 \
       -- bash -c 'exec "$@" 2>&1' worker-launch "${launch_environment[@]}" dc launch "$g" \

@@ -7,7 +7,7 @@ import time
 
 from .common import canonical, parse, require
 
-STAGES = {'runtime_package', 'allocating', 'base_setup', 'runtime_download', 'runtime_extract',
+STAGES = {'runtime_package', 'waiting_capacity', 'allocating', 'base_setup', 'runtime_download', 'runtime_extract',
           'database_check', 'index_warm', 'ready', 'search', 'gpu_allocation',
           'model_setup', 'inference', 'result_transfer', 'cleanup'}
 STALE_AFTER = 30
@@ -85,6 +85,8 @@ def unknown(basis='No measured remaining duration is available'):
 def estimated(value, history):
     if value.get('state') != 'running':
         return unknown('This stage has ended')
+    if value.get('stage') == 'waiting_capacity':
+        return unknown('Worker availability has no reliable estimate')
     if 'eta' in value:
         return eta(value['eta'])
     if not value.get('total') or 'completed' not in value:
@@ -124,6 +126,11 @@ def view(value, history=(), epoch=None):
     result = {k: deepcopy(v) for k, v in value.items() if k not in {'schema', 'state', 'eta'}}
     result['stage_state'] = value['state']
     result['eta'] = estimated(value, history)
+    if value['stage'] == 'waiting_capacity':
+        # Never display a retry-window countdown as fraction completed, even
+        # if an older producer attaches counters to its capacity observation.
+        for key in ('completed', 'total', 'unit'):
+            result.pop(key, None)
     return freshness(result, epoch)
 
 

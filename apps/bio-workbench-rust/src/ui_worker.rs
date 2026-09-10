@@ -33,6 +33,10 @@ fn duration(seconds: f64) -> String {
     }
 }
 
+fn waiting_for_capacity(progress: &Value) -> bool {
+    text(progress, "stage") == "waiting_capacity" && text(progress, "stage_state") == "running"
+}
+
 /// Use the head clock plus monotonic elapsed time, never the desktop wall clock.
 fn fresh_epoch(status: &Value, elapsed: f64) -> Option<f64> {
     let server = seconds(&status["server_epoch"])?;
@@ -56,6 +60,9 @@ fn deadline_label(status: &Value, epoch: Option<f64>) -> String {
     let Some(now) = epoch else {
         return "Countdown unavailable".into();
     };
+    if text(status, "state") == "starting" && waiting_for_capacity(&status["progress"]) {
+        return "No worker allocated yet".into();
+    }
     if let Some(end) = seconds(&status["shutdown_epoch"]) {
         if end <= now {
             return "Checking shutdown status".into();
@@ -195,9 +202,11 @@ fn control_reason(
 
 fn eta_label(progress: &Value, elapsed: f64, fresh: bool) -> String {
     let eta = &progress["eta"];
-    let scope = match text(eta, "scope") {
-        "startup" => "Startup ETA",
-        "job" => "Run ETA",
+    let capacity = text(progress, "stage") == "waiting_capacity";
+    let scope = match (capacity, text(eta, "scope")) {
+        (true, _) => "Availability ETA",
+        (_, "startup") => "Startup ETA",
+        (_, "job") => "Run ETA",
         _ => "Stage ETA",
     };
     if !fresh
@@ -206,6 +215,9 @@ fn eta_label(progress: &Value, elapsed: f64, fresh: bool) -> String {
         || seconds(&progress["age_seconds"]).unwrap_or(0.) + elapsed > MAX_FRESH_SECONDS
     {
         return format!("{scope}: update stale");
+    }
+    if capacity {
+        return format!("{scope}: unknown");
     }
     match text(eta, "state") {
         "estimate" => seconds(&eta["seconds"])
@@ -253,6 +265,9 @@ impl Worker {
         }
         match text(&self.status, "state") {
             "absent" => ("MSA OFFLINE", Color32::GRAY),
+            "starting" if waiting_for_capacity(&self.status["progress"]) => {
+                ("MSA WAITING FOR CAPACITY", AMBER)
+            }
             "starting" => ("MSA STARTING", AMBER),
             "warming" => ("MSA WARMING", AMBER),
             "ready" | "idle" => ("MSA ONLINE", GREEN),
@@ -493,12 +508,17 @@ impl Workbench {
             } else {
                 "MSA"
             };
-            ui.strong(format!("{scope} / {}", text(progress, "stage")));
+            let stage = match text(progress, "stage") {
+                "waiting_capacity" => "waiting for capacity".into(),
+                value => value.replace('_', " "),
+            };
+            ui.strong(format!("{scope} / {stage}"));
             ui.small(text(progress, "stage_state"));
         });
         ui.label(text(progress, "message"));
         if let (Some(done), Some(total)) =
             (seconds(&progress["completed"]), seconds(&progress["total"]))
+            && text(progress, "stage") != "waiting_capacity"
             && total > 0.
             && done <= total
         {
@@ -508,6 +528,7 @@ impl Workbench {
             );
         }
         if seconds(&progress["total"]).is_none()
+            && text(progress, "stage") != "waiting_capacity"
             && let Some(done) = seconds(&progress["completed"])
         {
             ui.small(format!("{done:.0} {}", text(progress, "unit")));
@@ -653,6 +674,47 @@ mod tests {
         assert_eq!(
             eta_label(&json!({"eta":{"state":"unknown","scope":"job"}}), 0., true),
             "Run ETA: unknown"
+        );
+    }
+    #[test]
+    fn capacity_wait_reports_unknown_availability_instead_of_retry_deadline() {
+        let mut progress = json!({"stage":"waiting_capacity","stage_state":"running",
+            "eta":{"state":"range","scope":"stage","lower_seconds":0,"upper_seconds":1800}});
+        assert_eq!(eta_label(&progress, 10., true), "Availability ETA: unknown");
+        assert_eq!(
+            eta_label(&progress, 10., false),
+            "Availability ETA: update stale"
+        );
+        progress["stage"] = json!("allocating");
+        progress["eta"] =
+            json!({"state":"range","scope":"stage","lower_seconds":60,"upper_seconds":180});
+        assert_eq!(eta_label(&progress, 10., true), "Stage ETA: ~0:50 - 2:50");
+    }
+    #[test]
+    fn capacity_wait_indicator_and_countdown_follow_current_startup_stage() {
+        let mut worker = Worker {
+            status: json!({"state":"starting","server_epoch":1000.,"checked_epoch":1000.,
+                "progress":{"stage":"waiting_capacity","stage_state":"running"}}),
+            received: Some(Instant::now()),
+            ..Worker::default()
+        };
+        assert_eq!(
+            worker.state_label(true),
+            ("MSA WAITING FOR CAPACITY", AMBER)
+        );
+        assert_eq!(
+            deadline_label(&worker.status, Some(1000.)),
+            "No worker allocated yet"
+        );
+        assert!(control_reason(&worker.status, "shutdown", Some(1000.), false).is_some());
+        assert_eq!(worker.state_label(false), ("MSA STALE", AMBER));
+        worker.status["progress"]["stage_state"] = json!("complete");
+        assert_eq!(worker.state_label(true), ("MSA STARTING", AMBER));
+        worker.status["progress"] = json!({"stage":"allocating","stage_state":"running"});
+        assert_eq!(worker.state_label(true), ("MSA STARTING", AMBER));
+        assert_eq!(
+            deadline_label(&worker.status, Some(1000.)),
+            "Shutdown time not yet available"
         );
     }
     #[test]

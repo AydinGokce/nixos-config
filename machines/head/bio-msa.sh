@@ -22,7 +22,7 @@ bio-msa install [--worker TYPE --timeout SECONDS]
 bio-msa install --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
 bio-msa convert [--worker TYPE --timeout SECONDS]
 bio-msa panel --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
-bio-msa session start [--worker TYPE --timeout SECONDS --idle-seconds SECONDS --warm report|prefetch|lock]
+bio-msa session start [--worker TYPE --timeout SECONDS --idle-seconds SECONDS --warm report|prefetch|lock --capacity-wait-seconds SECONDS]
 bio-msa session status
 bio-msa session stop
 bio-msa prepare --model openfold3|boltz2|protenix --fasta FILE [--require-session]
@@ -51,6 +51,11 @@ Session start, installation and standalone serving select FIN-02 compute with at
 $13/hour instance-price ceiling, including spot capacity. --spot selects only
 spot offers; --worker TYPE overrides automatic selection. dc rechecks the quote
 and total project budget before launch. Conversion keeps its smaller CPU default.
+Automatic selection waits up to 30 minutes for capacity, with a 30-second pause
+between checks; no compute is rented while waiting. --capacity-wait-seconds on
+session start/prepare overrides the wait (0..7200; 0 checks once). The request's
+overall timeout still includes startup. Confirmed pre-allocation failures recover
+on the next request; uncertain allocations retain their registration for review.
 Panel preparation keeps one private API worker for all manifest targets, runs
 them serially without inference, and records failures without dropping targets.
 Install with --json prepares that panel after installation on the same worker,

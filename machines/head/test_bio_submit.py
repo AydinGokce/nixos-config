@@ -84,6 +84,10 @@ esac
             "dc": '''#!/usr/bin/env bash
 set -eu
 if [ "$1" = launch ]; then
+  if [ -n "${BIO_MSA_SESSION_STATE:-}" ]; then
+    test -s "$BIO_MSA_SESSION_STATE/allocation-started.json"
+    test ! -e "$BIO_MSA_SESSION_STATE/no-allocation.json"
+  fi
   echo "launch:$2" >> "$AUDIT/events"
   echo "$*" >> "$AUDIT/launch-args"
   echo "${DC_MAX_INSTANCE_HOURLY:-unset}" >> "$AUDIT/launch-price-caps"
@@ -174,6 +178,11 @@ PY
         stubs["bio-msa-worker"] = '''#!/usr/bin/env bash
 set -eu
 echo "$*" >> "$AUDIT/worker-selection-calls"
+if [ -n "${BIO_MSA_SESSION_STATE:-}" ]; then
+  test -s "$BIO_MSA_SESSION_STATE/attempt.json"
+  test ! -e "$BIO_MSA_SESSION_STATE/allocation-started.json"
+  if [ "${MSA_MARKER_UNWRITABLE:-0}" = 1 ]; then mkdir "$BIO_MSA_SESSION_STATE/allocation-started.json"; fi
+fi
 [ "${MSA_SELECTOR_EXIT:-0}" = 0 ] || exit "$MSA_SELECTOR_EXIT"
 python3 - <<'PY'
 import json, os
@@ -265,9 +274,55 @@ except (OSError, ValueError, KeyError, AssertionError):
     def msa_settings(self, **settings):
         return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
 
+    def managed_startup_fixture(self):
+        """Use the real receipt protocol with a fake systemd identity and cloud."""
+        ident = 'c' * 32
+        state = self.root / 'sessions' / ident
+        state.mkdir(parents=True)
+        tools = state / 'tools'
+        shutil.copytree(self.root / 'tools', tools)
+        shutil.copy2(SCRIPT.parent / 'recipes/_common.sh', tools / 'recipes/_common.sh')
+        (tools / 'rf3').mkdir(exist_ok=True)
+        shutil.copy2(SCRIPT.parent / 'rf3/msa.py', tools / 'rf3/msa.py')
+        # Compute precisely the current set of pinned session source names.
+        source = SCRIPT.parent / 'msa/session.py'
+        names = subprocess.check_output([sys.executable, '-c',
+            'import json,sys;sys.path.insert(0,sys.argv[1]);import session;'
+            'print(json.dumps(session.sources(__import__("pathlib").Path(sys.argv[2]))))',
+            str(source.parent), str(tools)], text=True)
+        intent = dict(schema=1, kind='managed-private-msa-session', session_id=ident,
+                      unit='bio-msa-session-' + ident + '.service', tools=str(tools),
+                      sources=json.loads(names), submit_sha256=hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+                      argv=[str(SCRIPT), 'msa', '--sub', 'session', '--timeout', '7200'])
+        (state / 'intent.json').write_text(json.dumps(intent))
+        (state.parent / 'active.json').write_text(json.dumps(dict(session_id=ident,
+            intent_sha256=hashlib.sha256((state / 'intent.json').read_bytes()).hexdigest())))
+        (state / 'start-intent.json').write_text(json.dumps(dict(command=['systemd-run', *intent['argv']])))
+        (self.root / 'bin/systemctl').write_text('''#!/usr/bin/env python3
+import json,os,shlex
+from pathlib import Path
+intent=json.loads((Path(os.environ['BIO_MSA_SESSION_STATE'])/'intent.json').read_text())
+values=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='1234',ControlPID='0',
+    InvocationID=os.environ['INVOCATION_ID'],Description='Managed private MSA session '+intent['session_id'],
+    ExecStart='{ argv[]='+shlex.join(intent['argv'])+' ; }')
+for key,value in values.items(): print(key+'='+value)
+''')
+        (self.root / 'bin/systemctl').chmod(0o700)
+        self.env.update(BIO_MSA_SESSION_STATE=str(state), BIO_MSA_SESSION_ID=ident,
+                        INVOCATION_ID='b' * 32, BIO_TOOLS_SRC=str(tools))
+        return state
+
     def test_managed_msa_retains_first_ssh_key_and_uses_strict_connections_after_readiness(self):
         # The real session launcher creates its owned state before bio-submit.
         (self.root / "session-state").mkdir()
+        # This fixture isolates host-key handling. Receipt safety is exercised
+        # with the real startup helper in the managed allocation tests below.
+        (self.root / 'tools/msa/startup.py').write_text('''import json,sys
+from pathlib import Path
+state=Path(sys.argv[sys.argv.index('--state')+1])
+if sys.argv[1] == 'begin': (state/'attempt.json').write_text('{}')
+elif sys.argv[1] == 'mark-allocation': (state/'allocation-started.json').write_text('{}')
+''')
         # Only this fixture simulates OpenSSH's accept-new known-hosts write.
         # The real registrar is exercised separately with RSA/Ed25519/ECDSA keys.
         ssh = self.root / "bin/ssh"
@@ -917,6 +972,8 @@ sleep() { :; }
         self.assertIn('--image ubuntu-24.04-cuda-12.8-open-docker',args)
         self.assertEqual((self.root/'launch-price-caps').read_text().strip(),'9.0')
         self.assertIn('--spot-only',(self.root/'worker-selection-calls').read_text())
+        self.assertIn('--wait-seconds 1800.0 --poll-seconds 30',
+                      (self.root/'worker-selection-calls').read_text())
         choice=next((self.root/'results').glob('*/worker-choice.json'))
         self.assertFalse(json.loads(choice.read_text())['reserved'])
 
@@ -932,6 +989,66 @@ sleep() { :; }
                            **self.msa_settings(MSA_SELECTOR_EXIT='4'))
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertFalse((self.root/'worker-selection-calls').exists())
+
+    def test_managed_capacity_timeout_records_proof_without_any_cloud_launch(self):
+        state = self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session',
+                             **self.msa_settings(MSA_SELECTOR_EXIT='4', BIO_MSA_CAPACITY_WAIT_SECONDS='15'))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        proof = json.loads((state / 'no-allocation.json').read_text())
+        self.assertEqual(proof['reason'], 'capacity_timeout')
+        self.assertTrue(proof['no_allocation_attempted'])
+        self.assertEqual(proof['attempt_sha256'], hashlib.sha256((state / 'attempt.json').read_bytes()).hexdigest())
+        self.assertEqual(proof['invocation_id'], 'b' * 32)
+        self.assertFalse((state / 'allocation-started.json').exists())
+        self.assertFalse((self.root / 'launch-args').exists())
+        self.assertFalse(list((self.root / 'results').glob('*/job.json')))
+        self.assertIn('--wait-seconds 15.0', (self.root / 'worker-selection-calls').read_text())
+
+    def test_managed_storage_failure_before_selector_is_recoverable_without_allocation(self):
+        state = self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session', **self.msa_settings(EXPIRE_BEFORE_LAUNCH='1'))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads((state / 'no-allocation.json').read_text())['reason'], 'preallocation_failed')
+        self.assertFalse((self.root / 'worker-selection-calls').exists())
+        self.assertFalse((self.root / 'launch-args').exists())
+
+    def test_managed_failed_cloud_reply_keeps_uncertainty_fence(self):
+        state = self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session', **self.msa_settings(DENY_BUDGET='1'))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertTrue((state / 'allocation-started.json').is_file())
+        self.assertTrue((self.root / 'launch-args').is_file())
+        self.assertFalse((state / 'no-allocation.json').exists())
+        self.assertFalse(list((self.root / 'results').glob('*/job.json')))
+        self.assertIn('--max-hours 2.25', (self.root / 'launch-args').read_text())
+
+    def test_managed_allocation_marker_failure_prevents_cloud_submission(self):
+        state = self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session', **self.msa_settings(MSA_MARKER_UNWRITABLE='1'))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((state / 'allocation-started.json').is_dir())
+        self.assertFalse((self.root / 'launch-args').exists())
+        self.assertFalse((state / 'no-allocation.json').exists())
+
+    def test_expired_request_deadline_never_queries_or_allocates(self):
+        state = self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session',
+                             **self.msa_settings(BIO_MSA_CAPACITY_DEADLINE_EPOCH=str(time.time() - 1)))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(json.loads((state / 'no-allocation.json').read_text())['reason'], 'capacity_timeout')
+        self.assertFalse((self.root / 'worker-selection-calls').exists())
+        self.assertFalse((self.root / 'launch-args').exists())
+
+    def test_capacity_wait_is_clamped_to_parent_deadline_without_extending_paid_runtime(self):
+        result = self.submit('msa', '--sub', 'install',
+                             **self.msa_settings(BIO_MSA_CAPACITY_DEADLINE_EPOCH=str(time.time() + 100)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / 'worker-selection-calls').read_text().split()
+        remaining = float(args[args.index('--wait-seconds') + 1])
+        self.assertGreater(remaining, 80)
+        self.assertLess(remaining, 100)
+        self.assertIn('--max-hours 2.25', (self.root / 'launch-args').read_text())
 
     def test_msa_convert_worker_failure_preserves_status_and_cleans_exact_worker(self):
         (self.msa_root / ".msa-databases.json").unlink()

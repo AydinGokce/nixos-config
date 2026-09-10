@@ -31,7 +31,10 @@ class ClientTests(unittest.TestCase):
         state = Path(result["state"]); intent = session.load(state/"intent.json")
         self.assertEqual(intent["sources"], session.sources(state/"tools"))
         command = run.call_args.args[0]
-        self.assertIn("--property=RuntimeMaxSec=1500", command)
+        self.assertIn("--property=RuntimeMaxSec=3300", command)
+        self.assertIn("--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=1800", command)
+        self.assertEqual(intent['timeout_seconds'], 300)
+        self.assertEqual(intent['capacity_wait_seconds'], 1800)
         self.assertIn("--setenv=DC_MAX_INSTANCE_HOURLY=13.0", command)
         self.assertEqual(command[-6:], [str(self.submit), "msa", "--sub", "session", "--timeout", "300"])
         self.tools.joinpath("msa/session.py").write_text("changed later")
@@ -54,6 +57,25 @@ class ClientTests(unittest.TestCase):
              mock.patch.object(client.subprocess, "run") as run, self.assertRaises(ValueError):
             client.start(self.args)
         run.assert_not_called()
+
+    def test_capacity_wait_setting_does_not_extend_paid_worker_time(self):
+        self.args.capacity_wait_seconds = 120
+        with mock.patch.object(client.shutil, 'which', return_value=str(self.submit)), \
+             mock.patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            client.start(self.args)
+        command = run.call_args.args[0]
+        self.assertIn('--property=RuntimeMaxSec=1620', command)
+        self.assertIn('--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=120', command)
+        self.assertEqual(command[-2:], ['--timeout', '300'])
+
+    def test_invalid_capacity_window_fails_before_registering_or_starting(self):
+        for value in (-1, 7201, True, float('nan'), 'not-a-number'):
+            with self.subTest(value=value):
+                self.args.capacity_wait_seconds = value
+                with mock.patch.object(client.subprocess, 'run') as run, self.assertRaises(ValueError):
+                    client.start(self.args)
+                run.assert_not_called()
+                self.assertFalse((self.args.root/'active.json').exists())
 
     def test_prepare_without_active_session_never_launches_compute(self):
         with mock.patch.object(client.subprocess, "run") as run, self.assertRaises(ValueError):

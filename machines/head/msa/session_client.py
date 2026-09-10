@@ -247,6 +247,15 @@ def start(args):
 def _start_locked(args, deadline=None):
     session.finite(args.timeout, "session timeout", 120, 85500)
     session.finite(args.idle_seconds, "idle timeout", 60, 86400)
+    capacity_wait = getattr(args, 'capacity_wait_seconds', None)
+    if capacity_wait is None:
+        capacity_wait = os.environ.get('BIO_MSA_CAPACITY_WAIT_SECONDS', '1800')
+    if isinstance(capacity_wait, str):
+        require(re.fullmatch(r'[0-9]{1,6}', capacity_wait), 'Invalid capacity wait')
+        capacity_wait = int(capacity_wait)
+    capacity_wait = session.finite(capacity_wait, 'capacity wait', 0, 7200)
+    require(capacity_wait == int(capacity_wait), 'Capacity wait must be whole seconds')
+    capacity_wait = int(capacity_wait)
     root = args.root.absolute()
     require(not os.path.lexists(root/"active.json"), "A session registration exists; inspect/close it before another start")
     ident = uuid.uuid4().hex; state = root/ident; state.mkdir(mode=0o700)
@@ -262,19 +271,26 @@ def _start_locked(args, deadline=None):
     if args.spot: argv += ["--spot"]
     intent = dict(schema=1, kind="managed-private-msa-session", session_id=ident, unit=unit,
                   created_epoch=time.time(), timeout_seconds=args.timeout, idle_seconds=args.idle_seconds,
+                  capacity_wait_seconds=capacity_wait,
                   warm=args.warm, tools=str(tools), sources=session.sources(tools),
                   submit_sha256=session.sha(Path(submit).resolve()), argv=argv)
     session.atomic(state/"intent.json", intent, exclusive=True)
     session.atomic(root/"active.json", dict(session_id=ident, intent_sha256=session.sha(state/"intent.json")), exclusive=True)
     command = ["systemd-run", "--unit", unit, "--description", "Managed private MSA session "+ident,
                "--service-type=exec", "--property=Restart=no", "--property=KillMode=mixed",
-               "--property=TimeoutStopSec=180", "--property=RuntimeMaxSec="+str(args.timeout+1200),
+               "--property=TimeoutStopSec=180", "--property=RuntimeMaxSec="+str(args.timeout+capacity_wait+1200),
                "--setenv=PATH=/run/current-system/sw/bin:/run/wrappers/bin",
                "--setenv=BIO_TOOLS_SRC="+str(tools), "--setenv=BIO_MSA_SESSION_ID="+ident,
                "--setenv=BIO_MSA_SESSION_STATE="+str(state),
                "--setenv=BIO_MSA_SESSION_IDLE_SECONDS="+str(args.idle_seconds),
                "--setenv=BIO_MSA_SESSION_WARM="+args.warm,
                "--setenv=DC_MAX_INSTANCE_HOURLY="+str(min(cap, 13)), *argv]
+    # Waiting consumes the caller's startup deadline, but never increases the
+    # paid worker reservation passed to bio-submit/dc.
+    command.insert(-len(argv), '--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS='+str(capacity_wait))
+    if deadline is not None:
+        capacity_deadline = time.time() + max(0, deadline-time.monotonic()-60)
+        command.insert(-len(argv), '--setenv=BIO_MSA_CAPACITY_DEADLINE_EPOCH='+str(capacity_deadline))
     session.atomic(state/"start-intent.json", dict(command=command, started_epoch=time.time()), exclusive=True)
     result = subprocess.run(command, capture_output=True, text=True, timeout=lifecycle.timeout(deadline, 30))
     session.atomic(state/"start-result.json", dict(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr), exclusive=True)
@@ -324,6 +340,15 @@ def observe_session(root, deadline=None):
         live = unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
         if launch is None:
             if _terminal_unit(live):
+                if lifecycle.document(state / 'no-allocation.json', optional=True) is not None:
+                    import startup
+                    proof = startup.validate_no_allocation(state, intent, live)
+                    code = proof['reason']
+                    message = ('Private MSA capacity selection ended without a worker'
+                               if code == 'capacity_timeout' else 'Private MSA startup failed before allocation began')
+                    return {'state': 'terminal', 'session_id': ident, 'intent_sha256': session.sha(state / 'intent.json'),
+                            'no_allocation_sha256': session.sha(state / 'no-allocation.json'),
+                            'code': code, 'message': message+'; no worker was rented and a later request can retry'}
                 raise lifecycle.SessionError('session_uncertain',
                     'The saved MSA startup has no exact worker registration and its unit is absent or stopped; inspect its retained allocation records before replacement', ident)
             _starting_binding(state, intent, live)
@@ -370,6 +395,26 @@ def observe_session(root, deadline=None):
 def _retire_locked(root, observed, deadline=None):
     """Retire only exact, already-terminal resources; never stop a live unit."""
     state, intent = active(Path(root))
+    if 'no_allocation_sha256' in observed:
+        import startup
+        require(intent['session_id'] == observed['session_id']
+                and session.sha(state / 'intent.json') == observed['intent_sha256']
+                and session.sha(state / 'no-allocation.json') == observed['no_allocation_sha256'],
+                'MSA startup registration changed before recovery')
+        live = unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
+        proof = startup.validate_no_allocation(state, intent, live)
+        receipt = dict(schema=1, session_id=intent['session_id'], closed_epoch=time.time(),
+                       intent_sha256=observed['intent_sha256'], no_allocation_sha256=observed['no_allocation_sha256'],
+                       proof=proof)
+        if not (state / 'closed.json').exists():
+            session.atomic(state / 'closed.json', receipt, exclusive=True)
+        # Repeat verification after a crash between receipt publication and
+        # pointer removal; an old closure receipt alone proves nothing.
+        (Path(root) / 'active.json').unlink()
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+        return
     launch = lifecycle.document(state / 'launch.json')
     require(intent['session_id'] == observed['session_id']
             and session.sha(state / 'intent.json') == observed['intent_sha256']
@@ -496,7 +541,14 @@ def worker_control(root, action, params, deadline=None):
 def stop(root):
     with (root/"lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        state, intent = active(root); launch = session.load(state/"launch.json")
+        state, intent = active(root)
+        if lifecycle.document(state/'launch.json', optional=True) is None:
+            observed = observe_session(root)
+            require(observed['state'] == 'terminal' and 'no_allocation_sha256' in observed,
+                    'Startup allocation is not proven absent; registration retained')
+            _retire_locked(root, observed)
+            return dict(status='closed', session_id=intent['session_id'], no_allocation=True)
+        launch = session.load(state/"launch.json")
         borrowed=intent.get("lifecycle")=="borrowed-api"
         binding=launch["worker_session"] if borrowed else dict(unit=intent["unit"],invocation_id=launch["invocation_id"])
         retired_proof=None
@@ -550,6 +602,8 @@ def main(argv=None):
     p.add_argument("--timeout", type=int, default=7200); p.add_argument("--idle-seconds", type=int, default=900)
     p.add_argument('--session-timeout', type=int, default=7200,
                    help='Maximum lifetime for a newly started on-demand session; request timeout still includes startup')
+    p.add_argument('--capacity-wait-seconds', type=int,
+                   help='Wait for qualifying private MSA capacity (default BIO_MSA_CAPACITY_WAIT_SECONDS or 1800; 0 checks once)')
     p.add_argument('--require-session', action='store_true',
                    help='Preparation only: require an already-ready session and never start compute')
     p.add_argument("--warm", choices=["report", "prefetch", "lock"], default="prefetch")

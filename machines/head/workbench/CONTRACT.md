@@ -65,11 +65,17 @@ abandon accepted control intent. Up to 64 pending controls are retained at once.
 `job.progress` and optional `worker.status.progress` include real measured
 `stage`, `scope` (`msa|gpu`), `stage_state` (`running|complete|failed`), `message`,
 `timestamp_ns`, and optional integer `completed,total,unit` (`bytes|items|steps`).
-Stage names are `runtime_package`, `allocating`, `base_setup`,
+Stage names are `runtime_package`, `waiting_capacity`, `allocating`, `base_setup`,
 `runtime_download`, `runtime_extract`, `database_check`, `index_warm`, `ready`,
 `search`, `gpu_allocation`, `model_setup`, `inference`, `result_transfer`,
 and `cleanup`. Counters refer only to their named stage; no synthetic overall
 percentage is supplied.
+
+`waiting_capacity` keeps the shared worker in `starting` while no qualifying
+worker is available. Its message reports the remaining retry window;
+availability ETA stays unknown and completion counters are omitted. The retry
+window is not a promise of capacity. A later `allocating` stage starts its own
+estimate when the provider launch begins.
 
 `eta` contains `state:"estimate"|"range"|"unknown"|"stale"`, a human `basis`,
 and `scope:"stage"|"startup"|"job"`. An estimate supplies `seconds`, a range

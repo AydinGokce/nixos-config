@@ -45,6 +45,28 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(result['eta']['state'], 'range')
         self.assertEqual((result['eta']['lower_seconds'], result['eta']['upper_seconds']), (35, 70))
 
+    def test_capacity_wait_has_unknown_availability_and_allocation_starts_its_own_estimate(self):
+        samples = [event(1000 + second * 10, stage='waiting_capacity', stage_id='capacity-wait',
+                         completed=second * 10, total=1800, unit='steps',
+                         message='Waiting for capacity; retry window remaining 29:50',
+                         eta={'state': 'range', 'scope': 'stage', 'lower_seconds': 0,
+                              'upper_seconds': 1800, 'basis': 'Retry window'}) for second in range(2)]
+        # Even a producer confusing the retry deadline with an estimate must
+        # not expose numeric availability or an apparent completion fraction.
+        for state in ('running', 'complete', 'failed'):
+            value = {**samples[-1], 'state': state}
+            view = progress.view(value, samples, epoch=1010)
+            self.assertEqual(view['eta']['state'], 'unknown')
+            self.assertFalse({'seconds', 'lower_seconds', 'upper_seconds'} & set(view['eta']))
+            self.assertFalse({'completed', 'total', 'unit'} & set(view))
+            self.assertEqual(view['stage_state'], state)
+        allocation = event(1020, stage='allocating', stage_id='allocation',
+                           eta={'state': 'range', 'scope': 'stage', 'lower_seconds': 60,
+                                'upper_seconds': 180, 'basis': 'Prior startup observations'})
+        view = progress.view(allocation, [*samples, allocation], epoch=1025)
+        self.assertEqual(view['eta']['state'], 'range')
+        self.assertEqual((view['eta']['lower_seconds'], view['eta']['upper_seconds']), (55, 175))
+
     def test_eta_is_unknown_for_one_measurement_reset_different_stage_or_no_rate(self):
         first = event(1000, completed=100, total=1000, unit='bytes')
         for second in [event(1010, completed=100, total=1000, unit='bytes'),
@@ -178,15 +200,18 @@ class WorkerProgressTests(unittest.TestCase):
     def test_real_local_runner_exposes_stage_eta_and_retains_owned_evidence(self):
         from workbench.test_workbench import WorkbenchTests
         fixture = WorkbenchTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
-        stages = ['allocating', 'runtime_download', 'index_warm', 'model_setup', 'inference']
+        stages = ['waiting_capacity', 'allocating', 'runtime_download', 'index_warm', 'model_setup', 'inference']
         script = '''import json,os,pathlib,time
 side=pathlib.Path(os.environ['BIO_WORKER_PROGRESS_LOG'])
 assert side.stat().st_mode & 0o777 == 0o600
 root=pathlib.Path(ROOT)
 for stage in STAGES:
- value={'schema':1,'stage':stage,'scope':'msa' if stage=='index_warm' else 'gpu',
+ value={'schema':1,'stage':stage,'scope':'msa' if stage in ('waiting_capacity','index_warm') else 'gpu',
   'state':'running','message':'Fixture '+stage,'timestamp_ns':time.time_ns(),
   'eta':{'state':'range','scope':'stage','lower_seconds':30,'upper_seconds':60,'basis':'Synthetic measured fixture'}}
+ if stage=='waiting_capacity':
+  value['eta']={'state':'unknown','scope':'stage','basis':'Worker availability has no reliable estimate'}
+  value['message']='Waiting for capacity; retry window remaining 30:00'
  with side.open('a') as stream:stream.write('BIO_WORKER_STAGE '+json.dumps(value)+'\\n')
  limit=time.monotonic()+12
  while not(root/stage).exists():
@@ -207,8 +232,13 @@ for stage in STAGES:
                     if detail.get('stage') == stage:
                         self.assertEqual(job['state'], 'running')
                         self.assertEqual(detail['eta']['scope'], 'stage')
-                        self.assertEqual(detail['eta']['state'], 'range')
-                        self.assertLessEqual(detail['eta']['upper_seconds'], 60)
+                        if stage == 'waiting_capacity':
+                            self.assertEqual(job['phase'], 'private MSA waiting for capacity')
+                            self.assertEqual(detail['eta']['state'], 'unknown')
+                            self.assertNotIn('upper_seconds', detail['eta'])
+                        else:
+                            self.assertEqual(detail['eta']['state'], 'range')
+                            self.assertLessEqual(detail['eta']['upper_seconds'], 60)
                         self.assertNotIn('percent', detail)
                         batch = fixture.api.call('batch.get', {'batch_id': job['batch_id']})
                         self.assertEqual(batch['jobs'][0]['progress']['stage'], stage)
