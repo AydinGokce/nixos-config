@@ -346,6 +346,40 @@ def startup_progress(output, session_id, stage, state, message, **extra):
     else: print(line, file=sys.stderr, flush=True)
 
 
+class WarmProgress:
+    """Estimate from actual read deltas, excluding initial residency inspection."""
+    def __init__(self):
+        self.first_read = None
+        self.last_emitted = None
+        self.verifying = False
+
+    def observe(self, value, now):
+        completed, total = value['read_bytes'], value['total_bytes']
+        verifying = completed == total
+        if self.first_read is None and completed > 0 and not verifying:
+            self.first_read = (now, completed)
+        if (self.last_emitted is not None and now-self.last_emitted < 1
+                and verifying == self.verifying):
+            return None
+        self.last_emitted = now
+        self.verifying = verifying
+        eta = {'state': 'unknown', 'scope': 'stage',
+               'basis': 'Waiting for at least five seconds of increasing buffered-read observations'}
+        message = 'Prefetching private MSA index pages'
+        if verifying:
+            message = 'All index bytes read; verifying full page residency'
+            eta['basis'] = 'Final page-residency verification has no measured completion rate'
+        elif self.first_read is not None:
+            elapsed = now-self.first_read[0]
+            delta = completed-self.first_read[1]
+            if elapsed >= 5 and delta > 0:
+                seconds = (total-completed)*elapsed/delta
+                if math.isfinite(seconds) and 0 <= seconds <= 604800:
+                    eta = {'state': 'estimate', 'seconds': seconds, 'scope': 'stage',
+                           'basis': 'Observed buffered-read byte deltas; residency verification follows'}
+        return dict(message=message, completed=completed, total=total, unit='bytes', eta=eta)
+
+
 @contextmanager
 def startup_activity(tools, output, session_id, stage, message):
     helper = Path(tools)/'py/worker_progress.py'
@@ -402,18 +436,11 @@ def serve(args):
         warm_deadline = args.deadline-RESERVE
         if args.warm_seconds is not None:
             warm_deadline = min(warm_deadline, time.time()+args.warm_seconds)
-        started = time.monotonic(); last_progress = [0.0]
+        warm_progress = WarmProgress()
         def loading_progress(value):
-            elapsed = time.monotonic()-started
-            if elapsed-last_progress[0] < 1 and value['read_bytes'] != value['total_bytes']: return
-            last_progress[0] = elapsed
-            eta = {'state': 'unknown', 'scope': 'stage', 'basis': 'Waiting for measured buffered index throughput'}
-            if elapsed >= 1 and value['read_bytes']:
-                seconds = max(0, (value['total_bytes']-value['read_bytes'])*elapsed/value['read_bytes'])
-                if seconds <= 604800:
-                    eta = {'state': 'estimate', 'seconds': seconds, 'scope': 'stage', 'basis': 'Observed buffered index bytes per second'}
-            startup_progress(output, args.session_id, 'index_warm', 'running', 'Prefetching private MSA index pages',
-                             completed=value['read_bytes'], total=value['total_bytes'], unit='bytes', eta=eta)
+            fields = warm_progress.observe(value, time.monotonic())
+            if fields is not None:
+                startup_progress(output, args.session_id, 'index_warm', 'running', **fields)
         stage = 'index_warm'
         startup_progress(output, args.session_id, stage, 'running', 'Loading and checking full private MSA index residency')
         warm = cache.warm(args.warm, warm_deadline, int(args.headroom_gib*1024**3),
