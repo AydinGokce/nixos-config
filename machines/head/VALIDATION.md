@@ -1,9 +1,68 @@
-# Validation — 2026-09-06
+# Validation
 
-These are functional checks with small protein inputs. Production RFAA database
-installation is tracked separately from tests with miniature databases.
+Executed checks are recorded below with their input and execution scope.
+Production RFAA database installation is tracked separately from tests with
+miniature databases.
 
-## Resident execution and completed private comparison
+## Packaged runtimes and parallel MSA loading — 2026-09-10
+
+A fresh managed worker prepared the original 1,726-residue RF3 input using the
+full private database. Preparation took **958.68 seconds**; verifying reuse of
+that exact refreshed cache entry brought the proof to **964.08 seconds**. The
+replay forbade subprocesses and network access and started no second search.
+The older default cache entry remained unchanged. This exercise covered MSA
+preparation and cache reuse; folding inference was not rerun.
+
+| Observed stage | Duration |
+|---|---:|
+| Head preparation before allocation, including archive reuse checks | 63.3 s |
+| Instance allocation | 60.7 s |
+| SSH and base setup | 65.9 s |
+| Download 21.61 GB runtime archive | 69.3 s |
+| Extract 37.67 GB of runtime files | 139.4 s |
+| Verify database installation | 160.3 s |
+| Load all indexes and verify full residency | 362.9 s |
+| Private search stage | 6.5 s |
+
+These stage markers exclude small coordination and materialization gaps; the
+total above measures the entire preparation. Runtime transfer averaged
+**311.7 MB/s**. Full index loading including residency verification averaged
+**1.93 GB/s** across all **699,905,921,024 bytes**. The initial index observation
+was effectively cold; every page was resident afterward. Four independent
+readers ran, temporary NFS read-ahead changed from 128 to 15,360 KiB and was
+restored, and the original full `mincore` gate passed. Residency is a point-in-time
+observation. Search settings and all database components matched the retained
+original request. Earlier serial-loading/file-copy observations were not a
+controlled benchmark of this implementation.
+
+All five reusable archives (MSA, RF3, Boltz2, Protenix and OpenFold3) were built
+on the head before their next rental. They occupy 50.37 GB; the first MSA archive
+took 13 minutes 42 seconds to build once. Archives use the existing runtime
+assets and preserve absolute paths and executable modes on isolated worker disk.
+
+Live controls applied exactly one 900-second idle extension across repeated
+requests without changing the original hard deadline. Graceful shutdown then
+completed, and fresh provider inventory confirmed the exact worker and its OS
+disk absent, including trash. No other caller used this test generation.
+The native package passed 160 tests and actual isolated GUI checks for worker
+status, controls, interrupted-reply recovery and chronological run history.
+
+Follow-up telemetry corrections were checked against the saved runtime and
+loader observations. Runtime estimates now use bounded recent counters; loader
+estimates wait for five seconds of actual reading, and final residency verification
+shows an unknown duration. Replaying 280 saved loader observations removed the
+initial estimate spike and the zero-second verification interval. Normal verified
+shutdown reports offline with cleared timers. These follow-ups changed observation
+and display behavior; they did not require another worker or search. The final
+MSA suite ran 229 tests (211 passed, 18 environment-dependent skips), with all
+29 focused loader/progress tests passing; 183 Workbench tests also passed.
+
+Receipts, raw telemetry, source bindings and detailed test results are retained
+under `~/bio-runs/worker-startup-controls-20260910/`; the head retains the matching
+`/root/worker-startup-controls-20260910/` evidence. The shared filesystem was
+expanded in place to 200 GiB for the archives; see [BUDGET.md](BUDGET.md).
+
+## Resident execution and completed private comparison — 2026-09-06
 
 The full private ColabFold database snapshot is downloaded, extracted and
 indexed, including all five required components. All 42 private native
