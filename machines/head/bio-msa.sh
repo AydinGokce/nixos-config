@@ -25,15 +25,18 @@ bio-msa panel --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
 bio-msa session start [--worker TYPE --timeout SECONDS --idle-seconds SECONDS --warm report|prefetch|lock]
 bio-msa session status
 bio-msa session stop
-bio-msa prepare --model openfold3|boltz2|protenix --fasta FILE
-bio-msa prepare --model rf3 --json CHAIN_QUERIES.json
+bio-msa prepare --model openfold3|boltz2|protenix --fasta FILE [--require-session]
+bio-msa prepare --model rf3 --json CHAIN_QUERIES.json [--require-session]
 bio-msa serve [--worker TYPE --timeout SECONDS]
 bio-msa status
 bio-msa compare --help
 
-Private preparation reuses an explicitly started, budgeted session. It never
-rents a new worker per request or falls back to a public endpoint. A session
-keeps its full database API alive across requests until idle or maximum lifetime;
+Private preparation starts a budgeted session when needed and waits for its
+database API to become ready. Concurrent requests share that session; existing
+prepared inputs remain reusable without starting a worker. --require-session
+disables automatic startup. Private preparation never falls back to a public
+endpoint. A session keeps its full database API alive across requests until its
+idle or lifetime limit (defaults: 15 minutes idle, two hours maximum);
 the database volume persists after its managed worker is removed. Index prefetch
 is the default; report only measures residency, while lock requires sufficient
 RAM headroom and a suitable memory-lock limit. Readiness records the actual mode.
@@ -43,7 +46,7 @@ defaults to CPU.16V.64G and creates sequence databases without full search index
 it does not make the databases ready for preparation. Database volumes and
 prepared inputs remain after compute is removed. To prepare then predict:
   bio-submit openfold3 --fasta FILE --msa-backend private
-Public MSA remains the default until prediction-quality comparisons pass.
+The command-line default remains public; Bio Workbench defaults to private MSA.
 Session start, installation and standalone serving select FIN-02 compute with at least 768 GiB RAM and a
 $13/hour instance-price ceiling, including spot capacity. --spot selects only
 spot offers; --worker TYPE overrides automatic selection. dc rechecks the quote

@@ -1,27 +1,59 @@
 # Managed private MSA sessions
 
-`bio-msa session start --timeout 14400` requests one managed search worker using
-the existing worker selector, fresh quote, budget reservation and cleanup
-wrapper. Its API remains alive across preparation requests. `bio-msa prepare
---model protenix --fasta query.fasta --bundle-result prepared.json` submits a
-durable request to that session; it does not rent another worker. Public MSA
-remains the folding default unless private preparation is explicitly selected.
+`bio-msa prepare --model protenix --fasta query.fasta --bundle-result
+prepared.json` validates its input locally, then ensures one shared private search
+session. A missing session is started through the existing worker selector, fresh
+quote, budget reservation and cleanup wrapper. Concurrent callers join that same
+startup and wait for full database readiness. An already-ready session is reused.
+RF3's verified preparation-cache lookup still runs first: a cache hit does not
+start a search worker. Explicit prepared bundles likewise need no startup.
 
-`bio-msa session status` checks the original unit invocation, current managed
-provider identity, pinned SSH host key, boot and session generation before
-reporting readiness. `bio-msa session stop` stops the original managed
-submission and clears its registration only after fresh inventory confirms the
-exact worker and temporary OS are absent. Natural idle/deadline shutdown can
-be reconciled with the same stop command, including a collected systemd unit.
-Uncertain starts, replaced units and unresolved cleanup retain their records
-and prevent automatic repeat allocation.
+The default maximum session lifetime is 7,200 seconds, the idle timeout is 900
+seconds, and index prefetch remains enabled. Existing instance selection, the
+$13/hour instance-price ceiling and the current total project budget gate remain
+in force. Full database storage and completed prepared bundles persist when the
+worker is removed. The native GUI defaults to private MSA; the low-level legacy
+`bio-submit` default remains public unless private is selected. No request falls
+back to a public endpoint when private infrastructure is unavailable.
 
-The default idle timeout is 900 seconds after requests finish. The maximum
-lifetime and every request's absolute deadline are bounded by the managed
-worker deadline. Queued time counts toward a request timeout. Failed or
-uncertain requests retain their IDs, inputs, logs and partial outputs; the
-client never silently re-submits them. Full database storage and completed
-prepared bundles persist independently of compute.
+`bio-msa prepare --require-session ...` preserves the operator mode that requires
+an already-ready session and never starts compute. `bio-msa session start
+--timeout 7200` still starts an explicit managed session. `session status` checks
+the original unit invocation, current managed provider identity, pinned SSH host
+key, boot and session generation. `session stop` retains its explicit semantics.
+
+On-demand startup writes the immutable session/start intent and active registration
+before asking systemd to launch anything. All starters share the existing
+registration lock; readers wait out incomplete publication. A lost startup reply
+can join its exact saved unit command/invocation, but never issues another launch.
+A caller that starts or joins a starting generation does not replace it if startup
+fails. Later requests may retire an already-ended generation only after fresh
+provider evidence proves the exact worker and temporary OS disk are absent.
+Replaced units, missing worker identity, unknown startup outcomes and uncertain
+cleanup keep registration intact for inspection. An old closure receipt alone
+never authorizes replacement. No search request is silently replayed.
+
+Startup, readiness checks, queued search and execution consume the same request
+`--timeout`. Each provider/systemd/SSH readiness wait is bounded by the remaining
+deadline. Search deadlines are also capped by the managed session's deadline.
+There is the existing maximum 45-second result-receipt transport grace after
+search, followed by bounded local output validation; this does not extend native
+search or worker lifetime. `--session-timeout` controls only a newly started
+session's maximum lifetime and cannot extend an existing one. Cancelling a caller
+stops its wait; the independently owned shared service retains idle and maximum
+lifetime cleanup for other callers.
+
+Progress is emitted as flushed stderr lines:
+`BIO_MSA_SESSION_STAGE <starting|warming|ready|waiting|failed> <JSON>`.
+Each event contains `message` and `timestamp_ns`, with optional `session_id` and
+`code`; lines are at most 4,096 bytes and contain no credentials or command argv.
+If the trusted runner supplies `BIO_MSA_PROGRESS_LOG`, the caller also appends
+identical events to that existing private, regular, single-link, caller-owned
+file. It never grows past 1 MiB and is never passed to the shared service. This
+lets RF3 retain its nested diagnostic logs while the GUI sees startup, warm-up,
+search and actionable failure messages. Readiness failures use explicit
+`session_missing`, `session_starting`, `session_failed` or `session_uncertain`
+codes instead of a generic missing-document message.
 
 The official pinned CPU API runs on worker loopback. Requests travel through
 pinned SSH and a worker-local spool, with one preparation at a time and the
@@ -58,8 +90,7 @@ For the A3 transition, requests remain durably queued until the original
 the original audit-proxy port is free. The new spool's own earlier deadline
 and original worker deadline both remain enforced. Head registration binds
 the original managed head unit and the separately supervised worker spool
-invocation; stopping the registration targets only the latter. No public
-default is changed and no new allocation occurs.
+invocation; stopping the registration targets only the latter. Adoption itself changes no defaults and allocates no resources.
 
 If the original owner has already removed the borrowed worker, a failed SSH
 observation clears registration only after fresh managed-provider evidence proves
@@ -68,7 +99,9 @@ or uncertain cleanup keeps registration intact.
 
 Adoption is an operator workflow requiring explicit ready, owner-unit,
 spool-unit, source and known-host bindings; ordinary preparation uses
-`bio-msa prepare`. Production independent sessions use `session start`.
+`bio-msa prepare`. On-demand startup and explicit `session start` both use
+independent managed sessions; adoption never transfers ownership of its original
+worker to an ordinary waiting preparation.
 
 ## Validation
 
@@ -79,3 +112,9 @@ test verifies that its actual server remains responsive after spool shutdown.
 Local fixtures do not qualify a production database or establish prediction
 quality. Actual A3 adoption/preparation evidence is retained separately under
 `bio-runs/architecture-session-20260906/msa-adopt-v1`.
+
+The on-demand suites use isolated files and fake units/providers only. They cover
+concurrent callers, a real multiprocess barrier during registration publication,
+lost replies, generation replacement refusal, exact cleanup proofs, cancellation,
+request deadlines, malformed input before allocation and bounded progress logs.
+They do not start cloud instances or invoke native model/search execution.

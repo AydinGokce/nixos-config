@@ -14,7 +14,7 @@ import time
 
 from . import inputs
 from .common import (TERMINAL, Error, atomic, canonical, digest, file_sha, inventory,
-                     no_links, now, read_json, require, safe_file, uid, write_json)
+                     no_links, now, parse, read_json, require, safe_file, uid, write_json)
 
 
 def verify_prepared(prepared):
@@ -83,12 +83,69 @@ def resident_request(root, job_id, token):
     return data
 
 
-def observe_phase(log):
-    if not log.exists():
-        return 'starting', 'Starting the validated submission'
+MSA_PHASES = {'starting': 'private MSA startup', 'warming': 'private MSA warm-up',
+              'ready': 'private MSA ready', 'waiting': 'private MSA waiting',
+              'failed': 'private MSA failed'}
+MSA_MARKER = re.compile(r'^BIO_MSA_SESSION_STAGE (starting|warming|ready|waiting|failed) ([^\r\n]{1,4096})$', re.M)
+MSA_LOG_PREFIX = '[private MSA progress] '
+
+
+def log_tail(log):
+    """Read only a bounded tail of the runner's explicitly owned log paths."""
+    if log is None or not log.exists():
+        return '', 0
     with safe_file(log).open('rb') as stream:
-        size = stream.seek(0, 2); stream.seek(max(0, size - 32768))
-        text = stream.read().decode(errors='replace')
+        size = stream.seek(0, 2); offset = max(0, size - 32768)
+        stream.seek(offset)
+        raw = stream.read(32768)
+        modified = os.fstat(stream.fileno()).st_mtime_ns
+    if offset:
+        # Never interpret a suffix of a truncated line as a complete marker.
+        raw = raw.partition(b'\n')[2]
+    return raw.decode(errors='replace'), modified
+
+
+def session_stages(text, modified):
+    """Markers describe progress only; malformed output never controls jobs."""
+    events = []
+    for match in MSA_MARKER.finditer(text):
+        if len(match.group(0).encode()) > 4096:
+            continue
+        try:
+            event = parse(match.group(2))
+            if not isinstance(event, dict) or not set(event) <= {'message', 'session_id', 'code', 'timestamp_ns'}:
+                continue
+            message = event.get('message')
+            timestamp = event.get('timestamp_ns', modified)
+            if (not isinstance(message, str) or not 0 < len(message) <= 2048
+                    or any(ord(char) < 32 or 127 <= ord(char) < 160 or 0xD800 <= ord(char) <= 0xDFFF
+                           for char in message)
+                    or type(timestamp) is not int or not 0 < timestamp < 2**63):
+                continue
+            if 'session_id' in event and (not isinstance(event['session_id'], str)
+                    or re.fullmatch(r'[a-f0-9]{32}', event['session_id']) is None):
+                continue
+            if 'code' in event and (not isinstance(event['code'], str)
+                    or re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', event['code']) is None):
+                continue
+        except (ValueError, RecursionError):
+            continue
+        events.append({**event, 'stage': match.group(1), 'timestamp_ns': timestamp, 'end': match.end()})
+    return events
+
+
+def log_observation(log, msa_progress=None):
+    text, modified = log_tail(log)
+    main = session_stages(text, modified)
+    side_text, side_modified = log_tail(msa_progress)
+    side = session_stages(side_text, side_modified)
+    latest = max(([main[-1]] if main else []) + ([side[-1]] if side else []),
+                 key=lambda event: event['timestamp_ns'], default=None)
+    return text, modified, main, latest
+
+
+def native_phase(text, generic_msa=True):
+    text = '\n'.join(line for line in text.splitlines() if not line.startswith(MSA_LOG_PREFIX))
     if 'resident request' in text:
         return 'resident inference', 'Native resident request submitted; waiting for its durable result'
     md_phases = re.findall(r'BIO_MD_STAGE ([A-Za-z0-9_.-]+) (starting|complete|failed|interrupted)', text)
@@ -98,13 +155,99 @@ def observe_phase(log):
                  'MD analysis' if any(s in name for s in ('analysis', 'analyze', 'ddg', 'compare', 'pmf')) else
                  'MD equilibration' if any(s in name for s in ('minimiz', '_min', '_em', '_nvt', '_npt', 'equil')) else 'MD sampling')
         return phase, f'MD stage {name}: {state}'
-    rules = [('prefilter', 'MSA search'), ('MSA', 'MSA preparation'), ('checkpoint', 'model initialization'),
+    rules = [('prefilter', 'MSA search'), *([('MSA', 'MSA preparation')] if generic_msa else []), ('checkpoint', 'model initialization'),
              ('Inference', 'inference'), ('diffusion', 'inference'), ('sampling', 'inference'),
              ('removing ', 'worker cleanup'), ('result retrieval', 'result transfer')]
     for word, phase in reversed(rules):
         if word in text:
             return phase, phase[0].upper() + phase[1:] + ' observed in native log'
+    return None
+
+
+def observe_phase(log, msa_progress=None, *, native_modified=None):
+    text, modified, main, latest = log_observation(log, msa_progress)
+    if latest:
+        # A later native phase clears the prerequisite wait. The sidechannel is
+        # necessary when RF3 captures its child stderr in a preparation log;
+        # no cache source change or nested path discovery is required.
+        downstream = native_phase(text[main[-1]['end']:] if main else text, generic_msa=False)
+        actual_modified = modified if native_modified is None else native_modified
+        if downstream and actual_modified > latest['timestamp_ns'] and latest['stage'] != 'failed':
+            return downstream
+        return MSA_PHASES[latest['stage']], latest['message']
+    if not log.exists():
+        return 'starting', 'Starting the validated submission'
+    native = native_phase(text)
+    if native:
+        return native
     return 'running', 'Managed submission is running; native logs are available'
+
+
+class JobProgress:
+    """Expose nested preparation progress without treating our log mirror as
+    new native work. A child append changes the size and releases that override.
+    """
+    def __init__(self, log, msa_progress):
+        self.log, self.msa_progress = log, msa_progress
+        self.last_event = None
+        self.mirror_signature = None
+        self.native_modified = 0
+
+    def _main_stat(self):
+        stat = safe_file(self.log).stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if signature != self.mirror_signature:
+            self.native_modified = stat.st_mtime_ns
+        return stat
+
+    def observe(self):
+        self._main_stat()
+        return observe_phase(self.log, self.msa_progress, native_modified=self.native_modified)
+
+    def forward(self):
+        text, modified = log_tail(self.msa_progress)
+        events = session_stages(text, modified)
+        if not events:
+            return
+        event = events[-1]
+        payload = {key: value for key, value in event.items() if key not in {'stage', 'end'}}
+        line = b'BIO_MSA_SESSION_STAGE ' + event['stage'].encode() + b' ' + canonical(payload)
+        if line == self.last_event:
+            return
+        self.last_event = line
+        main_text, _ = log_tail(self.log)
+        if line.decode() in main_text:
+            return
+        before = self._main_stat()
+        entry = MSA_LOG_PREFIX.encode() + line + b'\n'
+        fd = os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        try:
+            require(os.write(fd, entry) == len(entry), 'Incomplete owned progress log append', 'integrity')
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        # If the child wrote concurrently, its append is genuine new native
+        # output. Otherwise ignore just our mirror's later modification time.
+        self.mirror_signature = ((after.st_size, after.st_mtime_ns)
+                                 if after.st_size == before.st_size + len(entry) else None)
+
+
+def submission_error(log, status, msa_progress=None):
+    text, _, _, latest = log_observation(log, msa_progress)
+    error = {'message': 'Submission exited with status ' + str(status), 'automatic_retry': False}
+    if latest and latest['stage'] == 'failed':
+        error.update(message='Private MSA prerequisite failed: ' + latest['message'],
+                     prerequisite='private_msa')
+        for field in ('code', 'session_id'):
+            if field in latest:
+                error[field] = latest[field]
+    else:
+        # Known human-readable entrypoint errors remain useful even if the
+        # session was already ready and a later native preparation step failed.
+        causes = re.findall(r'^(?:msa-session-client|bio-msa|rf3-msa|prepared|bio-submit): ([^\r\n]{1,3000})$', text, re.M)
+        if causes:
+            error['message'] = causes[-1]
+    return error
 
 
 def cancel_resident(config, receipt):
@@ -289,6 +432,9 @@ def run_job(store, job_id, config):
     prepared = job['_prepared']; verify_prepared(prepared)
     results = root / 'results'; results.mkdir(mode=0o700, exist_ok=False)
     log = root / 'run.log'
+    msa_progress = root / 'msa-session-progress.log'
+    progress_fd = os.open(msa_progress, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(progress_fd)
     cancelled = False
     process = None
     def signal_cancel(signum, frame):
@@ -309,6 +455,9 @@ def run_job(store, job_id, config):
         env.pop('BIO_WORKBENCH_ACTOR', None)
         env.update(BIO_RESULTS_DIR=str(results), BIO_TOOLS_SRC=prepared['tools_dir'], PYTHONUNBUFFERED='1')
         env.update(prepared['environment'])
+        # Only this waiting caller writes progress. The shared MSA lifecycle is
+        # a separate owned service, never a member of this submission's group.
+        env['BIO_MSA_PROGRESS_LOG'] = str(msa_progress)
         token = uid()
         write_json(root / 'resident-binding.json', {'schema': 1, 'job_id': job_id, 'token': token}, exclusive=True)
         env['BIO_WORKBENCH_BINDING_FILE'] = str(root / 'resident-binding.json')
@@ -319,12 +468,14 @@ def run_job(store, job_id, config):
             write_json(root / 'head-process.json', {'pid': process.pid, 'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19],
                         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'created_at': now()}, exclusive=True)
             sent_term = None; resident = None; resident_cancelled = False
+            progress = JobProgress(log, msa_progress)
             deadline = time.monotonic() + prepared['timeout'] + 1200
             while process.poll() is None:
                 current = store.read('job', job_id)
                 cancelled = cancelled or current['state'] == 'cancel_requested'
                 resident = resident_request(root, job_id, token) or resident
-                phase, message = observe_phase(log)
+                phase, message = progress.observe()
+                progress.forward()
                 row = None
                 if cancelled:
                     resident, row = request_cancel(root, job_id, token, config)
@@ -336,12 +487,14 @@ def run_job(store, job_id, config):
                                'Resident prediction already claimed; its bounded execution is finishing and outputs will be retained')
                     # Never kill the waiting client for an already claimed
                     # durable request, or the shared resident worker.
-                elif cancelled and sent_term is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    sent_term = time.monotonic()
+                elif cancelled:
+                    if sent_term is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        sent_term = time.monotonic()
+                    phase = 'cancellation requested'
                     message = 'Cancellation signalled to the exact owned submission; waiting for managed cleanup'
                 if sent_term is not None and time.monotonic() - sent_term > 840:
                     raise Error('unavailable', 'Owned submission cleanup exceeded its stop bound; retained for operator reconciliation')
@@ -357,6 +510,9 @@ def run_job(store, job_id, config):
                     store.put(db, 'job', current)
                 time.sleep(1)
         status = process.returncode
+        # A failed prerequisite can exit between polls. Retain its cause in the
+        # ordinary job log before sealing evidence or resident reconciliation.
+        progress.forward()
         latest_receipt = resident_request(root, job_id, token)
         if status != 0 and latest_receipt is not None:
             # Preserve any interrupted client copy separately. The authoritative
@@ -380,14 +536,20 @@ def run_job(store, job_id, config):
         artifacts = seal_results(store, job, results)
         # Retain the head log and submit binding separately from native files.
         head = root / 'head-evidence'; head.mkdir(mode=0o700)
-        for name in ('run.log', 'submission.json', 'head-process.json'):
+        for name in ('run.log', 'submission.json', 'head-process.json', 'msa-session-progress.log'):
             shutil.copyfile(root / name, head / name)
         artifacts += seal_results(store, job, head, 'head')
         state = 'complete' if status == 0 else 'cancelled' if cancelled else 'failed'
+        error = None if status == 0 else ({'message': 'Submission cancelled', 'automatic_retry': False}
+                                        if cancelled else submission_error(log, status, msa_progress))
         with store.transaction() as db:
             current = store.get(db, 'job', job_id)
             current.update(state=state, exit_code=status, finished_at=now(), phase=state,
-                           error=None if status == 0 else {'message': 'Submission exited with status ' + str(status), 'automatic_retry': False})
+                           error=error)
+            if error:
+                current['progress'] = {'message': error['message'], 'observed_at': now()}
+            else:
+                current['progress'] = {'message': 'Run completed; outputs retained', 'observed_at': now()}
             if cancelled and status == 0:
                 current['provenance']['cancel_requested_but_prediction_finished'] = True
             current['provenance']['artifacts_sha256'] = digest(artifacts)
