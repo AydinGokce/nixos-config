@@ -255,6 +255,92 @@ class LibraryProductTests(unittest.TestCase):
             self.assertFalse(edits.presentation(self.registry.show(ident))['archived'])
             self.assertEqual(self.peptide(ident)['sequence'], 'FAG')
 
+    def test_frame_edit_is_actual_sequence_revision_and_undo_preserves_old_snapshot(self):
+        self.seed(); result, _ = self.create(); ident = self.registry.show(result['ref'])['id']
+        initial = self.registry.show(ident)
+        snapshot = self.registry.snapshot(result['ref'])
+        changed, params = self.request({'frame_offset': 1}, ident)
+        current = self.registry.show(ident)
+        self.assertEqual(self.peptide(ident)['sequence'], 'WLG')
+        self.assertEqual(current['identity']['encoded_by']['translation']['codon_start'], 2)
+        self.assertEqual(current['identity']['encoded_by']['translation']['stop_policy'], 'first_stop')
+        self.assertEqual(current['identity']['encoded_by']['translation']['schema'], 2)
+        self.assertNotIn('sequence', current['identity'])
+        self.assertEqual(self.registry.show(result['ref']), initial)
+        self.assertEqual(self.registry.snapshot(result['ref']), snapshot)
+        self.assertEqual(edits.edit(self.api, params), changed)
+        self.reverse()
+        self.assertEqual(self.peptide(ident)['sequence'], 'MAG')
+        self.assertEqual(self.registry.show(ident)['identity']['encoded_by']['translation']['schema'], 1)
+        self.reverse('redo')
+        self.assertEqual(self.peptide(ident)['sequence'], 'WLG')
+        self.assertEqual(self.api.call('library.get', {'ref': ident})['sequence_view']['sequence'], 'WLG')
+
+    def test_frame_first_stop_and_invalid_frame_remain_repairable(self):
+        self.seed('ATGAATAAATAA'); result, _ = self.create(); ident = self.registry.show(result['ref'])['id']
+        self.assertEqual(self.peptide(ident)['sequence'], 'MNK')
+        self.request({'frame_offset': 1}, ident)  # TGA is the first codon.
+        self.assertFalse(self.peptide(ident)['available'])
+        detail = self.api.call('library.get', {'ref': ident})
+        self.assertFalse(detail['submission']['allowed'])
+        self.assertEqual(detail['sequence_view']['source']['sequence'], 'ATGAATAAATAA')
+        self.request({'frame_offset': 2}, ident)  # GAA, TAA => E.
+        self.assertEqual(self.peptide(ident)['sequence'], 'E')
+        self.assertEqual(self.api.call('library.get', {'ref': ident})['sequence_view']['codon_positions'], [[2, 3, 4]])
+        self.request({'frame_offset': 0}, ident)
+        self.assertEqual(self.peptide(ident)['sequence'], 'MNK')
+
+    def test_unchanged_frame_keeps_existing_cds_initiation_and_malformed_writes_fail(self):
+        self.seed(); result, _ = self.create(); ident = self.registry.show(result['ref'])['id']
+        original = deepcopy(self.registry.show(ident)['identity'])
+        reply, _ = self.request({'frame_offset': 0}, ident)
+        self.assertFalse(reply['changed'])
+        self.assertEqual(self.registry.show(ident)['identity'], original)
+        for invalid in (-1, 3, True, 1.0, '1'):
+            with self.subTest(invalid=invalid), self.assertRaises(Error):
+                self.request({'frame_offset': invalid}, ident)
+        for patch in ({'frame_offset': 1, 'sequence': 'AA'},
+                      {'frame_offset': 1, 'translation': definition()},
+                      {'frame_offset': 1, 'parent_ref': 'construct:plasmid@1'}):
+            with self.assertRaises(Error):
+                self.request(patch, ident)
+        with self.assertRaises(Error):
+            self.request({'frame_offset': 1}, 'plasmid')
+
+    def test_frame_edit_survives_registry_backup_and_new_actor_api(self):
+        self.seed(); result, _ = self.create(); ident = self.registry.show(result['ref'])['id']
+        changed, _ = self.request({'frame_offset': 2}, ident)
+        self.assertEqual(self.peptide(ident)['sequence'], 'GWV')
+        archive = self.base / 'frame-edited.tar.gz'; self.registry.export_snapshot(archive)
+        restored = self.base / 'frame-restored'; self.module.restore_backup(archive, restored)
+        reopened = API(Store(self.base / 'fresh-service'), 'alice',
+            library_config={**self.config, 'library_root': str(restored)})
+        detail = reopened.call('library.get', {'ref': ident})
+        self.assertEqual(detail['sequence_view']['translation']['codon_start'], 3)
+        self.assertEqual(detail['sequence_view']['sequence'], 'GWV')
+        reopened.call('library.undo', {'operation_id': changed['operation_id'], 'request_key': 'restore-frame'})
+        self.assertEqual(reopened.call('library.get', {'ref': ident})['sequence_view']['sequence'], 'MAG')
+
+    def test_rna_parent_creation_frame_and_undo_use_the_same_protein_type(self):
+        parent = self.registry.import_record({'kind': 'construct', 'id': 'plasmid',
+            'name': 'RNA coding template', 'identity': {'molecule_type': 'rna',
+                'sequence': 'AUGGCUGGGUAA'}})
+        self.project(refs=[self.module.reference(parent)])
+        result, _ = self.create()
+        ident = self.registry.show(result['ref'])['id']
+        self.assertEqual(self.peptide(ident)['sequence'], 'MAG')
+        self.request({'frame_offset': 1}, ident)
+        detail = self.api.call('library.get', {'ref': ident})
+        self.assertEqual(detail['record']['identity']['molecule_type'], 'protein')
+        self.assertNotIn('sequence', detail['record']['identity'])
+        self.assertEqual(detail['sequence_view']['source']['molecule_type'], 'rna')
+        self.assertEqual(detail['sequence_view']['source']['sequence'], 'AUGGCUGGGUAA')
+        self.assertEqual(detail['sequence_view']['sequence'], 'WLG')
+        self.reverse()
+        self.assertEqual(self.peptide(ident)['sequence'], 'MAG')
+        self.reverse('redo')
+        self.assertEqual(self.peptide(ident)['sequence'], 'WLG')
+
 
 if __name__ == '__main__':
     unittest.main()

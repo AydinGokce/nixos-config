@@ -189,11 +189,14 @@ def get_record(api, params):
                 'description': description, 'members': members,
                 'relations': relations, 'projects': projects,
                 'revisions': [summary(r, records) for r in revisions], 'submission': submission(record, records)}
+        from .common import WIRE, canonical
         if record['kind'] == 'construct' and record['identity'].get('molecule_type') in {'dna', 'rna', 'protein'}:
             from .library_sequence import view
+            remaining = WIRE - 8192 - len(canonical(result))
+            require(remaining > 0, 'Library detail exceeds the display limit; use sequence and attachment reads', 'limit')
             result['sequence_view'] = view(record, registry, records,
-                include_sequence=bool(record['identity'].get('encoded_by', {}).get('translation')))
-        from .common import WIRE, canonical
+                include_sequence=bool(record['identity'].get('encoded_by', {}).get('translation')),
+                max_bytes=remaining)
         require(len(canonical(result)) <= WIRE - 4096,
                 'Library detail exceeds the display limit; use sequence and attachment reads or export this revision', 'limit')
         return result

@@ -68,6 +68,16 @@ work. Molecular model compatibility remains part of the existing run preview.
   Imported annotation segments retain strand, partial and stale-evidence flags.
   Stored coordinates are zero-based half-open in biological traversal order;
   user-facing coordinates are one-based inclusive. No model or registry write occurs.
+  Derived proteins also expose their exact pinned nucleotide `source` with record
+  and sequence SHA-256 values, and `codon_positions`, one genomic position triplet
+  per displayed amino acid in biological order. The authoritative peptide retains
+  CDS initiator overrides and residue cropping. `codon_positions_complete` and
+  `source.complete` distinguish complete alignments from omitted bulk data;
+  `terminal_stop_positions` optionally identifies the terminal stop triplet.
+  Invalid products still expose a valid source for frame correction. Alignment
+  limits are 1,000,000 source bases and 16,384 residues; an exceeded size/response
+  budget omits whole alignment fields with explicit diagnostics. Annotation
+  metadata has a separate 256 KiB limit, within the 2 MiB response envelope.
 * `library.product_preview {parent_ref,translation}` returns the canonical
   definition and `parent_ref,parent_sha256,available,sequence,length,issues`.
   `parent_sha256` binds the parent record, not just its DNA sequence. This is
@@ -92,7 +102,17 @@ work. Molecular model compatibility remains part of the existing run preview.
   projects, `archived` (boolean), and `sequence` for explicit protein/DNA/RNA
   constructs. `sequence_edit:{start,end,replacement}` expresses an exact splice
   instead of replacing the whole sequence. Derived proteins use `translation`
-  and optionally `parent_ref`; direct peptide editing is rejected. Parent edits
+  and optionally `parent_ref`; direct peptide editing is rejected.
+  `frame_offset:0|1|2` changes a derived protein's actual reading frame within its
+  existing coding footprint, keeping strand, genetic code and residue crop.
+  It cannot be combined with a sequence, parent or full-definition patch.
+  A changed phase uses translation schema 2, literal initiation and
+  `stop_policy:first_stop`: translate complete codons through the first in-frame
+  stop and ignore a trailing partial codon. Empty peptides, encountered ambiguous
+  codons and invalid crops remain unavailable. An unchanged phase preserves the
+  entire definition, including schema-1 CDS initiation. Existing schema-1 records
+  and snapshots keep their original translation behavior. Frame changes use the
+  same revision checks and durable undo/redo as other edits. Parent edits
   advance every current derived product in the same transaction. Ambiguous
   remapping or an invalid coding region yields unavailable diagnostics rather
   than retaining the old peptide. The response is `{operation_id,ref,changed_refs,changed,history}`;

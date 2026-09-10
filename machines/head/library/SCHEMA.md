@@ -42,6 +42,31 @@ The residue range is zero-based and end-exclusive after translation, with a
 null end selecting the complete remaining product. No old or partial peptide
 is returned when the definition is unavailable.
 
+Translation schema 2 requires the same fields plus `stop_policy`, either
+`strict` or `first_stop`. `strict` retains the translation rules above.
+`first_stop` reads complete codons until the first in-frame stop and ignores a
+partial codon at the end of the coding footprint. Codons after that stop are not
+translated. Ambiguity in a codon encountered before the stop, an empty peptide,
+or a residue crop outside the translated product makes the definition
+unavailable; no partial peptide is returned. `literal` does not invent a start
+codon, while an explicitly selected `cds` still requires an initiator and stop
+and preserves its methionine initiation override.
+
+`frame_definition(definition, offset)` accepts an integer offset from 0 to 2.
+Changing the offset preserves the ordered coding segments, strand, genetic code
+and residue crop, and sets `codon_start` to `offset + 1`, `initiation: literal`,
+`schema: 2` and `stop_policy: first_stop`. Selecting the existing offset returns
+an unchanged deep copy, including schema-1 CDS semantics. Changing a frame does
+not reverse the strand or change the coding footprint.
+
+Schema-2 projections use engine `coordinate-translation-v2`. For `first_stop`,
+their results additionally report `terminal_stop_offset` as the zero-based stop
+position in joined coding DNA after the `codon_start` skip, or null if none was
+encountered, and `trailing_bases` as that coding footprint's length modulo three.
+These fields are present once coding DNA is available; invalid source metadata
+or coordinates may fail before they can be computed. Existing schema-1 records,
+projection fields and `coordinate-translation-v1` snapshots remain unchanged.
+
 Invalid biological coordinates may be retained as `draft` so a nucleotide edit
 can publish without preserving an incorrect previous peptide. Malformed field
 types, missing source revisions or wrong source sequence digests are rejected.

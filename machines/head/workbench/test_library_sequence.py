@@ -1,4 +1,5 @@
 """Exact-revision sequence displays and read-only coordinate product previews."""
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -328,6 +329,211 @@ class LibrarySequenceTests(unittest.TestCase):
         path.write_text('{"changed":true}')
         with self.assertRaisesRegex(Error, 'integrity'):
             sequence_api.get_view(self.api, {'ref': pin(parent)})
+
+    def test_alignment_uses_exact_source_triplets_for_reverse_join_and_origin_crossing(self):
+        cases = [
+            ('ATGGCTTAA', definition(), False, [[0, 1, 2], [3, 4, 5]], [6, 7, 8]),
+            ('TTAAGCCAT', definition(strand=-1), False, [[8, 7, 6], [5, 4, 3]], [2, 1, 0]),
+            ('ATCCGGCTTAA', definition([{'start': 0, 'end': 2}, {'start': 4, 'end': 11}]),
+             False, [[0, 1, 4], [5, 6, 7]], [8, 9, 10]),
+            ('GGCTTAAAT', definition([{'start': 7, 'end': 9}, {'start': 0, 'end': 7}]),
+             True, [[7, 8, 0], [1, 2, 3]], [4, 5, 6]),
+            (reverse('GGCTTAAAT'), definition([{'start': 0, 'end': 2}, {'start': 2, 'end': 9}], strand=-1),
+             True, [[1, 0, 8], [7, 6, 5]], [4, 3, 2]),
+            ('CATGGCTTAA', definition([{'start': 0, 'end': 10}], codon_start=2),
+             False, [[1, 2, 3], [4, 5, 6]], [7, 8, 9]),
+        ]
+        for index, (sequence, value, circular, positions, stop) in enumerate(cases):
+            with self.subTest(sequence=sequence, definition=value):
+                parent = self.parent(sequence, ident='source-' + str(index), circular=circular)
+                product = self.product(parent, value, ident='aligned-' + str(index))
+                result = sequence_api.get_view(self.api, {'ref': pin(product)})
+                self.assertEqual(result['sequence'], 'MA')
+                self.assertEqual(result['source'], {'ref': pin(parent), 'sha256': parent['sha256'],
+                    'sequence_sha256': digest(sequence), 'molecule_type': 'dna', 'length': len(sequence),
+                    'circular': circular, 'sequence': sequence, 'complete': True, 'issues': []})
+                self.assertEqual(result['codon_positions'], positions)
+                self.assertTrue(result['codon_positions_complete'])
+                self.assertEqual(result['terminal_stop_positions'], stop)
+                reconstructed = [''.join(sequence[p] for p in triplet) for triplet in positions]
+                if value['strand'] == -1:
+                    reconstructed = [codon.translate(sequence_api.COMPLEMENT) for codon in reconstructed]
+                self.assertEqual(reconstructed, ['ATG', 'GCT'])
+
+    def test_alignment_crops_residues_and_only_shows_a_visible_terminal_stop(self):
+        parent = self.parent('ATGGCTGGGTAA')
+        for index, (end, positions, stop) in enumerate([
+            (None, [[3, 4, 5], [6, 7, 8]], [9, 10, 11]),
+            (2, [[3, 4, 5]], None),
+        ]):
+            product = self.product(parent, definition([{'start': 0, 'end': 12}], residue_start=1, residue_end=end),
+                                   ident='crop-' + str(index))
+            result = sequence_api.get_view(self.api, {'ref': pin(product)})
+            self.assertEqual(result['codon_positions'], positions)
+            self.assertEqual(len(result['codon_positions']), len(result['sequence']))
+            self.assertEqual(result['terminal_stop_positions'], stop)
+
+    def test_alignment_letters_preserve_cds_initiator_override_and_rna_source(self):
+        parent = self.parent('GTGGCTTAA')
+        product = self.product(parent, definition(genetic_code=11))
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(result['sequence'], 'MA')  # GTG is an initiator here, not literal V.
+        self.assertEqual(result['codon_positions'][0], [0, 1, 2])
+        self.assertEqual(result['translation']['genetic_code'], 11)
+        rna = self.parent('AUGGCUUAA', ident='rna', molecule_type='rna')
+        product = self.product(rna, ident='rna-product')
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(result['sequence'], 'MA')
+        self.assertEqual(result['source']['sequence'], 'AUGGCUUAA')
+        self.assertEqual(result['source']['molecule_type'], 'rna')
+
+    def test_unavailable_product_retains_valid_source_but_never_a_partial_alignment(self):
+        parent = self.parent('ATGGCTTAAC')
+        product = self.product(parent, definition([{'start': 0, 'end': 10}]))
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertFalse(result['available']); self.assertIsNone(result['sequence'])
+        self.assertEqual(result['source']['sequence'], 'ATGGCTTAAC')
+        self.assertTrue(result['source']['complete'])
+        self.assertEqual(result['codon_positions'], [])
+        self.assertFalse(result['codon_positions_complete'])
+        self.assertIsNone(result['terminal_stop_positions'])
+        self.assertIn('incomplete_codon', [issue['code'] for issue in result['issues']])
+
+    def test_historical_alignment_never_substitutes_the_current_parent_or_unbound_dna(self):
+        parent = self.parent()
+        product = self.product(parent)
+        self.registry.revise('parent', {'identity': {**parent['identity'], 'sequence': 'ATGGGTTAA'}})
+        old = sequence_api.get_view(self.api, {'ref': pin(product)})
+        current = sequence_api.get_view(self.api, {'ref': 'product'})
+        self.assertEqual(old['sequence'], 'MA')
+        self.assertEqual(old['source']['sequence'], 'ATGGCTTAA')
+        self.assertEqual(old['source']['sha256'], parent['sha256'])
+        self.assertEqual(current['sequence'], 'MG')
+        self.assertEqual(current['source']['ref'], 'construct:parent@2')
+        self.assertEqual(current['source']['sequence'], 'ATGGGTTAA')
+        with opened(self.api) as (_, registry, records):
+            wrong = deepcopy(product)
+            wrong['identity']['encoded_by']['sequence_sha256'] = '0' * 64
+            result = sequence_api.view(wrong, registry, records)
+            self.assertFalse(result['source']['complete'])
+            self.assertIsNone(result['source']['sequence'])
+            self.assertEqual(result['codon_positions'], [])
+            self.assertIn('source_digest', [issue['code'] for issue in result['source']['issues']])
+
+    def test_standalone_proteins_have_no_invented_nucleotide_source(self):
+        record = self.registry.import_record({'kind': 'construct', 'id': 'standalone',
+            'identity': {'molecule_type': 'protein', 'sequence': 'MA'}})
+        result = sequence_api.get_view(self.api, {'ref': pin(record)})
+        self.assertEqual(result['sequence'], 'MA')
+        self.assertNotIn('source', result)
+        self.assertNotIn('codon_positions', result)
+
+    def test_alignment_bulk_caps_omit_whole_fields_without_losing_the_peptide(self):
+        parent = self.parent('ATGGCTTAA' + 'A' * sequence_api.MAX_SOURCE_BASES)
+        product = self.product(parent)
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(result['sequence'], 'MA')
+        self.assertFalse(result['source']['complete'])
+        self.assertIsNone(result['source']['sequence'])
+        self.assertEqual(result['source']['length'], sequence_api.MAX_SOURCE_BASES + 9)
+        self.assertFalse(result['codon_positions_complete'])
+        self.assertEqual(result['codon_positions'], [])
+        self.assertIn('alignment_source_limit', [issue['code'] for issue in result['issues']])
+        long = 'ATG' + 'GCT' * sequence_api.MAX_ALIGNED_RESIDUES + 'TAA'
+        parent = self.parent(long, ident='long-peptide-source')
+        product = self.product(parent, definition([{'start': 0, 'end': len(long)}]), ident='long-peptide')
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(len(result['sequence']), sequence_api.MAX_ALIGNED_RESIDUES + 1)
+        self.assertTrue(result['source']['complete'])
+        self.assertFalse(result['codon_positions_complete'])
+        self.assertEqual(result['codon_positions'], [])
+        self.assertIn('alignment_residue_limit', [issue['code'] for issue in result['issues']])
+
+    def test_alignment_uses_remaining_envelope_budget_and_can_be_fetched_separately(self):
+        parent = self.parent('ATGGCTTAA' + 'C' * 20000)
+        product = self.product(parent)
+        with opened(self.api) as (_, registry, records):
+            limited = sequence_api.view(product, registry, records, include_sequence=False, max_bytes=3000)
+            self.assertLessEqual(len(canonical(limited)), 3000)
+            self.assertEqual(limited['sequence'], 'MA')
+            self.assertEqual(limited['source']['ref'], pin(parent))
+            self.assertEqual(limited['source']['sha256'], parent['sha256'])
+            self.assertFalse(limited['source']['complete'])
+            self.assertIsNone(limited['source']['sequence'])
+            self.assertFalse(limited['codon_positions_complete'])
+            self.assertIsNone(limited['terminal_stop_positions'])
+            self.assertIn('alignment_response_limit', [issue['code'] for issue in limited['issues']])
+            for budget in (True, 0, -1, WIRE + 1):
+                with self.subTest(budget=budget), self.assertRaises(Error):
+                    sequence_api.view(product, registry, records, max_bytes=budget)
+            with self.assertRaises(Error) as raised:
+                sequence_api.view(product, registry, records, max_bytes=20)
+            self.assertEqual(raised.exception.code, 'limit')
+            self.assertLessEqual(len(canonical(sequence_api.view(product, registry, records, max_bytes=WIRE))), sequence_api.MAX_VIEW)
+        full = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertTrue(full['source']['complete']); self.assertTrue(full['codon_positions_complete'])
+        self.assertEqual(full['source']['sequence'], parent['identity']['sequence'])
+
+    def test_large_exact_codon_mapping_is_bulk_not_a_metadata_overflow(self):
+        coding = 'ATG' + 'GCT' * (sequence_api.MAX_ALIGNED_RESIDUES - 1) + 'TAA'
+        source = 'C' * 500000 + coding
+        parent = self.parent(source)
+        product = self.product(parent, definition([{'start': 500000, 'end': len(source)}]))
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(len(result['codon_positions']), sequence_api.MAX_ALIGNED_RESIDUES)
+        self.assertTrue(result['codon_positions_complete']); self.assertTrue(result['source']['complete'])
+        self.assertGreater(len(canonical(result['codon_positions'])), sequence_api.MAX_METADATA)
+        self.assertLess(len(canonical(result)), WIRE)
+
+    def test_schema2_first_stop_mapping_uses_actual_stop_after_frame_skip(self):
+        parent = self.parent('ATGAATAAATAA')
+        product = self.product(parent, definition([{'start': 0, 'end': 12}], schema=2,
+            codon_start=3, initiation='literal', stop_policy='first_stop'))
+        result = sequence_api.get_view(self.api, {'ref': pin(product)})
+        self.assertEqual(result['sequence'], 'E')
+        self.assertEqual(result['codon_positions'], [[2, 3, 4]])
+        self.assertEqual(result['terminal_stop_positions'], [5, 6, 7])
+        self.assertTrue(result['source']['complete'])
+        self.assertTrue(result['codon_positions_complete'])
+
+    def test_schema2_stop_and_crop_mapping_cover_reverse_circular_and_unused_ambiguity(self):
+        coding = 'ATGAATAAATAA'
+        cases = [
+            (reverse(coding), definition([{'start': 0, 'end': 12}], schema=2, strand=-1,
+                codon_start=3, initiation='literal', stop_policy='first_stop'),
+             False, 'E', [[9, 8, 7]], [6, 5, 4]),
+            (coding[4:] + coding[:4], definition([{'start': 8, 'end': 12}, {'start': 0, 'end': 8}],
+                schema=2, codon_start=3, initiation='literal', stop_policy='first_stop'),
+             True, 'E', [[10, 11, 0]], [1, 2, 3]),
+            ('GCTGGGTAANN', definition([{'start': 0, 'end': 11}], schema=2,
+                initiation='literal', stop_policy='first_stop', residue_start=1),
+             False, 'G', [[3, 4, 5]], [6, 7, 8]),
+        ]
+        for index, (source, value, circular, peptide, positions, stop) in enumerate(cases):
+            parent = self.parent(source, ident='source-' + str(index), circular=circular)
+            product = self.product(parent, value, ident='product-' + str(index))
+            result = sequence_api.get_view(self.api, {'ref': pin(product)})
+            self.assertEqual(result['sequence'], peptide)
+            self.assertEqual(result['codon_positions'], positions)
+            self.assertEqual(result['terminal_stop_positions'], stop)
+            self.assertTrue(result['codon_positions_complete'])
+            self.assertEqual(result['source']['sequence'], source)
+
+    def test_schema2_boundary_partial_and_empty_stop_retain_correct_source(self):
+        for index, (source, peptide, stop) in enumerate([
+            ('GCTGG', 'A', None),
+            ('TAAGCT', None, None),
+        ]):
+            parent = self.parent(source, ident='source-' + str(index))
+            product = self.product(parent, definition([{'start': 0, 'end': len(source)}], schema=2,
+                initiation='literal', stop_policy='first_stop'), ident='product-' + str(index))
+            result = sequence_api.get_view(self.api, {'ref': pin(product)})
+            self.assertEqual(result['sequence'], peptide)
+            self.assertEqual(result['terminal_stop_positions'], stop)
+            self.assertTrue(result['source']['complete'])
+            self.assertEqual(result['source']['sequence'], source)
+            self.assertEqual(result['codon_positions_complete'], peptide is not None)
+            self.assertEqual(result['codon_positions'], [[0, 1, 2]] if peptide else [])
 
 
 if __name__ == '__main__':

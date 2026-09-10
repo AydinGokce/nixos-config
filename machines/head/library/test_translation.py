@@ -30,6 +30,117 @@ def resolve(sequence, value=None, circular=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_schema1_projection_bytes_remain_identical_to_published_engine(self):
+        goldens = {
+            'ATGGCTTAA': '6fdce461f5de2f5bc181fea4fbfdf1fce58648cba0589e209f70c4f13316b12c',
+            'ATGTAAGCTTAA': '7045ad9ad2d71ea104d00a3c17bade95eb44e69240ed5bc43128c385da1455a1',
+            'ATGNNNTAA': '102e1c46fc32c74a2d6d6d4b099121e8287b66080aca72b96a2805d108d64fc9',
+        }
+        for sequence, expected in goldens.items():
+            value = definition([{'start': 0, 'end': len(sequence)}])
+            product = {'identity': {'molecule_type': 'protein', 'encoded_by': {
+                'construct_ref': 'construct:source@1', 'sequence_sha256': t.digest(sequence), 'translation': value}}}
+            source = {'kind': 'construct', 'identity': {'molecule_type': 'dna', 'sequence': sequence}}
+            projected = t.projection(product, {'construct:source@1': source})
+            self.assertEqual(t.digest(json.dumps(projected, sort_keys=True, separators=(',', ':'))), expected)
+            self.assertEqual(projected['engine_version'], 'coordinate-translation-v1')
+            self.assertNotIn('terminal_stop_offset', projected)
+            self.assertNotIn('trailing_bases', projected)
+
+    def test_frame_definition_preserves_same_phase_and_all_other_coordinate_fields(self):
+        original = definition([{'start': 20, 'end': 32}, {'start': 0, 'end': 6}], strand=-1,
+                              genetic_code=11, codon_start=2, residue_start=1, residue_end=4)
+        same = t.frame_definition(original, 1)
+        self.assertEqual(same, original)
+        self.assertIsNot(same, original)
+        self.assertIsNot(same['segments'], original['segments'])
+        for offset in (0, 2):
+            changed = t.frame_definition(original, offset)
+            self.assertEqual(changed, {**original, 'schema': 2, 'codon_start': offset + 1,
+                                       'initiation': 'literal', 'stop_policy': 'first_stop'})
+            self.assertEqual(t.frame_definition(changed, offset), changed)
+            t.validate_definition(changed)
+        self.assertEqual(original['schema'], 1)
+        self.assertEqual(original['initiation'], 'cds')
+        for offset in (-1, 3, True, False, 1.0, '1', None):
+            with self.subTest(offset=offset), self.assertRaises(ValueError):
+                t.frame_definition(original, offset)
+
+    def test_frame_changes_translate_complete_codons_in_both_strand_directions(self):
+        for sequence, strand in [('ATGGCTTAA', 1), ('TTAAGCCAT', -1)]:
+            original = definition(strand=strand)
+            self.assertEqual(resolve(sequence, t.frame_definition(original, 0))['sequence'], 'MA')
+            for offset, peptide, trailing in [(1, 'WL', 2), (2, 'GL', 1)]:
+                result = resolve(sequence, t.frame_definition(original, offset))
+                self.assertTrue(result['available'], result)
+                self.assertEqual(result['sequence'], peptide)
+                self.assertEqual(result['trailing_bases'], trailing)
+                self.assertIsNone(result['terminal_stop_offset'])
+                self.assertEqual(result['engine_version'], t.ENGINE_V2)
+
+    def test_first_stop_halts_before_downstream_codons_and_ignores_only_boundary_partial(self):
+        cases = [('ATGTAANNNC', 'M', 3, 1), ('ATGGCTA', 'MA', None, 1), ('ATGGCTNN', 'MA', None, 2)]
+        for sequence, peptide, stop, trailing in cases:
+            value = definition([{'start': 0, 'end': len(sequence)}], schema=2,
+                               stop_policy='first_stop', initiation='literal')
+            result = resolve(sequence, value)
+            self.assertTrue(result['available'], result)
+            self.assertEqual((result['sequence'], result['terminal_stop_offset'], result['trailing_bases']),
+                             (peptide, stop, trailing))
+        # The stop offset is relative to coding DNA after the declared frame skip.
+        value = definition([{'start': 0, 'end': 10}], schema=2, stop_policy='first_stop',
+                           codon_start=2, initiation='literal')
+        self.assertEqual(resolve('NATGGCTTAA', value)['terminal_stop_offset'], 6)
+
+    def test_first_stop_preserves_crops_and_reports_unavailable_products_without_partial_peptides(self):
+        valid = definition([{'start': 0, 'end': 15}], schema=2, stop_policy='first_stop',
+                           initiation='literal', residue_start=1, residue_end=3)
+        result = resolve('ATGGCTGGTTAAATG', valid)
+        self.assertEqual((result['sequence'], result['uncropped_length'], result['terminal_stop_offset']), ('AG', 3, 9))
+        cases = [('ATGNNNTAA', {}, 'ambiguous_codon'), ('TAAGCTTAA', {}, 'empty_product'),
+                 ('AT', {}, 'incomplete_codon'), ('ATGTAAGCT', {'residue_start': 1}, 'residue_range'),
+                 ('ATGTAAGCT', {'residue_end': 2}, 'residue_range')]
+        for sequence, updates, code in cases:
+            value = definition([{'start': 0, 'end': len(sequence)}], schema=2,
+                               stop_policy='first_stop', initiation='literal', **updates)
+            result = resolve(sequence, value)
+            self.assertFalse(result['available'], result)
+            self.assertIsNone(result['sequence'])
+            self.assertEqual(result['issues'][0]['code'], code)
+
+    def test_first_stop_retains_explicit_cds_semantics_and_circular_segment_order(self):
+        value = definition([{'start': 0, 'end': 12}], schema=2, stop_policy='first_stop', genetic_code=11)
+        result = resolve('GTGGCTTAAGGG', value)
+        self.assertEqual(result['sequence'], 'MA')
+        self.assertEqual(result['terminal_stop_offset'], 6)
+        self.assertEqual(resolve('GTGGCTTAAGGG', {**value, 'initiation': 'literal'})['sequence'], 'VA')
+        self.assertEqual(resolve('GTGGCTTAAGGG', {**value, 'genetic_code': 1})['issues'][0]['code'], 'initiation')
+        self.assertEqual(resolve('GTGGCTGGGGGG', value)['issues'][0]['code'], 'terminal_stop')
+        for sequence, value in [
+            ('TAACCCATGGCT', definition([{'start': 6, 'end': 12}, {'start': 0, 'end': 3}])),
+            ('AGCCATGGGTTA', definition([{'start': 0, 'end': 6}, {'start': 9, 'end': 12}], strand=-1)),
+        ]:
+            original = resolve(sequence, {**value, 'schema': 2, 'stop_policy': 'first_stop'}, circular=True)
+            self.assertEqual(original['sequence'], 'MA')
+            self.assertEqual(original['terminal_stop_offset'], 6)
+            result = resolve(sequence, t.frame_definition(value, 1), circular=True)
+            self.assertEqual(result['sequence'], 'WL')
+            self.assertEqual(result['trailing_bases'], 2)
+
+    def test_schema2_strict_retains_strict_rules_and_schema_validation_is_versioned(self):
+        for sequence in ['ATGGCTTAA', 'ATGTAAGCTTAA', 'ATGNNNTAA', 'ATGGCTA']:
+            value = definition([{'start': 0, 'end': len(sequence)}])
+            strict = resolve(sequence, {**value, 'schema': 2, 'stop_policy': 'strict'})
+            expected = resolve(sequence, value)
+            if 'engine_version' in expected:
+                expected['engine_version'] = t.ENGINE_V2
+            self.assertEqual(strict, expected)
+        for value in [definition(stop_policy='strict'), definition(schema=2),
+                      definition(schema=True), definition(schema=2, stop_policy=False),
+                      definition(schema=2, stop_policy='unknown'), definition(schema=2, stop_policy={})]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                t.validate_definition(value)
+
     def test_forward_reverse_spliced_and_circular_strands(self):
         for sequence, value, circular in [
             ('ATGGCTTAA', definition(), False),
@@ -128,6 +239,28 @@ class DerivedRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.show('construct:product@1')['sha256'], product['sha256'])
         adapters.verify_snapshot(old)
         adapters.verify_snapshot(self.registry.snapshot('product'))
+
+    def test_schema2_frame_revision_snapshots_and_model_identity_keep_old_schema1_exact(self):
+        product = self.registry.import_record(self.document())
+        old = self.registry.snapshot('product')
+        before = json.dumps(old, sort_keys=True, separators=(',', ':'))
+        identity = deepcopy(product['identity'])
+        identity['encoded_by']['translation'] = t.frame_definition(identity['encoded_by']['translation'], 1)
+        current = self.registry.revise('product', {'identity': identity})
+        snapshot = self.registry.snapshot('product')
+        projected = snapshot['resolved_polymers'][r.reference(current)]
+        self.assertEqual(projected['engine_version'], t.ENGINE_V2)
+        self.assertEqual(projected['sequence'], 'WL')
+        self.assertEqual(projected['trailing_bases'], 2)
+        self.assertEqual(t.materialized_identity(current, snapshot)['sequence'], 'WL')
+        self.assertEqual(json.dumps(self.registry.snapshot(r.reference(product)), sort_keys=True, separators=(',', ':')), before)
+        adapters.verify_snapshot(old)
+        adapters.verify_snapshot(snapshot)
+        altered = deepcopy(snapshot)
+        altered['resolved_polymers'][r.reference(current)]['trailing_bases'] = 1
+        altered['sha256'] = r.digest_json(altered)
+        with self.assertRaises(ValueError):
+            adapters.verify_snapshot(altered)
 
     def test_metadata_revisions_and_cropped_variants_follow_parent_without_resetting_review(self):
         self.registry.import_record(self.document(review='review_required'))

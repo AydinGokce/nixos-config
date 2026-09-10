@@ -11,6 +11,7 @@ import itertools
 import json
 
 ENGINE = 'coordinate-translation-v1'
+ENGINE_V2 = 'coordinate-translation-v2'
 _AMINO = 'FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG'
 CODONS = dict(zip((''.join(x) for x in itertools.product('TCAG', repeat=3)), _AMINO))
 STARTS = {1: {'TTG', 'CTG', 'ATG'}, 11: {'TTG', 'CTG', 'ATT', 'ATC', 'ATA', 'ATG', 'GTG'}}
@@ -33,9 +34,16 @@ def is_derived(record):
 
 
 def validate_definition(value, *, require=_require):
-    require(isinstance(value, dict) and set(value) == FIELDS,
+    require(isinstance(value, dict),
             'translation requires exactly the versioned coordinate, code, frame and residue-range fields')
-    require(type(value['schema']) is int and value['schema'] == 1, 'Unsupported translation schema')
+    schema = value.get('schema')
+    fields = FIELDS | {'stop_policy'} if type(schema) is int and schema == 2 else FIELDS
+    require(set(value) == fields,
+            'translation requires exactly the versioned coordinate, code, frame and residue-range fields')
+    require(type(schema) is int and schema in {1, 2}, 'Unsupported translation schema')
+    if schema == 2:
+        require(isinstance(value['stop_policy'], str) and value['stop_policy'] in {'strict', 'first_stop'},
+                'stop_policy must be strict or first_stop')
     require(type(value['strand']) is int and value['strand'] in {-1, 1}, 'Translation strand must be +1 or -1')
     require(type(value['genetic_code']) is int and value['genetic_code'] in STARTS, 'Supported genetic codes are 1 and 11')
     require(type(value['codon_start']) is int and value['codon_start'] in {1, 2, 3}, 'codon_start must be 1, 2 or 3')
@@ -48,6 +56,20 @@ def validate_definition(value, *, require=_require):
         require(isinstance(segment, dict) and set(segment) == {'start', 'end'} and
                 all(type(segment[key]) is int and segment[key] >= 0 for key in segment),
                 'Translation segments use nonnegative, zero-based start/end integers')
+
+
+def frame_definition(definition, offset):
+    """Change phase within the exact coding footprint without inventing initiation.
+
+    A same-phase release preserves all versioned semantics, including CDS
+    initiator overrides. Callers still receive an independent definition.
+    """
+    validate_definition(definition)
+    _require(type(offset) is int and offset in {0, 1, 2}, 'frame offset must be 0, 1 or 2')
+    result = deepcopy(definition)
+    if offset != definition['codon_start'] - 1:
+        result.update(schema=2, codon_start=offset + 1, initiation='literal', stop_policy='first_stop')
+    return result
 
 
 def effective_sequence(record, records):
@@ -69,6 +91,7 @@ def effective_sequence(record, records):
         return result
     definition = encoded['translation']
     validate_definition(definition)
+    first_stop = definition['schema'] == 2 and definition['stop_policy'] == 'first_stop'
     if identity.get('molecule_type') != 'protein' or 'sequence' in identity or 'residues' in identity:
         return fail('ambiguous_definition', 'A derived protein must have coordinates instead of a stored sequence or residues.')
     source = records.get(encoded.get('construct_ref'), {})
@@ -94,15 +117,30 @@ def effective_sequence(record, records):
         if not any(segments == expected_order[n:] + expected_order[:n] for n in range(len(segments))):
             return fail('segment_order', 'Circular segments must follow the strand with at most one origin crossing.')
     parts = [sequence[s['start']:s['end']].replace('U', 'T') for s in segments]
-    if any(set(part) - set('ACGT') for part in parts):
+    if not first_stop and any(set(part) - set('ACGT') for part in parts):
         return fail('ambiguous_codon', 'The coding span contains ambiguous nucleotides; no residues were guessed.')
     if definition['strand'] == -1:
         parts = [part.translate(_COMPLEMENT)[::-1] for part in parts]
     coding = ''.join(parts)[definition['codon_start'] - 1:]
-    result.update(coding_length=len(coding), coding_sequence_sha256=digest(coding), engine_version=ENGINE)
-    if not coding or len(coding) % 3:
+    result.update(coding_length=len(coding), coding_sequence_sha256=digest(coding),
+                  engine_version=ENGINE if definition['schema'] == 1 else ENGINE_V2)
+    if first_stop:
+        result.update(terminal_stop_offset=None, trailing_bases=len(coding) % 3)
+    if not coding or (not first_stop and len(coding) % 3) or (first_stop and len(coding) < 3):
         return fail('incomplete_codon', 'The selected coding span does not contain complete codons.')
-    protein = ''.join(CODONS[coding[index:index + 3]] for index in range(0, len(coding), 3))
+    if first_stop:
+        translated = []
+        for index in range(0, len(coding) - len(coding) % 3, 3):
+            amino = CODONS.get(coding[index:index + 3])
+            if amino is None:
+                return fail('ambiguous_codon', 'An encountered codon contains ambiguous nucleotides; no residues were guessed.')
+            translated.append(amino)
+            if amino == '*':
+                result['terminal_stop_offset'] = index
+                break
+        protein = ''.join(translated)
+    else:
+        protein = ''.join(CODONS[coding[index:index + 3]] for index in range(0, len(coding), 3))
     if definition['initiation'] == 'cds':
         if coding[:3] not in STARTS[definition['genetic_code']]:
             return fail('initiation', 'The first codon is not an initiator under the selected genetic code.')
@@ -116,6 +154,8 @@ def effective_sequence(record, records):
     start, end = definition['residue_start'], definition['residue_end']
     end = len(protein) if end is None else end
     result['uncropped_length'] = len(protein)
+    if first_stop and not protein:
+        return fail('empty_product', 'The selected frame terminates before producing any amino acids.')
     if not 0 <= start < end <= len(protein):
         return fail('residue_range', 'The requested protein residue range is empty or outside the translated product.')
     protein = protein[start:end]
@@ -174,7 +214,7 @@ def projection(record, records):
     encoded = record['identity']['encoded_by']
     return {**result, 'source_sequence_sha256': encoded['sequence_sha256'],
             'derivation_sha256': digest(json.dumps(encoded['translation'], sort_keys=True, separators=(',', ':'))),
-            'engine_version': ENGINE}
+            'engine_version': ENGINE if encoded['translation']['schema'] == 1 else ENGINE_V2}
 
 
 def materialized_identity(record, snapshot):

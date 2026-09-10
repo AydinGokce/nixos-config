@@ -39,6 +39,11 @@ writing; `library.product_create` adds a protein to its parent's projects.
 advance current derived products and project references atomically. Invalid
 translations remain visible with diagnostics and cannot be submitted. Undo/redo
 also covers coordinate edits and creation, with creation undone by archiving.
+Derived sequence views include the exact source bases and genomic codon triplets
+aligned to the current peptide. A `library.edit` with `frame_offset:0|1|2` changes
+the actual protein translation, preserving its strand and coding footprint and
+using a first-stop policy. Existing records retain their original behavior until
+explicitly edited; frame revisions and their undo/redo survive library backups.
 
 State lives in `/var/lib/bio-workbench`: SQLite WAL, immutable upload and artifact
 bytes, isolated per-batch construct libraries, validation evidence, owned process

@@ -8,6 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import importlib
+import itertools
 import json
 
 from .common import Error, WIRE, canonical, keys, number, require, string
@@ -16,6 +17,8 @@ from .library_api import opened, pin
 MAX_FEATURES = 1000
 MAX_ORFS = 250
 MAX_SCAN_BASES = 1_000_000
+MAX_SOURCE_BASES = 1_000_000
+MAX_ALIGNED_RESIDUES = 16_384
 MAX_ATTACHMENT = 16 * 1024 * 1024
 MAX_METADATA = 256 * 1024
 MAX_VIEW = WIRE - 64 * 1024
@@ -185,6 +188,73 @@ def _protein_features(record, registry, records, resolved, module, issues):
     return result, len(evidence) > MAX_FEATURES
 
 
+def _position_triplets(definition, offset, count):
+    """Map the resolver's coding offsets back to exact genomic coordinates."""
+    ranges = (range(part['start'], part['end']) if definition['strand'] == 1
+              else range(part['end'] - 1, part['start'] - 1, -1)
+              for part in definition['segments'])
+    selected = list(itertools.islice(itertools.chain.from_iterable(ranges), offset, offset + 3 * count))
+    require(len(selected) == 3 * count, 'Resolved peptide exceeds its coding-coordinate map', 'integrity')
+    return [selected[index:index + 3] for index in range(0, len(selected), 3)]
+
+
+def _alignment_issue(result, code, message, *, omit_source=False):
+    issue = _issue(code, message)
+    if not any(item['code'] == code for item in result['issues']):
+        result['issues'].append(issue)
+    result['source']['issues'].append(issue)
+    result.update(codon_positions=[], codon_positions_complete=False, terminal_stop_positions=None)
+    if omit_source:
+        result['source'].update(sequence=None, complete=False)
+
+
+def _source_alignment(record, records, resolved, result):
+    encoded = record['identity']['encoded_by']
+    parent = records.get(encoded['construct_ref'], {})
+    identity = parent.get('identity', {})
+    sequence = identity.get('sequence')
+    nucleotide = (parent.get('kind') == 'construct' and identity.get('molecule_type') in {'dna', 'rna'}
+                  and isinstance(sequence, str))
+    sequence_sha = hashlib.sha256(sequence.encode()).hexdigest() if nucleotide else None
+    result.update(source={'ref': encoded['construct_ref'], 'sha256': parent.get('sha256'),
+        'sequence_sha256': sequence_sha, 'molecule_type': identity.get('molecule_type'),
+        'length': len(sequence) if nucleotide else None, 'circular': identity.get('circular', False),
+        'sequence': None, 'complete': False, 'issues': []}, codon_positions=[],
+        codon_positions_complete=False, terminal_stop_positions=None)
+    if not nucleotide:
+        _alignment_issue(result, 'source_unavailable', 'The exact pinned nucleotide source is unavailable.')
+        return
+    if sequence_sha != encoded['sequence_sha256']:
+        _alignment_issue(result, 'source_digest', 'The parent nucleotide sequence differs from its pinned SHA-256.')
+        return
+    if len(sequence) > MAX_SOURCE_BASES:
+        _alignment_issue(result, 'alignment_source_limit',
+                         'Source DNA/RNA exceeds the one-million-base alignment limit; export the pinned parent to inspect it.')
+        return
+    result['source'].update(sequence=sequence, complete=True)
+    # A bad frame must still expose its valid source so it can be corrected.
+    # Never invent partial peptide letters or an alignment for an unavailable product.
+    if not resolved['available']:
+        return
+    if resolved['length'] > MAX_ALIGNED_RESIDUES:
+        _alignment_issue(result, 'alignment_residue_limit',
+                         'Codon alignment exceeds the 16384-residue display limit; the complete peptide and source remain available.')
+        return
+    definition = encoded['translation']
+    skip = definition['codon_start'] - 1
+    offset = skip + definition['residue_start'] * 3
+    result['codon_positions'] = _position_triplets(definition, offset, resolved['length'])
+    result['codon_positions_complete'] = True
+    # Schema 2 reports the actual first-stop offset. Schema 1 strips only its
+    # terminal stop, so its original result shape suffices without changing it.
+    uncropped = resolved['uncropped_length']
+    stop = resolved.get('terminal_stop_offset')
+    if 'terminal_stop_offset' not in resolved and resolved['coding_length'] == 3 * (uncropped + 1):
+        stop = 3 * uncropped
+    if stop is not None and definition['residue_start'] + resolved['length'] == uncropped:
+        result['terminal_stop_positions'] = _position_triplets(definition, skip + stop, 1)[0]
+
+
 def _segments(start, end, length, strand):
     oriented = [(start, min(end, length))]
     if end > length:
@@ -237,10 +307,20 @@ def _options(min_orf_aa, genetic_code):
     require(type(genetic_code) is int and genetic_code in {1, 11}, 'genetic_code must be 1 or 11')
 
 
-def _bound(result):
+def _bound(result, max_bytes=MAX_VIEW):
+    def metadata():
+        value = {key: value for key, value in result.items() if key not in {'sequence', 'codon_positions'}}
+        if 'source' in value:
+            value['source'] = {key: value for key, value in value['source'].items() if key != 'sequence'}
+        return value
+
     def fits():
-        metadata = {key: value for key, value in result.items() if key != 'sequence'}
-        return len(canonical(metadata)) <= MAX_METADATA and len(canonical(result)) <= MAX_VIEW
+        return len(canonical(metadata())) <= MAX_METADATA and len(canonical(result)) <= max_bytes
+
+    if len(canonical(result)) > max_bytes and result.get('source', {}).get('complete'):
+        _alignment_issue(result, 'alignment_response_limit',
+                         'Source alignment was omitted to fit this response; use a separate sequence read or export the pinned parent.',
+                         omit_source=True)
 
     if fits():
         return result
@@ -267,8 +347,10 @@ def _bound(result):
     raise Error('limit', 'Sequence exceeds the interactive view size limit; export the original record instead.')
 
 
-def view(record, registry, records, min_orf_aa=30, genetic_code=1, include_sequence=True):
+def view(record, registry, records, min_orf_aa=30, genetic_code=1, include_sequence=True, max_bytes=MAX_VIEW):
     _options(min_orf_aa, genetic_code)
+    number(max_bytes, 'max_bytes', 1, WIRE)
+    max_bytes = min(max_bytes, MAX_VIEW)
     module = importlib.import_module(type(registry).__module__)
     identity = record['identity']
     require(record['kind'] == 'construct', 'Sequence view requires a molecular construct')
@@ -300,7 +382,9 @@ def view(record, registry, records, min_orf_aa=30, genetic_code=1, include_seque
             result['orfs_truncated'] = result['orf_count'] > MAX_ORFS
     elif identity.get('molecule_type') == 'protein':
         result['features'], result['features_truncated'] = _protein_features(record, registry, records, resolved, module, result['issues'])
-    return _bound(result)
+    if derived:
+        _source_alignment(record, records, resolved, result)
+    return _bound(result, max_bytes)
 
 
 def get_view(api, params):

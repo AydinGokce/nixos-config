@@ -148,7 +148,7 @@ def _current(module, registry, records, ref, expected_sha256=None):
 
 
 def _patch(module, record, patch, records=None, registry=None):
-    keys(patch, optional=('alt_name', 'name', 'sequence', 'sequence_edit', 'archived', 'translation', 'parent_ref'))
+    keys(patch, optional=('alt_name', 'name', 'sequence', 'sequence_edit', 'archived', 'translation', 'parent_ref', 'frame_offset'))
     require(patch, 'An edit must contain at least one field')
     require(record['kind'] in {'construct', 'assembly', 'project'}, 'This library entry is not editable')
     document = {key: deepcopy(value) for key, value in record.items() if key in module.USER_FIELDS}
@@ -157,6 +157,17 @@ def _patch(module, record, patch, records=None, registry=None):
             'Reserved workbench provenance has an incompatible format', 'conflict')
     curated = provenance.setdefault('workbench', {})
     labels = []
+    frame_edit = 'frame_offset' in patch
+    if frame_edit:
+        require(not ({'translation', 'parent_ref', 'sequence', 'sequence_edit'} & set(patch)),
+                'Change a reading frame or its source/definition in one operation')
+        require(record['kind'] == 'construct' and record['identity'].get('molecule_type') == 'protein'
+                and module.translation.is_derived(record),
+                'A reading frame requires a protein derived from a nucleotide source')
+        require(type(patch['frame_offset']) is int and 0 <= patch['frame_offset'] <= 2,
+                'frame_offset must be an integer from 0 to 2')
+        patch = {**patch, 'translation': module.translation.frame_definition(
+            record['identity']['encoded_by']['translation'], patch['frame_offset'])}
     if 'alt_name' in patch:
         require(record['kind'] != 'project', 'Projects use name instead of Alt name')
         value = patch['alt_name']
@@ -190,8 +201,8 @@ def _patch(module, record, patch, records=None, registry=None):
         parent_ref = patch.get('parent_ref', encoded.get('construct_ref'))
         require(isinstance(parent_ref, str) and parent_ref, 'Select a source plasmid for this protein')
         parent = _current(module, registry, records, parent_ref)
-        require(parent['kind'] == 'construct' and parent['identity'].get('molecule_type') == 'dna',
-                'Protein products require a DNA parent')
+        require(parent['kind'] == 'construct' and parent['identity'].get('molecule_type') in {'dna', 'rna'},
+                'Protein products require a DNA or RNA parent')
         definition = deepcopy(patch.get('translation', encoded.get('translation')))
         module.translation.validate_definition(definition, require=module.require)
         before = module.effective_sequence(record, records)
@@ -202,13 +213,14 @@ def _patch(module, record, patch, records=None, registry=None):
         after = module.effective_sequence(document, records)
         if identity != record['identity']:
             curated['translation_edit'] = {'source_ref': module.reference(record),
-                'definition': 'User selected a DNA coding footprint and protein residue range.',
+                'definition': ('User changed the coding frame; translate complete codons through the first in-frame stop.'
+                               if frame_edit else 'User selected a nucleotide coding footprint and protein residue range.'),
                 'annotation_applicability': 'Inherited protein annotations and purpose refer to the predecessor; reassess against the translated product.'}
             if before['sequence_sha256'] != after['sequence_sha256'] and identity.get('product_review', {}).get('status') == 'reference_matched':
                 curated['translation_edit']['historical_product_review'] = identity.pop('product_review')
                 document['tags'] = [tag for tag in document['tags'] if tag != 'reference_matched']
             document['status'] = 'defined' if after['available'] else 'draft'
-            labels.append('Change protein definition')
+            labels.append('Change translation frame' if frame_edit else 'Change protein definition')
     require(not ('sequence_edit' in patch and 'sequence' in patch), 'Choose a sequence splice or a complete sequence')
     require(not ({'sequence', 'sequence_edit'} & set(patch) and {'translation', 'parent_ref'} & set(patch)),
             'Edit a direct sequence or its translation definition in one operation')
@@ -316,8 +328,8 @@ def create_product(api, params):
         if replay is not None:
             return replay
         parent = _current(module, registry, records, params['parent_ref'], params['expected_sha256'])
-        require(parent['kind'] == 'construct' and parent['identity'].get('molecule_type') == 'dna',
-                'Select a DNA parent for a protein product')
+        require(parent['kind'] == 'construct' and parent['identity'].get('molecule_type') in {'dna', 'rna'},
+                'Select a DNA or RNA parent for a protein product')
         require(not presentation(parent)['archived'], 'Restore the parent before adding a product', 'conflict')
         definition = deepcopy(params['translation'])
         module.translation.validate_definition(definition, require=module.require)
@@ -493,7 +505,7 @@ def _current_parent_pin(module, registry, records, document):
     encoded = document['identity']['encoded_by']
     parent = records[registry._resolve(encoded['construct_ref'].split('@')[0], records)]
     require(hashlib.sha256(parent['identity']['sequence'].encode()).hexdigest() == encoded['sequence_sha256'],
-            'The parent DNA changed. Undo or redo cannot restore coordinates for a different sequence.', 'conflict')
+            'The parent nucleotide sequence changed. Undo or redo cannot restore coordinates for a different sequence.', 'conflict')
     encoded['construct_ref'] = module.reference(parent)
 
 
