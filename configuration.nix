@@ -92,8 +92,18 @@
     bluez
     calibre
     cargo
+    # OpenAI's desktop app (nixpkgs `chatgpt`) is macOS-only; give the web app
+    # its own window and launcher entry via Chromium instead.
+    (makeDesktopItem {
+      name = "chatgpt";
+      desktopName = "ChatGPT";
+      exec = "chromium --app=https://chatgpt.com/";
+      icon = "chatgpt";
+      categories = [ "Network" "Chat" ];
+    })
     chromium
     claude-code
+    codex
     electrum
     element-desktop
     firebase-tools
@@ -137,6 +147,13 @@
 
   environment.sessionVariables = {
     TERM = "alacritty";
+  };
+
+  # Compressed swap in RAM: these machines run with no disk swap, so a single
+  # memory spike (e.g. a from-source nix build) hard-freezes the box.
+  zramSwap = {
+    enable = true;
+    memoryPercent = 50;
   };
 
   nixpkgs.config.allowUnfree = true;

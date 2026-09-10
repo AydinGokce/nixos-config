@@ -3,17 +3,24 @@
 
     inputs = {
         nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+        # codex on 26.05 lags upstream (0.146 as of 2026-09); unstable-small
+        # carries 0.153+. Used only for the codex overlay below.
+        nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable-small";
         rust-overlay.url = "github:oxalica/rust-overlay";
         nix-flatpak.url = "github:gmodena/nix-flatpak/?ref=v0.4.1";
         disko.url = "github:nix-community/disko";
         disko.inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    outputs = { nixpkgs, rust-overlay, nix-flatpak, disko, ... }:
-    let 
+    outputs = { nixpkgs, nixpkgs-unstable, rust-overlay, nix-flatpak, disko, ... }:
+    let
+        codexOverlay = final: prev: {
+            codex = nixpkgs-unstable.legacyPackages.${prev.stdenv.hostPlatform.system}.codex;
+        };
         mkSystem = name: system: extraModules: extraConfig: nixpkgs.lib.nixosSystem {
             inherit system;
             modules = [
+                { nixpkgs.overlays = [ codexOverlay ]; }
                 ./configuration.nix
                 (./machines + "/${name}/configuration.nix")
                 (./machines + "/${name}/hardware-configuration.nix")
