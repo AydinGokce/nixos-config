@@ -2,9 +2,9 @@
 let
   desktopItem = makeDesktopItem {
     name = "bio-workbench";
-    desktopName = "Bio Workbench";
-    comment = "Submit and compare cloud molecular models";
-    exec = "bio-workbench %u";
+    desktopName = "GC Protein Engineering Console";
+    comment = "Run and compare cloud protein engineering models";
+    exec = "gc-protein-engineering-console %u";
     icon = "bio-workbench";
     mimeTypes = [ "x-scheme-handler/bio-workbench" ];
     startupWMClass = "bio-workbench";
@@ -31,6 +31,7 @@ in rustPlatform.buildRustPackage {
       ])}
     done
     ln -s bio-workbench-rust $out/bin/bio-workbench
+    ln -s bio-workbench-rust $out/bin/gc-protein-engineering-console
     mkdir -p $out/share/icons/hicolor/scalable/apps
     cp ${./icon.svg} $out/share/icons/hicolor/scalable/apps/bio-workbench.svg
     ${lib.optionalString stdenv.hostPlatform.isLinux ''
@@ -39,22 +40,23 @@ in rustPlatform.buildRustPackage {
         --set GALLIUM_DRIVER llvmpipe \
         --set LIBGL_DRIVERS_PATH ${mesa.drivers}/lib/dri \
         --set __EGL_VENDOR_LIBRARY_FILENAMES ${mesa.drivers}/share/glvnd/egl_vendor.d/50_mesa.json
+      ln -s bio-workbench-software $out/bin/gc-protein-engineering-console-software
       mkdir -p $out/share/applications
       cp ${desktopItem}/share/applications/* $out/share/applications/
     ''}
     ${lib.optionalString stdenv.hostPlatform.isDarwin ''
-      mkdir -p "$out/Applications/Bio Workbench.app/Contents/MacOS" "$out/Applications/Bio Workbench.app/Contents/Resources"
-      ln -s $out/bin/bio-workbench "$out/Applications/Bio Workbench.app/Contents/MacOS/bio-workbench"
-      cat > "$out/Applications/Bio Workbench.app/Contents/Info.plist" <<PLIST
+      mkdir -p "$out/Applications/GC Protein Engineering Console.app/Contents/MacOS" "$out/Applications/GC Protein Engineering Console.app/Contents/Resources"
+      ln -s $out/bin/bio-workbench "$out/Applications/GC Protein Engineering Console.app/Contents/MacOS/bio-workbench"
+      cat > "$out/Applications/GC Protein Engineering Console.app/Contents/Info.plist" <<PLIST
       <?xml version="1.0" encoding="UTF-8"?>
       <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-      <plist version="1.0"><dict><key>CFBundleName</key><string>Bio Workbench</string><key>CFBundleDisplayName</key><string>Bio Workbench</string><key>CFBundleIdentifier</key><string>org.harrison.bio-workbench</string><key>CFBundleVersion</key><string>0.3.0</string><key>CFBundleExecutable</key><string>bio-workbench</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>Bio Workbench batch</string><key>CFBundleURLSchemes</key><array><string>bio-workbench</string></array></dict></array></dict></plist>
+      <plist version="1.0"><dict><key>CFBundleName</key><string>GC Protein Engineering Console</string><key>CFBundleDisplayName</key><string>GC Protein Engineering Console</string><key>CFBundleIdentifier</key><string>org.harrison.bio-workbench</string><key>CFBundleVersion</key><string>0.3.0</string><key>CFBundleExecutable</key><string>bio-workbench</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>GC Protein Engineering Console batch</string><key>CFBundleURLSchemes</key><array><string>bio-workbench</string></array></dict></array></dict></plist>
       PLIST
     ''}
   '';
   meta = {
-    description = "Native Rust desktop for cloud molecular prediction and comparison";
-    mainProgram = "bio-workbench";
+    description = "GC Protein Engineering Console for cloud molecular prediction and comparison";
+    mainProgram = "gc-protein-engineering-console";
     platforms = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
   };
 }

@@ -173,7 +173,7 @@ impl Workbench {
         let (ui_tx, ui_rx) = mpsc::channel();
         let library = ui_library::Explorer::restore(&state.extra);
         let library_runs = ui_library_runs::RunControls::default();
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["Bio Workbench — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["GC Protein Engineering Console — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
@@ -215,7 +215,11 @@ impl Workbench {
             .exact_height(28.)
             .show(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
-                    ui.label(RichText::new("BIO WORKBENCH").strong().size(12.));
+                    ui.label(
+                        RichText::new("GC Protein Engineering Console")
+                            .strong()
+                            .size(12.),
+                    );
                     ui.separator();
                     ui.menu_button("File", |ui| {
                         if ui.button("Add input files…").clicked() {
@@ -412,7 +416,7 @@ impl Workbench {
                         ("sticks", "Show the selected structure as sticks."),
                         ("spheres", "Show the selected structure as spheres."),
                         ("trace", "Show the selected structure as a backbone trace."),
-                        ("help", "Open Bio Workbench help."),
+                        ("help", "Open GC Protein Engineering Console help."),
                     ] {
                         let view = self.views.get(&self.state.selected_view);
                         let selected = view.is_some_and(|view| {
@@ -581,7 +585,7 @@ impl eframe::App for Workbench {
         self.settings_dialog(ctx);
         self.text_dialog(ctx);
         let mut help = self.help_open;
-        egui::Window::new("Bio Workbench help").open(&mut help).show(ctx,|ui|{
+        egui::Window::new("GC Protein Engineering Console help").open(&mut help).show(ctx,|ui|{
             ui.label("Paste or load inputs, select models, and click Run. Compatible jobs queue automatically; follow their progress in Run status or history.");
             ui.label("Jobs and artifacts live on the head. Closing this client does not cancel them. Use the explicit job/batch Cancel controls.");
             ui.label("Click a run or structure under Runs / results to open its tab. Drag tabs to reorder, onto another tab bar to group, or to a viewer edge to split. Close a tab with its left X. Linking cameras does not align structures.");
@@ -618,7 +622,7 @@ fn main() -> eframe::Result {
         .is_some_and(|arg| arg == "--render")
     {
         if let Err(error) = render::run(std::env::args_os().skip(2).collect()) {
-            eprintln!("Bio Workbench render: {error}");
+            eprintln!("GC Protein Engineering Console render: {error}");
             std::process::exit(1);
         }
         return Ok(());
@@ -627,7 +631,7 @@ fn main() -> eframe::Result {
         Ok(navigation::Launch::Forwarded) => return Ok(()),
         Ok(navigation::Launch::Primary(navigation)) => navigation,
         Err(error) => {
-            eprintln!("Bio Workbench: {error}");
+            eprintln!("GC Protein Engineering Console: {error}");
             return Ok(());
         }
     };
@@ -642,7 +646,10 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        &format!("Bio Workbench {}", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "GC Protein Engineering Console {}",
+            env!("CARGO_PKG_VERSION")
+        ),
         options,
         Box::new(move |cc| {
             wake.attach(cc.egui_ctx.clone());

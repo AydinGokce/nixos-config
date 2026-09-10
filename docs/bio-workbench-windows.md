@@ -1,4 +1,4 @@
-# Install Bio Workbench on a Windows PC
+# Install GC Protein Engineering Console on a Windows PC
 
 The current Windows route runs the Rust desktop in **Ubuntu on WSL2**, with its
 window displayed by WSLg. There is no native `.exe` installer yet. The Linux app
@@ -45,11 +45,11 @@ The installer may request your Ubuntu password when creating `/nix`.
 
 ## 3. Copy the source archive and build
 
-Copy `bio-workbench-rust-0.3.0-one-click-run-source.tar.gz` from the existing workstation to
+Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing workstation to
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/workbench-one-click-run-20260910/bio-workbench-rust-0.3.0-one-click-run-source.tar.gz
+/home/aydin/bio-runs/gc-console-rename-20260910/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -57,10 +57,10 @@ folder name:
 
 ```sh
 mkdir -p ~/bio-workbench-rust
-tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/bio-workbench-rust-0.3.0-one-click-run-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
+tar -xzf "/mnt/c/Users/YOUR_WINDOWS_USERNAME/Downloads/gc-protein-engineering-console-0.3.0-source.tar.gz" --strip-components=1 -C ~/bio-workbench-rust
 cd ~/bio-workbench-rust
 nix --extra-experimental-features 'nix-command flakes' build path:.
-./result/bin/bio-workbench
+./result/bin/gc-protein-engineering-console
 ```
 
 This archive includes the native **Library** explorer with project navigation,
@@ -78,6 +78,8 @@ It also includes draggable viewer tabs, independent duplicate tabs, right-click
 Duplicate tab / Split down / Split right, persistent splits, working quick controls
 and the console resize fix. To update an existing installation, close the app,
 extract over its source directory and rebuild with the same command.
+Existing `bio-workbench` and `bio-workbench-rust` launch commands still work;
+the renamed app uses the same connection settings, saved inputs and results.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem
@@ -88,7 +90,7 @@ close it and use the included software launcher:
 
 ```sh
 cd ~/bio-workbench-rust
-./result/bin/bio-workbench-software
+./result/bin/gc-protein-engineering-console-software
 ```
 
 This uses the package's pinned Mesa/llvmpipe CPU renderer. Rotation can be slower
@@ -129,7 +131,7 @@ Choose **Save & connect**. Windows files are accessible through paths such as
 the head if you close the app.
 
 For later launches, open Ubuntu and run
-`~/bio-workbench-rust/result/bin/bio-workbench` (or the software launcher).
+`~/bio-workbench-rust/result/bin/gc-protein-engineering-console` (or the software launcher).
 Slack's `bio-workbench://` links are not registered with the Windows browser by
 this setup; Linux desktop registration inside WSL does not register a Windows
 URL handler. Open batches through the app's run history for now.

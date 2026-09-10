@@ -100,7 +100,9 @@ fn navigation_value(value: OsString) -> Result<String, String> {
         return Ok(value);
     }
     if value.starts_with("bio-workbench:") || value.starts_with('-') {
-        return Err("Expected a Bio Workbench batch link or an existing local file".into());
+        return Err(
+            "Expected a GC Protein Engineering Console batch link or an existing local file".into(),
+        );
     }
     let path = fs::canonicalize(&value).map_err(|error| format!("Cannot open {value}: {error}"))?;
     if !path.is_file() {

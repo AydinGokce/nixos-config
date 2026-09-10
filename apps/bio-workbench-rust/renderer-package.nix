@@ -29,7 +29,7 @@ rustPlatform.buildRustPackage {
     chmod +x $out/bin/bio-render-headless
   '';
   meta = {
-    description = "Bio Workbench studio renderer for original PDB and mmCIF structures";
+    description = "GC Protein Engineering Console renderer for original PDB and mmCIF structures";
     mainProgram = "bio-render";
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };

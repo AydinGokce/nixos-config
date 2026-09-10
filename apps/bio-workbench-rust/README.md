@@ -1,7 +1,7 @@
-# Bio Workbench — native desktop
+# GC Protein Engineering Console
 
-Bio Workbench is the Rust desktop client for the existing cloud head. It provides
-the `bio-workbench` application with compact
+GC Protein Engineering Console is the Rust desktop client for the existing cloud head. It provides
+the `gc-protein-engineering-console` application with compact
 gray controls, black molecular viewports, object inspector, and console. The
 interface uses egui/eframe and native OpenGL; it has no browser or JavaScript
 runtime.
@@ -12,8 +12,15 @@ runtime.
 nix run path:.
 # Or build once:
 nix build path:.
-./result/bin/bio-workbench
+./result/bin/gc-protein-engineering-console
 ```
+
+The named flake package and app are `gc-protein-engineering-console`, for example
+`nix run path:.#gc-protein-engineering-console`. Existing `bio-workbench` and
+`bio-workbench-rust` commands remain available and open the same saved session.
+The Linux software launcher is `gc-protein-engineering-console-software`;
+`bio-workbench-software` remains available too. The macOS bundle is
+`Applications/GC Protein Engineering Console.app`.
 
 The standalone flake supports x86_64/aarch64 Linux and Darwin. NixOS/Linux native
 windows have been exercised; macOS code has been cross-checked, but macOS and
@@ -278,7 +285,7 @@ its saved molecular data remains readable through this one-time native import.
 local process. Linux Nix packaging supplies a pinned PyMOL. Other installations
 may set `BIO_WORKBENCH_PYMOL` to one executable path or place `pymol` on PATH.
 Startup failure and the readiness marker appear in the status/console. Closing
-Bio Workbench leaves that external viewer open. A demo launch exports only the
+GC Protein Engineering Console leaves that external viewer open. A demo launch exports only the
 same experimental A/B/C coordinates displayed in the pane.
 
 `bio-workbench://batch/ID` opens a batch. A second launch forwards links or local

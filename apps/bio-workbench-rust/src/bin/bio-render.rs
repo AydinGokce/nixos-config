@@ -9,7 +9,7 @@ mod scene;
 
 fn main() {
     if let Err(error) = render::run(std::env::args_os().skip(1).collect()) {
-        eprintln!("Bio renderer: {error}");
+        eprintln!("GC Protein Engineering Console renderer: {error}");
         std::process::exit(1);
     }
 }

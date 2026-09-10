@@ -345,7 +345,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         ..Default::default()
     };
     eframe::run_native(
-        "Bio Workbench figure renderer",
+        "GC Protein Engineering Console figure renderer",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_pixels_per_point(1.);

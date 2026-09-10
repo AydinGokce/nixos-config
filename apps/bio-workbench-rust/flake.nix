@@ -1,5 +1,5 @@
 {
-  description = "Bio Workbench — native cloud molecular modeling desktop";
+  description = "GC Protein Engineering Console — native cloud molecular modeling desktop";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/8f0500b9660505dc3cb647775fe9a978a74b5283";
   outputs = { self, nixpkgs }:
     let
@@ -9,13 +9,15 @@
       packages = eachSystem (system: let pkgs = import nixpkgs { inherit system; }; in rec {
         bio-workbench-rust = pkgs.callPackage ./package.nix { };
         bio-workbench = bio-workbench-rust;
+        gc-protein-engineering-console = bio-workbench-rust;
         bio-renderer = pkgs.callPackage ./renderer-package.nix { };
-        default = bio-workbench-rust;
+        default = gc-protein-engineering-console;
       });
       apps = eachSystem (system: rec {
-        default = bio-workbench-rust;
+        default = gc-protein-engineering-console;
         bio-workbench-rust = { type = "app"; program = "${self.packages.${system}.default}/bin/bio-workbench-rust"; };
         bio-workbench = { type = "app"; program = "${self.packages.${system}.default}/bin/bio-workbench"; };
+        gc-protein-engineering-console = { type = "app"; program = "${self.packages.${system}.default}/bin/gc-protein-engineering-console"; };
         bio-render = { type = "app"; program = "${self.packages.${system}.bio-renderer}/bin/bio-render"; };
       });
       devShells = eachSystem (system: let pkgs = import nixpkgs { inherit system; }; in {
