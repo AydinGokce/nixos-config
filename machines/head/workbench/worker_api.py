@@ -99,8 +99,16 @@ def normalize_status(value, current=None):
     startup = value.get('progress', value.get('startup_progress'))
     if isinstance(startup, dict):
         try:
-            result['progress'] = progress.view(startup, epoch=current)
-        except (ValueError, TypeError):
+            history = []
+            raw_history = value.get('startup_history', [])
+            if isinstance(raw_history, list):
+                for sample in raw_history[-64:]:
+                    try:
+                        history.append(progress.event(sample))
+                    except (ValueError, TypeError, RecursionError):
+                        continue
+            result['progress'] = progress.view(startup, history, epoch=current)
+        except (ValueError, TypeError, RecursionError):
             pass
     return result
 

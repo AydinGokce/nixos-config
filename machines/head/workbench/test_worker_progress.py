@@ -57,6 +57,49 @@ class WorkerProgressTests(unittest.TestCase):
         self.assertEqual(progress.view(unknown_total, epoch=1000)['completed'], 100)
         self.assertEqual(progress.view(unknown_total, epoch=1000)['eta']['state'], 'unknown')
 
+    def test_one_second_cadence_accumulates_measured_intervals(self):
+        samples = [event(1000 + second, completed=completed, total=1000, unit='bytes')
+                   for second, completed in enumerate([0, 10, 20, 40, 60])]
+        result = progress.view(samples[-1], samples, epoch=1004)
+        self.assertEqual(result['eta']['state'], 'range')
+        self.assertEqual((result['eta']['lower_seconds'], result['eta']['upper_seconds']), (47, 94))
+        self.assertEqual(result['eta']['scope'], 'stage')
+        # Duplicate mirrored events and the latest snapshot are one observation.
+        self.assertEqual(result, progress.view(samples[-1], [*reversed(samples), *samples], epoch=1004))
+        stale = progress.view(samples[-1], samples, epoch=1035)
+        self.assertEqual(stale['eta']['state'], 'stale')
+        self.assertNotIn('lower_seconds', stale['eta'])
+
+    def test_fast_cadence_reset_stall_and_stage_transition_discard_previous_rates(self):
+        initial = [event(1000 + second, completed=100 + second * 10, total=1000, unit='bytes')
+                   for second in range(3)]
+        for boundary in [event(1003, completed=10, total=1000, unit='bytes'),
+                         event(1003, completed=120, total=1000, unit='bytes')]:
+            self.assertEqual(progress.view(boundary, [*initial, boundary], epoch=1003)['eta']['state'], 'unknown')
+            after = [event(1004 + second, completed=boundary['completed'] + (second + 1) * 10,
+                           total=1000, unit='bytes') for second in range(2)]
+            self.assertEqual(progress.view(after[0], [*initial, boundary, after[0]], epoch=1004)['eta']['state'], 'unknown')
+            self.assertEqual(progress.view(after[-1], [*initial, boundary, *after], epoch=1005)['eta']['state'], 'estimate')
+        different = event(1003, completed=150, total=1000, unit='bytes', stage='runtime_download')
+        returning = event(1004, completed=160, total=1000, unit='bytes')
+        self.assertEqual(progress.view(returning, [*initial, different, returning], epoch=1004)['eta']['state'], 'unknown')
+        old = event(800, completed=0, total=1000, unit='bytes')
+        self.assertEqual(progress.view(returning, [old, returning], epoch=1004)['eta']['state'], 'unknown')
+
+    def test_direct_gpu_log_with_one_second_counters_exposes_measured_eta(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        log, msa = root / 'run.log', root / 'msa.log'
+        now = int(time.time())
+        samples = [event(now - 4 + second, stage='runtime_extract', scope='gpu',
+                         completed=second * 10, total=1000, unit='bytes') for second in range(5)]
+        log.write_text(''.join(line(value) for value in samples)); msa.write_text('')
+        phase, result = JobProgress(log, msa).details()
+        self.assertEqual(phase, 'runtime extract')
+        self.assertEqual(result['eta']['state'], 'estimate')
+        self.assertGreater(result['eta']['seconds'], 94)
+        self.assertLessEqual(result['eta']['seconds'], 96)
+
     def test_stale_and_future_observations_suppress_durations(self):
         value = event(eta={'state': 'range', 'scope': 'startup', 'lower_seconds': 100,
                            'upper_seconds': 200, 'basis': 'Measured prior startup stages'})

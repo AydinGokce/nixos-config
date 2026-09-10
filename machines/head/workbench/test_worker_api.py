@@ -86,6 +86,20 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(result['progress']['eta']['seconds'], 90)
         self.assertNotIn('startup_progress', result)
 
+    def test_status_uses_validated_bounded_history_without_exposing_raw_events(self):
+        from workbench.test_worker_progress import event
+        samples = [event(996 + second, stage='runtime_download', completed=second * 10,
+                         total=1000, unit='bytes') for second in range(5)]
+        raw_history = [None, [], {'timestamp_ns': 'bad'}, {**samples[0], 'argv': ['secret']}, *samples]
+        result = worker_api.normalize_status(observed(startup_progress=samples[-1], startup_history=raw_history), current=1000)
+        self.assertEqual(result['progress']['eta']['state'], 'estimate')
+        self.assertEqual(result['progress']['eta']['seconds'], 96)
+        self.assertNotIn('startup_history', result)
+        self.assertNotIn('secret', canonical(result).decode())
+        for history in [None, 'bad', {'events': samples}, [*samples, *[None] * 64]]:
+            result = worker_api.normalize_status(observed(startup_progress=samples[-1], startup_history=history), current=1000)
+            self.assertEqual(result['progress']['eta']['state'], 'unknown')
+
     def test_control_intent_returns_immediately_and_replays_across_restart(self):
         with patch('workbench.worker_api.invoke', side_effect=AssertionError('API must not call the worker')):
             first = self.api.call('worker.extend', self.params)

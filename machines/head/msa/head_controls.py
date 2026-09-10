@@ -18,7 +18,8 @@ PINS = ('session_id', 'invocation_id', 'intent_sha256', 'launch_sha256')
 LAST_PROGRESS = None
 
 
-def startup_snapshot(state, launch=None):
+def startup_history(state, launch=None):
+    """Retain bounded observations from the same exact paths as the snapshot."""
     paths = [Path(state)/'startup-progress.json']
     if launch: paths.append(Path(launch['remote_out'])/'startup-progress.json')
     values = []
@@ -26,9 +27,9 @@ def startup_snapshot(state, launch=None):
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096: continue
             value = json.loads(path.read_bytes())
-            if value.get('schema') == 1 and type(value.get('timestamp_ns')) is int:
+            if isinstance(value, dict) and value.get('schema') == 1 and type(value.get('timestamp_ns')) is int:
                 values.append(value)
-        except (OSError, ValueError, TypeError): pass
+        except (OSError, ValueError, TypeError, RecursionError): pass
     if launch and launch.get('job_file'):
         log = Path(launch['job_file']).parent/'run.log'
         try:
@@ -39,10 +40,18 @@ def startup_snapshot(state, launch=None):
                     if not line.startswith(b'BIO_WORKER_STAGE ') or not line.endswith(b'\n') or len(line)>4096: continue
                     try:
                         value=json.loads(line[len(b'BIO_WORKER_STAGE '):])
-                        if value.get('schema') == 1 and type(value.get('timestamp_ns')) is int: values.append(value)
-                    except (ValueError, TypeError): pass
+                        if isinstance(value, dict) and value.get('schema') == 1 and type(value.get('timestamp_ns')) is int: values.append(value)
+                    except (ValueError, TypeError, RecursionError): pass
         except OSError: pass
-    return max(values, key=lambda value: value['timestamp_ns']) if values else None
+    # A snapshot and its mirrored log line are one observation. The input is
+    # already bounded to 16 KiB of log plus two 4 KiB snapshots; cap count too.
+    values = {value['timestamp_ns']: value for value in values}
+    return [values[timestamp] for timestamp in sorted(values)[-64:]]
+
+
+def startup_snapshot(state, launch=None):
+    history = startup_history(state, launch)
+    return history[-1] if history else None
 
 
 def forward_progress(value):
@@ -95,7 +104,9 @@ def worker_status(root, deadline=None):
         value.update(state='starting', session_id=intent['session_id'], intent_sha256=session.sha(state/'intent.json'),
                      control_reason='Controls become available after this worker is ready')
         launch = lifecycle.document(state/'launch.json', optional=True)
-        value['startup_progress'] = startup_snapshot(state, launch)
+        history = startup_history(state, launch)
+        value['startup_progress'] = history[-1] if history else None
+        value['startup_history'] = history
         live = client.unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
         if launch is None:
             session.require(live.get('Description') == 'Managed private MSA session '+intent['session_id'], 'Startup unit identity changed')

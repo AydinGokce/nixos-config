@@ -210,5 +210,33 @@ class HeadControlTests(unittest.TestCase):
             self.assertEqual(progress.events(log.read_text()),[latest])
         finally:sys.path.pop(0)
 
+    def test_status_retains_bounded_exact_path_history_for_one_second_eta(self):
+        now=int(time.time())
+        samples=[dict(schema=1,stage='runtime_extract',scope='msa',state='running',
+            stage_id='fixture-extract',message='Extracting runtime',timestamp_ns=(now-4+i)*10**9,
+            completed=i*10,total=1000,unit='bytes') for i in range(5)]
+        session.atomic(self.state/'startup-progress.json',samples[0])
+        session.atomic(Path(self.ready['output'])/'startup-progress.json',samples[-2])
+        job=self.fixture.root/'job';job.mkdir()
+        old=dict(samples[0],timestamp_ns=(now-200)*10**9)
+        wire=lambda value:'BIO_WORKER_STAGE '+json.dumps(value)+'\n'
+        (job/'run.log').write_text(wire(old)+'x'*20000+'\n'+wire([])+''.join(map(wire,samples))+wire(samples[-1]).rstrip('\n'))
+        other=self.fixture.root/'unrelated';other.mkdir()
+        (other/'run.log').write_text(wire(dict(samples[-1],timestamp_ns=(now+1)*10**9)))
+        self.launch['job_file']=str(job/'job.json')
+        session.atomic(self.state/'launch.json',self.launch)
+        status=head.worker_status(self.root)
+        self.assertEqual(status['startup_history'],samples)
+        self.assertEqual(status['startup_progress'],samples[-1])
+        self.assertEqual(head.startup_snapshot(self.state,self.launch),samples[-1])
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+        try:
+            from workbench.worker_api import normalize_status
+            result=normalize_status(status,current=now)
+            self.assertEqual(result['progress']['eta']['state'],'estimate')
+            self.assertEqual(result['progress']['eta']['seconds'],96)
+            self.assertEqual(result['target']['launch_sha256'],session.sha(self.state/'launch.json'))
+        finally:sys.path.pop(0)
+
 
 if __name__=='__main__':unittest.main()

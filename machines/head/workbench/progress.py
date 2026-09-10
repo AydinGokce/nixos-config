@@ -90,18 +90,25 @@ def estimated(value, history):
     if not value.get('total') or 'completed' not in value:
         return unknown()
     identity = tuple(value.get(k) for k in ('scope', 'stage', 'stage_id', 'total', 'unit'))
-    samples = sorted({v['timestamp_ns']: v for v in history if
-        tuple(v.get(k) for k in ('scope', 'stage', 'stage_id', 'total', 'unit')) == identity
-        and v.get('state') == 'running' and 'completed' in v
-        and 0 <= value['timestamp_ns'] - v['timestamp_ns'] <= 120 * 10**9}.values(), key=lambda v: v['timestamp_ns'])
+    observations = sorted({v['timestamp_ns']: v for v in [*history, value] if
+        0 <= value['timestamp_ns'] - v['timestamp_ns'] <= 120 * 10**9}.values(), key=lambda v: v['timestamp_ns'])
+    samples = []
+    for sample in observations:
+        if (tuple(sample.get(k) for k in ('scope', 'stage', 'stage_id', 'total', 'unit')) != identity
+                or sample.get('state') != 'running' or 'completed' not in sample):
+            samples.clear()
+            continue
+        if samples and sample['completed'] <= samples[-1]['completed']:
+            samples.clear()  # A stall or reset invalidates previous throughput.
+        samples.append(sample)
     rates = []
-    for before, after in zip(samples, samples[1:]):
+    before = samples[0] if samples else None
+    for after in samples[1:]:
         seconds = (after['timestamp_ns'] - before['timestamp_ns']) / 10**9
         delta = after['completed'] - before['completed']
-        if delta <= 0:
-            rates.clear()
-        elif seconds >= 2 and delta > 0:
+        if seconds >= 2:
             rates.append(delta / seconds)
+            before = after  # Accumulate fast samples until a useful interval.
     remaining = value['total'] - value['completed']
     if not rates or remaining / min(rates) > 604800:
         return unknown('Waiting for measured throughput')
