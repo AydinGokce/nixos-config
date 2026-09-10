@@ -111,10 +111,11 @@ dc ls
 dc spend
 ```
 
-The head has a 50 GB OS disk. `/mnt/bio-shared` is the original 100 GB managed
-shared filesystem in FIN-02, containing `envs/`, `src/`, `weights/`, `cache/`,
-`tools/` and job staging directories. CPU/GPU workers must launch in FIN-02 to
-attach it. Old CUDA environments use Ampere-compatible GPU choices; the RTX
+The head has a 50 GB OS disk. `/mnt/bio-shared` is the 200 GiB managed shared
+filesystem in FIN-02, expanded in place from 100 GiB on 2026-09-10 to hold reusable
+runtime archives. It contains `envs/`, `src/`, `weights/`, `cache/`,
+`runtime-packages/`, `tools/` and job staging directories. CPU/GPU workers must
+launch in FIN-02 to attach it. Old CUDA environments use Ampere-compatible GPU choices; the RTX
 A6000 requires the CUDA 12.6 image. Modern recipes can use newer GPUs.
 Protenix 2.0.0 uses A100, L40S or H100 workers with CUDA 12.8. Its pinned
 Torch/Triton kernels do not support Blackwell, and its compiled LayerNorm needs
@@ -215,8 +216,8 @@ those checks do not qualify full-database inference.
 
 Full datasets expand to approximately 2.5 TiB. Use a **separate dedicated shared
 volume** with at least 3 TiB capacity plus appropriate temporary-download
-headroom, not the 100 GB model cache. Provisioning and retention are separate
-from merely installing the model. Configure its ID and NFS export in
+headroom, separate from the 200 GiB model/runtime cache. Provisioning and retention
+are separate from merely installing the model. Configure its ID and NFS export in
 [`rfaa-storage.nix`](rfaa-storage.nix), then deploy. An empty configuration rejects
 full RFAA submissions before renting a GPU. The 3300 GB allocation is now
 registered with persistent retention. Its full installation is incomplete and paused.
@@ -251,7 +252,7 @@ teardown; the timer is not an absolute billing cutoff.
 
 ## Budget and cleanup
 
-The configured ceiling is $500. `dc` estimates observed compute **and storage**
+The configured ceiling is $750. `dc` estimates observed compute **and storage**
 spending, imports the previous GPU ledger, reserves each job's maximum duration,
 and requires a healthy watchdog before launching. The watchdog runs every minute
 and deletes expired managed workers. Worker OS disks are included in confirmed
@@ -263,8 +264,8 @@ this delay; removal and watchdog actions never wait on it.
 This is an estimated guard, not a provider-enforced billing cap. Protected
 persistent storage continues billing after GPU work stops, so expensive databases
 have an explicit retention policy. Both databases are retained persistently at
-approximately $41.42/day combined; head and original storage bring the current
-background to about $43.56/day before temporary compute. See [BUDGET.md](BUDGET.md) for formulas,
+approximately $41.42/day combined; the head and expanded runtime storage bring
+the observed background to about $44.22/day before temporary compute. See [BUDGET.md](BUDGET.md) for formulas,
 limitations and recovery commands. Automatic account top-ups do not reset spending.
 
 ```bash

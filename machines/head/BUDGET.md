@@ -37,6 +37,14 @@ background reserve at those prices was **$2.14**, in addition to the **$10 safet
 margin**. These figures describe this project's observed inventory, not an
 invoice or an assertion about future prices.
 
+On **2026-09-10**, the existing `bio-shared` filesystem was expanded in place
+from 100 to 200 GiB for reusable runtime archives. Its live quote was
+$0.20/GiB-month: $40/month total, an increase of $20/month ($0.027397/hour).
+The same volume UUID, NFS export and files were retained. Including the head,
+its OS and retained database volumes, observed persistent infrastructure then
+cost **$1.84252/hour, or $44.22/day**, before temporary compute. The spending
+ledger was reconciled to the new storage price; the $750 ceiling is unchanged.
+
 On first use, accounting imports `/var/lib/dc/ledger.tsv`, then reconciles every
 instance, active volume, and trashed volume returned by the project's public
 API. Previously existing resources are estimated from creation time using their
@@ -218,4 +226,4 @@ can postpone enforcement. Persistent resources continue charging even after all
 workers have stopped, so retaining a large RFAA database needs its own storage
 and retention decision. The 24-hour reserve is an allowance for that ongoing
 cost, not an automatic storage expiration or a guarantee that the total invoice
-can never exceed $500.
+can never exceed $750.
