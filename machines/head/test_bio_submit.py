@@ -265,6 +265,55 @@ except (OSError, ValueError, KeyError, AssertionError):
     def msa_settings(self, **settings):
         return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
 
+    def test_managed_msa_retains_first_ssh_key_and_uses_strict_connections_after_readiness(self):
+        # Only this fixture simulates OpenSSH's accept-new known-hosts write.
+        # The real registrar is exercised separately with RSA/Ed25519/ECDSA keys.
+        ssh = self.root / "bin/ssh"
+        ssh.write_text(ssh.read_text().replace('if [ "${!#}" = true ]; then exit 0; fi', '''if [ "${!#}" = true ]; then
+  for option in "$@"; do
+    case "$option" in UserKnownHostsFile=*) printf '%s\\n' "$FIXTURE_HOST_KEY" > "${option#*=}";; esac
+  done
+  exit 0
+fi'''))
+        (self.root / "tools/msa/session_client.py").write_text('''import hashlib,json,os,stat,sys
+from pathlib import Path
+assert sys.argv[1] == 'register-launch'
+job_path=Path(sys.argv[sys.argv.index('--job')+1])
+known=Path(sys.argv[sys.argv.index('--known-hosts')+1])
+job=json.loads(job_path.read_text())
+assert known == job_path.parent/'worker-known-hosts'
+assert stat.S_IMODE(known.stat().st_mode) == 0o600
+assert job['ssh_host_key'] == {'known_hosts':str(known), 'sha256':hashlib.sha256(known.read_bytes()).hexdigest(),
+    'instance':job['instance'], 'ip':job['ip'], 'trust':'first-successful-ssh'}
+(Path(os.environ['AUDIT'])/'registration-args.json').write_text(json.dumps(sys.argv[1:]))
+print('{}')
+''')
+        public_key = '127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDHsUT5QDdMvUdc1eh6r4OYkuaxpRSIcmApPuTPFZjyB'
+        results = self.root / "results with 'quote"
+        result = self.submit("msa", "--sub", "session", **self.msa_settings(
+            BIO_MSA_SESSION_STATE=str(self.root / "session-state"), BIO_MSA_SESSION_ID="c"*32,
+            BIO_RESULTS_DIR=str(results), FIXTURE_HOST_KEY=public_key))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        job_path = next(results.glob("*/job.json"))
+        job = json.loads(job_path.read_text())
+        known = job_path.parent / "worker-known-hosts"
+        self.assertEqual(known.read_text(), public_key+"\n")
+        self.assertEqual(job['ssh_host_key']['sha256'], hashlib.sha256(known.read_bytes()).hexdigest())
+        lines = (self.root / "ssh-args").read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn('StrictHostKeyChecking=accept-new', lines[0])
+        self.assertIn('StrictHostKeyChecking=yes', lines[1])
+        for line in lines:
+            self.assertIn('UserKnownHostsFile='+str(known), line)
+            self.assertIn('GlobalKnownHostsFile=/dev/null', line)
+            self.assertIn('UpdateHostKeys=no', line)
+            self.assertNotIn('StrictHostKeyChecking=no', line)
+        arguments = json.loads((self.root / "registration-args.json").read_text())
+        self.assertEqual(arguments[arguments.index('--known-hosts')+1], str(known))
+        removals = (self.root / "removals").read_text().splitlines()
+        self.assertEqual(len(removals), 1)
+        self.assertIn('12345678-1234-1234-1234-123456789012', removals[0])
+
     def valid_bundle(self, model="boltz2"):
         path = self.root / "existing prepared bundle"
         path.mkdir(exist_ok=True)

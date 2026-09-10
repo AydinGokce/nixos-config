@@ -738,20 +738,42 @@ if [ -n "$db_nfs" ]; then
   "$storage_tool" track --volume "$db_volume" --job-dir "$LOCALOUT" --pid "$$" --instance "$id"
 fi
 SSHO=(-i /root/.ssh/datacrunch_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+worker_known_hosts=""
+if [ "$recipe" = msa ] && [ "$sub" = session ]; then
+  # Capture the key negotiated by the actual authenticated readiness connection.
+  # Subsequent attempts reject changes; session registration reuses these bytes.
+  worker_known_hosts="$LOCALOUT/worker-known-hosts"
+  ( set -o noclobber; : > "$worker_known_hosts" )
+  chmod 600 "$worker_known_hosts"
+  SSHO=(-i /root/.ssh/datacrunch_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$worker_known_hosts"
+    -o GlobalKnownHostsFile=/dev/null -o HashKnownHosts=no -o UpdateHostKeys=no
+    -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+fi
 ready=0
 for _ in $(seq 1 30); do
   if ssh "${SSHO[@]}" "root@$ip" true 2>/dev/null; then ready=1; break; fi
   sleep 8
 done
 [ "$ready" = 1 ] || { echo 'bio-submit: sshd never became ready' >&2; exit 1; }
-python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" "$db_volume" "$bundle_sha256" "$library_bundle" <<'PY'
-import json,sys,datetime
-p,job,model,instance,ip,gpu,timeout,db_volume,bundle_sha256,library=sys.argv[1:]
+if [ -n "$worker_known_hosts" ]; then
+  for index in "${!SSHO[@]}"; do
+    [ "${SSHO[$index]}" != StrictHostKeyChecking=accept-new ] || SSHO[$index]=StrictHostKeyChecking=yes
+  done
+fi
+python3 - "$LOCALOUT/job.json" "$jobid" "$recipe" "$id" "$ip" "$g" "$seconds" "$db_volume" "$bundle_sha256" "$library_bundle" "$worker_known_hosts" <<'PY'
+import hashlib,json,sys,datetime
+from pathlib import Path
+p,job,model,instance,ip,gpu,timeout,db_volume,bundle_sha256,library,known_hosts=sys.argv[1:]
 source = None
 if library:
     with open(library+'/bundle.json') as f: native=json.load(f)
     source = {k: native[k] for k in ('source_ref', 'source_snapshot_sha256', 'sha256', 'format', 'msa_backend')}
-with open(p,'w') as f: json.dump(dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,library_input=source,started=datetime.datetime.now(datetime.timezone.utc).isoformat()),f,indent=2)
+value=dict(job=job,model=model,instance=instance,ip=ip,gpu=gpu,timeout=int(timeout),database_volume=db_volume or None,tools_sha256=bundle_sha256,library_input=source,started=datetime.datetime.now(datetime.timezone.utc).isoformat())
+if known_hosts:
+    value['ssh_host_key']={'known_hosts':known_hosts,'sha256':hashlib.sha256(Path(known_hosts).read_bytes()).hexdigest(),
+                           'instance':instance,'ip':ip,'trust':'first-successful-ssh'}
+with open(p,'w') as f:json.dump(value,f,indent=2)
 PY
 python3 - "$LOCALOUT/job.json" "$LOCALOUT/runtime-plan.json" <<'RUNTIMEPLAN'
 import hashlib,json,pathlib,sys
@@ -770,7 +792,7 @@ RF3CACHEJOB
 fi
 if [ "$recipe" = msa ] && [ "$sub" = session ]; then
   python3 "$TOOLS_SRC/msa/session_client.py" register-launch --state "$BIO_MSA_SESSION_STATE" \
-    --job "$LOCALOUT/job.json" --remote-out "$ROUT"
+    --job "$LOCALOUT/job.json" --remote-out "$ROUT" --known-hosts "$worker_known_hosts"
 fi
 echo "bio-submit: running $recipe on $id ($ip), timeout ${seconds}s"
 status=0
@@ -781,7 +803,9 @@ fi
 timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" bash -s < "$remote_file" || status=$?
 # Fetch partial outputs even on failure; model status must remain nonzero.
 echo "bio-submit: fetching results -> $LOCALOUT"
-rsync -a -e "ssh ${SSHO[*]}" "root@$ip:$ROUT/" "$LOCALOUT/" || { echo 'bio-submit: result retrieval failed' >&2; status=1; }
+ssh_transport="ssh ${SSHO[*]}"
+[ -z "$worker_known_hosts" ] || printf -v ssh_transport '%q ' ssh "${SSHO[@]}"
+rsync -a -e "$ssh_transport" "root@$ip:$ROUT/" "$LOCALOUT/" || { echo 'bio-submit: result retrieval failed' >&2; status=1; }
 python3 - "$LOCALOUT/job.json" "$status" <<'PY'
 import json,sys,datetime
 p,status=sys.argv[1:]

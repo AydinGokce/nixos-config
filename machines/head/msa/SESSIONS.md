@@ -22,6 +22,14 @@ an already-ready session and never starts compute. `bio-msa session start
 the original unit invocation, current managed provider identity, pinned SSH host
 key, boot and session generation. `session stop` retains its explicit semantics.
 
+Managed sessions retain the host key negotiated by the first successful SSH
+readiness connection in a fresh, private per-job `worker-known-hosts` file.
+The job receipt binds those exact bytes to its instance and IP. Registration
+copies that key into the session after checking its path, ownership, mode and
+hash, then verifies the worker identity over strict SSH. All later connections
+use strict checking against the retained key; there is no separate key scan or
+forced Ed25519 host-key requirement.
+
 On-demand startup writes the immutable session/start intent and active registration
 before asking systemd to launch anything. All starters share the existing
 registration lock; readers wait out incomplete publication. A lost startup reply

@@ -5,6 +5,7 @@ Private preparation ensures one shared budgeted session on demand.
 Uncertain startups and submitted searches are never silently repeated.
 """
 import argparse
+import base64
 import fcntl
 import hashlib
 import ipaddress
@@ -16,6 +17,7 @@ import re
 import runpy
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -100,11 +102,48 @@ def ssh(launch):
     ipaddress.IPv4Address(launch["ip"])
     return ["ssh", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+str(known),
+            "-o", "GlobalKnownHostsFile=/dev/null", "-o", "UpdateHostKeys=no",
             "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
             "root@"+launch["ip"]]
 
 
-def register_launch(state, job_path, remote_out):
+def retained_host_keys(path, job_path, job):
+    """Use the negotiated first-connection key, regardless of its algorithm."""
+    require(path is not None, 'Managed MSA registration requires its retained SSH host key')
+    path = Path(path).absolute()
+    require(path == Path(job_path).absolute().parent / 'worker-known-hosts',
+            'SSH host-key file must belong to this exact managed job')
+    binding = job.get('ssh_host_key', {})
+    require(binding.get('known_hosts') == str(path) and binding.get('instance') == job['instance']
+            and binding.get('ip') == job['ip'] and binding.get('trust') == 'first-successful-ssh',
+            'SSH host-key receipt does not bind this exact managed worker')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1
+                and 0 < info.st_size <= 65536, 'Retained SSH host-key file is unsafe or empty')
+        raw = os.read(fd, 65537)
+    finally:
+        os.close(fd)
+    require(hashlib.sha256(raw).hexdigest() == binding.get('sha256'), 'Retained SSH host-key bytes changed')
+    ipaddress.IPv4Address(job['ip'])
+    lines = [line for line in raw.splitlines() if line.strip()]
+    require(lines, 'Retained SSH host-key file is empty')
+    for line in lines:
+        fields = line.split()
+        require(len(fields) == 3 and fields[0] == job['ip'].encode(), 'Retained SSH host key belongs to another host')
+        try:
+            key = base64.b64decode(fields[2], validate=True)
+            size = int.from_bytes(key[:4], 'big')
+            require(0 < size <= 128 and len(key) > 4+size and key[4:4+size] == fields[1],
+                    'Retained SSH public-key encoding is invalid')
+        except (ValueError, TypeError) as exc:
+            raise ValueError('Retained SSH public-key encoding is invalid') from exc
+    return raw
+
+
+def register_launch(state, job_path, remote_out, known_hosts=None):
     state = state.resolve(); intent = session.load(state/"intent.json"); job = session.load(job_path)
     require(state.name == intent["session_id"] and job["model"] == "msa", "Wrong session launch")
     require(os.environ.get("INVOCATION_ID") and os.environ.get("BIO_MSA_SESSION_ID") == intent["session_id"],
@@ -115,12 +154,12 @@ def register_launch(state, job_path, remote_out):
     require(Path(remote_out).is_absolute() and str(remote_out).startswith("/mnt/bio-shared/runs/msa-")
             and Path(remote_out).name == "out", "Invalid session result path")
     proof = provider_check(Path(intent["tools"]), job["instance"], job["ip"])
-    # This fresh allocation uses the project's existing first-connection trust;
-    # subsequent requests require these exact recorded host-key bytes and boot.
+    # The successful readiness connection already negotiated/authenticated this
+    # key. Do not replace it with a separate forced-algorithm discovery probe.
     known = state/"known_hosts"
-    raw = subprocess.check_output(["ssh-keyscan", "-T", "10", "-t", "ed25519", job["ip"]], timeout=15, stderr=subprocess.PIPE)
-    require(raw.strip() and all(line.startswith((job["ip"]+" ").encode()) for line in raw.splitlines()), "Invalid SSH host-key scan")
-    with known.open("xb") as stream: os.chmod(known, 0o600); stream.write(raw)
+    raw = retained_host_keys(known_hosts, job_path, job)
+    with known.open("xb") as stream:
+        os.chmod(known, 0o600); stream.write(raw); stream.flush(); os.fsync(stream.fileno())
     launch = dict(schema=1, session_id=intent["session_id"], job=job["job"], instance=job["instance"], ip=job["ip"],
                   known_hosts=str(known), known_hosts_sha256=session.sha(known), provider=proof,
                   unit=intent["unit"], invocation_id=live["InvocationID"], remote_out=str(remote_out),
@@ -507,7 +546,7 @@ def main(argv=None):
     p.add_argument("--session-unit");p.add_argument("--session-invocation");p.add_argument("--known-hosts");p.add_argument("--known-hosts-sha256")
     args = p.parse_args(argv)
     if args.action == "start": value = start(args)
-    elif args.action == "register-launch": value = register_launch(args.state, args.job, args.remote_out)
+    elif args.action == "register-launch": value = register_launch(args.state, args.job, args.remote_out, args.known_hosts)
     elif args.action in {"provider-check","provider-close"}: value = provider(args)
     elif args.action == "adopt": value = adopt(args)
     elif args.action == "prepare": value = prepare(args)
