@@ -5,10 +5,12 @@ The enclosing bio-submit owns the cloud reservation and resource cleanup.
 This process owns only its API and request children, never provider resources.
 """
 import argparse
+from contextlib import contextmanager
 import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import mmap
@@ -24,7 +26,9 @@ import uuid
 
 import databases
 import panel
+import prefetch
 import server
+import worker_controls
 
 SCHEMA = 1
 RESERVE = 60
@@ -154,8 +158,8 @@ def sources(tools):
              "msa/databases.py", "recipes/_common.sh", "rf3/msa.py"]
     # Existing frozen sessions predate the head lifecycle helper. New snapshots
     # include and bind it without invalidating those immutable old tool trees.
-    if (tools / 'msa/lifecycle.py').exists():
-        names.append('msa/lifecycle.py')
+    for extra in ('msa/lifecycle.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'py/worker_progress.py'):
+        if (tools / extra).exists(): names.append(extra)
     return {name: sha(tools/name) for name in names}
 
 
@@ -205,7 +209,7 @@ class IndexCache:
         return dict(indexes=rows, total_bytes=sum(r["bytes"] for r in rows),
                     fully_resident=all(r["pages"] == r["resident_pages"] for r in rows))
 
-    def warm(self, mode, deadline, headroom):
+    def warm(self, mode, deadline, headroom, *, prefetch_state=None, progress=None):
         require(mode in {"report", "prefetch", "lock"}, "Unknown index warm mode")
         before = self.residency(deadline)
         info = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
@@ -215,10 +219,8 @@ class IndexCache:
         if mode != "report":
             require(total >= before["total_bytes"]+headroom and available >= nonresident+headroom,
                     "Full index warm-up requires index bytes plus requested RAM headroom")
-            for _, mapping, _ in self.entries:
-                for start in range(0, len(mapping), 16*1024**2):
-                    require(STOP is None and time.time() < deadline, "Index warm-up interrupted or timed out")
-                    mapping[start:start+16*1024**2]
+            loading = prefetch.load([path for path, _, _ in self.entries], deadline,
+                lambda: STOP is not None, state=prefetch_state, progress=progress)
             if mode == "lock":
                 for _, mapping, address in self.entries:
                     require(STOP is None and time.time() < deadline, "Index warm-up interrupted or timed out")
@@ -229,6 +231,7 @@ class IndexCache:
         require(mode == "report" or after["fully_resident"], "Index pages were evicted during warm-up")
         return dict(mode=mode, checked_epoch=time.time(), before=before, after=after,
                     headroom_bytes=headroom, locked=mode == "lock",
+                    loading=loading if mode != 'report' else None,
                     residency_guarantee="session lifetime" if mode == "lock" else "observation only")
 
     def close(self):
@@ -331,6 +334,37 @@ def execute(state, request_id):
     return 0 if result["status"] == "complete" else 1
 
 
+def startup_progress(output, session_id, stage, state, message, **extra):
+    event = dict(schema=1, stage=stage, scope='msa', state=state, message=message,
+                 stage_id=session_id+':'+stage, timestamp_ns=time.time_ns(), **extra)
+    line = 'BIO_WORKER_STAGE '+canonical(event).decode()
+    require(len(line.encode()) <= 4096, 'Worker progress event too large')
+    atomic(Path(output)/'startup-progress.json', event)
+    if os.environ.get('BIO_WORKER_PROGRESS_LOG'):
+        import head_controls
+        head_controls.forward_progress(event)
+    else: print(line, file=sys.stderr, flush=True)
+
+
+@contextmanager
+def startup_activity(tools, output, session_id, stage, message):
+    helper = Path(tools)/'py/worker_progress.py'
+    if helper.is_file():
+        spec = importlib.util.spec_from_file_location('msa_worker_progress', helper)
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        previous = os.environ.get('BIO_WORKER_PROGRESS_JSON')
+        os.environ['BIO_WORKER_PROGRESS_JSON'] = str(Path(output)/'startup-progress.json')
+        try:
+            with module.Activity(stage, scope='msa', message=message, stage_id=session_id+':'+stage): yield
+        finally:
+            if previous is None: os.environ.pop('BIO_WORKER_PROGRESS_JSON', None)
+            else: os.environ['BIO_WORKER_PROGRESS_JSON'] = previous
+    else:
+        startup_progress(output, session_id, stage, 'running', message)
+        yield
+        startup_progress(output, session_id, stage, 'complete', message)
+
+
 def serve(args):
     global STOP
     require(re.fullmatch(r"[a-f0-9]{32}", args.session_id), "Invalid session ID")
@@ -347,7 +381,7 @@ def serve(args):
     adoption = None
     if not getattr(args, "adopt", None):
         with socket.socket() as probe: probe.bind(("127.0.0.1", 8080))
-    api = child = cache = None; ready = None; reason = "failed"; current = None
+    api = child = cache = None; ready = None; reason = "failed"; current = None; stage = 'database_check'
     def interrupted(sig, frame):
         global STOP
         STOP = sig
@@ -355,18 +389,39 @@ def serve(args):
     try:
         os.environ["MMSEQS_NUM_THREADS"] = "16"
         os.environ["BIO_TOOLS_DIR"] = str(tools)
-        if getattr(args, "adopt", None):
-            adoption, config, provenance, api = adopted_api(args.adopt, args.database, args.deadline)
-        else:
-            config, provenance = server.configuration(args.database.resolve(), args.results.resolve(), args.tools_root.resolve())
+        atomic(output/'session-starting.json', dict(schema=1, session_id=args.session_id, owner=identity(),
+            deadline_epoch=args.deadline, idle_seconds=args.idle_seconds), exclusive=True)
+        with startup_activity(tools, output, args.session_id, 'database_check', 'Verifying full private MSA database indexes'):
+            if getattr(args, "adopt", None):
+                adoption, config, provenance, api = adopted_api(args.adopt, args.database, args.deadline)
+            else:
+                config, provenance = server.configuration(args.database.resolve(), args.results.resolve(), args.tools_root.resolve())
         atomic(output/"msa-server.json", config, exclusive=True)
         atomic(output/"msa-server.provenance.json", provenance, exclusive=True)
         cache = IndexCache(index_paths(args.database, provenance))
         warm_deadline = args.deadline-RESERVE
         if args.warm_seconds is not None:
             warm_deadline = min(warm_deadline, time.time()+args.warm_seconds)
-        warm = cache.warm(args.warm, warm_deadline, int(args.headroom_gib*1024**3))
+        started = time.monotonic(); last_progress = [0.0]
+        def loading_progress(value):
+            elapsed = time.monotonic()-started
+            if elapsed-last_progress[0] < 1 and value['read_bytes'] != value['total_bytes']: return
+            last_progress[0] = elapsed
+            eta = {'state': 'unknown', 'scope': 'stage', 'basis': 'Waiting for measured buffered index throughput'}
+            if elapsed >= 1 and value['read_bytes']:
+                seconds = max(0, (value['total_bytes']-value['read_bytes'])*elapsed/value['read_bytes'])
+                if seconds <= 604800:
+                    eta = {'state': 'estimate', 'seconds': seconds, 'scope': 'stage', 'basis': 'Observed buffered index bytes per second'}
+            startup_progress(output, args.session_id, 'index_warm', 'running', 'Prefetching private MSA index pages',
+                             completed=value['read_bytes'], total=value['total_bytes'], unit='bytes', eta=eta)
+        stage = 'index_warm'
+        startup_progress(output, args.session_id, stage, 'running', 'Loading and checking full private MSA index residency')
+        warm = cache.warm(args.warm, warm_deadline, int(args.headroom_gib*1024**3),
+                         prefetch_state=Path('/tmp')/('bio-msa-prefetch-'+args.session_id), progress=loading_progress)
         atomic(output/"warm-index.json", warm, exclusive=True)
+        startup_progress(output, args.session_id, 'index_warm', 'complete',
+                         'Full private MSA index residency verified' if warm['after']['fully_resident'] else 'Private MSA index residency observation complete',
+                         completed=warm['after']['total_bytes'], total=warm['after']['total_bytes'], unit='bytes')
         if not adoption:
             log = (output/"msa-server.log").open("ab")
             api = subprocess.Popen([provenance["tools"]["server"], "-local", "-config", str(output/"msa-server.json")],
@@ -388,14 +443,17 @@ def serve(args):
                      provenance_sha256=sha(output/"msa-server.provenance.json"), namespace=provenance["namespace"],
                      warm_sha256=sha(output/"warm-index.json"), database=provenance["database"])
         ready.update(lifecycle="borrowed-api" if adoption else "owned-api", adoption=adoption,
-                     adoption_sha256=sha(args.adopt) if adoption else None)
+                     adoption_sha256=sha(args.adopt) if adoption else None, controls_version=0 if adoption else 1)
         atomic(state/"ready.json", ready, exclusive=True)
         ready_sha = sha(state/"ready.json")
         (state/"requests").mkdir(mode=0o700)
+        worker_controls.initialize(ready, ready_sha)
         atomic(state/"health.json", dict(schema=SCHEMA, session_id=args.session_id, ready_sha256=ready_sha,
             checked_epoch=time.time(), status="ready", request_id=None))
         atomic(output/"session-ready.json", ready, exclusive=True)
-        processed = set(); last_activity = time.monotonic()
+        stage = 'ready'
+        startup_progress(output, args.session_id, stage, 'complete', 'Shared private MSA worker is ready')
+        processed = set()
         monotonic_deadline = time.monotonic()+max(0,args.deadline-time.time())
         while STOP is None and time.time() < args.deadline-RESERVE and time.monotonic() < monotonic_deadline-RESERVE:
             require(api.poll() is None, "Private API exited")
@@ -403,11 +461,16 @@ def serve(args):
                 terminal = load(output/"requests"/current/"status.json")
                 require(terminal["status"] in {"complete", "failed"} and terminal["request_id"] == current,
                         "Request supervisor exited without a terminal receipt; closing session")
-                stop_request(child); child = None; last_activity = time.monotonic(); current = None
+                stop_request(child); child = None; current = None
             waiting = request_gate(adoption) if child is None else None
-            if child is None:
+            with worker_controls.locked(state):
                 queued = sorted(p for p in (state/"requests").glob("*.json") if p.stem not in processed)
-                if queued and waiting is None:
+                control, close = worker_controls.update_locked(ready, ready_sha,
+                    busy=child is not None or waiting is not None, queued=len(queued), active=current)
+                if close:
+                    reason = 'graceful_shutdown' if control['shutdown_requested'] else 'idle_timeout'
+                    break
+                if child is None and queued and waiting is None:
                     item = queued[0]; request = load(item)
                     request_document(request, ready, ready_sha)
                     processed.add(item.stem); current = item.stem
@@ -415,13 +478,20 @@ def serve(args):
                     with (output/("request-"+item.stem+".log")).open("ab") as log:
                         child = subprocess.Popen([sys.executable, str(tools/"msa/session.py"), "execute", "--state", str(state),
                                                   "--request-id", item.stem], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                elif not queued and waiting is None and time.monotonic()-last_activity >= args.idle_seconds:
-                    reason = "idle_timeout"; break
+                    control, _ = worker_controls.update_locked(ready, ready_sha,
+                        busy=True, queued=len(queued)-1, active=current)
+                live_status = worker_controls.snapshot(control)
+                atomic(output/'worker-status.json', dict(schema=1, session_id=args.session_id, ready_sha256=ready_sha,
+                    owner=ready['owner'], **live_status))
             atomic(state/"health.json", dict(schema=SCHEMA, session_id=args.session_id, ready_sha256=ready_sha,
                 checked_epoch=time.time(), status="busy" if child else "waiting" if waiting else "ready", request_id=current, waiting_reason=waiting))
             time.sleep(.5)
         else: reason = "cancelled" if STOP else "maximum_lifetime"
         return 0
+    except BaseException as error:
+        try: startup_progress(output, args.session_id, stage, 'failed', type(error).__name__+': '+str(error)[:512])
+        except Exception: pass
+        raise
     finally:
         stop_request(child)
         if not adoption: panel.stop(api)
@@ -441,9 +511,21 @@ def submit(state, expected, value, wait_seconds):
     require(time.time() < value["deadline_epoch"] <= time.time()+value["timeout_seconds"]+5,
             "Request deadline is expired or extends its declared timeout")
     path = state/"requests"/(value["request_id"]+".json")
-    try: atomic(path, value, exclusive=True)
-    except FileExistsError:
-        require(load(path) == value, "Existing request ID has different input; never overwrite or retry")
+    if ready.get('controls_version') == 1:
+        with worker_controls.locked(state):
+            if path.exists():
+                require(load(path) == value, 'Existing request ID has different input; never overwrite or retry')
+            else:
+                control = worker_controls.checked(ready, expected)
+                require(not control['shutdown_requested'] and not control['closing'], 'Shared MSA worker is draining; new searches are not accepted')
+                require(control['idle_deadline_epoch'] is None or time.time() < control['idle_deadline_epoch'], 'Shared MSA idle lease expired')
+                atomic(path, value, exclusive=True)
+                queued = sum(not (state/'claims'/(p.stem+'.json')).exists() for p in (state/'requests').glob('*.json'))
+                worker_controls.update_locked(ready, expected, busy=control['busy'], queued=queued, active=control['active_request_id'])
+    else:
+        try: atomic(path, value, exclusive=True)
+        except FileExistsError:
+            require(load(path) == value, "Existing request ID has different input; never overwrite or retry")
     until = min(time.monotonic()+wait_seconds, time.monotonic()+ready["deadline_epoch"]-time.time()-RESERVE)
     status_path = Path(ready["output"])/"requests"/value["request_id"]/"status.json"
     while True:
@@ -457,7 +539,7 @@ def submit(state, expected, value, wait_seconds):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=["serve", "submit", "execute", "status"])
+    p.add_argument("action", choices=["serve", "submit", "execute", "status", "control"])
     p.add_argument("--state", type=Path, required=True)
     p.add_argument("--session-id"); p.add_argument("--request-id"); p.add_argument("--expected-ready-sha256")
     p.add_argument("--out", type=Path); p.add_argument("--database", type=Path)
@@ -475,6 +557,12 @@ def main(argv=None):
     if args.action == "execute": return execute(args.state, args.request_id)
     if args.action == "status":
         print(json.dumps(check_ready(args.state, args.expected_ready_sha256), sort_keys=True)); return 0
+    if args.action == 'control':
+        ready = check_ready(args.state, args.expected_ready_sha256)
+        require(ready.get('controls_version') == 1, 'This worker generation does not support shared controls')
+        value = json.loads(sys.stdin.buffer.read(8193), object_pairs_hook=panel.unique_keys)
+        result = worker_controls.apply(ready, args.expected_ready_sha256, value)
+        print(json.dumps(result, sort_keys=True)); return 0
     value = json.loads(sys.stdin.buffer.read(16*1024**2+1), object_pairs_hook=panel.unique_keys)
     result = submit(args.state, args.expected_ready_sha256, value, args.wait_seconds)
     print(json.dumps(result, sort_keys=True)); return 0 if result["status"] == "complete" else 1

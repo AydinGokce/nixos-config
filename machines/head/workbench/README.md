@@ -93,6 +93,24 @@ update. Invalid receipts retain their slots and report an integrity error.
 Private/public MSA, model settings, native input constraints and runtime budget
 checks remain separate from dispatcher concurrency.
 
+The native worker panel uses `worker.status` to inspect the shared private MSA
+worker without starting it. It shows observed startup stages and the verified
+idle/hard deadlines. Keep warm adds up to 15 minutes inside the existing budgeted
+lifetime; Shutdown drains accepted searches and stops new admissions. Controls
+retain exact generation pins and a durable command ID before returning. The
+dispatcher reconciles that same command after a lost response or restart, so an
+extension cannot be applied twice. `worker.control_get` exposes the retained
+outcome without changing the worker. Trusted configuration can set
+`msa_sessions_root`; clients cannot choose it.
+
+Per-job startup telemetry exposes actual stages, optional byte/item/step
+counters, and explicitly scoped ETAs. Transfer estimates use observed throughput;
+unmeasured phases remain unknown, and observations older than 30 seconds lose
+their numeric ETA. A stage estimate is not an estimate of total model runtime.
+Private progress files and mirrored job logs retain the evidence without changing
+RF3 preparation code or its cache key. See the protocol for emitter fields and
+the difference between startup time, stage time, and whole-job time.
+
 Useful operator commands:
 
 ```sh

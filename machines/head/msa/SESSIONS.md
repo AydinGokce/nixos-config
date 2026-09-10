@@ -78,6 +78,22 @@ deadline bounded by the existing session lifetime minus its cleanup reserve.
 Runtime setup and index warm-up consume that lifetime; they never extend it.
 An explicit worker `--warm-seconds` can impose a shorter warm-up cap. The
 default no longer imposes an independent 30-minute limit on the full indexes.
+Loading uses four independent buffered readers over disjoint, page-aligned
+ranges, with 16 MiB read buffers. Each reader opens its own read-only descriptor
+so the kernel can maintain a separate sequential read-ahead stream. Index
+identity and byte counts are checked, and the existing final `mincore` check
+still requires every page of every full index to be resident before readiness.
+
+Where writable BDI controls are available, loading temporarily raises the
+worker device's read-ahead to at least 15,360 KiB. A private claim records its
+boot, device, original value and exact temporary setting before changing it.
+The loader restores it on completion, failure or cancellation, before waiting
+for outstanding reads. Enclosing worker cleanup repeats restoration from
+`/tmp/bio-msa-prefetch-<session-id>` after abnormal termination. Repeated cleanup
+is harmless; a missing claim is a no-op, and an unrelated later BDI change is
+never overwritten. Unsupported BDI controls are reported in the warm receipt;
+parallel reads and complete residency verification still run.
+
 `--warm report` performs Linux `mincore` residency
 measurement without loading missing pages. `--warm lock` additionally uses
 `mlock` and fails if the worker lacks sufficient RAM or memory-lock allowance.
@@ -88,6 +104,44 @@ later memory pressure. Only successful full-index locking reports a residency
 guarantee for the session's lifetime. No mode reduces the databases, skips an
 index or changes the search parameters. Native API settings and index identity
 remain bound to the provenance namespace.
+
+## Shared-worker observation and controls
+
+`session_client.py worker-status --root ...` returns bounded JSON without
+starting compute or sending a worker command. It distinguishes absent,
+starting, warming, ready, busy, idle, closing, failed and uncertain workers.
+The exact session, unit invocation, immutable intent hash and launch hash form
+the control target. New workers publish a heartbeat and an actual idle deadline;
+startup and older frozen workers never receive an invented idle countdown.
+Stale heartbeats disable controls. Startup snapshots and the last bounded
+progress lines from the registered job provide stage details and measured
+index-load progress. The waiting caller forwards those events to its private
+`BIO_WORKER_PROGRESS_LOG`; RF3's preparation-cache identity is unchanged.
+
+`worker-control --command-id <32-hex-id> --action extend|shutdown` requires all
+four target fields (`--session-id`, `--invocation-id`, `--intent-sha256`,
+`--launch-sha256`). The head journals the exact command before contacting the
+worker. The worker changes its lease and saves the command receipt in one
+atomic, locked ledger update on persistent shared storage. Exact retries return
+that same receipt, including after a lost reply or worker removal; reuse with a
+different payload fails. Known stale, unsupported or exhausted targets return
+a durable rejected receipt. Transport uncertainty requires retrying that exact
+command, never inventing a new ID.
+
+Extend adds 900 seconds to an idle lease. While searches are active or queued,
+it grants 900 seconds of credit to the next idle period. The original absolute
+worker lifetime and its cleanup reserve always prevail; the button is disabled
+when a full additional 15 minutes cannot currently fit. A search that consumes
+the remaining lifetime can shorten later usable idle credit. This operation
+does not renew the cloud reservation or change the two-hour default lifetime.
+
+Graceful shutdown stops admitting new requests under the same lock used by
+submission. Previously accepted current and queued searches drain normally,
+then the enclosing managed worker cleanup runs. An idle worker closes at once.
+During a drain the shutdown epoch is unknown until accepted work finishes; the
+hard lifetime remains visible and enforced. Shared GUI controls are unavailable
+for borrowed APIs and older frozen sessions. The existing explicit manual
+`session stop` command retains its original operator semantics.
 
 ## Existing-worker operational adoption
 

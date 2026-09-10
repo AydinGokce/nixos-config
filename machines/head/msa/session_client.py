@@ -319,6 +319,8 @@ def observe_session(root, deadline=None):
         state, intent = active(Path(root))
         ident = intent['session_id']
         launch = lifecycle.document(state / 'launch.json', optional=True)
+        import head_controls
+        head_controls.forward_progress(head_controls.startup_snapshot(state, launch))
         live = unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
         if launch is None:
             if _terminal_unit(live):
@@ -450,11 +452,12 @@ def prepare(args):
         launch_sha256=session.sha(state/"launch.json"), epoch=time.time()), exclusive=True)
     try:
         lifecycle.emit('waiting', 'Private MSA search is queued or running on the shared service', ready['session_id'])
-        result = subprocess.run(ssh(launch)+[shlex.join(command)], input=session.canonical(value), capture_output=True,
-                                timeout=min(remaining+45, max(1, ready["deadline_epoch"]-time.time())))
-        with (local/"stdout").open("xb") as out: out.write(result.stdout)
-        with (local/"stderr").open("xb") as out: out.write(result.stderr)
-        require(result.returncode == 0, "Preparation failed or outcome is uncertain; retained request must be reconciled before retry")
+        with session.startup_activity(Path(intent['tools']), local, ready['session_id'], 'search', 'Private MSA search is queued or running'):
+            result = subprocess.run(ssh(launch)+[shlex.join(command)], input=session.canonical(value), capture_output=True,
+                                    timeout=min(remaining+45, max(1, ready["deadline_epoch"]-time.time())))
+            with (local/"stdout").open("xb") as out: out.write(result.stdout)
+            with (local/"stderr").open("xb") as out: out.write(result.stderr)
+            require(result.returncode == 0, "Preparation failed or outcome is uncertain; retained request must be reconciled before retry")
         value = json.loads(result.stdout)
         require(value["status"] == "complete" and value["request_id"] == ident
                 and value["request_sha256"] == request_sha and value["ready_sha256"] == digest,
@@ -478,6 +481,16 @@ def prepare(args):
         session.atomic(local/"failure.json", dict(error=type(exc).__name__, request_id=ident,
             message="Request retained; no automatic retry", epoch=time.time()), exclusive=True)
         raise
+
+
+def worker_status(root, deadline=None):
+    import head_controls
+    return head_controls.worker_status(root, deadline)
+
+
+def worker_control(root, action, params, deadline=None):
+    import head_controls
+    return head_controls.worker_control(root, action, params, deadline)
 
 
 def stop(root):
@@ -530,7 +543,7 @@ def stop(root):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=["start", "status", "stop", "prepare", "adopt", "register-launch", "provider-check", "provider-close"])
+    p.add_argument("action", choices=["start", "status", "stop", "prepare", "adopt", "register-launch", "provider-check", "provider-close", "worker-status", "worker-control"])
     p.add_argument("--root", type=Path, default=DEFAULT_ROOT); p.add_argument("--tools", type=Path, default=TOOLS)
     p.add_argument("--state", type=Path); p.add_argument("--job", type=Path); p.add_argument("--remote-out")
     p.add_argument("--instance"); p.add_argument("--ip"); p.add_argument("--worker"); p.add_argument("--spot", action="store_true")
@@ -544,6 +557,8 @@ def main(argv=None):
     p.add_argument("--json", type=Path); p.add_argument("--name"); p.add_argument("--bundle-result", type=Path)
     p.add_argument("--os-id");p.add_argument("--ready",type=Path);p.add_argument("--owner-unit");p.add_argument("--owner-invocation")
     p.add_argument("--session-unit");p.add_argument("--session-invocation");p.add_argument("--known-hosts");p.add_argument("--known-hosts-sha256")
+    p.add_argument('--command-id'); p.add_argument('--control-action', '--action', dest='control_action', choices=['extend','shutdown'])
+    p.add_argument('--session-id'); p.add_argument('--invocation-id'); p.add_argument('--intent-sha256'); p.add_argument('--launch-sha256')
     args = p.parse_args(argv)
     if args.action == "start": value = start(args)
     elif args.action == "register-launch": value = register_launch(args.state, args.job, args.remote_out, args.known_hosts)
@@ -551,6 +566,10 @@ def main(argv=None):
     elif args.action == "adopt": value = adopt(args)
     elif args.action == "prepare": value = prepare(args)
     elif args.action == "stop": value = stop(args.root)
+    elif args.action == 'worker-status': value = worker_status(args.root, time.monotonic()+15)
+    elif args.action == 'worker-control':
+        value = worker_control(args.root, args.control_action, {key:getattr(args,key) for key in
+            ('command_id','session_id','invocation_id','intent_sha256','launch_sha256')}, time.monotonic()+15)
     else:
         state, intent, launch, ready, digest = ready_session(args.root)
         value = dict(status="ready", session_id=intent["session_id"], ready=ready, ready_sha256=digest)

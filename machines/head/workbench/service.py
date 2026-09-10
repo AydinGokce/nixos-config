@@ -16,6 +16,7 @@ def configuration(path=None):
     defaults = {'tools_dir': '/etc/bio-tools', 'bio_submit': '/run/current-system/sw/bin/bio-submit',
                 'library_root': '/var/lib/bio-library', 'runtime_config': '/etc/bio-tools/library-runtime.json',
                 'inference_state': '/var/lib/bio-inference', 'max_jobs': 1,
+                'msa_sessions_root': '/var/lib/dc/msa-sessions',
                 'md_runtime': '/var/lib/bio-md/runtime-cpu',
                 'md_admissions': '/var/lib/bio-md/admissions',
                 'md_runtime_archives': '/mnt/bio-shared/md-runtime',
@@ -249,6 +250,13 @@ class Daemon:
                 self.start_failed('job', job, exc)
                 errors.append({'id': job['job_id'], 'error': str(exc)})
         self.queued_progress()
+        # Controls have their own durable IDs and do not consume inference
+        # slots. A retry reconciles the same idempotent session command.
+        from .worker_api import reconcile
+        try:
+            reconcile(self.store, self.config)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            errors.append({'id': 'worker-controls', 'error': str(exc)})
         return {'observed_at': now(), 'errors': errors}
 
     def snapshot(self, db=None):

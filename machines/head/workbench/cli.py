@@ -17,8 +17,8 @@ from workbench.service import Daemon, configuration
 from workbench.store import Store
 
 
-def rpc(store, actor, incoming, outgoing):
-    api = API(store, actor)
+def rpc(store, actor, incoming, outgoing, *, worker_config=None):
+    api = API(store, actor, worker_config=worker_config)
     while True:
         line = incoming.readline(WIRE + 1)
         if not line:
@@ -61,7 +61,8 @@ def main(argv=None):
     store = Store(args.state)
     if args.command == 'rpc':
         require(bool(os.environ.get('BIO_WORKBENCH_ACTOR')), 'Trusted BIO_WORKBENCH_ACTOR is required')
-        rpc(store, os.environ['BIO_WORKBENCH_ACTOR'], sys.stdin.buffer, sys.stdout.buffer)
+        rpc(store, os.environ['BIO_WORKBENCH_ACTOR'], sys.stdin.buffer, sys.stdout.buffer,
+            worker_config=configuration(args.config) if args.config else None)
         return
     if args.command == 'import-retained':
         require(os.geteuid() == 0, 'Retained result import is an operator-only command')

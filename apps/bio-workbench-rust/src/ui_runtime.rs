@@ -1,4 +1,28 @@
 use super::*;
+
+fn sort_batch_history(batches: &mut [Value]) {
+    batches.sort_by(|a, b| {
+        text(b, "created_at")
+            .cmp(text(a, "created_at"))
+            .then_with(|| text(b, "batch_id").cmp(text(a, "batch_id")))
+    });
+}
+
+fn merge_batch_history(batches: &mut Vec<Value>, mut value: Value) {
+    if let Some(existing) = batches
+        .iter_mut()
+        .find(|batch| text(batch, "batch_id") == text(&value, "batch_id"))
+    {
+        if text(&value, "created_at").is_empty() {
+            value["created_at"] = existing["created_at"].clone();
+        }
+        *existing = value;
+    } else {
+        batches.push(value);
+    }
+    sort_batch_history(batches);
+}
+
 impl Workbench {
     pub(super) fn run_endpoint(&self) -> String {
         self.session
@@ -114,6 +138,7 @@ impl Workbench {
         }
         self.library_failed(&pending.purpose, &message);
         self.library_runs_failed(&pending.purpose, &message);
+        self.worker_failed(&pending.purpose, &message);
         self.log(format!("{}: {message}", pending.label));
         if pending.purpose == Purpose::Catalog {
             self.connected = false;
@@ -251,6 +276,7 @@ impl Workbench {
                 self.catalog = value;
                 self.connected = true;
                 self.connection_open = false;
+                self.worker_refresh();
                 self.log("Connected; loaded the head model catalog.");
                 if self.state.models.is_empty() {
                     for model in rows(&self.catalog, "models") {
@@ -265,8 +291,18 @@ impl Workbench {
                     self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
                 }
             }
-            Purpose::History => self.batches = rows(&value, "batches").to_vec(),
+            Purpose::History => {
+                self.batches = rows(&value, "batches").to_vec();
+                sort_batch_history(&mut self.batches);
+            }
+            Purpose::WorkerStatus(serial) => self.worker_received_status(serial, value),
+            Purpose::WorkerControl(_) | Purpose::WorkerReceipt(_) => {
+                self.worker_received_control(value);
+            }
             Purpose::Batch(batch_id) => {
+                for job in rows(&value, "jobs") {
+                    self.worker_observed_job(job);
+                }
                 if self
                     .state
                     .run
@@ -280,6 +316,7 @@ impl Workbench {
                 }
             }
             Purpose::Job(job_id) => {
+                self.worker_observed_job(&value);
                 if text(&value, "job_id") == job_id {
                     self.ingest_job_view(&value);
                 }
@@ -400,8 +437,7 @@ impl Workbench {
         for job in rows(&value, "jobs") {
             self.ingest_job_view(job);
         }
-        self.batches.retain(|batch| text(batch, "batch_id") != id);
-        self.batches.insert(0, value.clone());
+        merge_batch_history(&mut self.batches, value.clone());
         self.state.active_batch = id;
         self.batch = Some(value);
     }
@@ -409,6 +445,7 @@ impl Workbench {
         if !self.connected {
             return;
         }
+        self.worker_poll();
         if self.last_poll.elapsed() > Duration::from_secs(4) {
             self.last_poll = Instant::now();
             self.poll_job_tabs();
@@ -522,7 +559,7 @@ impl Workbench {
                         next_state.detach_library_sources(&old_endpoint)
                     } else { 0 };
                     let saved=if changed { serde_json::to_value(&next_state).map_err(rpc::RpcError::from).and_then(|draft|session.save_connection_with_draft(self.connection.clone(),draft)) } else {session.save_connection(self.connection.clone())};match saved{
-                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
+                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.worker=ui_worker::Worker::default();self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
                     if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before running."); }
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
                     self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before running.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),
@@ -531,5 +568,51 @@ impl Workbench {
             for failure in self.failures.iter().filter(|failure|failure.purpose==Purpose::Catalog).rev().take(1){ui.colored_label(RED,&failure.message);}
         });
         self.connection_open = open;
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    #[test]
+    fn opening_or_refreshing_an_older_run_preserves_creation_order() {
+        let newest =
+            json!({"batch_id":"new","created_at":"2026-09-10T03:00:00Z","state":"running"});
+        let older = json!({"batch_id":"old","created_at":"2026-09-09T03:00:00Z","state":"running"});
+        let mut history = vec![newest, older.clone()];
+        let mut opened = older;
+        opened["updated_at"] = json!("2026-09-11T00:00:00Z");
+        opened["state"] = json!("complete");
+        merge_batch_history(&mut history, opened.clone());
+        merge_batch_history(&mut history, opened);
+        assert_eq!(
+            history
+                .iter()
+                .map(|v| text(v, "batch_id"))
+                .collect::<Vec<_>>(),
+            vec!["new", "old"]
+        );
+        assert_eq!(history[1]["state"], "complete");
+        merge_batch_history(
+            &mut history,
+            json!({"batch_id":"latest","created_at":"2026-09-10T04:00:00Z"}),
+        );
+        assert_eq!(text(&history[0], "batch_id"), "latest");
+    }
+    #[test]
+    fn history_partial_update_keeps_known_creation_and_ties_are_stable() {
+        let mut history = vec![
+            json!({"batch_id":"a","created_at":"2026-09-10T03:00:00Z"}),
+            json!({"batch_id":"b","created_at":"2026-09-10T03:00:00Z"}),
+        ];
+        merge_batch_history(&mut history, json!({"batch_id":"a","state":"complete"}));
+        assert_eq!(
+            history
+                .iter()
+                .map(|v| text(v, "batch_id"))
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(text(&history[1], "created_at"), "2026-09-10T03:00:00Z");
     }
 }

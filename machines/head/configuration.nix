@@ -58,7 +58,7 @@ in
       ${builtins.readFile ./dc.sh}
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
-      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip zstd ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
       ${builtins.readFile ./bio-submit.sh}
     '')
     (pkgs.writeShellScriptBin "bio-library" ''
@@ -346,7 +346,7 @@ in
 
   systemd.services.bio-workbench = {
     description = "Durable desktop and Harrison molecular model jobs";
-    restartTriggers = [ ./workbench ./library ./md ./recipes ./msa ./bio-submit.sh ./bio-msa.sh workbenchConfig ];
+    restartTriggers = [ ./workbench ./library ./md ./recipes ./msa ../../modules/bio/py ./bio-submit.sh ./bio-msa.sh workbenchConfig ];
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];

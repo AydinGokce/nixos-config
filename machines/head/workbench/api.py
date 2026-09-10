@@ -21,14 +21,17 @@ def public(value):
 
 
 class API:
-    def __init__(self, store, actor, *, library_config=None):
+    def __init__(self, store, actor, *, library_config=None, worker_config=None):
         self.store, self.actor = store, string(actor, 'trusted actor', 128)
         self.library_config = library_config
+        self.worker_config = worker_config
 
     def call(self, method, params):
         require(isinstance(method, str), 'Method must be a string')
         function = {
             'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
+            'worker.status': self.worker_status, 'worker.extend': self.worker_extend,
+            'worker.shutdown': self.worker_shutdown, 'worker.control_get': self.worker_control_get,
             'library.list': self.library_list, 'library.get': self.library_get,
             'library.attachment': self.library_attachment,
             'library.edit': self.library_edit, 'library.history': self.library_history,
@@ -60,6 +63,22 @@ class API:
             # Workbench job fields to strip.
             return function(params)
         return public(function(params))
+
+    def worker_status(self, params):
+        from .worker_api import status
+        return status(self, params)
+
+    def worker_extend(self, params):
+        from .worker_api import submit
+        return submit(self, params, 'extend')
+
+    def worker_shutdown(self, params):
+        from .worker_api import submit
+        return submit(self, params, 'shutdown')
+
+    def worker_control_get(self, params):
+        from .worker_api import get
+        return get(self, params)
 
     def library_list(self, params):
         from .library_api import list_records
@@ -318,6 +337,8 @@ class API:
 
     def _job(self, job, db, with_artifacts=True):
         result = deepcopy(job)
+        from .progress import freshness
+        result['progress'] = freshness(result.get('progress', {}))
         from .common import parse
         where = "kind='artifact' AND actor=? AND json_extract(data,'$.job_id')=?"
         args = (self.actor, job['job_id'])

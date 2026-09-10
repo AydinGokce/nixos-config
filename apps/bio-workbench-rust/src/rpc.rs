@@ -33,6 +33,10 @@ const REMOTE: &str =
     "env BIO_WORKBENCH_ACTOR=harrison /run/current-system/sw/bin/bio-workbench rpc";
 const METHODS: &[&str] = &[
     "catalog",
+    "worker.status",
+    "worker.extend",
+    "worker.shutdown",
+    "worker.control_get",
     "upload.begin",
     "upload.chunk",
     "upload.get",
@@ -323,6 +327,8 @@ pub fn mutating(method: &str) -> bool {
     matches!(
         method,
         "upload.begin"
+            | "worker.extend"
+            | "worker.shutdown"
             | "upload.chunk"
             | "upload.finish"
             | "batch.run"
@@ -341,6 +347,29 @@ pub fn mutating(method: &str) -> bool {
 }
 pub fn allowed(method: &str) -> bool {
     METHODS.contains(&method)
+}
+
+fn validate_worker_receipt(method: &str, params: &Value, result: &Value) -> Result<(), RpcError> {
+    if !matches!(
+        method,
+        "worker.extend" | "worker.shutdown" | "worker.control_get"
+    ) {
+        return Ok(());
+    }
+    let control_id = result["control_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 200);
+    let envelope =
+        control_id.is_some() && matches!(result["state"].as_str(), Some("pending" | "complete"));
+    let identity = if method == "worker.control_get" {
+        result["control_id"] == params["control_id"]
+    } else {
+        result["request_key"] == params["request_key"] && result["target"] == params["target"]
+    };
+    if !envelope || !identity {
+        return Err(RpcError::new("protocol","The worker command receipt did not match its exact saved identity. Recover the same request.").uncertain(mutating(method)));
+    }
+    Ok(())
 }
 
 pub trait Backend: Send + Sync {
@@ -613,6 +642,7 @@ impl Backend for Client {
                     .uncertain(mutating(method)),
             );
         }
+        validate_worker_receipt(method, &params, &result)?;
         Ok(result)
     }
     fn library(&self) -> Result<Value, RpcError> {
@@ -979,6 +1009,30 @@ fn collect_pages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_receipts_reject_retargeted_or_incomplete_acknowledgements_as_uncertain() {
+        let params = json!({"request_key":"one","target":{"session_id":"original"}});
+        let valid = json!({"control_id":"control-one","request_key":"one","target":params["target"],"state":"pending"});
+        assert!(validate_worker_receipt("worker.extend", &params, &valid).is_ok());
+        for bad in [
+            json!({}),
+            json!({"control_id":"control-one","request_key":"one","target":{"session_id":"replacement"},"state":"pending"}),
+        ] {
+            assert!(
+                validate_worker_receipt("worker.extend", &params, &bad)
+                    .unwrap_err()
+                    .uncertain
+            );
+        }
+        assert!(
+            validate_worker_receipt(
+                "worker.control_get",
+                &json!({"control_id":"different"}),
+                &valid
+            )
+            .is_err()
+        );
+    }
     use std::sync::Mutex;
     struct LibraryMock {
         data: Vec<u8>,

@@ -423,6 +423,12 @@ fi
 jobid="$recipe-$(date -u +%Y%m%d-%H%M%S)-$$"
 LOCALOUT="$RESULTS_DIR/$jobid"; mkdir -p "$LOCALOUT"
 exec > >(tee -a "$LOCALOUT/run.log") 2>&1
+worker_scope=gpu
+[ "$recipe" != msa ] || worker_scope=msa
+export BIO_WORKER_PROGRESS_JSON="$LOCALOUT/startup-progress.json"
+if [ "$recipe" = msa ] && [ "$sub" = session ]; then
+  export BIO_WORKER_PROGRESS_JSON="$BIO_MSA_SESSION_STATE/startup-progress.json"
+fi
 run="$SHARED_MNT/runs/$jobid"; mkdir -p "$run/in" "$run/out"
 RIN=""; RLABELS=""; RPREP=""; RNATIVE=""; native_has_protein=""
 if [ -n "$infile" ]; then cp "$infile" "$run/in/input.${infile##*.}"; RIN="$run/in/input.${infile##*.}"; fi
@@ -478,10 +484,10 @@ finally:
         connection.close()
 PUBLICMSAREADY
 fi
-# Count only this model's runtime/checkpoint assets before rental. The quoted
-# OS disk includes room for private copies and setup; dc accounts for its cost.
+# Build/reuse one immutable archive before rental. The quoted OS disk includes
+# both the downloaded archive and extracted private files; dc accounts for it.
 [ "$recipe" = msa ] || head_preparation_acquire
-python3 "$TOOLS_SRC/py/worker_runtime.py" plan --shared "$SHARED_MNT" \
+python3 "$TOOLS_SRC/py/worker_runtime.py" plan --package --shared "$SHARED_MNT" \
   --recipe "$recipe" --model "$model" --sub "$sub" > "$LOCALOUT/runtime-plan.json"
 worker_os_size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["os_size_gb"])' "$LOCALOUT/runtime-plan.json")
 [ "$recipe" = msa ] || head_preparation_release
@@ -518,6 +524,7 @@ remote_msa_bundle="$RPREP"
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
   printf 'export BIO_MSA_SESSION_ID=%q BIO_MSA_SESSION_IDLE_SECONDS=%q BIO_MSA_SESSION_WARM=%q\n' \
     "${BIO_MSA_SESSION_ID:-}" "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" "${BIO_MSA_SESSION_WARM:-report}"
+  printf 'export BIO_WORKER_SCOPE=%q\n' "$worker_scope"
   printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
   printf 'export RFAA_CPU=%q RFAA_MEM_GB=%q\n' "${RFAA_CPU:-4}" "${RFAA_MEM_GB:-64}"
@@ -533,6 +540,10 @@ BIO_TOOLS_DIR=$(mktemp -d /tmp/bio-tools.XXXXXXXX)
 cleanup_worker_runtime() {
   local status=$?
   trap - EXIT
+  if [ -n "${BIO_MSA_SESSION_ID:-}" ] && [ -f "$BIO_TOOLS_DIR/msa/prefetch.py" ]; then
+    python3 "$BIO_TOOLS_DIR/msa/prefetch.py" restore \
+      --state "/tmp/bio-msa-prefetch-$BIO_MSA_SESSION_ID" || { [ "$status" -ne 0 ] || status=1; }
+  fi
   if declare -F bio_worker_cleanup_runtime >/dev/null; then
     bio_worker_cleanup_runtime || { [ "$status" -ne 0 ] || status=1; }
   fi
@@ -560,8 +571,14 @@ BUNDLE
   printf 'BIO_RUNTIME_PLAN\n'
   cat <<'REMOTE'
 export HOME=/root PATH=/root/.local/bin:$PATH
+export SHARED_NFS RFAA_DB_NFS MSA_DB_NFS
+# This snapshot is worker-local until its shared output mount is ready. Never
+# pass the caller's head-local progress log path through to a rented machine.
+export BIO_WORKER_PROGRESS_JSON="$BIO_TOOLS_DIR/startup-progress.json"
+cat > "$BIO_TOOLS_DIR/base-setup.sh" <<'BIO_BASE_SETUP'
+set -euo pipefail
 need=()
-for pair in 'mount.nfs:nfs-common' 'curl:curl' 'git:git' 'rsync:rsync' 'wget:wget' 'gcc:build-essential' 'bzip2:bzip2'; do
+for pair in 'mount.nfs:nfs-common' 'curl:curl' 'git:git' 'rsync:rsync' 'wget:wget' 'gcc:build-essential' 'bzip2:bzip2' 'zstd:zstd'; do
   command -v "${pair%%:*}" >/dev/null 2>&1 || need+=("${pair#*:}")
 done
 # A compiler can be installed without Python.h. Check headers independently.
@@ -612,11 +629,29 @@ if [ -n "$MSA_DB_NFS" ]; then
 fi
 command -v uv >/dev/null 2>&1 || curl --fail -LsS https://astral.sh/uv/install.sh | sh
 mkdir -p "$OUT"
+BIO_BASE_SETUP
+python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage base_setup --scope "$BIO_WORKER_SCOPE" \
+  --message "Preparing the worker and mounting shared storage" --eta-lower 30 --eta-upper 180 \
+  -- bash "$BIO_TOOLS_DIR/base-setup.sh"
+export BIO_WORKER_PROGRESS_JSON="$OUT/startup-progress.json"
 source "$BIO_TOOLS_DIR/recipes/_isolate-runtime.sh"
 bio_worker_isolate_runtime /mnt/bio-shared "$BIO_TOOLS_DIR/runtime-plan.json"
-source "$BIO_TOOLS_DIR/recipes/_common.sh"
 REMOTE
+  # Run the model in a child so its stdout is unchanged and long native calls
+  # still have a fresh progress heartbeat. Native recipes own their finer
+  # scientific phases; no completion ETA is invented for model execution.
+  printf 'cat > "$BIO_TOOLS_DIR/run-recipe.sh" <<\x27BIO_WORKER_RECIPE\x27\n'
+  printf 'set -euo pipefail\nEXTRA_ARGS=('
+  if [ "${#extra[@]}" -gt 0 ]; then printf ' %q' "${extra[@]}"; fi
+  printf ' )\nsource "$BIO_TOOLS_DIR/recipes/_common.sh"\n'
   printf 'source "$BIO_TOOLS_DIR/recipes/%s.sh"\n' "$recipe"
+  printf 'BIO_WORKER_RECIPE\n'
+  if [ "$recipe" = msa ]; then
+    printf 'bash "$BIO_TOOLS_DIR/run-recipe.sh"\n'
+  else
+    printf 'python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage inference --scope gpu --message %q -- bash "$BIO_TOOLS_DIR/run-recipe.sh"\n' \
+      'Loading the model and running the prediction'
+  fi
   printf 'sync\n'
 } > "$remote_file"
 id=""; ip=""
@@ -723,7 +758,13 @@ for g in "${candidates[@]}"; do
   [ "$g" != 1A6000.10V ] || image_args=(--image ubuntu-24.04-cuda-12.6-docker)
   if [[ "$recipe" = msa || "$recipe" = md ]] && [[ "$g" = CPU.* ]]; then image_args=(--image ubuntu-24.04); fi
   [ -z "$msa_worker_image" ] || image_args=(--image "$msa_worker_image")
-  if out=$("${launch_environment[@]}" dc launch "$g" --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" --os-size "$worker_os_size" --max-hours "$max_hours" 2>&1); then
+  # Preserve dc's captured READY/error response while emitting live stage
+  # heartbeats on stderr and the exact shared-session progress snapshot.
+  if out=$(python3 "$TOOLS_SRC/py/worker_progress.py" run --stage allocating --scope "$worker_scope" \
+      --message "Allocating $g and starting the operating system" --eta-lower 60 --eta-upper 180 \
+      -- bash -c 'exec "$@" 2>&1' worker-launch "${launch_environment[@]}" dc launch "$g" \
+      --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" \
+      --os-size "$worker_os_size" --max-hours "$max_hours"); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)
     ip=$(printf '%s\n' "$out" | sed -n 's/.*READY.*ip=\([^ ]*\).*/\1/p' | tail -1)
     [ -n "$id" ] && [ -n "$ip" ] && break
@@ -753,6 +794,8 @@ fi
 ready=0
 for _ in $(seq 1 30); do
   if ssh "${SSHO[@]}" "root@$ip" true 2>/dev/null; then ready=1; break; fi
+  python3 "$TOOLS_SRC/py/worker_progress.py" emit --stage base_setup --scope "$worker_scope" \
+    --message "Waiting for the worker's SSH service"
   sleep 8
 done
 [ "$ready" = 1 ] || { echo 'bio-submit: sshd never became ready' >&2; exit 1; }
@@ -805,7 +848,9 @@ timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward
 echo "bio-submit: fetching results -> $LOCALOUT"
 ssh_transport="ssh ${SSHO[*]}"
 [ -z "$worker_known_hosts" ] || printf -v ssh_transport '%q ' ssh "${SSHO[@]}"
-rsync -a -e "$ssh_transport" "root@$ip:$ROUT/" "$LOCALOUT/" || { echo 'bio-submit: result retrieval failed' >&2; status=1; }
+python3 "$TOOLS_SRC/py/worker_progress.py" run --stage result_transfer --scope "$worker_scope" \
+  --message "Retaining results on the head" -- rsync -a -e "$ssh_transport" \
+  "root@$ip:$ROUT/" "$LOCALOUT/" || { echo 'bio-submit: result retrieval failed' >&2; status=1; }
 python3 - "$LOCALOUT/job.json" "$status" <<'PY'
 import json,sys,datetime
 p,status=sys.argv[1:]
@@ -825,7 +870,8 @@ if [ -n "$panel_manifest_sha" ]; then
   python3 "$TOOLS_SRC/msa/panel.py" verify --manifest "$LOCALOUT/panel-manifest.json" \
     --expected-sha256 "$panel_manifest_sha" --out "$LOCALOUT/panel"
 fi
-dc rm "$id"; id=""
+python3 "$TOOLS_SRC/py/worker_progress.py" run --stage cleanup --scope "$worker_scope" \
+  --message "Removing the temporary worker" -- dc rm "$id"; id=""
 if [ "$recipe" = msa ] && [ "$sub" = prepare ] && [ -n "$bundle_result" ]; then
     python3 - "$bundle_result" "$LOCALOUT/prepared" <<'PY'
 import json, os, pathlib, sys, tempfile

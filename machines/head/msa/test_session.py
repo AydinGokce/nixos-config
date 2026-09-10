@@ -174,7 +174,9 @@ class ServiceTests(unittest.TestCase):
              mock.patch.object(session.subprocess, "Popen") as launch, \
              self.assertRaisesRegex(ValueError, "fixture interrupted"):
             session.serve(self.args)
-        cache.warm.assert_called_once_with("prefetch", expected, 16*1024**3)
+        self.assertEqual(cache.warm.call_count, 1)
+        self.assertEqual(cache.warm.call_args.args, ("prefetch", expected, 16*1024**3))
+        self.assertEqual(cache.warm.call_args.kwargs['prefetch_state'], Path('/tmp/bio-msa-prefetch-'+self.args.session_id))
         cache.close.assert_called_once_with()
         launch.assert_not_called()
         self.assertFalse((self.args.out/"warm-index.json").exists())
@@ -203,6 +205,32 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(session.load(self.args.state/"closed.json")["reason"], "cancelled")
         with self.assertRaises(ProcessLookupError): os.kill(ready["api"]["pid"], 0)
         with self.assertRaises(FileExistsError): session.serve(self.args)
+
+    def test_graceful_control_closes_idle_owned_api_without_signalling_worker(self):
+        errors=[];receipts=[]
+        def request_shutdown():
+            try:
+                until=time.monotonic()+5
+                while not (self.args.out/'session-ready.json').exists():
+                    if time.monotonic() >= until:raise AssertionError('Fixture session did not become ready')
+                    time.sleep(.02)
+                ready=session.load(self.args.state/'ready.json')
+                value=dict(schema=1,command_id='c'*32,action='shutdown',session_id=self.args.session_id,
+                    invocation_id='d'*32,intent_sha256='e'*64,launch_sha256='f'*64)
+                receipts.append(session.worker_controls.apply(ready,session.sha(self.args.state/'ready.json'),value))
+            except BaseException as error:
+                errors.append(error);os.kill(os.getpid(),signal.SIGTERM)
+        thread=threading.Thread(target=request_shutdown)
+        with mock.patch.object(session,'API_LOCK',self.root/'api.lock'), \
+             mock.patch.object(session.server,'configuration',return_value=({},self.provenance)), \
+             mock.patch.object(session,'sources',return_value={'fixture':'not-production'}):
+            thread.start()
+            try:self.assertEqual(session.serve(self.args),0)
+            finally:thread.join(timeout=6)
+        self.assertEqual(errors,[]);self.assertEqual(receipts[0]['status'],'applied')
+        self.assertEqual(session.load(self.args.out/'session-closed.json')['reason'],'graceful_shutdown')
+        ready=session.load(self.args.state/'ready.json')
+        with self.assertRaises(ProcessLookupError):os.kill(ready['api']['pid'],0)
 
     def test_cancellation_of_borrowed_spool_preserves_real_api(self):
         import subprocess

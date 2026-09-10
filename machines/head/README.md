@@ -4,8 +4,8 @@
 use resident GPU workers that load a pinned model once and process multiple
 requests. The head keeps a durable queue, prepares inputs and validates outputs
 on CPUs. Other jobs use the existing temporary Ubuntu/CUDA worker path, which
-copies the selected model environment and weights from managed shared storage
-to its private disk, and removes the worker after retrieval. Independent jobs
+downloads a verified archive of the selected model environment and weights,
+extracts it to private disk, and removes the worker after retrieval. Independent jobs
 can provision and run concurrently; the Workbench dispatcher admits up to ten
 jobs. No temporary GPU is kept running between jobs.
 
@@ -42,11 +42,28 @@ See [resident execution and operator commands](inference/README.md).
 Temporary workers preserve the existing absolute environment/source paths with
 local bind mounts. Package installs, source checkouts and cache writes cannot
 change another worker's runtime. `runtime-plan.json` records the selected assets,
-their byte count, and the quoted OS disk (50–200 GB, with setup headroom); requests
-that exceed the cap stop before rental. Initial copies add NFS transfer/setup
-time. Inputs, model options, checkpoints and MSA choices retain their native
+their byte count, archive identity, and the quoted OS disk (50–200 GB, including
+both archive and extraction headroom); requests that exceed the cap stop before
+rental. Before renting, the head builds or reuses an immutable `.tar.zst` under
+`/mnt/bio-shared/runtime-packages/v1/`. Its identity binds selected source paths,
+metadata and the packager version; runtime changes create a new archive. Workers
+download sequentially, verify SHA-256 before extraction, and preserve executable
+modes and original symlink paths. They never write into the archive or another
+worker's files. Source publication uses the same runtime maintenance locks;
+archive construction leaves at least 8 GiB for results and refuses insufficient
+storage before renting. Inputs, model options, checkpoints and MSA choices retain their native
 behavior. Outputs remain on shared staging storage and are fetched to the head
 before the instance and its OS disk are removed.
+
+Workbench shows observed allocation, base setup, archive download/extraction,
+private database checks/index loading, search, model execution and result transfer
+stages. Download and loader ETAs use measured counters; initial allocation/setup
+ranges are estimates from previous observations. Stale observations suppress
+countdowns, and model execution has no fabricated completion estimate. The
+shared MSA worker indicator and idle countdown appear beside head status. Its
+`+15 minutes` action adds idle credit within the existing reserved hard lifetime;
+shutdown drains accepted searches first. Both controls reconcile the same durable
+command after interrupted connections. See [MSA controls](msa/README.md).
 
 Public MSA queries remain serial through the head's IP, following the
 [ColabFold service guidance](https://github.com/sokrypton/ColabFold/blob/main/README.md#faq).

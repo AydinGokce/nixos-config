@@ -21,6 +21,80 @@ JSON numbers must be finite; duplicate keys and unknown method/parameter names
 are rejected. IDs are opaque strings. Times are UTC ISO 8601. Error codes include
 `invalid`, `not_found`, `conflict`, `limit`, `unavailable`, `integrity`, `internal`.
 
+## Shared MSA worker and startup progress
+
+`worker.status {}` reads the existing shared worker; it does not allocate, ensure,
+extend, or retire one. Its bounded response includes `schema:1`, `shared:true`,
+`state` (`absent|starting|warming|ready|busy|idle|closing|failed|uncertain`),
+`message`, `server_epoch`, `checked_epoch`, `stale`, `stale_after_seconds:30`,
+`target`, `shutdown_epoch`, `shutdown_reason`, `hard_deadline_epoch`,
+`idle_deadline_epoch`, `active_request_id`, `queued_requests`, and optional
+`idle_credit_seconds` and `progress`. These countdown timestamps use epoch
+seconds, unlike the ordinary job ISO timestamps. Unknown deadlines are null.
+The target is null or the exact four-pin object
+`{session_id,invocation_id,intent_sha256,launch_sha256}`. Never substitute the
+current active worker for a retained target.
+
+`controls.extend` and `controls.shutdown` contain `enabled` and `reason`.
+Extend also contains `seconds:900`; shutdown contains `mode:"drain"`.
+Missing, stale, legacy, or unverified generations cannot expose active controls.
+The returned deadline is authoritative; the desktop must not infer a hard
+deadline from a worker's creation time. Idle keep-warm credit stays within the
+existing budgeted hard lifetime and does not renew that reservation. Shutdown
+stops admitting searches and drains accepted work; it does not cancel other
+Workbench runs or signal unrelated workers.
+
+`worker.extend {request_key,target}` and `worker.shutdown {request_key,target}`
+immediately retain an actor-owned intent. They return
+`{control_id,request_key,action,target,state,result,error,created_at,updated_at}`,
+where state is `pending` or `complete`. The dispatcher applies the same command
+ID to the exact generation. Transport failures retain pending uncertainty and
+retry that ID with backoff; the MSA control journal deduplicates the side effect.
+No replacement worker or new command is created during recovery. The completed
+result includes `status:"applied"|"rejected"`, `reason`, `applied_seconds`,
+the four identity pins, the command ID, and any verified control revision and
+deadlines. A hard cap may reject a requested increment or report its smaller
+effective value. Reusing a request key with different parameters conflicts.
+
+`worker.control_get {control_id}` reads that actor's durable command receipt,
+including after disconnect, daemon restart, or an unrelated worker generation.
+Polling is read-only. If the initial response is lost, retry the exact original
+write request/key to recover its control ID. Closing the desktop does not
+abandon accepted control intent. Up to 64 pending controls are retained at once.
+
+`job.progress` and optional `worker.status.progress` include real measured
+`stage`, `scope` (`msa|gpu`), `stage_state` (`running|complete|failed`), `message`,
+`timestamp_ns`, and optional integer `completed,total,unit` (`bytes|items|steps`).
+Stage names are `runtime_package`, `allocating`, `base_setup`,
+`runtime_download`, `runtime_extract`, `database_check`, `index_warm`, `ready`,
+`search`, `gpu_allocation`, `model_setup`, `inference`, `result_transfer`,
+and `cleanup`. Counters refer only to their named stage; no synthetic overall
+percentage is supplied.
+
+`eta` contains `state:"estimate"|"range"|"unknown"|"stale"`, a human `basis`,
+and `scope:"stage"|"startup"|"job"`. An estimate supplies `seconds`, a range
+supplies `lower_seconds,upper_seconds`. The response normalizes durations to
+its `server_epoch` (also recorded as `eta.as_of_epoch`); the client may subtract
+its own elapsed monotonic time after receipt. Stage ETA must never be presented
+as the whole run's remaining time. Unmeasured work is explicitly unknown.
+Observations older than 30 seconds or more than 5 seconds in the future are stale;
+stale estimates omit durations. Job reads recompute age even if the runner has
+stopped updating. Throughput-based estimates use real, monotonic samples of the
+same stage identity, total and unit. Resets, stalls and missing measurements do
+not produce a fabricated rate.
+
+Trusted emitters write newline-terminated
+`BIO_WORKER_STAGE {"schema":1,"stage":...,"scope":...,"state":...,"message":...,"timestamp_ns":...}`
+to stdout/stderr or the runner-created private `BIO_WORKER_PROGRESS_LOG`.
+Optional fields are `stage_id`, counters and `eta` (raw ETA durations are relative
+to the event timestamp). Each line is at most 4096 bytes. Unknown fields,
+nonfinite numbers, duplicate keys, malformed types and unfinished lines are
+ignored. A bounded tail is read only from the runner's own known paths; nested
+RF3 logs are not discovered and frontend source identity does not change.
+The last accepted sidechannel event is mirrored into the retained job log.
+Later native output supersedes waiting infrastructure, and a final failed event
+preserves the concrete cause even when its process exits between polls.
+
 ## Construct library explorer
 
 The authoritative registry is the operator-configured `library_root` (normally

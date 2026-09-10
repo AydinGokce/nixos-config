@@ -313,3 +313,28 @@ transformation and matched anchors. Unavailable fits show **UNALIGNED** on the
 panel and an explicit reason in the receipt. Fit RMSD describes the display
 alignment, not prediction quality. Labels and the bottom-right XYZ indicator
 use the same viewer code as the desktop.
+
+## Shared MSA worker
+
+The **MSA** indicator beside **HEAD CONNECTED** shows whether the shared private
+MSA worker is offline, starting, warming, online, busy, closing, or stale. Click
+it to inspect measured startup stages and the shutdown countdown. Private runs
+also show this service status in **Run status**. An ETA is labeled for its stage,
+startup, or run scope; unavailable estimates remain unknown. A stage estimate
+does not imply an estimate for the whole prediction.
+
+**+15 minutes** adds idle keep-warm time inside the worker's original paid runtime
+limit, including credit for when an active search finishes. **Shut down now**
+closes an idle worker. During accepted work, **Finish N searches and shut down**
+drains those searches and rejects new ones. These controls affect the shared MSA
+service; GPU prediction workers have separate lifetimes. The head enables each
+button only when that exact worker supports it and the full extension fits its
+runtime limit.
+
+Countdowns use the head's clock and monotonic elapsed time. An observation older
+than 30 seconds, a transport error, or a reached deadline disables the controls
+and marks the timer unavailable or awaiting refresh. Status polling neither
+launches a worker nor extends its idle timer. Commands retain their exact worker
+generation and request key across reconnects and restarts. A pending receipt is
+checked automatically; **Recover exact command** reconciles a lost reply without
+issuing a replacement command against another worker.

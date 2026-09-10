@@ -663,9 +663,6 @@ impl Workbench {
                 &["public", "private"],
             );
         });
-        if self.state.msa_backend == "public" {
-            ui.small("Protein queries use the configured public search service.");
-        }
         ui.horizontal(|ui| {
             ui.label("Execution");
             select(
@@ -747,6 +744,9 @@ impl Workbench {
             };
             ui.heading(text(&run.request, "name"));
             ui.small(format!("{} inputs · {} models · {} MSA", rows(&run.request,"inputs").len(), rows(&run.request,"models").len(), text(&run.request,"msa_backend")));
+            if text(&run.request,"msa_backend") == "private" && (run.batch_id.is_empty() || self.run_batch.as_ref().is_none_or(|batch| !ui_state::terminal(text(batch,"state")))) {
+                self.worker_run_summary(ui);
+            }
             if run.batch_id.is_empty() {
                 ui.horizontal(|ui| {
                     if self.run_pending() { ui.spinner(); }
@@ -801,6 +801,7 @@ impl Workbench {
                             if let Some(job) = job {
                                 let progress = text(&job["progress"],"message");
                                 if !progress.is_empty() { details.push(progress.into()); }
+                                if let Some(eta) = self.worker_job_eta(job) { details.push(eta); }
                                 if job.pointer("/provenance/msa_applicable") == Some(&json!(false)) { details.push("MSA not applicable".into()); }
                                 for key in ["message","error"] { if let Some(value) = job.get(key).filter(|v| !v.is_null()) { details.push(value.get("message").and_then(Value::as_str).or_else(||value.as_str()).map(str::to_owned).unwrap_or_else(||value.to_string())); } } }
                             ui.label(details.join("; ")); ui.end_row();

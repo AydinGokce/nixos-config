@@ -247,7 +247,7 @@ except (OSError, ValueError, KeyError, AssertionError):
         (self.root / "tools" / "recipes").mkdir()
         (self.root / "tools" / "recipes" / "boltz2.sh").write_text("# authoritative deployed recipe\n")
         (self.root / "tools" / "py").mkdir()
-        for helper in ("head_preparation_gate.py", "worker_runtime.py"):
+        for helper in ("head_preparation_gate.py", "worker_runtime.py", "runtime_package.py", "worker_progress.py"):
             shutil.copy2(SCRIPT.parents[2] / "modules/bio/py" / helper, self.root / "tools/py" / helper)
         shutil.copy2(SCRIPT.parent / "recipes/_isolate-runtime.sh", self.root / "tools/recipes/_isolate-runtime.sh")
         (self.root / "tools" / "requirements").mkdir()
@@ -266,6 +266,8 @@ except (OSError, ValueError, KeyError, AssertionError):
         return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
 
     def test_managed_msa_retains_first_ssh_key_and_uses_strict_connections_after_readiness(self):
+        # The real session launcher creates its owned state before bio-submit.
+        (self.root / "session-state").mkdir()
         # Only this fixture simulates OpenSSH's accept-new known-hosts write.
         # The real registrar is exercised separately with RSA/Ed25519/ECDSA keys.
         ssh = self.root / "bin/ssh"

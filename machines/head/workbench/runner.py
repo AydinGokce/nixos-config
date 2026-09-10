@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from . import inputs
+from . import inputs, progress as telemetry
 from .common import (TERMINAL, Error, atomic, canonical, digest, file_sha, inventory,
                      no_links, now, parse, read_json, require, safe_file, uid, write_json)
 
@@ -145,7 +145,8 @@ def log_observation(log, msa_progress=None):
 
 
 def native_phase(text, generic_msa=True):
-    text = '\n'.join(line for line in text.splitlines() if not line.startswith(MSA_LOG_PREFIX))
+    text = '\n'.join(line for line in text.splitlines() if not line.startswith(
+        (MSA_LOG_PREFIX, telemetry.MIRROR_PREFIX, telemetry.PREFIX)))
     if 'resident request' in text:
         return 'resident inference', 'Native resident request submitted; waiting for its durable result'
     md_phases = re.findall(r'BIO_MD_STAGE ([A-Za-z0-9_.-]+) (starting|complete|failed|interrupted)', text)
@@ -187,9 +188,11 @@ class JobProgress:
     """Expose nested preparation progress without treating our log mirror as
     new native work. A child append changes the size and releases that override.
     """
-    def __init__(self, log, msa_progress):
+    def __init__(self, log, msa_progress, worker_progress=None):
         self.log, self.msa_progress = log, msa_progress
+        self.worker_progress = worker_progress
         self.last_event = None
+        self.last_worker_event = None
         self.mirror_signature = None
         self.native_modified = 0
 
@@ -201,25 +204,63 @@ class JobProgress:
         return stat
 
     def observe(self):
+        phase, detail = self.details()
+        return phase, detail['message']
+
+    def details(self):
         self._main_stat()
-        return observe_phase(self.log, self.msa_progress, native_modified=self.native_modified)
+        phase, message = observe_phase(self.log, self.msa_progress, native_modified=self.native_modified)
+        text, _, _, msa = log_observation(self.log, self.msa_progress)
+        worker_text, _ = log_tail(self.worker_progress)
+        history = telemetry.events(text) + telemetry.events(worker_text)
+        event = max(history, key=lambda value: value['timestamp_ns'], default=None)
+        newer_msa = (msa and event and msa['timestamp_ns'] > event['timestamp_ns']
+                     and (event['scope'] != 'msa' or msa['stage'] in {'ready', 'failed'}))
+        if event is None or newer_msa:
+            result = {'message': message, 'eta': telemetry.unknown()}
+            if msa and phase in MSA_PHASES.values():
+                result['timestamp_ns'] = msa['timestamp_ns']
+            return phase, telemetry.freshness(result)
+        # A direct marker was written just after its timestamp, so the log's
+        # mtime alone cannot distinguish it from later native output. Ignore
+        # native words before this exact event (including its own mirror).
+        lines = text.splitlines(keepends=True)
+        after = 0
+        for index, line in enumerate(lines):
+            raw = line.removeprefix(telemetry.MIRROR_PREFIX)
+            values = telemetry.events(raw)
+            if values and values[-1]['timestamp_ns'] >= event['timestamp_ns']:
+                after = index + 1
+        downstream = native_phase(''.join(lines[after:]), generic_msa=False)
+        if downstream and self.native_modified > event['timestamp_ns'] and event['state'] != 'failed':
+            return downstream[0], {'message': downstream[1], 'eta': telemetry.unknown()}
+        phase = ('private MSA ' if event['scope'] == 'msa' else '') + event['stage'].replace('_', ' ')
+        return phase, telemetry.view(event, history)
 
     def forward(self):
         text, modified = log_tail(self.msa_progress)
         events = session_stages(text, modified)
-        if not events:
-            return
-        event = events[-1]
-        payload = {key: value for key, value in event.items() if key not in {'stage', 'end'}}
-        line = b'BIO_MSA_SESSION_STAGE ' + event['stage'].encode() + b' ' + canonical(payload)
-        if line == self.last_event:
-            return
-        self.last_event = line
+        if events:
+            event = events[-1]
+            payload = {key: value for key, value in event.items() if key not in {'stage', 'end'}}
+            line = b'BIO_MSA_SESSION_STAGE ' + event['stage'].encode() + b' ' + canonical(payload)
+            if line != self.last_event:
+                self.last_event = line
+                self._mirror(line, MSA_LOG_PREFIX)
+        worker_text, _ = log_tail(self.worker_progress)
+        values = telemetry.events(worker_text)
+        if values:
+            line = telemetry.PREFIX.encode() + canonical(values[-1])
+            if line != self.last_worker_event:
+                self.last_worker_event = line
+                self._mirror(line, telemetry.MIRROR_PREFIX)
+
+    def _mirror(self, line, prefix):
         main_text, _ = log_tail(self.log)
         if line.decode() in main_text:
             return
         before = self._main_stat()
-        entry = MSA_LOG_PREFIX.encode() + line + b'\n'
+        entry = prefix.encode() + line + b'\n'
         fd = os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
         try:
             require(os.write(fd, entry) == len(entry), 'Incomplete owned progress log append', 'integrity')
@@ -232,10 +273,15 @@ class JobProgress:
                                  if after.st_size == before.st_size + len(entry) else None)
 
 
-def submission_error(log, status, msa_progress=None):
+def submission_error(log, status, msa_progress=None, worker_progress=None):
     text, _, _, latest = log_observation(log, msa_progress)
+    worker_text, _ = log_tail(worker_progress)
+    event = max(telemetry.events(text) + telemetry.events(worker_text),
+                key=lambda value: value['timestamp_ns'], default=None)
     error = {'message': 'Submission exited with status ' + str(status), 'automatic_retry': False}
-    if latest and latest['stage'] == 'failed':
+    if event and event['state'] == 'failed' and (latest is None or event['timestamp_ns'] >= latest['timestamp_ns']):
+        error.update(message=event['message'], stage=event['stage'], scope=event['scope'])
+    elif latest and latest['stage'] == 'failed':
         error.update(message='Private MSA prerequisite failed: ' + latest['message'],
                      prerequisite='private_msa')
         for field in ('code', 'session_id'):
@@ -433,8 +479,10 @@ def run_job(store, job_id, config):
     results = root / 'results'; results.mkdir(mode=0o700, exist_ok=False)
     log = root / 'run.log'
     msa_progress = root / 'msa-session-progress.log'
-    progress_fd = os.open(msa_progress, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.close(progress_fd)
+    worker_progress = root / 'worker-progress.log'
+    for path in (msa_progress, worker_progress):
+        progress_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        os.close(progress_fd)
     cancelled = False
     process = None
     def signal_cancel(signum, frame):
@@ -458,6 +506,7 @@ def run_job(store, job_id, config):
         # Only this waiting caller writes progress. The shared MSA lifecycle is
         # a separate owned service, never a member of this submission's group.
         env['BIO_MSA_PROGRESS_LOG'] = str(msa_progress)
+        env['BIO_WORKER_PROGRESS_LOG'] = str(worker_progress)
         token = uid()
         write_json(root / 'resident-binding.json', {'schema': 1, 'job_id': job_id, 'token': token}, exclusive=True)
         env['BIO_WORKBENCH_BINDING_FILE'] = str(root / 'resident-binding.json')
@@ -468,13 +517,14 @@ def run_job(store, job_id, config):
             write_json(root / 'head-process.json', {'pid': process.pid, 'start_ticks': Path(f'/proc/{process.pid}/stat').read_text().rsplit(')', 1)[1].split()[19],
                         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'created_at': now()}, exclusive=True)
             sent_term = None; resident = None; resident_cancelled = False
-            progress = JobProgress(log, msa_progress)
+            progress = JobProgress(log, msa_progress, worker_progress)
             deadline = time.monotonic() + prepared['timeout'] + 1200
             while process.poll() is None:
                 current = store.read('job', job_id)
                 cancelled = cancelled or current['state'] == 'cancel_requested'
                 resident = resident_request(root, job_id, token) or resident
-                phase, message = progress.observe()
+                phase, detail = progress.details()
+                message = detail['message']
                 progress.forward()
                 row = None
                 if cancelled:
@@ -504,7 +554,9 @@ def run_job(store, job_id, config):
                     if cancelled:
                         current['state'] = 'cancel_requested'
                     current['phase'] = phase
-                    current['progress'] = {'message': message, 'observed_at': now()}
+                    current['progress'] = ({'message': message, 'eta': telemetry.unknown('Cancellation is being reconciled')}
+                                           if cancelled else detail)
+                    current['progress']['observed_at'] = now()
                     if resident:
                         current['provenance']['resident_job_id'] = resident['request_id']
                     store.put(db, 'job', current)
@@ -536,12 +588,12 @@ def run_job(store, job_id, config):
         artifacts = seal_results(store, job, results)
         # Retain the head log and submit binding separately from native files.
         head = root / 'head-evidence'; head.mkdir(mode=0o700)
-        for name in ('run.log', 'submission.json', 'head-process.json', 'msa-session-progress.log'):
+        for name in ('run.log', 'submission.json', 'head-process.json', 'msa-session-progress.log', 'worker-progress.log'):
             shutil.copyfile(root / name, head / name)
         artifacts += seal_results(store, job, head, 'head')
         state = 'complete' if status == 0 else 'cancelled' if cancelled else 'failed'
         error = None if status == 0 else ({'message': 'Submission cancelled', 'automatic_retry': False}
-                                        if cancelled else submission_error(log, status, msa_progress))
+                                        if cancelled else submission_error(log, status, msa_progress, worker_progress))
         with store.transaction() as db:
             current = store.get(db, 'job', job_id)
             current.update(state=state, exit_code=status, finished_at=now(), phase=state,

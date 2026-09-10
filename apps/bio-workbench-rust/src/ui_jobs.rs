@@ -220,6 +220,7 @@ impl Workbench {
                                 if !message.is_empty() {
                                     ui.label(message);
                                 }
+                                if let Some(eta) = self.worker_job_eta(job) { ui.small(eta); }
                                 let done = progress
                                     .get("completed")
                                     .or_else(|| progress.get("done"))
@@ -432,6 +433,14 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
             Purpose::History => {
                 self.request("batch.list", json!({}), purpose);
             }
+            Purpose::WorkerStatus(_) => self.worker_refresh(),
+            Purpose::WorkerReceipt(control_id) => {
+                self.request(
+                    "worker.control_get",
+                    json!({"control_id":control_id}),
+                    purpose,
+                );
+            }
             Purpose::Batch(batch) => {
                 self.request("batch.get", json!({"batch_id":batch}), purpose);
             }
@@ -532,6 +541,10 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                 Purpose::Preview
             }
             "batch.create" => Purpose::Commit,
+            "worker.extend" | "worker.shutdown" => {
+                self.worker.open = true;
+                Purpose::WorkerControl(text(op, "method").into())
+            }
             "library.edit"
             | "library.undo"
             | "library.redo"

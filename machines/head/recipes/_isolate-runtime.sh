@@ -8,8 +8,8 @@ bio_worker_isolate_runtime() {
   BIO_WORKER_MOUNTS=()
   BIO_WORKER_SCRATCH=$(mktemp -d "$parent/bio-runtime.XXXXXXXX")
   # Managed NFS advertises an unsupported system.nfs4_acl attribute, so kernel
-  # and FUSE overlay copy-up both fail. Copy only this model's selected assets,
-  # then bind them over the original paths: venv shebangs and editable imports
+  # and FUSE overlay copy-up both fail. Verify/extract this model's runtime
+  # archive, then bind it over the original paths: shebangs and editable imports
   # continue to resolve exactly as before, while package writes stay local.
   python3 "$BIO_TOOLS_DIR/py/worker_runtime.py" stage --shared "$shared" \
     --plan "$plan" --destination "$BIO_WORKER_SCRATCH/root"

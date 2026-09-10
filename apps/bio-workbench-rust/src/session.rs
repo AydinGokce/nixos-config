@@ -268,6 +268,8 @@ impl Session {
         if matches!(
             method,
             "batch.run"
+                | "worker.extend"
+                | "worker.shutdown"
                 | "batch.validate"
                 | "batch.create"
                 | "library.edit"
@@ -458,7 +460,7 @@ impl Session {
         let Ok(journal) = self.journal.lock() else {
             return Vec::new();
         };
-        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"batch.run"|"batch.validate"|"batch.create"|"local.upload")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
+        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"batch.run"|"batch.validate"|"batch.create"|"local.upload"|"worker.extend"|"worker.shutdown")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
     }
     pub fn drain_events(&mut self) -> Vec<Event> {
         self.events.try_iter().map(|delivery| {
@@ -1198,6 +1200,72 @@ mod tests {
                 "conflict"
             );
         }
+    }
+
+    #[test]
+    fn worker_controls_keep_generation_and_key_across_restart_and_lost_reply() {
+        struct Commands(Mutex<Vec<(String, Value)>>, AtomicUsize);
+        impl Backend for Commands {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                self.0.lock().unwrap().push((method.into(), params.clone()));
+                if self.1.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(RpcError::new("ssh", "accepted, reply lost").uncertain(true))
+                } else {
+                    Ok(
+                        json!({"control_id":"one","request_key":params["request_key"],"state":"pending","target":params["target"]}),
+                    )
+                }
+            }
+            fn library(&self) -> Result<Value, RpcError> {
+                unreachable!()
+            }
+        }
+        for method in ["worker.extend", "worker.shutdown"] {
+            let directory = tempfile::tempdir().unwrap();
+            let backend = Arc::new(Commands(Mutex::new(Vec::new()), AtomicUsize::new(0)));
+            let open = || {
+                Session::open_internal(
+                    egui::Context::default(),
+                    directory.path().into(),
+                    Some(backend.clone()),
+                    false,
+                )
+                .unwrap()
+            };
+            let mut session = open();
+            let params = json!({"request_key":"original-key","target":{"session_id":"generation-one","invocation_id":"invocation-one","intent_sha256":"a".repeat(64),"launch_sha256":"b".repeat(64)}});
+            let id = session.request(method, params.clone()).unwrap();
+            assert!(next_result(&mut session).1.unwrap_err().uncertain);
+            drop(session);
+            let mut session = open();
+            assert_eq!(
+                backend.0.lock().unwrap().len(),
+                1,
+                "restart must not replay mutations"
+            );
+            assert_eq!(session.retryable_operations()[0]["params"], params);
+            session.retry(&id).unwrap();
+            next_result(&mut session).1.unwrap();
+            {
+                let calls = backend.0.lock().unwrap();
+                assert_eq!(calls[0], calls[1]);
+            }
+            assert_eq!(
+                session.retryable_operations()[0]["result"]["state"],
+                "pending"
+            );
+            let mut changed = params.clone();
+            changed["target"]["session_id"] = json!("replacement-generation");
+            assert_eq!(
+                session.request(method, changed).unwrap_err().code,
+                "conflict"
+            );
+            session.connection.host = "another-head".into();
+            assert!(session.retry(&id).is_err());
+            assert_eq!(backend.0.lock().unwrap().len(), 2);
+        }
+        assert!(rpc::allowed("worker.status") && !rpc::mutating("worker.status"));
+        assert!(rpc::allowed("worker.control_get") && !rpc::mutating("worker.control_get"));
     }
 
     #[test]
