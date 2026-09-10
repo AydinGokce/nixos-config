@@ -46,6 +46,7 @@ pub(super) struct Viewer {
     editor: Option<ProteinEditor>,
     standalone: Option<Standalone>,
     requested_options: Value,
+    options_due: Option<f64>,
     pub error: String,
 }
 
@@ -87,7 +88,11 @@ impl Viewer {
             let same_family = self.reference.split('@').next() == reference.split('@').next();
             self.reference = reference.into();
             self.zoom = 1.;
-            self.center = view["length"].as_u64().unwrap_or(literal.len() as u64) as f32 / 2.;
+            self.center = if view["circular"] == true {
+                0.
+            } else {
+                view["length"].as_u64().unwrap_or(literal.len() as u64) as f32 / 2.
+            };
             self.mode = 0;
             self.selection = None;
             self.anchor = None;
@@ -102,6 +107,7 @@ impl Viewer {
                 self.pending_preview = None;
             }
             self.requested_options = Value::Null;
+            self.options_due = None;
             self.show_features = true;
             self.show_orfs = rows(&view, "features").is_empty();
             self.min_orf = 30;
@@ -131,6 +137,23 @@ impl Viewer {
     pub fn received_options(&mut self, sent: &Value, view: Value, literal: &str) {
         if self.requested_options == *sent {
             self.accept(text(sent, "ref"), view, literal);
+        }
+    }
+
+    fn schedule_options(&mut self, now: f64) {
+        self.show_orfs = true;
+        self.requested_options = Value::Null;
+        self.options_due = Some(now + 0.3);
+    }
+
+    fn poll_options(&mut self, now: f64) -> Option<Action> {
+        if self.options_due.is_some_and(|due| now >= due) {
+            self.options_due = None;
+            let params = json!({"ref":self.reference,"min_orf_aa":self.min_orf,"genetic_code":self.genetic_code});
+            self.requested_options = params.clone();
+            Some(Action::Options(params))
+        } else {
+            None
         }
     }
     pub fn refresh_receipt(&mut self, reference: &str, sha: &str) {
@@ -420,40 +443,6 @@ impl Viewer {
         if let Some(params) = self.pending_preview.take() {
             actions.push(Action::Preview(params));
         }
-        if derived {
-            if ui
-                .button(if self.variant_open {
-                    "[-] New variant"
-                } else {
-                    "[+] New variant"
-                })
-                .clicked()
-            {
-                if self.variant_open {
-                    self.variant_open = false;
-                } else if self.editor.is_some() {
-                    self.variant_open = true;
-                } else if let Some(action) =
-                    self.begin_definition(detail, self.view["translation"].clone(), false)
-                {
-                    actions.push(action);
-                }
-            }
-            if !self.variant_open {
-                return actions;
-            }
-        }
-        if self.editor.is_some() {
-            actions.extend(self.show_definition_form(
-                ui,
-                !editable || self.rebase_variant.is_some(),
-                parents,
-            ));
-            if self.editor.is_none() && derived {
-                self.variant_open = false;
-                return actions;
-            }
-        }
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!(
                 "{} · {} {}",
@@ -506,6 +495,57 @@ impl Viewer {
             return actions;
         }
         if molecule == "protein" {
+            egui::CollapsingHeader::new("Protein sequence")
+                .id_salt(("protein-sequence", self.reference.split('@').next()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("protein-plaintext-scroll", &self.reference))
+                        .max_height(240.)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            protein_plaintext(ui, &sequence, &self.reference);
+                        });
+                });
+        }
+        if derived {
+            if ui
+                .button(if self.variant_open {
+                    "[-] New variant"
+                } else {
+                    "[+] New variant"
+                })
+                .clicked()
+            {
+                if self.variant_open {
+                    self.variant_open = false;
+                } else if self.editor.is_some() {
+                    self.variant_open = true;
+                } else if let Some(action) =
+                    self.begin_definition(detail, self.view["translation"].clone(), false)
+                {
+                    actions.push(action);
+                }
+            }
+            if !self.variant_open {
+                return actions;
+            }
+        }
+        if self.editor.is_some() {
+            actions.extend(self.show_definition_form(
+                ui,
+                !editable || self.rebase_variant.is_some(),
+                parents,
+            ));
+            if self.editor.is_none() && derived {
+                self.variant_open = false;
+                return actions;
+            }
+        }
+        if molecule == "protein" {
+            if !derived {
+                return actions;
+            }
             if derived {
                 ui.weak("This peptide is computed from the pinned parent and definition. Editing the parent or definition creates coordinated new revisions; previous runs keep their original inputs.");
                 let original = frame_offset(&self.view["translation"]);
@@ -649,67 +689,100 @@ impl Viewer {
         let length = sequence.len();
         let max_zoom = (length as f32 / 12.).max(1.);
         self.zoom = self.zoom.clamp(1., max_zoom);
+        let original_options = (self.min_orf, self.genetic_code);
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.mode,0,"Auto");ui.selectable_value(&mut self.mode,1,"Circular");ui.selectable_value(&mut self.mode,2,"Linear");
-            if ui.button("Fit").clicked(){self.zoom=1.;self.center=length as f32/2.;}
-            ui.label("Zoom");ui.add(egui::Slider::new(&mut self.zoom,1.0..=max_zoom).logarithmic(true).show_value(false).custom_formatter(|v,_|format!("{v:.1}×")));
-            ui.checkbox(&mut self.show_features,"Annotations");ui.checkbox(&mut self.show_orfs,"ORFs");
-            ui.label("Min ORF");ui.add(egui::DragValue::new(&mut self.min_orf).range(1..=10000));ui.weak("aa");
-            egui::ComboBox::from_id_salt("map-code").selected_text(format!("Code {}",self.genetic_code)).show_ui(ui,|ui|{ui.selectable_value(&mut self.genetic_code,1,"1 · Standard");ui.selectable_value(&mut self.genetic_code,11,"11 · Bacterial");});
-            egui::ComboBox::from_id_salt("map-reading-frame").selected_text(format!("Preview frame {:+}", self.translation_frame)).show_ui(ui, |ui| {
-                for frame in [1, 2, 3, -1, -2, -3] {
-                    ui.selectable_value(&mut self.translation_frame, frame, format!("{frame:+}"));
-                }
-            });
-            if ui.button("Find ORFs").clicked(){self.show_orfs=true;let params=json!({"ref":self.reference,"min_orf_aa":self.min_orf,"genetic_code":self.genetic_code});self.requested_options=params.clone();actions.push(Action::Options(params));}
+            ui.selectable_value(&mut self.mode, 0, "Auto");
+            ui.selectable_value(&mut self.mode, 1, "Circular");
+            ui.selectable_value(&mut self.mode, 2, "Linear");
+            if ui.button("Fit").clicked() {
+                self.zoom = 1.;
+                self.center = if self.view["circular"] == true || self.mode == 1 {
+                    0.
+                } else {
+                    length as f32 / 2.
+                };
+            }
+            ui.label("Zoom");
+            ui.add(
+                egui::Slider::new(&mut self.zoom, 1.0..=max_zoom)
+                    .logarithmic(true)
+                    .show_value(false)
+                    .custom_formatter(|v, _| format!("{v:.1}×")),
+            );
+            ui.checkbox(&mut self.show_features, "Annotations");
+            ui.checkbox(&mut self.show_orfs, "ORFs");
+            ui.label("Min ORF");
+            ui.add(egui::DragValue::new(&mut self.min_orf).range(1..=10000));
+            ui.weak("aa");
+            egui::ComboBox::from_id_salt("map-code")
+                .selected_text(format!("Code {}", self.genetic_code))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.genetic_code, 1, "1 · Standard");
+                    ui.selectable_value(&mut self.genetic_code, 11, "11 · Bacterial");
+                });
+            egui::ComboBox::from_id_salt("map-reading-frame")
+                .selected_text(format!("Preview frame {:+}", self.translation_frame))
+                .show_ui(ui, |ui| {
+                    for frame in [1, 2, 3, -1, -2, -3] {
+                        ui.selectable_value(
+                            &mut self.translation_frame,
+                            frame,
+                            format!("{frame:+}"),
+                        );
+                    }
+                });
         });
-        let circular =
-            self.mode == 1 || self.mode == 0 && self.view["circular"] == true && self.zoom < 1.6;
-        ui.weak(if circular{"Scroll to zoom into the linear sequence; click a feature or drag a range. Coordinates are 1-based."}else{"Scroll to zoom; right-drag to pan; left-drag to select bases. One preview translation follows the selected reading frame."});
-        let size = Vec2::new(
-            ui.available_width().max(300.),
-            if circular { 420. } else { 400. },
+        let now = ui.input(|input| input.time);
+        if original_options != (self.min_orf, self.genetic_code) {
+            self.schedule_options(now);
+        }
+        if let Some(action) = self.poll_options(now) {
+            actions.push(action);
+        }
+        if let Some(due) = self.options_due {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64((due - now).max(0.)));
+        }
+        let cyclic = self.view["circular"] == true || self.mode == 1;
+        ui.weak("Scroll to pan / rotate · Ctrl/Cmd + scroll to zoom · Drag to select · Right-drag to pan");
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width().max(300.), 420.),
+            Sense::click_and_drag(),
         );
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3., Color32::from_rgb(25, 29, 32));
-        let visible = (length as f32 / self.zoom).max(12.).min(length as f32);
-        self.center = self
-            .center
-            .clamp(visible / 2., length as f32 - visible / 2.);
-        let left = (self.center - visible / 2.).max(0.);
-        let plot = Rect::from_min_max(
-            rect.min + Vec2::new(50., 35.),
-            rect.max - Vec2::new(24., 20.),
-        );
         let items = track_items(&self.view, self.show_features, self.show_orfs);
         let pointer = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
-        let base_at = |p: Pos2| {
-            if circular {
-                circle_base(p, circle_center(rect), length)
-            } else {
-                (left + (p.x - plot.left()) / plot.width() * visible)
-                    .floor()
-                    .clamp(0., (length - 1) as f32) as usize
-            }
-        };
+        let previous = MapGeometry::new(rect, length, self.center, self.zoom, self.mode, cyclic);
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.1 {
-                if circular && let Some(p) = pointer {
-                    self.center = base_at(p) as f32;
-                }
-                self.zoom = (self.zoom * (scroll * 0.006).exp()).clamp(1., max_zoom);
-                ui.input_mut(|i| {
-                    i.smooth_scroll_delta = Vec2::ZERO;
-                });
+            let (scroll, zoom_delta, modified) = ui.input(|input| {
+                (
+                    input.smooth_scroll_delta.x + input.smooth_scroll_delta.y,
+                    input.zoom_delta(),
+                    input.modifiers.ctrl || input.modifiers.command,
+                )
+            });
+            if (zoom_delta - 1.).abs() > f32::EPSILON || modified {
+                let factor = if (zoom_delta - 1.).abs() > f32::EPSILON {
+                    zoom_delta
+                } else {
+                    (scroll * 0.006).exp()
+                };
+                self.zoom = (self.zoom * factor).clamp(1., max_zoom);
+            } else {
+                self.center -= scroll / previous.scale;
             }
+            // Consume map navigation only while the pointer is inside this map.
+            ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
         }
-        if response.dragged_by(egui::PointerButton::Secondary) && !circular {
-            self.center -= response.drag_delta().x / plot.width() * visible;
+        if response.dragged_by(egui::PointerButton::Secondary) {
+            self.center -= response.drag_delta().x / previous.scale;
         }
+        let geometry = MapGeometry::new(rect, length, self.center, self.zoom, self.mode, cyclic);
+        self.center = geometry.center;
+        let base_at = |pos| geometry.base_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(p) = pointer
         {
@@ -719,7 +792,7 @@ impl Viewer {
             && let (Some(start), Some(p)) = (self.anchor, pointer)
         {
             self.selection = Some(Selection {
-                segments: selection_ranges(start, base_at(p), length, circular),
+                segments: selection_ranges(start, base_at(p), length, cyclic),
                 strand: 1,
                 label: "Selected range".into(),
                 ..Default::default()
@@ -728,26 +801,15 @@ impl Viewer {
         if response.drag_stopped() {
             self.anchor = None;
         }
-        let hit = if circular {
-            draw_circle(
-                &painter,
-                rect,
-                &items,
-                self.selection.as_ref(),
-                length,
-                pointer,
-            )
-        } else {
-            draw_linear(
-                &painter,
-                plot,
-                &items,
-                self.selection.as_ref(),
-                &sequence,
-                (left, visible, molecule == "rna", self.translation_frame),
-                pointer,
-            )
-        };
+        let hit = draw_map(
+            &painter,
+            geometry,
+            &items,
+            self.selection.as_ref(),
+            &sequence,
+            (molecule == "rna", self.translation_frame),
+            pointer,
+        );
         if response.clicked() {
             if let Some(item) = hit {
                 self.selection = Some(item);
@@ -764,7 +826,7 @@ impl Viewer {
         if let Some(selection) = self.selection.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&selection.label);ui.monospace(range_label(&selection.segments));ui.label(if selection.strand<0{"reverse strand"}else{"forward strand"});
-                if ui.button("Zoom to selection").clicked(){let start=selection.segments.first().map(|p|p.0).unwrap_or(0);let end=selection.segments.last().map(|p|p.1).unwrap_or(length);if end>start{self.center=(start+end)as f32/2.;self.zoom=(length as f32/(end-start)as f32/1.2).clamp(1.,max_zoom);self.mode=2;}}
+                if ui.button("Zoom to selection").clicked(){let start=selection.segments.first().map(|p|p.0).unwrap_or(0);let span=selection.segments.iter().map(|(start,end)|end-start).sum::<usize>();if span>0{self.center=start as f32+span as f32/2.;self.zoom=(length as f32/span as f32/1.2).clamp(1.,max_zoom);self.mode=2;}}
                 if ui.add_enabled(editable && selection.warning.is_empty(),egui::Button::new("Create protein…")).clicked(){
                     let definition=selection.translation.clone().unwrap_or_else(||json!({"schema":1,"segments":selection.segments.iter().map(|(start,end)|json!({"start":start,"end":end})).collect::<Vec<_>>(),"strand":selection.strand,"genetic_code":self.genetic_code,"codon_start":1,"initiation":"literal","residue_start":0,"residue_end":null}));
                     if let Some(action)=self.begin_definition(detail,definition,false){actions.push(action);}
@@ -881,6 +943,55 @@ impl ProteinEditor {
     }
 }
 
+/// Keep the buffer continuous: visual wrapping and the separate gutter never enter the clipboard.
+fn protein_plaintext(
+    ui: &mut egui::Ui,
+    sequence: &str,
+    reference: &str,
+) -> egui::text_edit::TextEditOutput {
+    let font = FontId::monospace(13.);
+    let color = ui.visuals().text_color();
+    let gutter_width = sequence.len().max(1).to_string().len() as f32 * 8. + 12.;
+    ui.horizontal_top(|ui| {
+        let (gutter, _) = ui.allocate_exact_size(Vec2::new(gutter_width, 0.), Sense::hover());
+        let mut buffer = sequence;
+        let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, width: f32| {
+            let mut job = egui::text::LayoutJob::simple(
+                buffer.as_str().to_owned(),
+                font.clone(),
+                color,
+                width,
+            );
+            job.wrap.break_anywhere = true;
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+        let output = egui::TextEdit::multiline(&mut buffer)
+            .id_salt(("protein-plaintext", reference))
+            .font(font.clone())
+            .frame(false)
+            .desired_rows(1)
+            .desired_width(ui.available_width())
+            .layouter(&mut layouter)
+            .show(ui);
+        let mut position = 1;
+        for row in &output.galley.rows {
+            let point = Pos2::new(gutter.right(), output.galley_pos.y + row.pos.y);
+            if point.y + row.size.y >= ui.clip_rect().top() && point.y <= ui.clip_rect().bottom() {
+                ui.painter().text(
+                    point,
+                    Align2::RIGHT_TOP,
+                    position.to_string(),
+                    font.clone(),
+                    ui.visuals().weak_text_color(),
+                );
+            }
+            position += row.char_count_excluding_newline();
+        }
+        output
+    })
+    .inner
+}
+
 fn show_issues(ui: &mut egui::Ui, value: &Value) {
     for issue in rows(value, "issues") {
         let message = issue.as_str().unwrap_or_else(|| text(issue, "message"));
@@ -914,11 +1025,6 @@ fn selection_ranges(
     } else {
         vec![(start.min(end), start.max(end) + 1)]
     }
-}
-fn circle_base(p: Pos2, c: Pos2, length: usize) -> usize {
-    let a = ((p.y - c.y).atan2(p.x - c.x) + std::f32::consts::FRAC_PI_2)
-        .rem_euclid(std::f32::consts::TAU);
-    ((a / std::f32::consts::TAU * length as f32).floor() as usize).min(length.saturating_sub(1))
 }
 fn track_items(view: &Value, features: bool, orfs: bool) -> Vec<Selection> {
     let length = view["length"].as_u64().unwrap_or(0) as usize;
@@ -983,373 +1089,416 @@ fn item_color(item: &Selection, _index: usize) -> Color32 {
         }
     }
 }
-fn arrow(painter: &egui::Painter, end: Pos2, direction: f32, color: Color32) {
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            end + Vec2::new(5. * direction, 0.),
-            end + Vec2::new(-4. * direction, -5.),
-            end + Vec2::new(-4. * direction, 5.),
-        ],
-        color,
-        Stroke::NONE,
-    ));
+#[derive(Clone, Copy)]
+struct MapGeometry {
+    rect: Rect,
+    plot: Rect,
+    anchor: Pos2,
+    length: f32,
+    center: f32,
+    scale: f32,
+    curve: f32,
+    angular: f32,
+    cyclic: bool,
 }
-fn circle_center(rect: Rect) -> Pos2 {
-    if rect.width() > 760. {
-        Pos2::new(rect.left() + rect.width() * 0.39, rect.center().y)
-    } else {
-        rect.center()
+
+impl MapGeometry {
+    fn new(rect: Rect, length: usize, center: f32, zoom: f32, mode: usize, cyclic: bool) -> Self {
+        let plot = Rect::from_min_max(
+            rect.min + Vec2::new(50., 35.),
+            rect.max - Vec2::new(24., 20.),
+        );
+        let progress = (zoom.max(1.).log2() / 2.).clamp(0., 1.);
+        let straight = progress * progress * (3. - 2. * progress);
+        let curve = match mode {
+            1 => 1.,
+            0 if cyclic => 1. - straight,
+            _ => 0.,
+        };
+        let radius = (rect.height() / 2. - 65.)
+            .min(plot.width() / 2. - 25.)
+            .max(20.);
+        let length = length.max(1) as f32;
+        let circumference = std::f32::consts::TAU * radius;
+        // Keep scale monotonic even when a narrow circle straightens into a shorter axis.
+        let span_pixels = match mode {
+            1 => circumference * zoom,
+            0 if cyclic && zoom < 4. => {
+                circumference * (4. * plot.width() / circumference).powf(progress)
+            }
+            _ => plot.width() * zoom,
+        };
+        let scale = span_pixels / length;
+        let visible = (plot.width() / scale).min(length);
+        let center = if cyclic {
+            center.rem_euclid(length)
+        } else {
+            center.clamp(visible / 2., length - visible / 2.)
+        };
+        Self {
+            rect,
+            plot,
+            anchor: Pos2::new(plot.center().x, plot.top() + 16.),
+            length,
+            center,
+            scale,
+            curve,
+            angular: std::f32::consts::TAU * curve / length,
+            cyclic,
+        }
+    }
+
+    fn position(self, base: f32, offset: f32) -> Pos2 {
+        let delta = base - self.center;
+        if self.curve < 0.0001 {
+            return self.anchor + Vec2::new(delta * self.scale, offset);
+        }
+        let angle = delta * self.angular;
+        let radius = self.scale / self.angular;
+        self.anchor
+            + Vec2::new(
+                angle.sin() * (radius - offset),
+                2. * (angle / 2.).sin().powi(2) * radius + angle.cos() * offset,
+            )
+    }
+
+    fn tangent(self, base: f32) -> Vec2 {
+        Vec2::angled((base - self.center) * self.angular)
+    }
+
+    fn base_at(self, pos: Pos2) -> usize {
+        let delta = if self.curve < 0.0001 {
+            (pos.x - self.anchor.x) / self.scale
+        } else {
+            let radius = self.scale / self.angular;
+            (pos.x - self.anchor.x).atan2(radius - (pos.y - self.anchor.y)) / self.angular
+        };
+        let base = self.center + delta.clamp(-self.length / 2., self.length / 2.);
+        let base = if self.cyclic {
+            base.rem_euclid(self.length)
+        } else {
+            base.clamp(0., self.length - 1.)
+        };
+        (base.floor() as usize).min(self.length as usize - 1)
+    }
+
+    fn window(self) -> (f32, f32) {
+        let half = if self.curve < 0.0001 {
+            (self.plot.width() / 2. + 35.) / self.scale
+        } else {
+            let radius = self.scale / self.angular;
+            if radius > self.rect.height() + 100. {
+                (self.plot.width() / 2. + 35.).atan2(radius - self.rect.height()) / self.angular
+            } else {
+                self.length / 2.
+            }
+        }
+        .min(self.length / 2.);
+        let (left, right) = (self.center - half, self.center + half);
+        if self.cyclic {
+            (left, right)
+        } else {
+            (left.max(0.), right.min(self.length))
+        }
+    }
+
+    fn spans(self, start: usize, end: usize) -> Vec<(f32, f32)> {
+        let (left, right) = self.window();
+        let cycles = if self.cyclic {
+            (left / self.length).floor() as i32..=(right / self.length).floor() as i32
+        } else {
+            0..=0
+        };
+        cycles
+            .filter_map(|cycle| {
+                let shift = cycle as f32 * self.length;
+                let a = (start as f32 + shift).max(left);
+                let b = (end as f32 + shift).min(right);
+                (a < b).then_some((a, b))
+            })
+            .collect()
+    }
+
+    fn path(self, start: f32, end: f32, offset: f32) -> Vec<Pos2> {
+        let steps = (((end - start) * self.angular).abs() * 60.)
+            .ceil()
+            .clamp(1., 500.) as usize;
+        (0..=steps)
+            .map(|index| {
+                self.position(egui::lerp(start..=end, index as f32 / steps as f32), offset)
+            })
+            .collect()
     }
 }
-fn draw_circle(
+
+fn tick_step(span: f32) -> usize {
+    let raw = (span / 8.).max(1.);
+    let magnitude = 10f32.powf(raw.log10().floor());
+    let multiplier = [1., 2., 5., 10.]
+        .into_iter()
+        .find(|factor| magnitude * factor >= raw)
+        .unwrap_or(10.);
+    (magnitude * multiplier).max(1.) as usize
+}
+
+fn segment_distance(point: Pos2, start: Pos2, end: Pos2) -> f32 {
+    let along = end - start;
+    let fraction = ((point - start).dot(along) / along.length_sq().max(f32::EPSILON)).clamp(0., 1.);
+    point.distance(start + along * fraction)
+}
+
+fn draw_map(
     p: &egui::Painter,
-    rect: Rect,
+    geometry: MapGeometry,
     items: &[Selection],
     selected: Option<&Selection>,
-    length: usize,
+    sequence: &str,
+    preview: (bool, i64),
     pointer: Option<Pos2>,
 ) -> Option<Selection> {
-    let c = circle_center(rect);
-    let radius = (rect.height() / 2. - 55.).min(rect.width() / 2. - 95.);
-    let tau = std::f32::consts::TAU;
-    p.circle_stroke(c, radius, Stroke::new(2., Color32::from_rgb(109, 121, 129)));
-    p.text(
-        c - Vec2::new(0., 10.),
-        Align2::CENTER_CENTER,
-        format!("{length} bp"),
-        FontId::proportional(22.),
-        Color32::LIGHT_GRAY,
-    );
-    p.text(
-        c + Vec2::new(0., 14.),
-        Align2::CENTER_CENTER,
-        "SEQUENCE MAP",
-        FontId::monospace(11.),
-        Color32::GRAY,
-    );
-    for i in 0..12 {
-        let a = i as f32 / 12. * tau - std::f32::consts::FRAC_PI_2;
-        let v = Vec2::angled(a);
+    let (rna, reading_frame) = preview;
+    let (left, right) = geometry.window();
+    p.add(egui::Shape::line(
+        geometry.path(left, right, 0.),
+        Stroke::new(2., Color32::from_rgb(109, 121, 129)),
+    ));
+    let step = tick_step((geometry.plot.width() / geometry.scale).min(geometry.length)) as i64;
+    let begin = (left.floor() as i64).div_euclid(step) * step;
+    for base in (begin..=right.ceil() as i64).step_by(step as usize) {
+        let base = base as f32;
+        let point = geometry.position(base, -18.);
+        if !geometry.rect.contains(point) {
+            continue;
+        }
         p.line_segment(
-            [c + v * (radius - 4.), c + v * (radius + 5.)],
+            [geometry.position(base, -5.), geometry.position(base, 4.)],
             Stroke::new(1., Color32::GRAY),
         );
         p.text(
-            c + v * (radius + 35.),
+            point,
             Align2::CENTER_CENTER,
-            format!("{}", i * length / 12 + 1),
+            format!("{}", base.rem_euclid(geometry.length) as usize + 1),
             FontId::monospace(10.),
             Color32::LIGHT_GRAY,
         );
     }
+    if geometry.curve > 0.85 && geometry.scale * geometry.length < 1300. {
+        let center = geometry.anchor + Vec2::new(0., geometry.scale / geometry.angular);
+        p.text(
+            center - Vec2::new(0., 10.),
+            Align2::CENTER_CENTER,
+            format!("{} bp", sequence.len()),
+            FontId::proportional(22.),
+            Color32::LIGHT_GRAY,
+        );
+        p.text(
+            center + Vec2::new(0., 14.),
+            Align2::CENTER_CENTER,
+            "SEQUENCE MAP",
+            FontId::monospace(11.),
+            Color32::GRAY,
+        );
+    }
     let mut hit = None;
-    let mut annotation_index = 0usize;
-    for (i, item) in items.iter().enumerate() {
-        if item.kind == "source" {
-            continue;
-        }
-        let ring = if item.is_orf {
-            radius - 66. - (i % 6) as f32 * 7.
-        } else {
-            let ring = radius - 14. - (annotation_index % 4) as f32 * 11.;
-            annotation_index += 1;
-            ring
-        };
-        let color = item_color(item, i);
-        let active = selected.is_some_and(|s| s.segments == item.segments && s.label == item.label);
-        for &(start, end) in &item.segments {
-            let a = start as f32 / length as f32 * tau - std::f32::consts::FRAC_PI_2;
-            let b = end as f32 / length as f32 * tau - std::f32::consts::FRAC_PI_2;
-            let steps = (((b - a) * ring / 5.).ceil() as usize).clamp(2, 300);
-            let points: Vec<_> = (0..=steps)
-                .map(|j| c + Vec2::angled(a + (b - a) * j as f32 / steps as f32) * ring)
-                .collect();
-            p.add(egui::Shape::line(
-                points,
-                Stroke::new(
-                    if active {
-                        9.
-                    } else if item.is_orf {
-                        2.
-                    } else {
-                        6.
-                    },
-                    color.gamma_multiply(if item.is_orf { 0.6 } else { 1. }),
-                ),
-            ));
-            let tip = if item.strand < 0 { a } else { b };
-            let tang = tip
-                + if item.strand < 0 {
-                    -std::f32::consts::FRAC_PI_2
-                } else {
-                    std::f32::consts::FRAC_PI_2
-                };
-            let center = c + Vec2::angled(tip) * ring;
-            let along = Vec2::angled(tang);
-            let normal = Vec2::angled(tip);
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    center + along * 5.,
-                    center - along * 4. + normal * 5.,
-                    center - along * 4. - normal * 5.,
-                ],
-                color,
-                Stroke::NONE,
-            ));
-            if let Some(pos) = pointer {
-                let base = circle_base(pos, c, length);
-                if (pos.distance(c) - ring).abs() < 7. && base >= start && base < end {
+    if geometry.curve > 0.8 {
+        let radius = geometry.scale / geometry.angular;
+        let legend_x = geometry.rect.right() - 225.;
+        let opacity = ((legend_x - geometry.anchor.x - radius - 20.) / 55.).clamp(0., 1.)
+            * ((geometry.rect.bottom() - geometry.anchor.y - radius * 2.) / 30.).clamp(0., 1.);
+        if opacity > 0.01 {
+            let top = geometry.rect.top() + 24.;
+            p.text(
+                Pos2::new(legend_x, top),
+                Align2::LEFT_TOP,
+                "FEATURES",
+                FontId::monospace(11.),
+                Color32::GRAY.gamma_multiply(opacity),
+            );
+            for (index, item) in items
+                .iter()
+                .filter(|item| item.kind != "source" && !item.is_orf)
+                .take(16)
+                .enumerate()
+            {
+                let pos = Pos2::new(legend_x, top + 24. + index as f32 * 20.);
+                let region = Rect::from_min_size(pos, Vec2::new(215., 19.));
+                p.rect_filled(
+                    Rect::from_min_size(pos + Vec2::new(0., 3.), Vec2::splat(7.)),
+                    1.,
+                    item_color(item, index).gamma_multiply(opacity),
+                );
+                p.text(
+                    pos + Vec2::new(14., 0.),
+                    Align2::LEFT_TOP,
+                    item.label.chars().take(28).collect::<String>(),
+                    FontId::proportional(11.),
+                    Color32::LIGHT_GRAY.gamma_multiply(opacity),
+                );
+                if opacity > 0.25 && pointer.is_some_and(|point| region.contains(point)) {
                     hit = Some(item.clone());
                 }
             }
         }
     }
-    if rect.width() > 760. {
-        let legend_x = rect.right() - 275.;
-        let legend_y = rect.top() + 24.;
-        p.text(
-            Pos2::new(legend_x, legend_y),
-            Align2::LEFT_TOP,
-            "FEATURES",
-            FontId::monospace(11.),
-            Color32::GRAY,
-        );
-        for (i, item) in items
-            .iter()
-            .filter(|v| v.kind != "source" && !v.is_orf)
-            .take(16)
-            .enumerate()
-        {
-            let y = legend_y + 24. + i as f32 * 21.;
-            let region = Rect::from_min_size(Pos2::new(legend_x, y), Vec2::new(260., 20.));
-            p.rect_filled(
-                Rect::from_min_size(Pos2::new(legend_x, y + 3.), Vec2::new(7., 7.)),
-                1.,
-                item_color(item, i),
-            );
-            p.text(
-                Pos2::new(legend_x + 14., y),
-                Align2::LEFT_TOP,
-                item.label.chars().take(34).collect::<String>(),
-                FontId::proportional(11.),
-                Color32::LIGHT_GRAY,
-            );
-            if pointer.is_some_and(|pos| region.contains(pos)) {
-                hit = Some(item.clone());
-            }
-        }
-        p.text(
-            Pos2::new(legend_x, rect.bottom() - 30.),
-            Align2::LEFT_TOP,
-            "Full annotation / ORF list below",
-            FontId::proportional(10.),
-            Color32::GRAY,
-        );
-    }
-    if let Some(s) = selected {
-        for &(start, end) in &s.segments {
-            let a = start as f32 / length as f32 * tau - std::f32::consts::FRAC_PI_2;
-            let b = end as f32 / length as f32 * tau - std::f32::consts::FRAC_PI_2;
-            let points = (0..=80)
-                .map(|i| c + Vec2::angled(a + (b - a) * i as f32 / 80.) * (radius + 12.))
-                .collect();
-            p.add(egui::Shape::line(points, Stroke::new(5., AMBER)));
-        }
-    }
-    hit
-}
-fn draw_linear(
-    p: &egui::Painter,
-    plot: Rect,
-    items: &[Selection],
-    selected: Option<&Selection>,
-    sequence: &str,
-    window: (f32, f32, bool, i64),
-    pointer: Option<Pos2>,
-) -> Option<Selection> {
-    let (left, visible, rna, reading_frame) = window;
-    let px = plot.width() / visible;
-    let x = |base: f32| plot.left() + (base - left) * px;
-    let axis = plot.top() + 16.;
-    let right = left + visible;
-    let mut hit = None;
-    p.line_segment(
-        [Pos2::new(plot.left(), axis), Pos2::new(plot.right(), axis)],
-        Stroke::new(1., Color32::GRAY),
-    );
-    let step = if visible > 2000. {
-        1000
-    } else if visible > 400. {
-        100
-    } else if visible > 90. {
-        20
-    } else {
-        5
-    };
-    let begin = (left as usize / step) * step;
-    for base in (begin..=(right.ceil() as usize).min(sequence.len())).step_by(step) {
-        let xx = x(base as f32);
-        if plot.left() <= xx && xx <= plot.right() {
-            p.line_segment(
-                [Pos2::new(xx, axis - 4.), Pos2::new(xx, axis + 4.)],
-                Stroke::new(1., Color32::GRAY),
-            );
-            p.text(
-                Pos2::new(xx, axis - 8.),
-                Align2::CENTER_BOTTOM,
-                format!("{}", base + 1),
-                FontId::monospace(10.),
-                Color32::LIGHT_GRAY,
-            );
-        }
-    }
-    let mut lanes = [f32::NEG_INFINITY; 10];
+    let mut annotation_index = 0;
     for (index, item) in items.iter().enumerate() {
-        let start = item.segments.iter().map(|s| s.0).min().unwrap_or(0) as f32;
-        let end = item.segments.iter().map(|s| s.1).max().unwrap_or(0) as f32;
-        if end < left || start > right {
+        if item.kind == "source" {
             continue;
         }
-        let base_lane = if item.is_orf {
-            if item.strand < 0 { 7 } else { 4 }
+        let (circular_offset, lane) = if item.is_orf {
+            (
+                66. + (index % 6) as f32 * 7.,
+                (if item.strand < 0 { 7 } else { 4 }) + index % 3,
+            )
         } else {
-            0
+            let lane = annotation_index % 4;
+            annotation_index += 1;
+            (14. + lane as f32 * 11., lane)
         };
-        let lane = (base_lane..(base_lane + 3).min(10))
-            .find(|i| lanes[*i] < start)
-            .unwrap_or(base_lane);
-        lanes[lane] = end;
-        let yy = axis + 22. + lane as f32 * 18.;
+        let offset = egui::lerp(
+            circular_offset.min(geometry.scale / geometry.angular * 0.85)..=22. + lane as f32 * 18.,
+            1. - geometry.curve,
+        );
         let color = item_color(item, index);
-        for &(s, e) in &item.segments {
-            let a = x((s as f32).max(left));
-            let b = x((e as f32).min(right));
-            if a >= b {
-                continue;
-            }
-            let r = Rect::from_min_max(Pos2::new(a, yy - 5.), Pos2::new(b, yy + 5.));
-            p.rect_filled(
-                r,
-                2.,
-                color.gamma_multiply(if item.is_orf { 0.65 } else { 1. }),
-            );
-            arrow(
-                p,
-                Pos2::new(if item.strand < 0 { a } else { b }, yy),
-                if item.strand < 0 { -1. } else { 1. },
-                color,
-            );
-            if b - a > 65. {
-                p.text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    item.label
-                        .chars()
-                        .take(((b - a) / 7.) as usize)
-                        .collect::<String>(),
-                    FontId::monospace(10.),
-                    Color32::from_rgb(21, 25, 28),
-                );
-            }
-            if pointer.is_some_and(|pos| r.expand(4.).contains(pos)) {
-                hit = Some(item.clone());
+        let active = selected.is_some_and(|selection| {
+            selection.segments == item.segments && selection.label == item.label
+        });
+        for &(start, end) in &item.segments {
+            for (a, b) in geometry.spans(start, end) {
+                let points = geometry.path(a, b, offset);
+                if pointer.is_some_and(|pos| {
+                    points
+                        .windows(2)
+                        .any(|pair| segment_distance(pos, pair[0], pair[1]) <= 7.)
+                }) {
+                    hit = Some(item.clone());
+                }
+                p.add(egui::Shape::line(
+                    points,
+                    Stroke::new(
+                        if active {
+                            10.
+                        } else if item.is_orf {
+                            3.
+                        } else {
+                            7.
+                        },
+                        color.gamma_multiply(if item.is_orf { 0.65 } else { 1. }),
+                    ),
+                ));
+                let tip_base = if item.strand < 0 { a } else { b };
+                let tip = geometry.position(tip_base, offset);
+                let along = geometry.tangent(tip_base) * if item.strand < 0 { -1. } else { 1. };
+                let normal = Vec2::new(-along.y, along.x);
+                p.add(egui::Shape::convex_polygon(
+                    vec![
+                        tip + along * 5.,
+                        tip - along * 4. + normal * 5.,
+                        tip - along * 4. - normal * 5.,
+                    ],
+                    color,
+                    Stroke::NONE,
+                ));
+                if geometry.curve < 0.8 && (b - a) * geometry.scale > 65. {
+                    p.text(
+                        geometry.position((a + b) / 2., offset),
+                        Align2::CENTER_CENTER,
+                        item.label
+                            .chars()
+                            .take((((b - a) * geometry.scale) / 7.).min(60.) as usize)
+                            .collect::<String>(),
+                        FontId::monospace(10.),
+                        Color32::from_rgb(21, 25, 28),
+                    );
+                }
             }
         }
     }
-    if let Some(s) = selected {
-        for &(start, end) in &s.segments {
-            let a = x((start as f32).max(left));
-            let b = x((end as f32).min(right));
-            if a < b {
-                p.rect_filled(
-                    Rect::from_min_max(Pos2::new(a, axis + 8.), Pos2::new(b, plot.bottom())),
-                    0.,
-                    Color32::from_rgba_unmultiplied(220, 174, 75, 35),
-                );
+    if let Some(selection) = selected {
+        for &(start, end) in &selection.segments {
+            for (a, b) in geometry.spans(start, end) {
+                p.add(egui::Shape::line(
+                    geometry.path(a, b, -9.),
+                    Stroke::new(5., AMBER),
+                ));
             }
         }
     }
-    if px >= 3. {
-        let y = axis + 214.;
+    if geometry.scale >= 3.
+        && (geometry.curve < 0.0001
+            || geometry.scale / geometry.angular > geometry.rect.height() + 100.)
+    {
         let bytes = sequence.as_bytes();
-        let start = left.floor() as usize;
-        let end = (right.ceil() as usize).min(bytes.len());
-        p.text(
-            Pos2::new(plot.left() - 8., y + 12.),
-            Align2::RIGHT_CENTER,
-            "5′",
-            FontId::monospace(11.),
-            Color32::GRAY,
-        );
-        p.text(
-            Pos2::new(plot.left() - 8., y + 38.),
-            Align2::RIGHT_CENTER,
-            "3′",
-            FontId::monospace(11.),
-            Color32::GRAY,
-        );
-        let tracks = p.with_clip_rect(plot);
-        for (i, &b) in bytes.iter().enumerate().take(end).skip(start) {
-            letter_block(
-                &tracks,
-                Rect::from_min_size(Pos2::new(x(i as f32), y), Vec2::new(px, 25.)),
-                b,
-                base_color(b),
-                false,
-            );
-            let complementary = if rna && b == b'A' {
-                b'U'
-            } else {
-                complement(b)
-            };
-            letter_block(
-                &tracks,
-                Rect::from_min_size(Pos2::new(x(i as f32), y + 26.), Vec2::new(px, 25.)),
-                complementary,
-                base_color(complementary),
-                false,
-            );
+        let start = left.floor() as i64;
+        let end = right.ceil() as i64;
+        for base in start..end {
+            let index = base.rem_euclid(bytes.len() as i64) as usize;
+            let b = bytes[index];
+            for (offset, letter) in [
+                (214., b),
+                (
+                    240.,
+                    if rna && b == b'A' {
+                        b'U'
+                    } else {
+                        complement(b)
+                    },
+                ),
+            ] {
+                let pos = geometry.position(base as f32 + 0.5, offset);
+                let rect = Rect::from_center_size(
+                    pos + Vec2::new(0., 12.),
+                    Vec2::new(geometry.scale, 25.),
+                );
+                letter_block(p, rect, letter, base_color(letter), false);
+            }
         }
         let frame = reading_frame.unsigned_abs().clamp(1, 3) as usize - 1;
         let reverse = reading_frame < 0;
-        p.text(
-            Pos2::new(plot.left() - 8., y + 67.),
-            Align2::RIGHT_CENTER,
-            format!("{reading_frame:+}"),
-            FontId::monospace(11.),
-            Color32::LIGHT_GRAY,
-        );
-        let mut i = start.saturating_sub(2);
-        while i < end {
-            if i + 3 <= bytes.len()
+        for base in start.saturating_sub(2)..end {
+            if !geometry.cyclic && (base < 0 || base >= bytes.len() as i64) {
+                continue;
+            }
+            let index = base.rem_euclid(bytes.len() as i64) as usize;
+            if index + 3 <= bytes.len()
                 && if reverse {
-                    (bytes.len() - i - 3) % 3 == frame
+                    (bytes.len() - index - 3) % 3 == frame
                 } else {
-                    i % 3 == frame
+                    index % 3 == frame
                 }
             {
                 let amino = if reverse {
                     codon(&[
-                        complement(bytes[i + 2]),
-                        complement(bytes[i + 1]),
-                        complement(bytes[i]),
+                        complement(bytes[index + 2]),
+                        complement(bytes[index + 1]),
+                        complement(bytes[index]),
                     ])
                 } else {
-                    codon(&bytes[i..i + 3])
+                    codon(&bytes[index..index + 3])
                 };
+                let pos = geometry.position(base as f32 + 1.5, 268.);
                 letter_block(
-                    &tracks,
-                    Rect::from_min_size(Pos2::new(x(i as f32), y + 54.), Vec2::new(px * 3., 27.)),
+                    p,
+                    Rect::from_center_size(
+                        pos + Vec2::new(0., 13.),
+                        Vec2::new(geometry.scale * 3., 27.),
+                    ),
                     amino,
                     amino_color(amino),
                     false,
                 );
             }
-            i += 1;
         }
+        p.text(
+            geometry.plot.left_bottom(),
+            Align2::LEFT_BOTTOM,
+            format!("5' / 3' · preview frame {reading_frame:+}"),
+            FontId::monospace(10.),
+            Color32::GRAY,
+        );
     } else {
         p.text(
-            Pos2::new(plot.left(), plot.bottom() - 8.),
+            geometry.plot.left_bottom(),
             Align2::LEFT_BOTTOM,
             "Zoom closer to reveal bases and codon translations",
             FontId::proportional(11.),
@@ -1874,6 +2023,361 @@ fn protein_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map(zoom: f32, mode: usize, center: f32) -> MapGeometry {
+        MapGeometry::new(
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(900., 420.)),
+            1000,
+            center,
+            zoom,
+            mode,
+            true,
+        )
+    }
+
+    #[test]
+    fn circular_zoom_scales_the_arc_without_moving_its_focal_base() {
+        let fitted = map(1., 1, 250.);
+        let zoomed = map(1.25, 1, 250.);
+        assert_eq!(fitted.position(250., 0.), zoomed.position(250., 0.));
+        assert!((zoomed.scale / fitted.scale - 1.25).abs() < 0.0001);
+        assert!(
+            fitted
+                .position(400., 0.)
+                .distance(zoomed.position(400., 0.))
+                > 20.
+        );
+        assert_eq!(
+            map(5., 1, 250.).curve,
+            1.,
+            "explicit Circular keeps its curvature while enlarging"
+        );
+    }
+
+    #[test]
+    fn auto_unroll_preserves_focal_base_scale_and_position_continuity() {
+        let mut previous = map(1., 0, 990.);
+        for index in 1..=300 {
+            let zoom = 1. + index as f32 / 100.;
+            let current = map(zoom, 0, 990.);
+            assert_eq!(current.position(990., 0.), previous.position(990., 0.));
+            assert!(current.curve <= previous.curve);
+            assert!(current.scale >= previous.scale);
+            assert!(
+                current
+                    .position(1020., 22.)
+                    .distance(previous.position(1020., 22.))
+                    < 3.
+            );
+            previous = current;
+        }
+        let before = map(3.9999, 0, 990.);
+        let after = map(4., 0, 990.);
+        assert!(
+            before
+                .position(1020., 22.)
+                .distance(after.position(1020., 22.))
+                < 0.01
+        );
+        assert_eq!(after.curve, 0.);
+        assert_eq!(
+            after.position(1020., 22.),
+            map(4., 2, 990.).position(1020., 22.)
+        );
+    }
+
+    #[test]
+    fn auto_zoom_scale_is_monotonic_on_narrow_and_wide_viewports() {
+        for width in [300., 450., 700., 900., 1800.] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 420.));
+            let mut previous = MapGeometry::new(rect, 1000, 0., 1., 0, true);
+            let (left, right) = previous.window();
+            assert!(
+                previous
+                    .position(left, 0.)
+                    .distance(previous.position(right, 0.))
+                    < 0.001,
+                "fitted ring is closed"
+            );
+            for index in 1..=500 {
+                let zoom = 1. + index as f32 / 100.;
+                let current = MapGeometry::new(rect, 1000, 0., zoom, 0, true);
+                assert!(
+                    current.scale > previous.scale,
+                    "zoom must enlarge bases at width {width}, zoom {zoom}"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn map_hit_testing_and_feature_spans_follow_rotation_across_origin() {
+        for mode in 0..=2 {
+            for zoom in [1., 1.6, 2.5, 4., 10.] {
+                let geometry = map(zoom, mode, 990.);
+                for base in [970usize, 990, 1010, 1040] {
+                    let point = geometry.position(base as f32 + 0.25, 14.);
+                    assert_eq!(
+                        geometry.base_at(point),
+                        base % 1000,
+                        "mode {mode}, zoom {zoom}, base {base}"
+                    );
+                }
+            }
+        }
+        let geometry = map(4., 0, 0.);
+        assert_eq!(geometry.spans(980, 1000), vec![(-20., 0.)]);
+        assert_eq!(geometry.spans(0, 20), vec![(0., 20.)]);
+        assert_eq!(map(4., 0, -10.).center, 990.);
+        let linear = MapGeometry::new(geometry.rect, 1000, -10., 4., 2, false);
+        assert!(linear.center >= 125.);
+        assert!(linear.spans(980, 1000).is_empty());
+    }
+
+    fn screen() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700., 600.))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn map_wheel_routes_pan_and_modified_zoom_only_inside_its_viewport() {
+        let context = egui::Context::default();
+        let reference = "construct:wheel-proof@1";
+        let mut viewer = Viewer::default();
+        viewer.accept(
+            reference,
+            json!({"ref":reference,"molecule_type":"dna","length":1000,"circular":true}),
+            &"ACGT".repeat(250),
+        );
+        let detail = json!({"ref":reference,"is_latest":true});
+        let draw = |viewer: &mut Viewer, input| {
+            context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    viewer.show(ui, &detail, false, &[]);
+                });
+            })
+        };
+        let first = draw(&mut viewer, screen());
+        let rect = first
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(25, 29, 32) => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("map background is rendered");
+        let wheel = |pos, modifiers| {
+            let mut input = screen();
+            input.modifiers = modifiers;
+            input.events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0., 4.),
+                    modifiers,
+                },
+            ];
+            input
+        };
+        let before = (viewer.center, viewer.zoom, context.zoom_factor());
+        draw(&mut viewer, wheel(rect.center(), egui::Modifiers::NONE));
+        assert_ne!(viewer.center, before.0);
+        assert_eq!(
+            viewer.zoom, before.1,
+            "ordinary wheel rotates without zooming"
+        );
+        assert_eq!(context.input(|input| input.smooth_scroll_delta), Vec2::ZERO);
+        let center = viewer.center;
+        draw(
+            &mut viewer,
+            wheel(
+                rect.center(),
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            ),
+        );
+        assert_eq!(viewer.center, center);
+        assert!(viewer.zoom > before.1);
+        assert_eq!(
+            context.zoom_factor(),
+            before.2,
+            "map zoom must not resize the GUI"
+        );
+        let before = (viewer.center, viewer.zoom);
+        draw(&mut viewer, wheel(Pos2::new(2., 2.), egui::Modifiers::NONE));
+        assert_eq!((viewer.center, viewer.zoom), before);
+        assert!(
+            context.input(|input| input.smooth_scroll_delta.y) > 0.,
+            "outside scrolling remains available to the page"
+        );
+        viewer.mode = 2;
+        viewer.zoom = 4.;
+        let center = viewer.center;
+        draw(&mut viewer, wheel(rect.center(), egui::Modifiers::NONE));
+        assert_ne!(viewer.center, center);
+        assert_eq!(viewer.zoom, 4., "ordinary wheel pans the linear view");
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn collect(shape: &egui::Shape, result: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => result.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for shape in shapes {
+            collect(&shape.shape, &mut result);
+        }
+        result
+    }
+
+    #[test]
+    fn plaintext_cross_row_copy_contains_only_selected_residues() {
+        let context = egui::Context::default();
+        let sequence = "ACDEFGHIKLMNPQRSTVWY".repeat(20);
+        let mut selected = 0..0;
+        let first = context.run(screen(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.set_max_width(280.);
+                let mut output = protein_plaintext(ui, &sequence, "construct:copy-proof@1");
+                assert_eq!(output.galley.job.text, sequence);
+                assert!(output.galley.rows.len() > 3);
+                assert!(output.galley.rows.iter().all(|row| !row.ends_with_newline));
+                let first_row = output.galley.rows[0].char_count_excluding_newline();
+                selected = first_row - 3..first_row * 2 + 4;
+                output
+                    .state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(selected.start),
+                        egui::text::CCursor::new(selected.end),
+                    )));
+                output.response.request_focus();
+                output.state.store(context, output.response.id);
+            });
+        });
+        assert!(
+            painted_text(&first.shapes).contains(&"1".into()),
+            "numbered gutter is painted separately"
+        );
+        let mut input = screen();
+        input.events.push(egui::Event::Copy);
+        let copied = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.set_max_width(280.);
+                protein_plaintext(ui, &sequence, "construct:copy-proof@1");
+            });
+        });
+        let text = copied
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("the actual immutable text widget handles Copy");
+        assert_eq!(text, &sequence[selected]);
+        assert!(text.bytes().all(|byte| byte.is_ascii_uppercase()));
+        assert!(!text.contains(['\n', '\r']));
+    }
+
+    #[test]
+    fn protein_sequence_and_revision_controls_show_with_variant_closed() {
+        for derived in [false, true] {
+            let mut viewer = Viewer::default();
+            let reference = "construct:plain-proof@1";
+            viewer.accept(
+                reference,
+                json!({
+                    "ref":reference,"molecule_type":"protein","length":3,"sequence":"MAG",
+                    "derivation_kind":if derived {"derived"} else {"literal"},
+                    "parent_ref":"construct:parent@1"
+                }),
+                "MAG",
+            );
+            let context = egui::Context::default();
+            let output = context.run(screen(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    assert!(
+                        viewer
+                            .show(ui, &json!({"ref":reference,"is_latest":true}), false, &[])
+                            .is_empty()
+                    );
+                });
+            });
+            let labels = painted_text(&output.shapes);
+            for label in ["Protein sequence", "MAG", "Copy sequence", "Copy FASTA"] {
+                assert!(
+                    labels.iter().any(|painted| painted == label),
+                    "missing {label}: {labels:?}"
+                );
+            }
+            assert!(labels.iter().any(|label| label
+                == if derived {
+                    "Edit definition"
+                } else {
+                    "Edit sequence"
+                }));
+            assert_eq!(labels.iter().any(|label| label == "Open parent"), derived);
+            assert!(!labels.iter().any(|label| label == "PROTEIN ANNOTATIONS"));
+            assert!(!viewer.variant_open);
+        }
+    }
+
+    #[test]
+    fn automatic_orf_rescan_debounces_and_rejects_previous_reply() {
+        let reference = "construct:scan-proof@1";
+        let mut viewer = Viewer::default();
+        viewer.accept(
+            reference,
+            json!({"ref":reference,"molecule_type":"dna","length":12}),
+            "ATGGCTGGGTAA",
+        );
+        viewer.schedule_options(1.);
+        assert!(viewer.poll_options(1.2).is_none());
+        viewer.min_orf = 5;
+        viewer.schedule_options(1.2);
+        assert!(viewer.poll_options(1.4).is_none());
+        let Some(Action::Options(first)) = viewer.poll_options(1.51) else {
+            panic!("settled options must refresh");
+        };
+        assert_eq!(first["min_orf_aa"], 5);
+        assert!(
+            viewer.poll_options(2.).is_none(),
+            "one request per settled change"
+        );
+        viewer.genetic_code = 11;
+        viewer.schedule_options(2.);
+        viewer.received_options(&first, json!({"ref":reference,"sequence":"STALE"}), "");
+        assert_eq!(text(&viewer.view, "sequence"), "ATGGCTGGGTAA");
+        let Some(Action::Options(second)) = viewer.poll_options(2.31) else {
+            panic!("updated code must refresh");
+        };
+        assert_eq!(second["genetic_code"], 11);
+        viewer.accept(
+            "construct:other@1",
+            json!({"ref":"construct:other@1","length":3}),
+            "ATG",
+        );
+        viewer.received_options(&second, json!({"ref":reference,"sequence":"STALE"}), "");
+        assert_eq!(viewer.reference, "construct:other@1");
+        assert!(viewer.options_due.is_none());
+    }
     #[test]
     fn wrap_selection_retains_origin_order() {
         assert_eq!(selection_ranges(95, 4, 100, true), vec![(95, 100), (0, 5)]);

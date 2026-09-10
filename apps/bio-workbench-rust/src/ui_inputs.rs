@@ -1,5 +1,27 @@
 use super::*;
-use ui_state::{Editor, Preview, infer_file};
+use ui_state::{Editor, RunIntent, infer_file};
+
+fn model_name(model: &Value) -> String {
+    let name = text(model, "name");
+    if text(model, "id") == "rfaa" {
+        name.replace(" (parked)", "").replace(" — parked", "")
+    } else {
+        name.into()
+    }
+}
+fn pair_status<'a>(pair: &'a Value, job: Option<&'a Value>) -> &'a str {
+    if matches!(text(pair, "state"), "incompatible" | "rejected") {
+        "Skipped (incompatible)"
+    } else if let Some(job) = job {
+        text(job, "state")
+    } else {
+        match text(pair, "state") {
+            "compatible" => "Queued for dispatch",
+            "pending" => "Validating",
+            state => state,
+        }
+    }
+}
 fn select(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut String, choices: &[&str]) {
     egui::ComboBox::from_id_salt(id)
         .width(130.)
@@ -108,6 +130,12 @@ impl Workbench {
         if let Some(session) = self.session.as_mut() {
             match session.upload(path.clone()) {
                 Ok(id) => {
+                    if let UploadTarget::Run(run_id, index) = &target
+                        && let Some(run) = self.state.run.as_mut().filter(|run| &run.id == run_id)
+                        && let Some(upload) = run.uploads.get_mut(*index)
+                    {
+                        upload.operation = id.clone();
+                    }
                     self.pending.insert(
                         id,
                         Pending {
@@ -122,16 +150,31 @@ impl Workbench {
                     );
                 }
                 Err(error) => {
-                    self.preview_after_uploads = false;
+                    if let UploadTarget::Run(run_id, _) = &target {
+                        self.run_error(run_id, &error.to_string(), false);
+                    }
                     self.log(format!("Upload failed: {error}"));
                 }
             }
         }
     }
     pub(super) fn uploaded(&mut self, target: UploadTarget, receipt: Value) {
+        if let UploadTarget::Run(run_id, index) = &target {
+            if let Some(mut run) = self.state.run.take() {
+                let result = if &run.id == run_id {
+                    run.accept_upload_for_draft(*index, &receipt, &mut self.state)
+                } else {
+                    Ok(())
+                };
+                self.state.run = Some(run);
+                if let Err(error) = result {
+                    self.run_error(run_id, &error, false);
+                }
+            }
+            return;
+        }
         let id = text(&receipt, "upload_id");
         if id.is_empty() {
-            self.preview_after_uploads = false;
             self.log("Upload did not return a completed receipt.");
             return;
         }
@@ -165,65 +208,182 @@ impl Workbench {
                     .entry(model)
                     .or_insert_with(|| json!({}))["labels_upload_id"] = json!(id);
             }
+            UploadTarget::Run(_, _) => unreachable!(),
         }
     }
-    pub(super) fn begin_preview(&mut self) {
+    pub(super) fn flash_input(&mut self, id: &str) {
+        self.input_flash = Some((id.into(), Instant::now(), true));
+        self.sidebar_tab = 0;
+    }
+    pub(super) fn run_error(&mut self, id: &str, message: &str, uncertain: bool) {
+        if let Some(run) = self.state.run.as_mut().filter(|run| run.id == id) {
+            run.error = message.into();
+            run.stage = if run.operation.is_empty() && !run.submission_attempted {
+                "upload_failed"
+            } else if uncertain {
+                "uncertain"
+            } else {
+                "rejected"
+            }
+            .into();
+            self.run_after_uploads = false;
+        }
+    }
+    pub(super) fn begin_run(&mut self) {
+        self.run_input_error.clear();
         if !self.connected {
             self.connection_open = true;
-            self.log("Connect to the head before requesting a compatibility preview.");
+            self.log("Connect to the head before running predictions.");
             return;
         }
-        let mut uploads = Vec::new();
-        for input in &self.state.inputs {
-            if input.needs_upload() {
-                uploads.push((
-                    PathBuf::from(input.local_path.as_ref().unwrap()),
-                    UploadTarget::Input(input.id.clone()),
-                ));
-            }
-            for (name, path) in &input.attachment_paths {
-                if input.source["attachments"][name].as_str().is_none() {
-                    uploads.push((
-                        PathBuf::from(path),
-                        UploadTarget::Attachment(input.id.clone(), name.clone()),
-                    ));
-                }
-            }
-        }
-        if !uploads.is_empty() {
-            self.preview_after_uploads = true;
-            for (path, target) in uploads {
-                self.start_upload(path, target);
+        if self
+            .state
+            .run
+            .as_ref()
+            .is_some_and(|run| !run.accepts_new_run())
+        {
+            self.preview_open = true;
+            if !self.run_pending() {
+                self.resume_run();
             }
             return;
         }
-        let payload = match self.state.payload() {
-            Ok(value) => value,
+        let endpoint = self.run_endpoint();
+        let run = match RunIntent::capture(&self.state, endpoint) {
+            Ok(run) => run,
             Err(error) => {
+                self.run_input_error = error.clone();
+                self.preview_open = false;
                 self.log(error);
                 return;
             }
         };
-        if let Some(preview) = &self.state.preview
-            && preview.snapshot == payload
-            && !preview.batch_id.is_empty()
-        {
-            self.preview_open = true;
-            let id = preview.batch_id.clone();
-            self.state.active_batch = id.clone();
+        self.preview_open = true;
+        self.state.add_active();
+        self.state.run = Some(run);
+        self.run_batch = None;
+        self.persist();
+        if !self.save_error.is_empty() {
+            self.log(
+                "Run preparation could not be saved. Resolve the local save error before retrying.",
+            );
+            return;
+        }
+        self.resume_run();
+    }
+    pub(super) fn run_pending(&self) -> bool {
+        self.state.run.as_ref().is_some_and(|run| {
+            self.pending.values().any(|pending| match &pending.purpose {
+                Purpose::Run(id) | Purpose::Upload(UploadTarget::Run(id, _)) => id == &run.id,
+                _ => false,
+            })
+        })
+    }
+    pub(super) fn resume_run(&mut self) {
+        let Some(run) = self.state.run.clone() else {
+            return;
+        };
+        if run.endpoint != self.run_endpoint() {
+            self.log("This run belongs to another head. Reconnect to its original endpoint to recover it.");
+            return;
+        }
+        self.preview_open = true;
+        if !run.batch_id.is_empty() {
+            let id = run.batch_id;
             self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
             return;
         }
-        let mut request = payload.clone();
-        request["request_key"] = json!(uid());
-        if let Some(operation) = self.request("batch.validate", request, Purpose::Preview) {
-            self.state.preview = Some(Preview {
-                snapshot: payload,
-                operation,
-                ..Default::default()
-            });
-            self.preview_open = true;
+        if self.run_pending() {
+            return;
+        }
+        if let Some(current) = self.state.run.as_mut() {
+            current.error.clear();
+        }
+        if !run.operation.is_empty() {
+            if let Some(current) = self.state.run.as_mut() {
+                current.stage = "requesting".into();
+            }
+            self.retry(&run.operation, Purpose::Run(run.id), "batch.run".into());
+            return;
+        }
+        self.run_after_uploads = true;
+        if let Some(current) = self.state.run.as_mut() {
+            current.stage = "uploading".into();
+        }
+        for (index, upload) in run
+            .uploads
+            .iter()
+            .enumerate()
+            .filter(|(_, upload)| !upload.complete)
+        {
+            let purpose = Purpose::Upload(UploadTarget::Run(run.id.clone(), index));
+            if upload.operation.is_empty() {
+                self.start_upload(
+                    PathBuf::from(&upload.path),
+                    UploadTarget::Run(run.id.clone(), index),
+                );
+            } else {
+                self.retry(&upload.operation, purpose, "Resume captured upload".into());
+            }
+        }
+        self.persist();
+        self.continue_run();
+    }
+    pub(super) fn continue_run(&mut self) {
+        if !self.run_after_uploads || self.run_pending() {
+            return;
+        }
+        let Some(run) = self.state.run.clone() else {
+            return;
+        };
+        if !run.error.is_empty() || run.uploads.iter().any(|upload| !upload.complete) {
+            return;
+        }
+        self.run_after_uploads = false;
+        if run.endpoint != self.run_endpoint()
+            || !run.operation.is_empty()
+            || !run.batch_id.is_empty()
+        {
+            return;
+        }
+        if run.request.to_string().len() + 256 > rpc::MAX_WIRE {
+            self.run_error(
+                &run.id,
+                "Input exceeds the request limit. Use a file upload for large inputs.",
+                false,
+            );
+            return;
+        }
+        // Persist the attempted-send boundary before calling the durable session:
+        // a crash can otherwise leave a sent journal entry without its UI ID.
+        if let Some(current) = self.state.run.as_mut() {
+            current.submission_attempted = true;
+        }
+        self.persist();
+        if !self.save_error.is_empty() {
+            self.run_error(
+                &run.id,
+                "Could not save the prepared run locally. Retry after resolving the save error.",
+                true,
+            );
+            return;
+        }
+        if let Some(current) = self.state.run.as_mut() {
+            current.stage = "requesting".into();
+        }
+        if let Some(operation) =
+            self.request("batch.run", run.request, Purpose::Run(run.id.clone()))
+        {
+            if let Some(current) = self.state.run.as_mut() {
+                current.operation = operation;
+            }
             self.persist();
+        } else {
+            self.run_error(
+                &run.id,
+                "Could not send the saved run request. Retry keeps its exact request key.",
+                true,
+            );
         }
     }
     pub(super) fn inputs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -313,11 +473,14 @@ impl Workbench {
                         .font(egui::TextStyle::Monospace)
                         .desired_rows(7)
                         .desired_width(f32::INFINITY)
-                        .hint_text(if self.state.editor.kind == "library" {
-                            "construct:name@revision or assembly:name@revision"
-                        } else {
-                            "Paste sequence(s), FASTA, or the selected format"
-                        }),
+                        .hint_text(
+                            RichText::new(if self.state.editor.kind == "library" {
+                                "construct:name@revision or assembly:name@revision"
+                            } else {
+                                "Paste sequence(s), FASTA, or the selected format"
+                            })
+                            .color(Color32::GRAY),
+                        ),
                 );
             });
         ui.horizontal(|ui| {
@@ -339,88 +502,119 @@ impl Workbench {
         if self.state.active_input().is_some() {
             ui.colored_label(
                 GREEN,
-                "The active editor is included in Preview; Add input is optional.",
+                "The active editor is included in Run; Add input is optional.",
             );
         }
         let mut remove = None;
         let mut attachment = None;
         for (index, input) in self.state.inputs.iter_mut().enumerate() {
-            ui.push_id(input.id.clone(), |ui| {
-                egui::CollapsingHeader::new(format!("{} · {}", index + 1, input.name))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.text_edit_singleline(&mut input.name);
-                        select(
-                            ui,
-                            "input-type",
-                            &mut input.molecule_type,
-                            &["protein", "dna", "rna", "ligand", "assembly", "structure"],
-                        );
-                        if self.state.mode == "assembly" {
-                            ui.horizontal(|ui| {
-                                ui.label("Chain");
-                                ui.text_edit_singleline(&mut input.chain_id);
-                            });
-                        }
-                        if text(&input.source, "kind") != "library" {
-                            let mut format = text(&input.source, "format").to_owned();
-                            select(
-                                ui,
-                                "input-format",
-                                &mut format,
-                                &[
-                                    "sequence",
-                                    "fasta",
-                                    "smiles",
-                                    "ccd",
-                                    "sdf",
-                                    "pdb",
-                                    "mmcif",
-                                    "library-json",
-                                    "contigs",
-                                ],
-                            );
-                            input.source["format"] = json!(format);
-                        }
-                        if text(&input.source, "kind") == "text" {
-                            let mut value = text(&input.source, "text").to_owned();
-                            if ui
-                                .add(
-                                    egui::TextEdit::multiline(&mut value)
-                                        .desired_rows(3)
-                                        .desired_width(f32::INFINITY)
-                                        .font(egui::TextStyle::Monospace),
-                                )
-                                .changed()
-                            {
-                                input.source["text"] = json!(value);
-                            }
-                        }
-                        if let Some(path) = &input.local_path {
-                            ui.small(path);
-                            ui.small(if input.needs_upload() {
-                                "Uploads when you request Preview"
-                            } else {
-                                "Immutable upload ready"
-                            });
-                        } else if text(&input.source, "kind") == "library" {
-                            ui.monospace(text(&input.source, "ref"));
-                        }
-                        for name in input.attachment_paths.keys() {
-                            ui.small(format!("Attachment: {name}"));
-                        }
-                        ui.horizontal(|ui| {
-                            if text(&input.source, "format") == "library-json"
-                                && ui.button("Attach SDF…").clicked()
-                            {
-                                attachment = Some(input.id.clone());
-                            }
-                            if ui.button("Remove input").clicked() {
-                                remove = Some(index);
-                            }
-                        });
-                    });
+            let flash = self
+                .input_flash
+                .as_ref()
+                .filter(|(id, _, _)| id == &input.id);
+            let intensity = flash.map_or(0., |(_, started, _)| {
+                (1. - started.elapsed().as_secs_f32() / 2.2).clamp(0., 1.)
             });
+            let scroll = flash.is_some_and(|(_, _, scroll)| *scroll);
+            let row = egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(
+                    50,
+                    210,
+                    100,
+                    (intensity * 115.) as u8,
+                ))
+                .inner_margin(3.)
+                .show(ui, |ui| {
+                    ui.push_id(input.id.clone(), |ui| {
+                        egui::CollapsingHeader::new(format!("{} · {}", index + 1, input.name))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.text_edit_singleline(&mut input.name);
+                                select(
+                                    ui,
+                                    "input-type",
+                                    &mut input.molecule_type,
+                                    &["protein", "dna", "rna", "ligand", "assembly", "structure"],
+                                );
+                                if self.state.mode == "assembly" {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Chain");
+                                        ui.text_edit_singleline(&mut input.chain_id);
+                                    });
+                                }
+                                if text(&input.source, "kind") != "library" {
+                                    let mut format = text(&input.source, "format").to_owned();
+                                    select(
+                                        ui,
+                                        "input-format",
+                                        &mut format,
+                                        &[
+                                            "sequence",
+                                            "fasta",
+                                            "smiles",
+                                            "ccd",
+                                            "sdf",
+                                            "pdb",
+                                            "mmcif",
+                                            "library-json",
+                                            "contigs",
+                                        ],
+                                    );
+                                    input.source["format"] = json!(format);
+                                }
+                                if text(&input.source, "kind") == "text" {
+                                    let mut value = text(&input.source, "text").to_owned();
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::multiline(&mut value)
+                                                .desired_rows(3)
+                                                .desired_width(f32::INFINITY)
+                                                .font(egui::TextStyle::Monospace),
+                                        )
+                                        .changed()
+                                    {
+                                        input.source["text"] = json!(value);
+                                    }
+                                }
+                                if let Some(path) = &input.local_path {
+                                    ui.small(path);
+                                    ui.small(if input.needs_upload() {
+                                        "Uploads when you click Run"
+                                    } else {
+                                        "Immutable upload ready"
+                                    });
+                                } else if text(&input.source, "kind") == "library" {
+                                    ui.monospace(text(&input.source, "ref"));
+                                }
+                                for name in input.attachment_paths.keys() {
+                                    ui.small(format!("Attachment: {name}"));
+                                }
+                                ui.horizontal(|ui| {
+                                    if text(&input.source, "format") == "library-json"
+                                        && ui.button("Attach SDF…").clicked()
+                                    {
+                                        attachment = Some(input.id.clone());
+                                    }
+                                    if ui.button("Remove input").clicked() {
+                                        remove = Some(index);
+                                    }
+                                });
+                            });
+                    });
+                });
+            if scroll {
+                row.response.scroll_to_me(Some(egui::Align::Center));
+                if let Some((_, _, scroll)) = self.input_flash.as_mut() {
+                    *scroll = false;
+                }
+            }
+        }
+        if let Some((_, started, _)) = &self.input_flash {
+            if started.elapsed() < Duration::from_millis(2200) {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else {
+                self.input_flash = None;
+            }
         }
         if let Some(index) = remove {
             self.state.inputs.remove(index);
@@ -440,7 +634,7 @@ impl Workbench {
                 if ui
                     .add_enabled(
                         enabled || selected,
-                        egui::Checkbox::new(&mut selected, text(model, "name")),
+                        egui::Checkbox::new(&mut selected, model_name(model)),
                     )
                     .on_hover_text(if enabled {
                         text(model, "description")
@@ -459,9 +653,6 @@ impl Workbench {
                     self.settings_model = Some(id.into());
                 }
             });
-            if !enabled {
-                ui.weak(text(model, "disabled_reason"));
-            }
         }
         ui.horizontal(|ui| {
             ui.label("MSA");
@@ -472,11 +663,9 @@ impl Workbench {
                 &["public", "private"],
             );
         });
-        ui.small(if self.state.msa_backend == "public" {
-            "Protein queries use the configured public search service."
-        } else {
-            "Uses the configured private databases; availability is checked on the head."
-        });
+        if self.state.msa_backend == "public" {
+            ui.small("Protein queries use the configured public search service.");
+        }
         ui.horizontal(|ui| {
             ui.label("Execution");
             select(
@@ -487,33 +676,42 @@ impl Workbench {
             );
         });
         ui.separator();
-        let busy = self.busy(&Purpose::Preview) || self.preview_after_uploads;
-        if ui
-            .add_enabled(
-                !busy,
-                egui::Button::new(if busy {
-                    "Preparing preview…"
+        let preparing = self.run_pending();
+        let response = ui.add(
+            egui::Button::new(
+                // Reserve the leading icon area in this left-aligned sidebar.
+                RichText::new(if preparing {
+                    "    Run status"
                 } else {
-                    "Check compatibility (CPU)"
+                    "    Run"
                 })
-                .min_size(Vec2::new(ui.available_width(), 26.)),
+                .strong()
+                .size(16.)
+                .color(Color32::WHITE),
             )
-            .clicked()
-        {
-            self.begin_preview();
+            .fill(Color32::from_rgb(28, 116, 66))
+            .min_size(Vec2::new(ui.available_width(), 36.)),
+        );
+        // A drawn triangle uses the same native palette and works with every font.
+        let center = egui::pos2(response.rect.left() + 18., response.rect.center().y);
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                center + egui::vec2(-4., -6.),
+                center + egui::vec2(-4., 6.),
+                center + egui::vec2(6., 0.),
+            ],
+            Color32::WHITE,
+            egui::Stroke::NONE,
+        ));
+        if response.clicked() {
+            self.begin_run();
         }
-        if self.state.preview.is_some() {
-            ui.horizontal(|ui| {
-                if ui.button("Review preview").clicked() {
-                    self.preview_open = true;
-                }
-                if ui.button("New preview").clicked() {
-                    self.state.preview = None;
-                    self.begin_preview();
-                }
-            });
+        if !self.run_input_error.is_empty() {
+            ui.colored_label(RED, &self.run_input_error);
         }
-        ui.small("Preview runs native CPU validation. Only the selected compatible pairs are submitted in the review window.");
+        if self.state.run.is_some() && ui.small_button("Run status").clicked() {
+            self.preview_open = true;
+        }
         for pending in self
             .pending
             .values()
@@ -529,34 +727,80 @@ impl Workbench {
         }
         self.recovery_panel(ui);
     }
-    pub(super) fn preview_dialog(&mut self, ctx: &egui::Context) {
+    pub(super) fn run_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.preview_open;
-        egui::Window::new("Compatibility preview — select exact pairs").open(&mut open).default_size([780.,480.]).min_width(720.).show(ctx,|ui|{
-            let Some(preview)=self.state.preview.clone()else{ui.label("Create a preview from the Inputs panel.");return;};
-            ui.label(format!("{} · {}",text(&preview.snapshot,"name"),text(&preview.snapshot,"mode")));ui.small("Native CPU validation only; no inference has been launched by Preview.");
-            if preview.batch_id.is_empty(){ui.spinner();ui.label("Waiting for the durable preview receipt. A failed transport can be retried from Operations without creating a second preview.");return;}
-            let Some(batch)=self.batch.clone().filter(|batch|text(batch,"batch_id")==preview.batch_id)else{ui.label("Loading preview…");return;};
-            ui.horizontal(|ui|{ui.label(format!("State: {}",text(&batch,"state")));if ui.button("Select all compatible").clicked() && let Some(preview)=self.state.preview.as_mut(){preview.selected_pairs=rows(&batch,"pairs").iter().filter(|pair|text(pair,"state")=="compatible").map(|pair|text(pair,"pair_id").into()).collect();}
-if ui.button("Clear selection").clicked() && let Some(preview)=self.state.preview.as_mut(){preview.selected_pairs.clear();}});
-            egui::ScrollArea::both().max_height(300.).show(ui,|ui|{egui::Grid::new("preview-pairs").striped(true).num_columns(4).min_col_width(110.).show(ui,|ui|{
-                ui.strong("Submit");ui.strong("Input / model");ui.strong("Validation");ui.strong("Reason");ui.end_row();
-                for pair in rows(&batch,"pairs"){let id=text(pair,"pair_id");let compatible=text(pair,"state")=="compatible";let mut selected=self.state.preview.as_ref().is_some_and(|p|p.selected_pairs.contains(id));
-                    if ui.add_enabled(compatible,egui::Checkbox::without_text(&mut selected)).changed() && let Some(preview)=self.state.preview.as_mut(){if selected{preview.selected_pairs.insert(id.into());}else{preview.selected_pairs.remove(id);}}
-                    ui.label(format!("{} / {}",text(pair,"input_name"),text(pair,"model")));ui.colored_label(if compatible{GREEN}else{AMBER},text(pair,"state"));ui.label(rows(pair,"reasons").iter().map(|v|v.as_str().map(str::to_owned).unwrap_or_else(||v.to_string())).collect::<Vec<_>>().join("; "));ui.end_row();
+        egui::Window::new("Run status").open(&mut open).default_size([780.,480.]).min_width(620.).show(ctx, |ui| {
+            let Some(run) = self.state.run.clone() else {
+                ui.label("Paste or load inputs, select models, then click Run.");
+                return;
+            };
+            ui.heading(text(&run.request, "name"));
+            ui.small(format!("{} inputs · {} models · {} MSA", rows(&run.request,"inputs").len(), rows(&run.request,"models").len(), text(&run.request,"msa_backend")));
+            if run.batch_id.is_empty() {
+                ui.horizontal(|ui| {
+                    if self.run_pending() { ui.spinner(); }
+                    ui.strong(match run.stage.as_str() {
+                        "uploading" => "Uploading molecular inputs",
+                        "upload_failed" => "Preparation needs attention",
+                        "uncertain" => "Connection interrupted — recover the saved run",
+                        "rejected" => "Run request rejected",
+                        _ => "Waiting for the head to accept this run",
+                    });
+                });
+                for (index, upload) in run.uploads.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(if upload.complete { GREEN } else { AMBER }, if upload.complete { "Ready" } else { "Upload" });
+                        ui.label(PathBuf::from(&upload.path).file_name().unwrap_or_default().to_string_lossy());
+                    });
+                    if let Some(pending) = self.pending.values().find(|pending| pending.purpose == Purpose::Upload(UploadTarget::Run(run.id.clone(),index))) {
+                        if pending.total > 0 { ui.add(egui::ProgressBar::new(pending.done as f32 / pending.total as f32).show_percentage()); }
+                        else { ui.small("Preparing upload…"); }
+                    }
                 }
-            });});
-            for error in rows(&batch,"errors"){ui.colored_label(RED,error.as_str().map(str::to_owned).unwrap_or_else(||error.to_string()));}
-            let matches=self.state.preview_matches();if !matches{ui.colored_label(AMBER,"The draft changed after this preview. Create a new preview before submitting.");}
-            let count=self.state.preview.as_ref().map_or(0,|p|p.selected_pairs.len());
-            let can=matches&&text(&batch,"state")=="validated"&&count>0&&!self.busy(&Purpose::Commit);
-            if !preview.create_operation.is_empty(){
-                ui.colored_label(AMBER,"A submission request is already retained for this preview. Recover that exact request to resolve its outcome.");
-                if ui.add_enabled(!self.busy(&Purpose::Commit),egui::Button::new("Recover exact submission")).clicked(){self.retry(&preview.create_operation,Purpose::Commit,"batch.create".into());}
-            }else if ui.add_enabled(can,egui::Button::new(format!("Submit {count} selected model jobs"))).clicked(){
-                let selected=self.state.preview.as_ref().unwrap();let payload=json!({"batch_id":selected.batch_id,"request_key":uid(),"pair_ids":selected.selected_pairs});
-                if let Some(operation)=self.request("batch.create",payload.clone(),Purpose::Commit){if let Some(preview)=self.state.preview.as_mut(){preview.create_operation=operation;preview.create_payload=payload;}self.persist();}
-            }
-            ui.small("Submission may rent cloud compute. Retry an uncertain submission from Operations; its exact request key is retained.");
+                if !run.error.is_empty() { ui.colored_label(RED, &run.error); }
+                if !self.run_pending() && run.stage != "rejected" && ui.button(if !run.submission_attempted && run.operation.is_empty() { "Resume preparation" } else { "Recover exact run" }).clicked() {
+                    self.resume_run();
+                }
+                if run.stage == "rejected" { ui.small("Edit the inputs if needed, then click Run to start a new request."); }
+                if run.can_discard_preparation() && !self.run_pending()
+                    && ui.button("Discard failed preparation").clicked()
+                {
+                    self.state.run = None; self.run_after_uploads = false;
+                    self.log("Failed local preparation discarded. Edit the inputs and click Run when ready.");
+                }
+            } else if let Some(batch) = self.run_batch.clone().filter(|batch| text(batch,"batch_id") == run.batch_id) {
+                let state = text(&batch,"state");
+                ui.horizontal(|ui| {
+                    if !ui_state::terminal(state) { ui.spinner(); }
+                    ui.colored_label(if state == "complete" { GREEN } else if matches!(state,"failed"|"validation_failed") { RED } else { AMBER }, state);
+                    if ui.button("View in run history").clicked() {
+                        self.state.active_batch = run.batch_id.clone(); self.sidebar_tab = 1; self.ingest_batch(batch.clone());
+                    }
+                });
+                ui.small(&run.batch_id);
+                egui::ScrollArea::both().max_height(330.).show(ui, |ui| {
+                    egui::Grid::new("run-status-pairs").striped(true).num_columns(3).min_col_width(100.).show(ui, |ui| {
+                        ui.strong("Input / model"); ui.strong("Progress"); ui.strong("Details"); ui.end_row();
+                        for pair in rows(&batch,"pairs") {
+                            let job = rows(&batch,"jobs").iter().find(|job| text(job,"pair_id") == text(pair,"pair_id") && !text(pair,"pair_id").is_empty());
+                            let status = if job.is_none() && text(pair,"state") == "pending" && ui_state::terminal(state) { state } else { pair_status(pair, job) };
+                            ui.label(format!("{} / {}", text(pair,"input_name"), text(pair,"model")));
+                            ui.colored_label(if status == "complete" { GREEN } else if status == "failed" { RED } else { AMBER }, status);
+                            let mut details = rows(pair,"reasons").iter().map(|v| v.as_str().map(str::to_owned).unwrap_or_else(||v.to_string())).collect::<Vec<_>>();
+                            if let Some(job) = job {
+                                let progress = text(&job["progress"],"message");
+                                if !progress.is_empty() { details.push(progress.into()); }
+                                if job.pointer("/provenance/msa_applicable") == Some(&json!(false)) { details.push("MSA not applicable".into()); }
+                                for key in ["message","error"] { if let Some(value) = job.get(key).filter(|v| !v.is_null()) { details.push(value.get("message").and_then(Value::as_str).or_else(||value.as_str()).map(str::to_owned).unwrap_or_else(||value.to_string())); } } }
+                            ui.label(details.join("; ")); ui.end_row();
+                        }
+                    });
+                });
+                for error in rows(&batch,"errors") { ui.colored_label(RED, error.as_str().map(str::to_owned).unwrap_or_else(||error.to_string())); }
+                if let Some(error) = batch.get("error").filter(|v| !v.is_null()) { ui.colored_label(RED, error.get("message").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| error.to_string())); }
+            } else { ui.spinner(); ui.label("Loading run status…"); }
+            ui.separator();
+            ui.small("You can close this window. Accepted runs continue on the head; closing does not cancel them.");
         });
         self.preview_open = open;
     }
@@ -573,7 +817,7 @@ if ui.button("Clear selection").clicked() && let Some(preview)=self.state.previe
         };
         let mut open = true;
         let mut labels = false;
-        egui::Window::new(format!("{} settings",text(&model,"name"))).open(&mut open).default_width(520.).show(ctx,|ui|{
+        egui::Window::new(format!("{} settings",model_name(&model))).open(&mut open).default_width(520.).show(ctx,|ui|{
             ui.label(text(&model,"description"));ui.small("Unchecked options retain native defaults. Only catalog-approved settings are accepted.");
             let values=self.state.settings.entry(id.clone()).or_insert_with(||json!({}));if !values.is_object(){*values=json!({});}
             if let Some(specs)=model["settings"].as_object(){for(key,spec)in specs{
@@ -596,5 +840,27 @@ if ui.button("Clear selection").clicked() && let Some(preview)=self.state.previe
         if !open {
             self.settings_model = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    #[test]
+    fn run_status_keeps_incompatibility_visible_alongside_live_job_states() {
+        let rejected = json!({"state":"rejected","reasons":["Unsupported RNA"]});
+        assert_eq!(pair_status(&rejected, None), "Skipped (incompatible)");
+        let compatible = json!({"state":"compatible"});
+        for state in ["queued", "running", "complete", "failed", "cancelled"] {
+            let job = json!({"state":state});
+            assert_eq!(pair_status(&compatible, Some(&job)), state);
+        }
+        assert_eq!(pair_status(&json!({"state":"pending"}), None), "Validating");
+        assert_eq!(
+            model_name(
+                &json!({"id":"rfaa","name":"RoseTTAFold All-Atom (parked)","enabled":false})
+            ),
+            "RoseTTAFold All-Atom"
+        );
     }
 }

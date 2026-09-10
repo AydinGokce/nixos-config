@@ -131,14 +131,23 @@ impl Workbench {
             if let Some(error) = batch.get("error").filter(|v| !v.is_null()) {
                 ui.colored_label(RED, error.to_string());
             }
-            if text(&batch, "state") == "validated"
-                && self
+            if batch["auto_run"] == true && ui.button("Run status").clicked() {
+                if self
                     .state
-                    .preview
+                    .run
                     .as_ref()
-                    .is_some_and(|p| p.batch_id == text(&batch, "batch_id"))
-                && ui.button("Review compatibility & submit…").clicked()
-            {
+                    .is_none_or(|run| run.accepts_new_run())
+                {
+                    self.state.run = Some(ui_state::RunIntent {
+                        id: uid(),
+                        endpoint: self.run_endpoint(),
+                        request: batch.clone(),
+                        batch_id: text(&batch, "batch_id").into(),
+                        stage: text(&batch, "state").into(),
+                        ..Default::default()
+                    });
+                    self.run_batch = Some(batch.clone());
+                }
                 self.preview_open = true;
             }
             if !self.selected_artifacts.is_empty() {
@@ -403,6 +412,16 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
     }
     fn recover_failure(&mut self, id: &str, purpose: Purpose, label: String) {
         match purpose.clone() {
+            Purpose::Run(_) | Purpose::Upload(UploadTarget::Run(_, _)) => {
+                if let Some(op) = self.session.as_ref().and_then(|session| {
+                    session
+                        .retryable_operations()
+                        .into_iter()
+                        .find(|op| text(op, "id") == id)
+                }) {
+                    self.recover_operation(&op);
+                }
+            }
             Purpose::LibraryRuns(_) => self.library_runs_refresh(None),
             Purpose::LibraryHistory => {
                 self.request("library.history", json!({}), Purpose::LibraryHistory);
@@ -472,6 +491,36 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
         let id = text(op, "id").to_owned();
         let params = &op["params"];
         let purpose = match text(op, "method") {
+            "batch.run" => {
+                if self.state.run.as_ref().is_some_and(|run| {
+                    !run.accepts_new_run() && run.operation != id && run.request != *params
+                }) {
+                    self.log(
+                        "Resolve the current pending run before opening another saved run request.",
+                    );
+                    self.preview_open = true;
+                    return;
+                }
+                let run_id = self
+                    .state
+                    .run
+                    .as_ref()
+                    .filter(|run| run.operation == id || run.request == *params)
+                    .map_or_else(uid, |run| run.id.clone());
+                self.state.run = Some(ui_state::RunIntent {
+                    id: run_id.clone(),
+                    endpoint: text(op, "endpoint").into(),
+                    request: params.clone(),
+                    operation: id.clone(),
+                    submission_attempted: true,
+                    stage: "requesting".into(),
+                    ..Default::default()
+                });
+                self.run_batch = None;
+                self.preview_open = true;
+                self.persist();
+                Purpose::Run(run_id)
+            }
             "batch.validate" => {
                 let mut snapshot = params.clone();
                 snapshot.as_object_mut().map(|v| v.remove("request_key"));
@@ -480,7 +529,6 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                     operation: id.clone(),
                     ..Default::default()
                 });
-                self.preview_open = true;
                 Purpose::Preview
             }
             "batch.create" => Purpose::Commit,
@@ -496,6 +544,12 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
                 text(params, "text").into(),
             ),
             "local.upload" => {
+                if let Some(run) = &self.state.run
+                    && run.uploads.iter().any(|upload| upload.operation == id)
+                {
+                    self.resume_run();
+                    return;
+                }
                 let path = text(params, "path");
                 let target = self
                     .state

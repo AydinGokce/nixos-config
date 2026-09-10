@@ -89,6 +89,178 @@ pub struct Preview {
     pub create_operation: String,
     pub create_payload: Value,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RunUploadTarget {
+    Input(usize),
+    Attachment(usize, String),
+    Labels(String),
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RunUpload {
+    pub target: RunUploadTarget,
+    pub path: String,
+    pub operation: String,
+    pub complete: bool,
+}
+/// A Run click fixes its molecular inputs and settings before any asynchronous
+/// upload. Only immutable upload receipts may fill the captured request later.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunIntent {
+    pub id: String,
+    pub endpoint: String,
+    pub request: Value,
+    pub uploads: Vec<RunUpload>,
+    pub operation: String,
+    pub batch_id: String,
+    pub stage: String,
+    pub error: String,
+    pub submission_attempted: bool,
+}
+impl RunIntent {
+    pub fn capture(state: &UiState, endpoint: String) -> Result<Self, String> {
+        let mut request = state.payload_allow_uploads(true)?;
+        request["request_key"] = json!(uid());
+        let mut uploads = Vec::new();
+        let mut add = |target, path: &str| {
+            uploads.push(RunUpload {
+                target,
+                path: path.into(),
+                operation: String::new(),
+                complete: false,
+            })
+        };
+        for (index, input) in state.effective_inputs().iter().enumerate() {
+            if input.needs_upload() {
+                add(
+                    RunUploadTarget::Input(index),
+                    input.local_path.as_deref().unwrap(),
+                );
+            }
+            for (name, path) in &input.attachment_paths {
+                if input.source["attachments"][name]
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                {
+                    add(RunUploadTarget::Attachment(index, name.clone()), path);
+                }
+            }
+        }
+        if let Some(paths) = state.extra.get("label_paths").and_then(Value::as_object) {
+            for (model, path) in paths {
+                if state.models.contains(model)
+                    && request["settings"][model]["labels_upload_id"]
+                        .as_str()
+                        .is_none_or(str::is_empty)
+                    && let Some(path) = path.as_str()
+                {
+                    add(RunUploadTarget::Labels(model.clone()), path);
+                }
+            }
+        }
+        Ok(Self {
+            id: uid(),
+            endpoint,
+            request,
+            uploads,
+            stage: "uploading".into(),
+            ..Default::default()
+        })
+    }
+    pub fn accepts_new_run(&self) -> bool {
+        !self.batch_id.is_empty() || self.stage == "rejected"
+    }
+    pub fn can_discard_preparation(&self) -> bool {
+        !self.submission_attempted && self.operation.is_empty() && !self.error.is_empty()
+    }
+    pub fn accept_upload_for_draft(
+        &mut self,
+        index: usize,
+        receipt: &Value,
+        draft: &mut UiState,
+    ) -> Result<(), String> {
+        let upload = self
+            .uploads
+            .get(index)
+            .ok_or("Unknown captured upload.")?
+            .clone();
+        let before = match &upload.target {
+            RunUploadTarget::Input(index) | RunUploadTarget::Attachment(index, _) => {
+                self.request["inputs"][*index]["source"].clone()
+            }
+            RunUploadTarget::Labels(model) => self.request["settings"][model].clone(),
+        };
+        self.accept_upload(index, receipt)?;
+        match &upload.target {
+            RunUploadTarget::Input(index) | RunUploadTarget::Attachment(index, _) => {
+                let captured = &self.request["inputs"][*index];
+                if let Some(input) = draft
+                    .inputs
+                    .iter_mut()
+                    .find(|input| input.id == text(captured, "id") && input.source == before)
+                {
+                    let same_path = match &upload.target {
+                        RunUploadTarget::Input(_) => {
+                            input.local_path.as_deref() == Some(upload.path.as_str())
+                        }
+                        RunUploadTarget::Attachment(_, name) => {
+                            input.attachment_paths.get(name) == Some(&upload.path)
+                        }
+                        _ => false,
+                    };
+                    if same_path {
+                        input.source = captured["source"].clone();
+                    }
+                }
+            }
+            RunUploadTarget::Labels(model) => {
+                if draft.settings.get(model).unwrap_or(&Value::Null) == &before
+                    && draft
+                        .extra
+                        .get("label_paths")
+                        .and_then(|paths| paths.get(model))
+                        .and_then(Value::as_str)
+                        == Some(upload.path.as_str())
+                {
+                    draft
+                        .settings
+                        .insert(model.clone(), self.request["settings"][model].clone());
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn accept_upload(&mut self, index: usize, receipt: &Value) -> Result<(), String> {
+        let id = text(receipt, "upload_id");
+        if id.is_empty() {
+            return Err("Upload did not return a completed receipt.".into());
+        }
+        let upload = self
+            .uploads
+            .get_mut(index)
+            .ok_or("Unknown captured upload.")?;
+        match &upload.target {
+            RunUploadTarget::Input(index) => {
+                self.request["inputs"][*index]["source"]["upload_id"] = json!(id)
+            }
+            RunUploadTarget::Attachment(index, name) => {
+                let source = &mut self.request["inputs"][*index]["source"];
+                if !source["attachments"].is_object() {
+                    source["attachments"] = json!({});
+                }
+                source["attachments"][name] = json!(id);
+            }
+            RunUploadTarget::Labels(model) => {
+                if !self.request["settings"][model].is_object() {
+                    self.request["settings"][model] = json!({});
+                }
+                self.request["settings"][model]["labels_upload_id"] = json!(id);
+            }
+        }
+        upload.complete = true;
+        Ok(())
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
@@ -96,6 +268,7 @@ pub struct UiState {
     pub name: String,
     pub mode: String,
     pub msa_backend: String,
+    pub msa_default_version: u32,
     pub execution: String,
     pub editor: Editor,
     pub inputs: Vec<Input>,
@@ -103,6 +276,7 @@ pub struct UiState {
     pub settings: BTreeMap<String, Value>,
     pub active_batch: String,
     pub preview: Option<Preview>,
+    pub run: Option<RunIntent>,
     pub view_refs: Vec<Value>,
     pub dock_layout: Value,
     pub view_count: usize,
@@ -119,7 +293,8 @@ impl Default for UiState {
             schema: 1,
             name: String::new(),
             mode: "batch".into(),
-            msa_backend: "public".into(),
+            msa_backend: "private".into(),
+            msa_default_version: 1,
             execution: "auto".into(),
             editor: Editor::default(),
             inputs: Vec::new(),
@@ -127,6 +302,7 @@ impl Default for UiState {
             settings: BTreeMap::new(),
             active_batch: String::new(),
             preview: None,
+            run: None,
             view_refs: Vec::new(),
             dock_layout: Value::Null,
             view_count: 2,
@@ -141,6 +317,18 @@ impl Default for UiState {
 impl UiState {
     pub fn restore(value: &Value) -> Self {
         let mut value = value.clone();
+        // One upgrade switches the former public default, including existing
+        // drafts. Subsequent explicit public choices retain this version marker.
+        if value
+            .get("msa_default_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < 1
+            && value.is_object()
+        {
+            value["msa_backend"] = json!("private");
+            value["msa_default_version"] = json!(1);
+        }
         // Retain both editors from Electron, including inactive drafts.
         if value.pointer("/editor/paste").is_some() {
             let original = value["editor"].clone();
@@ -305,7 +493,11 @@ impl UiState {
             };
         }
     }
+    #[cfg(test)]
     pub fn payload(&self) -> Result<Value, String> {
+        self.payload_allow_uploads(false)
+    }
+    fn payload_allow_uploads(&self, allow_uploads: bool) -> Result<Value, String> {
         let inputs = self.effective_inputs();
         if inputs.is_empty() {
             return Err("Add a sequence, file, or library reference.".into());
@@ -317,9 +509,11 @@ impl UiState {
             return Err("Select at least one model from the head catalog.".into());
         }
         if inputs.iter().any(|input| {
-            text(&input.source, "kind") == "upload" && text(&input.source, "upload_id").is_empty()
+            text(&input.source, "kind") == "upload"
+                && text(&input.source, "upload_id").is_empty()
+                && !(allow_uploads && input.local_path.is_some())
         }) {
-            return Err("An input file is awaiting upload. Reload any file imported from a different head before previewing.".into());
+            return Err("An input file is awaiting upload. Reload any file imported from a different head before running.".into());
         }
         if self.mode == "assembly" {
             let chains: BTreeSet<_> = inputs.iter().map(|input| &input.chain_id).collect();
@@ -336,6 +530,7 @@ impl UiState {
             json!({"name":if self.name.trim().is_empty(){"Molecular run"}else{&self.name},"mode":self.mode,"inputs":inputs.iter().map(|input|input.wire(self.mode=="assembly")).collect::<Vec<_>>(),"models":self.models,"msa_backend":self.msa_backend,"execution":self.execution,"settings":settings}),
         )
     }
+    #[cfg(test)]
     pub fn preview_matches(&self) -> bool {
         self.preview.as_ref().is_some_and(|preview| {
             self.payload()
@@ -400,6 +595,150 @@ pub fn infer_file(path: &std::path::Path) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_msa_upgrade_runs_once_and_retains_later_explicit_public_choice() {
+        assert_eq!(UiState::default().msa_backend, "private");
+        let mut upgraded = UiState::restore(
+            &json!({"msa_backend":"public","name":"Existing draft","editor":{"text":"MAG"}}),
+        );
+        assert_eq!(upgraded.msa_backend, "private");
+        assert_eq!(upgraded.editor.text, "MAG");
+        assert_eq!(upgraded.name, "Existing draft");
+        upgraded.msa_backend = "public".into();
+        let restored = UiState::restore(&serde_json::to_value(upgraded).unwrap());
+        assert_eq!(restored.msa_backend, "public");
+        assert_eq!(restored.msa_default_version, 1);
+    }
+    #[test]
+    fn captured_run_survives_changed_draft_and_receipts_only_fill_saved_slots() {
+        let mut state = UiState::default();
+        state.models.insert("rf3".into());
+        state.editor.text = "MAG\n".into();
+        state.inputs.push(Input {
+            id: "file".into(),
+            name: "Original".into(),
+            molecule_type: "protein".into(),
+            source: json!({"kind":"upload","format":"fasta","upload_id":""}),
+            local_path: Some("/original.fasta".into()),
+            attachment_paths: BTreeMap::from([("ligand.sdf".into(), "/ligand.sdf".into())]),
+            ..Default::default()
+        });
+        state
+            .extra
+            .insert("label_paths".into(), json!({"rf3":"/labels.json"}));
+        let mut run = RunIntent::capture(&state, "head-one".into()).unwrap();
+        let mut expected = run.request.clone();
+        assert_eq!(run.uploads.len(), 3);
+        assert!(!run.accepts_new_run());
+        state.inputs.clear();
+        state.editor.text = "CHANGED".into();
+        state.models.clear();
+        state.msa_backend = "public".into();
+        for index in 0..3 {
+            run.accept_upload(index, &json!({"upload_id":format!("upload-{index}")}))
+                .unwrap();
+        }
+        expected["inputs"][0]["source"]["upload_id"] = json!("upload-0");
+        expected["inputs"][0]["source"]["attachments"] = json!({"ligand.sdf":"upload-1"});
+        expected["settings"]["rf3"] = json!({"labels_upload_id":"upload-2"});
+        assert_eq!(run.request, expected);
+        assert_eq!(run.request["inputs"][1]["source"]["text"], "MAG\n");
+        assert_eq!(run.request["msa_backend"], "private");
+        assert!(run.uploads.iter().all(|upload| upload.complete));
+        run.operation = "durable-operation".into();
+        state.run = Some(run.clone());
+        let restored = UiState::restore(&serde_json::to_value(state).unwrap());
+        assert_eq!(restored.run.unwrap().request, expected);
+        run.batch_id = "accepted-batch".into();
+        assert!(run.accepts_new_run());
+    }
+    #[test]
+    fn every_deliberate_run_has_a_new_key_but_incomplete_upload_cannot_be_ready() {
+        let mut state = UiState::default();
+        state.models.insert("rf3".into());
+        state.editor.text = "MAG".into();
+        let first = RunIntent::capture(&state, "head".into()).unwrap();
+        let second = RunIntent::capture(&state, "head".into()).unwrap();
+        assert_ne!(first.request["request_key"], second.request["request_key"]);
+        assert_ne!(first.id, second.id);
+        let mut run = first;
+        assert!(run.accept_upload(0, &json!({"state":"uploading"})).is_err());
+        run.stage = "uncertain".into();
+        assert!(!run.accepts_new_run());
+        run.stage = "rejected".into();
+        assert!(run.accepts_new_run());
+    }
+    #[test]
+    fn interrupted_submission_before_ui_operation_id_cannot_be_discarded() {
+        let mut run = RunIntent {
+            stage: "upload_failed".into(),
+            error: "File unavailable".into(),
+            ..Default::default()
+        };
+        assert!(run.can_discard_preparation());
+        run.submission_attempted = true;
+        let restored: RunIntent =
+            serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        assert!(restored.operation.is_empty());
+        assert!(!restored.can_discard_preparation());
+        assert!(!restored.accepts_new_run());
+    }
+    #[test]
+    fn upload_receipts_reuse_unchanged_draft_but_never_overwrite_changed_sources_or_paths() {
+        let mut state = UiState::default();
+        state.models.insert("rf3".into());
+        state.inputs.push(Input {
+            id: "file".into(),
+            source: json!({"kind":"upload","format":"fasta","upload_id":""}),
+            local_path: Some("/original.fasta".into()),
+            ..Default::default()
+        });
+        state
+            .extra
+            .insert("label_paths".into(), json!({"rf3":"/labels.json"}));
+        let original = state.clone();
+        let mut run = RunIntent::capture(&state, "head".into()).unwrap();
+        run.accept_upload_for_draft(0, &json!({"upload_id":"file-receipt"}), &mut state)
+            .unwrap();
+        run.accept_upload_for_draft(1, &json!({"upload_id":"label-receipt"}), &mut state)
+            .unwrap();
+        assert_eq!(state.inputs[0].source["upload_id"], "file-receipt");
+        assert_eq!(state.settings["rf3"]["labels_upload_id"], "label-receipt");
+        assert!(
+            RunIntent::capture(&state, "head".into())
+                .unwrap()
+                .uploads
+                .is_empty()
+        );
+        for change_path in [false, true] {
+            let mut changed = original.clone();
+            let mut run = RunIntent::capture(&changed, "head".into()).unwrap();
+            if change_path {
+                changed.inputs[0].local_path = Some("/replacement.fasta".into());
+            } else {
+                changed.inputs[0].source["format"] = json!("sequence");
+            }
+            changed.settings.insert("rf3".into(), json!({"seed":7}));
+            let expected = serde_json::to_value(&changed).unwrap();
+            run.accept_upload_for_draft(0, &json!({"upload_id":"original-file"}), &mut changed)
+                .unwrap();
+            run.accept_upload_for_draft(1, &json!({"upload_id":"original-labels"}), &mut changed)
+                .unwrap();
+            assert_eq!(serde_json::to_value(&changed).unwrap(), expected);
+            assert_eq!(
+                run.request["inputs"][0]["source"]["upload_id"],
+                "original-file"
+            );
+        }
+    }
+    #[test]
+    fn legacy_validation_is_retained_without_an_automatic_run_intent() {
+        let state = UiState::restore(
+            &json!({"preview":{"batch_id":"legacy-validated","operation":"old-validate","snapshot":{"msa_backend":"public"}}}),
+        );
+        assert!(state.run.is_none());
+        assert_eq!(state.preview.unwrap().batch_id, "legacy-validated");
+    }
     #[test]
     fn changing_heads_detaches_equal_named_refs_but_preserves_molecular_text_and_archive() {
         let mut state = UiState::default();

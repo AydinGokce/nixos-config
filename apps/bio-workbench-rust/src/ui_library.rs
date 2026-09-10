@@ -1244,7 +1244,6 @@ impl Workbench {
             let record = &detail["record"];
             self.library_detail_header(ui,&detail,ctx);
             if !self.library.write_error.is_empty() { ui.colored_label(RED,&self.library.write_error); }
-            self.library_edit_sequence(ui);
             let review = &record["identity"]["product_review"];
             if !text(review, "status").is_empty() {
                 let color = if text(review, "status") == "review_required" { AMBER } else { GREEN };
@@ -1256,7 +1255,9 @@ impl Workbench {
                     if ui.add_enabled(input.is_ok(), egui::Button::new(RichText::new("▶ Prepare prediction").strong().color(GREEN)).min_size(Vec2::new(180.,30.))).clicked()
                         && let Ok(input) = input.clone()
                     {
+                        let id = input.id.clone();
                         self.state.inputs.push(input);
+                        self.flash_input(&id);
                         self.sidebar_tab = 0;
                         self.library.added = format!("Added {} to the run composer.", text(&detail, "ref"));
                         self.log(self.library.added.clone());
@@ -1276,6 +1277,7 @@ impl Workbench {
             egui::ScrollArea::both().id_salt(("library-detail", self.library.selected.clone(), self.library.tab))
                 .auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
+                    self.library_edit_sequence(ui);
                     if self.library.tab==0 {self.library_run_controls(ui, &detail);}
                     match self.library.tab {
                         0 => self.library_purpose(ui, &detail, ctx),
@@ -1433,25 +1435,36 @@ impl Workbench {
         else {
             return;
         };
+        let (save, cancel) = Self::sequence_editor(ui, edit, writing);
+        if cancel {
+            self.library.edit = None;
+        } else if save {
+            self.library_save_edit();
+        }
+    }
+
+    fn sequence_editor(ui: &mut egui::Ui, edit: &mut Edit, writing: bool) -> (bool, bool) {
         let mut save = false;
         let mut cancel = false;
         egui::Frame::group(ui.style()).show(ui,|ui| {
             Self::section(ui,"EDIT SEQUENCE");
             ui.weak("Save creates a new revision. Previous annotations remain original source evidence, and existing runs retain their original input.");
             ui.weak("Enter the exact uppercase sequence without spaces or line breaks. Modified polymers require a compatible residue mapping.");
-            let response=ui.add_enabled(!writing,egui::TextEdit::multiline(&mut edit.value).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(7));
-            if edit.focus { response.request_focus();edit.focus=false; }
             ui.horizontal(|ui| {
                 save=ui.add_enabled(!writing && !edit.value.is_empty() && edit.value!=edit.original,egui::Button::new("Save sequence")).clicked();
                 cancel=ui.add_enabled(!writing,egui::Button::new("Cancel")).clicked();
                 ui.weak(format!("{} characters",edit.value.len()));
             });
+            egui::ScrollArea::vertical()
+                .id_salt(("edit-sequence-scroll", &edit.reference))
+                .max_height(220.)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let response=ui.add_enabled(!writing,egui::TextEdit::multiline(&mut edit.value).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(7));
+                    if edit.focus { response.request_focus();edit.focus=false; }
+                });
         });
-        if cancel {
-            self.library.edit = None;
-        } else if save {
-            self.library_save_edit();
-        }
+        (save, cancel)
     }
 
     fn library_purpose(&mut self, ui: &mut egui::Ui, detail: &Value, ctx: &egui::Context) {
@@ -2010,6 +2023,60 @@ fn inline_markdown(value: &str) -> egui::text::LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_sequence_editor_keeps_actions_above_bounded_text() {
+        let context = egui::Context::default();
+        let mut edit = Edit {
+            reference: "construct:large-plasmid@1".into(),
+            sha256: "digest".into(),
+            field: "sequence".into(),
+            value: "ATGC".repeat(4000),
+            original: "ATGC".into(),
+            focus: false,
+        };
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640., 420.),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let top = ui.cursor().top();
+                    assert_eq!(
+                        Workbench::sequence_editor(ui, &mut edit, false),
+                        (false, false)
+                    );
+                    assert!(
+                        ui.cursor().top() - top < 400.,
+                        "a large plasmid must not push the actions outside the details viewport"
+                    );
+                });
+            },
+        );
+        fn find(shape: &egui::Shape, label: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => Some(text.pos.y),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        for label in ["Save sequence", "Cancel"] {
+            let y = output
+                .shapes
+                .iter()
+                .find_map(|shape| find(&shape.shape, label))
+                .expect("sequence action is rendered");
+            assert!(
+                y < 180.,
+                "{label} remains above the independently scrolling text"
+            );
+        }
+        assert_eq!(edit.value.len(), 16000);
+    }
 
     #[test]
     fn refreshed_project_index_advances_navigation_only_within_the_same_family() {

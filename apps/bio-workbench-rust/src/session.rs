@@ -267,7 +267,8 @@ impl Session {
         let endpoint = self.connection.identity();
         if matches!(
             method,
-            "batch.validate"
+            "batch.run"
+                | "batch.validate"
                 | "batch.create"
                 | "library.edit"
                 | "library.undo"
@@ -303,7 +304,7 @@ impl Session {
                 if old.params != params {
                     return Err(RpcError::new(
                         "conflict",
-                        "This request key is already associated with a different payload. Start a new preview for a new intent.",
+                        "This request key is already associated with a different payload. Use a new request key for a new run intent.",
                     ));
                 }
                 let id = old.id.clone();
@@ -457,7 +458,7 @@ impl Session {
         let Ok(journal) = self.journal.lock() else {
             return Vec::new();
         };
-        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"batch.validate"|"batch.create"|"local.upload")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
+        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"batch.run"|"batch.validate"|"batch.create"|"local.upload")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
     }
     pub fn drain_events(&mut self) -> Vec<Event> {
         self.events.try_iter().map(|delivery| {
@@ -935,7 +936,7 @@ mod tests {
         fn call(&self, method: &str, p: Value) -> Result<Value, RpcError> {
             self.calls.lock().unwrap().push((method.into(), p.clone()));
             match method {
-                "batch.validate" | "batch.create" => {
+                "batch.run" | "batch.validate" | "batch.create" => {
                     if self.fail_first.swap(0, Ordering::SeqCst) > 0 {
                         Err(RpcError::new("ssh", "lost response").uncertain(true))
                     } else {
@@ -1068,6 +1069,73 @@ mod tests {
         session.retry(&id).unwrap();
         assert!(next_result(&mut session).1.is_ok());
         assert_eq!(mock.calls.lock().unwrap().len(), count);
+    }
+    #[test]
+    fn automatic_run_retry_keeps_exact_key_after_lost_reply_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(Mock::new());
+        mock.fail_first.store(1, Ordering::SeqCst);
+        let mut session = Session::open_internal(
+            egui::Context::default(),
+            dir.path().into(),
+            Some(mock.clone()),
+            false,
+        )
+        .unwrap();
+        let params = json!({"request_key":"stable-key","inputs":[{"source":{"text":"EXACT\n"}}]});
+        let id = session.request("batch.run", params.clone()).unwrap();
+        assert!(next_result(&mut session).1.unwrap_err().uncertain);
+        drop(session);
+        let mut session = Session::open_internal(
+            egui::Context::default(),
+            dir.path().into(),
+            Some(mock.clone()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+        assert_eq!(session.retryable_operations()[0]["params"], params);
+        assert_eq!(session.retry(&id).unwrap(), id);
+        assert!(next_result(&mut session).1.is_ok());
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, calls[1].1);
+        drop(calls);
+        let mut changed = params;
+        changed["inputs"] = json!([]);
+        assert_eq!(
+            session.request("batch.run", changed).unwrap_err().code,
+            "conflict"
+        );
+        let count = mock.calls.lock().unwrap().len();
+        session.retry(&id).unwrap();
+        assert!(next_result(&mut session).1.is_ok());
+        assert_eq!(mock.calls.lock().unwrap().len(), count);
+    }
+    #[test]
+    fn automatic_runs_use_fresh_keys_and_never_call_manual_submission_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(Mock::new());
+        let mut session = Session::open_internal(
+            egui::Context::default(),
+            dir.path().into(),
+            Some(mock.clone()),
+            false,
+        )
+        .unwrap();
+        let first = session.request("batch.run", json!({"request_key":"run-one","msa_backend":"private","inputs":[{"source":{"text":"MAG"}}]})).unwrap();
+        let second = session.request("batch.run", json!({"request_key":"run-two","msa_backend":"private","inputs":[{"source":{"text":"MAG"}}]})).unwrap();
+        assert_ne!(first, second);
+        assert!(next_result(&mut session).1.is_ok());
+        assert!(next_result(&mut session).1.is_ok());
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(method, _)| method == "batch.run"));
+        assert_ne!(calls[0].1["request_key"], calls[1].1["request_key"]);
+        drop(calls);
+        session.connection.host = "other-head".into();
+        assert!(session.retry(&first).is_err());
+        assert_eq!(mock.calls.lock().unwrap().len(), 2);
     }
     #[test]
     fn library_writes_keep_exact_payload_and_key_across_lost_reply_restart() {

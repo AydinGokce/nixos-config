@@ -1,5 +1,11 @@
 use super::*;
 impl Workbench {
+    pub(super) fn run_endpoint(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|session| session.connection.identity())
+            .unwrap_or_default()
+    }
     pub(super) fn busy(&self, purpose: &Purpose) -> bool {
         self.pending.values().any(|p| &p.purpose == purpose)
     }
@@ -79,11 +85,21 @@ impl Workbench {
                     );
                     self.failures.retain(|failure| failure.id != id);
                 }
-                Err(error) => self.log(error.to_string()),
+                Err(error) => {
+                    match &purpose {
+                        Purpose::Run(run_id) => self.run_error(run_id, &error.to_string(), true),
+                        Purpose::Upload(UploadTarget::Run(run_id, _)) => {
+                            self.run_error(run_id, &error.to_string(), false)
+                        }
+                        _ => {}
+                    }
+                    self.log(error.to_string());
+                }
             }
         }
     }
-    fn failure(&mut self, id: String, pending: Pending, message: String) {
+    fn failure(&mut self, id: String, pending: Pending, error: rpc::RpcError) {
+        let message = error.to_string();
         if let Purpose::Artifact(ArtifactTarget::View(slot)) = &pending.purpose {
             if !self.has_view(*slot)
                 || self.view_loading.get(slot) != Some(&format!("download:{id}"))
@@ -102,8 +118,12 @@ impl Workbench {
         if pending.purpose == Purpose::Catalog {
             self.connected = false;
         }
-        if matches!(pending.purpose, Purpose::Upload(_)) {
-            self.preview_after_uploads = false;
+        match &pending.purpose {
+            Purpose::Run(run_id) => self.run_error(run_id, &message, error.uncertain),
+            Purpose::Upload(UploadTarget::Run(run_id, _)) => {
+                self.run_error(run_id, &message, false)
+            }
+            _ => {}
         }
         self.failures.retain(|failure| failure.id != id);
         self.failures.push(Failure {
@@ -140,7 +160,7 @@ impl Workbench {
                     };
                     match result {
                         Ok(value) => self.received(id, pending.purpose, value, ctx),
-                        Err(error) => self.failure(id, pending, error.to_string()),
+                        Err(error) => self.failure(id, pending, error),
                     }
                 }
                 session::Event::Artifact {
@@ -220,15 +240,7 @@ impl Workbench {
                 self.navigate(&link, ctx);
             }
         }
-        if self.preview_after_uploads
-            && !self
-                .pending
-                .values()
-                .any(|pending| matches!(pending.purpose, Purpose::Upload(_)))
-        {
-            self.preview_after_uploads = false;
-            self.begin_preview();
-        }
+        self.continue_run();
         for event in self.pymol.poll() {
             self.log(event);
         }
@@ -255,6 +267,14 @@ impl Workbench {
             }
             Purpose::History => self.batches = rows(&value, "batches").to_vec(),
             Purpose::Batch(batch_id) => {
+                if self
+                    .state
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| run.batch_id == batch_id)
+                {
+                    self.run_batch = Some(value.clone());
+                }
                 if self.state.active_batch == batch_id {
                     self.ingest_batch(value);
                 }
@@ -270,13 +290,33 @@ impl Workbench {
                 {
                     preview.batch_id = text(&value, "batch_id").into();
                     self.state.active_batch = preview.batch_id.clone();
-                    self.preview_open = true;
                     self.ingest_batch(value);
+                    self.sidebar_tab = 1;
+                    self.log("Recovered a legacy validation receipt. Click Run from Inputs to start a new automatic run.");
+                }
+            }
+            Purpose::Run(run_id) => {
+                if let Some(run) = self
+                    .state
+                    .run
+                    .as_mut()
+                    .filter(|run| run.id == run_id && run.operation == id)
+                {
+                    if text(&value, "batch_id").is_empty() {
+                        self.run_error(&run_id, "The run response did not identify its batch. Recover the exact saved request.", true);
+                        return;
+                    }
+                    run.batch_id = text(&value, "batch_id").into();
+                    run.stage = text(&value, "state").into();
+                    run.error.clear();
+                    self.run_batch = Some(value.clone());
+                    self.ingest_batch(value);
+                    self.log("Run accepted. Compatible jobs queue automatically and continue on the head.");
+                    self.persist();
                 }
             }
             Purpose::Commit => {
                 self.ingest_batch(value);
-                self.preview_open = false;
                 self.sidebar_tab = 1;
                 self.log(
                     "Selected pairs submitted. Jobs remain on the head when this window closes.",
@@ -377,6 +417,18 @@ impl Workbench {
                 let id = self.state.active_batch.clone();
                 self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
             }
+            if let Some(run) = &self.state.run
+                && !run.batch_id.is_empty()
+                && run.batch_id != self.state.active_batch
+                && (self.preview_open
+                    || self
+                        .run_batch
+                        .as_ref()
+                        .is_none_or(|batch| !ui_state::terminal(text(batch, "state"))))
+            {
+                let id = run.batch_id.clone();
+                self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
+            }
             if !self.focused_job.is_empty() {
                 let id = self.focused_job.clone();
                 self.request(
@@ -462,12 +514,18 @@ impl Workbench {
             });ui.small("Leave key path empty for SSH agent authentication. Verify unknown host keys in SSH first.");
             if ui.add_enabled(!self.busy(&Purpose::Catalog),egui::Button::new("Save & connect")).clicked(){
                 if let Some(session)=self.session.as_mut(){let old_endpoint=session.connection.identity();let changed=session.connection.host!=self.connection.host||session.connection.user!=self.connection.user||session.connection.port!=self.connection.port;
-                    let mut next_state=self.state.clone();let detached=if changed { next_state.detach_library_sources(&old_endpoint) } else { 0 };
+                    let mut next_state=self.state.clone();let detached=if changed {
+                        if let Some(run) = next_state.run.take() {
+                            let archive = next_state.extra.entry("detached_run_intents".into()).or_insert_with(||json!([]));
+                            if let Some(archive) = archive.as_array_mut() { archive.push(serde_json::to_value(run).unwrap_or(Value::Null)); }
+                        }
+                        next_state.detach_library_sources(&old_endpoint)
+                    } else { 0 };
                     let saved=if changed { serde_json::to_value(&next_state).map_err(rpc::RpcError::from).and_then(|draft|session.save_connection_with_draft(self.connection.clone(),draft)) } else {session.save_connection(self.connection.clone())};match saved{
-                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
-                    if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before previewing."); }
+                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
+                    if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before running."); }
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
-                    self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before previewing.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),
+                    self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before running.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),
                 }}else{match session::Session::open(ctx.clone()){Ok(session)=>{self.session=Some(session);self.log("Local session reopened; save connection settings to connect.");},Err(error)=>self.log(error.to_string())}}
             }
             for failure in self.failures.iter().filter(|failure|failure.purpose==Purpose::Catalog).rev().take(1){ui.colored_label(RED,&failure.message);}

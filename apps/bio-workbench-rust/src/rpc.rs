@@ -37,6 +37,7 @@ const METHODS: &[&str] = &[
     "upload.chunk",
     "upload.get",
     "upload.finish",
+    "batch.run",
     "batch.validate",
     "batch.create",
     "batch.get",
@@ -324,6 +325,7 @@ pub fn mutating(method: &str) -> bool {
         "upload.begin"
             | "upload.chunk"
             | "upload.finish"
+            | "batch.run"
             | "batch.validate"
             | "batch.create"
             | "batch.cancel"

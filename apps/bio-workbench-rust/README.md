@@ -1,7 +1,7 @@
 # Bio Workbench — native desktop
 
-Bio Workbench is a Rust desktop client for the existing cloud head. It replaces
-Electron as the main `bio-workbench` application while retaining the compact
+Bio Workbench is the Rust desktop client for the existing cloud head. It provides
+the `bio-workbench` application with compact
 gray controls, black molecular viewports, object inspector, and console. The
 interface uses egui/eframe and native OpenGL; it has no browser or JavaScript
 runtime.
@@ -36,7 +36,7 @@ worker scheduling, and accounting continue to apply.
 ## Submit and follow work
 
 1. Paste a sequence, FASTA, ligand/assembly description, or other supported input
-   format. **The active editor is included in Preview even before clicking Add
+   format. **The active editor is included in Run even before clicking Add
    input.** Add input moves it into the list for composing larger batches. Paste
    and library-reference editors retain separate drafts.
 2. Use **Files…**, drag files into the window, or browse the head construct
@@ -48,21 +48,25 @@ worker scheduling, and accounting continue to apply.
    assembly chain IDs. Select models and settings from the live head catalog.
    Unchecked settings retain native defaults. The catalog includes folding,
    sequence analysis, variant ranking, sequence design, and backbone design;
-   parked models remain visibly unavailable.
-4. Choose the public/private MSA backend and execution preference, then **Check
-   compatibility (CPU)**. This calls native input validation without inference.
-   Every input/model pair appears with its result and rejection reason. Select
-   the compatible pairs explicitly, then submit the reviewed selection.
+   unavailable models remain disabled.
+4. Choose the MSA backend (default **private**) and execution preference, then
+   press the green **Run** button. Its status dialog follows uploads, native
+   compatibility checks, queueing and execution. The head automatically submits
+   every compatible input/model pair; incompatible entries remain visible with
+   their reasons and are skipped. There is no separate review or submission step.
 5. **Runs / results** follows real batch/job states, observed progress messages,
    queue information when supplied by the head, and native logs. It supports
    explicit job/batch cancellation and history navigation. Closing the desktop
    does not cancel work on the head.
 
-Preview and submission payloads are persisted before transmission. **Saved
-request receipts** and **Recover exact submission** recover the original
-operation and request key after a lost reply or restart. Recovery does not
-create another inference request. A changed input/settings draft requires a new
-compatibility preview. No prediction is automatically submitted on startup.
+Run payloads are persisted before transmission. Saved request receipts recover
+the original operation and key after a lost reply or restart. An accepted Run
+continues on the head even if the desktop closes during validation. Each later
+Run creates an independent batch, so existing jobs can continue in parallel.
+An uncertain request retains its exact key instead of silently launching a
+replacement. Legacy compatibility previews stay unsubmitted after upgrading.
+New and existing unversioned drafts receive the private MSA default once; later
+explicit public/private choices are retained.
 
 A file upload whose initial receipt was lost cannot safely reuse an unknown
 upload ID; the client retains the uncertain operation and explains when a new
@@ -121,15 +125,18 @@ soon as any parent is expanded. Derived proteins are indented under their DNA/RN
 parent; standalone proteins remain independent entries.
 
 **Sequence / identity** is a native vector viewer. Circular plasmids open as an
-annotated ring; **Auto** zoom changes to a linear map and then individual bases,
-complementary bases and one selectable translation track. **Circular**, **Linear** and
-**Fit** provide explicit controls. Scroll over the map to zoom, right-drag to pan
-the linear view, and left-drag to select a range. Click an annotation or detected
+annotated ring; **Auto** zoom magnifies and progressively straightens the visible
+arc into a linear map, then individual bases, complementary bases and one
+selectable translation track. **Circular** retains curved magnification;
+**Linear** and **Fit** provide explicit controls. Scroll over the map to move
+left/right in Linear or rotate in Circular. **Ctrl+scroll** zooms. Right-drag
+also pans, and left-drag selects a range. Click an annotation or detected
 ORF to inspect its strand and ranges. Imported annotations carry historical,
 fuzzy or unsupported-coordinate flags; the original attachments remain intact.
-Annotated plasmids initially show their annotation tracks. **ORFs** and **Find
-ORFs** expose the six-frame detector, with minimum-length and genetic-code
-controls. ORFs are candidates, not confirmation of expression or function.
+Annotated plasmids initially show their annotation tracks. **ORFs** exposes the
+six-frame detector, with minimum-length and genetic-code controls that update
+the scan automatically. ORFs are candidates, not confirmation of expression
+or function.
 
 **Create protein…** previews a selected ORF/range before creating a protein under
 its parent. The definition stores ordered nucleotide ranges, strand, genetic code,
@@ -137,6 +144,12 @@ codon start and an optional amino-acid crop; the protein sequence is computed by
 the head. UI positions are 1-based inclusive; the backend stores zero-based
 half-open coordinates and preserves biological traversal order across joins.
 For derived proteins, identity, aliases and provenance appear first in a dropdown.
+The plain numbered **Protein sequence** pane is expanded by default and can be
+collapsed. Its line numbers are a separate gutter; selecting across wrapped rows
+and copying yields only the selected contiguous amino acids, without numbers,
+spaces or newline characters. Copy sequence, Copy FASTA and edit/parent controls
+remain accessible while New variant is closed. The nucleotide editor scrolls
+inside the details pane, with a bounded text area and reachable Save/Cancel buttons.
 **New variant…** opens its form immediately below the button, followed by the
 CDS viewer and annotation selector. Selecting another annotated residue range
 immediately updates the form's crop and invalidates any older preview. The form
@@ -165,7 +178,8 @@ derived entry, and its sequence stays directly editable.
 
 **▶ Prepare prediction** adds the exact selected revision to the existing Inputs
 composer and opens it so you can select models and submit. It preserves current
-inputs and never validates or launches automatically. Whole plasmids and products
+inputs and briefly highlights the new entry in green, then fades to normal. It
+never validates or launches automatically. Whole plasmids and products
 requiring review are blocked with the head's reason. Protein **Run history** lists
 retained jobs explicitly submitted from that construct, with revision labels;
 select a result to open its structure in the molecular viewer.
@@ -257,9 +271,8 @@ locally and reauthorized against the head when opened again.
 On first launch, the client imports the previous Electron input draft and
 annotation documents, including
 `~/.config/bio-workbench-desktop/molecular-state.json`. The original files and
-unknown migration fields are retained. Existing Electron remains available
-through the separately packaged `bio-workbench-electron` rollback command;
-its state is not deleted by the native migration.
+unknown migration fields are retained. The Electron application has been removed;
+its saved molecular data remains readable through this one-time native import.
 
 **Launch in PyMOL** opens the selected pane's exact PDB/mmCIF bytes in a separate
 local process. Linux Nix packaging supplies a pinned PyMOL. Other installations
