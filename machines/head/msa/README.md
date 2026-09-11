@@ -9,7 +9,7 @@ The immutable candidate pins are ColabFold `c35de0221f4d297a39edf4cf292ba2832e32
 
 Run installation on a preparation worker with the dedicated database volume mounted read/write. The 16 GB head is unsuitable. The installer rejects less than 120 GiB **available** RAM; this is a minimum preflight, not a guarantee that every index fits. Managed installation, preparation and serving automatically select available FIN-02 x86 compute with at least 768 GiB RAM and an instance-price ceiling of $13/hour; spot offers are eligible. `--spot` restricts selection to spot offers, and `--worker TYPE` overrides automatic selection. The launch rechecks the price and project budget. Full API preparation also checks available RAM on the worker because upstream's much smaller batch-RAM guidance does not describe this API's complete `.idx`/mmap execution. A cold-disk, lower-RAM API deployment requires separate measurement without changing the search. Source archives total about 242 GB before extraction. Serial working allowances are conservative planning estimates, not measured final footprints; actual free-space checks stop before exhaustion and require additional storage rather than reduced datasets. [Official MSA server](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/README.md).
 
-Automatic worker selection waits up to **30 minutes** for qualifying capacity,
+Automatic worker selection waits up to **two hours** for qualifying capacity,
 rechecking regular and spot offers after each **30-second** pause. Provider query
 latency adds to the interval. `BIO_MSA_CAPACITY_WAIT_SECONDS` accepts 0–7200 seconds
 (0 checks once); `BIO_MSA_CAPACITY_POLL_SECONDS` accepts 1–300 seconds. For a shared
@@ -17,8 +17,20 @@ session, `bio-msa session start --capacity-wait-seconds N` or
 `bio-msa prepare --capacity-wait-seconds N ...` overrides the
 wait setting. Invalid evidence and API errors fail immediately. The Console shows
 the remaining retry window separately from an unknown availability ETA. Waiting
-does not rent compute or increase the paid worker lifetime; preparation's overall
-request timeout still includes startup and bounds its capacity wait.
+does not rent compute or increase the paid worker lifetime. Private preparation,
+RF3's preparation wrapper, and Console supervision allow this unpaid wait in
+addition to their work timeout. Native search time remains capped at the original
+request timeout, and allocation/warm-up still consume the remaining work budget
+after the capacity allowance. Public and non-MSA jobs keep their existing bounds.
+The two head preparation permits also allow this longer wait; their concurrency
+remains two, and a request can hold a permit while its shared MSA session starts.
+Already-started sessions retain their frozen policy, including a previous
+30-minute wait; the two-hour default applies to new session starts.
+
+RF3 preparation cache keys pin the complete frontend source. This orchestration
+update changes that source pin, so a new request can capture a fresh search once;
+older captured inputs remain retained, and subsequent requests under the updated
+source reuse the new cache entry. Search settings and database contents are unchanged.
 
 Managed shared sessions retain an immutable startup attempt and write an
 allocation marker before calling `dc launch`. A terminal failure with a verified

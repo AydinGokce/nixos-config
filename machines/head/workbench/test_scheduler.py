@@ -101,6 +101,32 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.restart().tick()['errors'], [])
         self.assertEqual(len(self.units.launched), 10)
 
+    def test_only_private_msa_job_supervision_includes_capacity_allowance(self):
+        jobs = self.jobs(3)
+        with self.store.transaction() as db:
+            for job, backend, applicable in zip(jobs, ['private', 'public', 'not_applicable'], [True, True, False]):
+                job['_prepared'].update(msa_backend=backend, msa_applicable=applicable)
+                self.store.put(db, 'job', job)
+        with patch.dict('os.environ', {'BIO_MSA_CAPACITY_WAIT_SECONDS': '7200'}):
+            self.assertEqual(self.daemon.tick()['errors'], [])
+        for job, expected in zip(jobs, [9060, 1860, 1860]):
+            command = read_json(self.store.directory('operations', job['job_id']) / 'systemd-command.json')['argv']
+            self.assertIn('--property=RuntimeMaxSec=' + str(expected), command)
+            self.assertEqual(self.store.read('job', job['job_id'])['_prepared']['timeout'], 60)
+            policy = [arg for arg in command if arg.startswith('--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=')]
+            self.assertEqual(policy, ['--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=7200'] if expected == 9060 else [])
+
+    def test_daemon_capacity_override_is_forwarded_to_owned_private_job(self):
+        job = self.jobs(1)[0]
+        job['_prepared'].update(msa_backend='private', msa_applicable=True)
+        with self.store.transaction() as db:
+            self.store.put(db, 'job', job)
+        with patch.dict('os.environ', {'BIO_MSA_CAPACITY_WAIT_SECONDS': '1800'}):
+            self.assertEqual(self.daemon.tick()['errors'], [])
+        command = read_json(self.store.directory('operations', job['job_id']) / 'systemd-command.json')['argv']
+        self.assertIn('--property=RuntimeMaxSec=3660', command)
+        self.assertIn('--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=1800', command)
+
     def test_receipt_window_releases_slot_and_restarts_exactly_once(self):
         jobs = self.jobs(12)
         self.daemon.tick()

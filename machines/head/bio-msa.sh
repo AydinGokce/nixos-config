@@ -51,10 +51,11 @@ Session start, installation and standalone serving select FIN-02 compute with at
 $13/hour instance-price ceiling, including spot capacity. --spot selects only
 spot offers; --worker TYPE overrides automatic selection. dc rechecks the quote
 and total project budget before launch. Conversion keeps its smaller CPU default.
-Automatic selection waits up to 30 minutes for capacity, with a 30-second pause
+Automatic selection waits up to two hours for capacity, with a 30-second pause
 between checks; no compute is rented while waiting. --capacity-wait-seconds on
-session start/prepare overrides the wait (0..7200; 0 checks once). The request's
-overall timeout still includes startup. Confirmed pre-allocation failures recover
+session start/prepare overrides the wait (0..7200; 0 checks once). Private preparation
+and Console supervision allow this unpaid wait in addition to the work timeout;
+native search limits and paid worker lifetimes stay unchanged. Confirmed pre-allocation failures recover
 on the next request; uncertain allocations retain their registration for review.
 Panel preparation keeps one private API worker for all manifest targets, runs
 them serially without inference, and records failures without dropping targets.

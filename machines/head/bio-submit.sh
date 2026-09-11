@@ -103,9 +103,16 @@ if [[ "$recipe" = protenix || "$recipe" = rf3 ]] && [ -n "$gpu" ]; then
   esac
 fi
 case "$msa_backend" in public|private) ;; *) echo 'bio-submit: --msa-backend must be public or private' >&2; exit 2;; esac
+private_capacity_allowance=0
+if [ "$msa_backend" = private ] && [ -z "$msa_bundle" ]; then
+  case "$recipe" in
+    openfold3|boltz2|protenix|rf3) private_capacity_allowance=$(python3 "$TOOLS_SRC/msa/capacity.py") ;;
+  esac
+fi
 head_preparation_acquire() {
   echo 'bio-submit: waiting for a head preparation slot (at most two preparations at once)'
-  coproc BIO_PREPARATION_GATE { python3 "$TOOLS_SRC/py/head_preparation_gate.py" --state "$STATE_DIR" --timeout "$seconds"; }
+  coproc BIO_PREPARATION_GATE { python3 "$TOOLS_SRC/py/head_preparation_gate.py" --state "$STATE_DIR" \
+    --timeout "$seconds" --capacity-wait-seconds "$private_capacity_allowance"; }
   preparation_gate_pid=$BIO_PREPARATION_GATE_PID
   preparation_gate_input=${BIO_PREPARATION_GATE[1]}
   if ! IFS= read -r preparation_ready <&"${BIO_PREPARATION_GATE[0]}" || [ "$preparation_ready" != ready ]; then
@@ -323,7 +330,12 @@ RF3CHECK
     [ -z "$library_sha" ] || rf3_cache_args+=(--chemistry-sha "$library_sha")
     [ -z "$library_ref" ] || rf3_cache_args+=(--library-reference "$library_ref")
     [ "$rf3_refresh_preparation" = 0 ] || rf3_cache_args+=(--refresh-preparation)
-    timeout --signal=TERM --kill-after=20 "$seconds" python3 "$TOOLS_SRC/inference/frontend.py" \
+    rf3_preparation_seconds="$seconds"
+    if [ "$private_capacity_allowance" -gt 0 ]; then
+      rf3_query_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$rf3_root/queries.json")
+      [ "$rf3_query_count" -eq 0 ] || rf3_preparation_seconds=$((seconds + private_capacity_allowance))
+    fi
+    timeout --signal=TERM --kill-after=20 "$rf3_preparation_seconds" python3 "$TOOLS_SRC/inference/frontend.py" \
       "${rf3_input_args[@]}" "${rf3_cache_args[@]}" > "$rf3_root/preparation-result.json"
     msa_bundle="$rf3_root/prepared"
     rf3_preparation_receipt="$rf3_root/prepared.preparation-cache.json"
@@ -724,7 +736,7 @@ if [ "$recipe" = msa ] && [ "$sub" != convert ] && [ -z "$gpu" ]; then
   msa_capacity_wait=$(python3 - <<'MSACAPACITY'
 import math, os, sys, time
 try:
-    wait = float(os.environ.get('BIO_MSA_CAPACITY_WAIT_SECONDS', '1800'))
+    wait = float(os.environ.get('BIO_MSA_CAPACITY_WAIT_SECONDS', '7200'))
     if not math.isfinite(wait) or not 0 <= wait <= 7200:
         raise ValueError('invalid capacity wait')
     deadline = os.environ.get('BIO_MSA_CAPACITY_DEADLINE_EPOCH')

@@ -31,10 +31,10 @@ class ClientTests(unittest.TestCase):
         state = Path(result["state"]); intent = session.load(state/"intent.json")
         self.assertEqual(intent["sources"], session.sources(state/"tools"))
         command = run.call_args.args[0]
-        self.assertIn("--property=RuntimeMaxSec=3300", command)
-        self.assertIn("--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=1800", command)
+        self.assertIn("--property=RuntimeMaxSec=8700", command)
+        self.assertIn("--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=7200", command)
         self.assertEqual(intent['timeout_seconds'], 300)
-        self.assertEqual(intent['capacity_wait_seconds'], 1800)
+        self.assertEqual(intent['capacity_wait_seconds'], 7200)
         self.assertIn("--setenv=DC_MAX_INSTANCE_HOURLY=13.0", command)
         self.assertEqual(command[-6:], [str(self.submit), "msa", "--sub", "session", "--timeout", "300"])
         self.tools.joinpath("msa/session.py").write_text("changed later")
@@ -67,6 +67,17 @@ class ClientTests(unittest.TestCase):
         self.assertIn('--property=RuntimeMaxSec=1620', command)
         self.assertIn('--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=120', command)
         self.assertEqual(command[-2:], ['--timeout', '300'])
+
+    def test_environment_capacity_override_preserves_paid_worker_timeout(self):
+        with mock.patch.dict(os.environ, BIO_MSA_CAPACITY_WAIT_SECONDS='1800'), \
+             mock.patch.object(client.shutil, 'which', return_value=str(self.submit)), \
+             mock.patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            result = client.start(self.args)
+        intent = session.load(Path(result['state']) / 'intent.json')
+        self.assertEqual(intent['capacity_wait_seconds'], 1800)
+        self.assertEqual(intent['timeout_seconds'], 300)
+        self.assertIn('--property=RuntimeMaxSec=3300', run.call_args.args[0])
+        self.assertEqual(run.call_args.args[0][-2:], ['--timeout', '300'])
 
     def test_invalid_capacity_window_fails_before_registering_or_starting(self):
         for value in (-1, 7201, True, float('nan'), 'not-a-number'):

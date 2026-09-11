@@ -13,6 +13,7 @@ import sys
 import time
 
 from . import inputs, progress as telemetry
+from msa.capacity import preparation_allowance
 from .common import (TERMINAL, Error, atomic, canonical, digest, file_sha, inventory,
                      no_links, now, parse, read_json, require, safe_file, uid, write_json)
 
@@ -519,7 +520,7 @@ def run_job(store, job_id, config):
                         'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'created_at': now()}, exclusive=True)
             sent_term = None; resident = None; resident_cancelled = False
             progress = JobProgress(log, msa_progress, worker_progress)
-            deadline = time.monotonic() + prepared['timeout'] + 1200
+            deadline = time.monotonic() + prepared['timeout'] + preparation_allowance(prepared) + 1200
             while process.poll() is None:
                 current = store.read('job', job_id)
                 cancelled = cancelled or current['state'] == 'cancel_requested'

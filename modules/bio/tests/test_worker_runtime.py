@@ -83,9 +83,10 @@ class PreparationGateTests(unittest.TestCase):
         self.processes = []
         self.addCleanup(self.stop)
 
-    def start(self, timeout=10):
+    def start(self, timeout=10, capacity_wait=0):
         process = subprocess.Popen([sys.executable, str(SOURCE / "head_preparation_gate.py"),
-            "--state", self.temporary.name, "--timeout", str(timeout)],
+            "--state", self.temporary.name, "--timeout", str(timeout),
+            '--capacity-wait-seconds', str(capacity_wait)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
         return process
@@ -125,6 +126,23 @@ class PreparationGateTests(unittest.TestCase):
         self.assertEqual(one.wait(timeout=5), 0)
         replacement = self.start()
         self.ready(replacement)
+
+    def test_capacity_allowance_keeps_third_private_request_waiting_without_extra_permits(self):
+        one, two = self.start(), self.start()
+        self.ready(one); self.ready(two)
+        third = self.start(timeout=0.1, capacity_wait=1)
+        self.assertFalse(select.select([third.stdout], [], [], 0.25)[0])
+        self.assertIsNone(third.poll())
+        one.stdin.close(); one.wait(timeout=5)
+        self.ready(third)
+        self.assertIsNone(two.poll())
+
+    def test_largest_native_timeout_can_add_bounded_capacity_allowance(self):
+        self.ready(self.start(timeout=85500, capacity_wait=7200))
+        for timeout, allowance in ((85501, 0), (85500, 7201), (1, -1)):
+            with self.subTest(timeout=timeout, allowance=allowance):
+                process = self.start(timeout=timeout, capacity_wait=allowance)
+                self.assertEqual(process.wait(timeout=5), 2)
 
     def test_bash_coprocess_permit_does_not_leak_to_a_surviving_native_child(self):
         first = self.start()

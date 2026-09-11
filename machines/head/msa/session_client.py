@@ -25,6 +25,7 @@ import uuid
 
 import session
 import lifecycle
+import capacity
 
 DEFAULT_ROOT = Path(os.environ.get("BIO_MSA_SESSIONS_ROOT", "/var/lib/dc/msa-sessions"))
 TOOLS = Path(os.environ.get("BIO_TOOLS_SRC", "/etc/bio-tools"))
@@ -247,15 +248,7 @@ def start(args):
 def _start_locked(args, deadline=None):
     session.finite(args.timeout, "session timeout", 120, 85500)
     session.finite(args.idle_seconds, "idle timeout", 60, 86400)
-    capacity_wait = getattr(args, 'capacity_wait_seconds', None)
-    if capacity_wait is None:
-        capacity_wait = os.environ.get('BIO_MSA_CAPACITY_WAIT_SECONDS', '1800')
-    if isinstance(capacity_wait, str):
-        require(re.fullmatch(r'[0-9]{1,6}', capacity_wait), 'Invalid capacity wait')
-        capacity_wait = int(capacity_wait)
-    capacity_wait = session.finite(capacity_wait, 'capacity wait', 0, 7200)
-    require(capacity_wait == int(capacity_wait), 'Capacity wait must be whole seconds')
-    capacity_wait = int(capacity_wait)
+    capacity_wait = capacity.wait_seconds(getattr(args, 'capacity_wait_seconds', None))
     root = args.root.absolute()
     require(not os.path.lexists(root/"active.json"), "A session registration exists; inspect/close it before another start")
     ident = uuid.uuid4().hex; state = root/ident; state.mkdir(mode=0o700)
@@ -285,8 +278,8 @@ def _start_locked(args, deadline=None):
                "--setenv=BIO_MSA_SESSION_IDLE_SECONDS="+str(args.idle_seconds),
                "--setenv=BIO_MSA_SESSION_WARM="+args.warm,
                "--setenv=DC_MAX_INSTANCE_HOURLY="+str(min(cap, 13)), *argv]
-    # Waiting consumes the caller's startup deadline, but never increases the
-    # paid worker reservation passed to bio-submit/dc.
+    # The caller's deadline includes a separate unpaid capacity allowance;
+    # it never increases the paid reservation passed to bio-submit/dc.
     command.insert(-len(argv), '--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS='+str(capacity_wait))
     if deadline is not None:
         capacity_deadline = time.time() + max(0, deadline-time.monotonic()-60)
@@ -479,7 +472,9 @@ def preparation_input(args):
 def prepare(args):
     lifecycle.validate_progress_log()
     name, molecular = preparation_input(args)
-    deadline = time.monotonic() + args.timeout
+    allowance = 0 if getattr(args, 'require_session', False) else capacity.wait_seconds(
+        getattr(args, 'capacity_wait_seconds', None))
+    deadline = time.monotonic() + args.timeout + allowance
     state, intent, launch, ready, digest = (ready_session(args.root, deadline=deadline) if getattr(args, 'require_session', False)
         else ensure_session(args, deadline))
     remaining = min(args.timeout, math.ceil(deadline - time.monotonic()))
@@ -601,9 +596,9 @@ def main(argv=None):
     p.add_argument("--instance"); p.add_argument("--ip"); p.add_argument("--worker"); p.add_argument("--spot", action="store_true")
     p.add_argument("--timeout", type=int, default=7200); p.add_argument("--idle-seconds", type=int, default=900)
     p.add_argument('--session-timeout', type=int, default=7200,
-                   help='Maximum lifetime for a newly started on-demand session; request timeout still includes startup')
+                   help='Runtime limit for a newly started on-demand worker session; capacity waiting is separate')
     p.add_argument('--capacity-wait-seconds', type=int,
-                   help='Wait for qualifying private MSA capacity (default BIO_MSA_CAPACITY_WAIT_SECONDS or 1800; 0 checks once)')
+                   help='Wait for qualifying private MSA capacity (default BIO_MSA_CAPACITY_WAIT_SECONDS or 7200 / two hours; 0 checks once)')
     p.add_argument('--require-session', action='store_true',
                    help='Preparation only: require an already-ready session and never start compute')
     p.add_argument("--warm", choices=["report", "prefetch", "lock"], default="prefetch")

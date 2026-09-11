@@ -758,6 +758,13 @@ print('resident boundary accepted')
 
     def test_rf3_search_cache_boundary_forwards_request_before_launch_and_retains_receipt(self):
         bundle=self.rf3_fixture()
+        timeout_command = shutil.which('timeout')
+        (self.root / 'bin/timeout').write_text('#!' + sys.executable + '\n' + '''import json,os,sys
+from pathlib import Path
+with (Path(os.environ['AUDIT'])/'timeout-calls.jsonl').open('a') as stream:
+    stream.write(json.dumps(sys.argv[1:])+'\\n')
+os.execv(''' + repr(timeout_command) + ', [' + repr(timeout_command) + ', *sys.argv[1:]])\n')
+        (self.root / 'bin/timeout').chmod(0o700)
         # The actual RF3 parser/cache/API boundary is exercised by test_rf3_preparation_cache.
         # Here a deterministic CPU boundary isolates shell routing and evidence transfer.
         (self.root/'tools/inference/frontend.py').write_text('''import json,os,pathlib,shutil,sys
@@ -785,6 +792,18 @@ print(json.dumps(receipt))
         job=next((self.root/'results').glob('rf3-*/job.json'))
         data=json.loads(job.read_text());receipt=job.parent/'rf3-preparation-cache.json'
         self.assertEqual(data['rf3_preparation']['sha256'],hashlib.sha256(receipt.read_bytes()).hexdigest())
+        calls = [json.loads(line) for line in (self.root / 'timeout-calls.jsonl').read_text().splitlines()]
+        outer = [call for call in calls if '--rf3-prepare-only' in call]
+        self.assertEqual(outer[-1][2], '7200')
+        result = self.submit('rf3', '--fasta', self.input, '--msa-backend', 'private', '--execution', 'ephemeral',
+                             RF3_FAKE_CAPTURED_BUNDLE=str(bundle), BIO_MSA_CAPACITY_WAIT_SECONDS='7200')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in (self.root / 'timeout-calls.jsonl').read_text().splitlines()]
+        outer = [call for call in calls if '--rf3-prepare-only' in call]
+        self.assertEqual(outer[-1][2], '14400')
+        args = json.loads((self.root / 'rf3-cache-argv.json').read_text())
+        self.assertEqual(args[args.index('--timeout') + 1], '7200')
+        self.assertTrue(all('--max-hours 2.25' in line for line in (self.root / 'launch-args').read_text().splitlines()))
 
     def test_rf3_failed_search_does_not_fall_back_or_rent(self):
         self.rf3_fixture()
@@ -972,8 +991,9 @@ sleep() { :; }
         self.assertIn('--image ubuntu-24.04-cuda-12.8-open-docker',args)
         self.assertEqual((self.root/'launch-price-caps').read_text().strip(),'9.0')
         self.assertIn('--spot-only',(self.root/'worker-selection-calls').read_text())
-        self.assertIn('--wait-seconds 1800.0 --poll-seconds 30',
+        self.assertIn('--wait-seconds 7200.0 --poll-seconds 30',
                       (self.root/'worker-selection-calls').read_text())
+        self.assertIn('--max-hours 2.25', args)
         choice=next((self.root/'results').glob('*/worker-choice.json'))
         self.assertFalse(json.loads(choice.read_text())['reserved'])
 
@@ -1049,6 +1069,29 @@ sleep() { :; }
         self.assertGreater(remaining, 80)
         self.assertLess(remaining, 100)
         self.assertIn('--max-hours 2.25', (self.root / 'launch-args').read_text())
+
+    def test_only_unprepared_private_folding_extends_head_permit_wait(self):
+        gate = self.root / 'tools/py/head_preparation_gate.py'
+        original_gate = gate.with_name('original_preparation_gate.py')
+        shutil.copy2(gate, original_gate)
+        gate.write_text('''import json,os,runpy,sys
+from pathlib import Path
+with (Path(os.environ['AUDIT'])/'gate-calls.jsonl').open('a') as stream:
+    stream.write(json.dumps(sys.argv[1:])+'\\n')
+runpy.run_path(''' + repr(str(original_gate)) + ", run_name='__main__')\n")
+        for backend, explicit, expected in [('public', False, '0'), ('private', False, '7200'), ('private', True, '0')]:
+            with self.subTest(backend=backend, explicit=explicit):
+                (self.root / 'gate-calls.jsonl').unlink(missing_ok=True)
+                arguments = ['--fasta', self.input, '--msa-backend', backend]
+                if explicit:
+                    arguments += ['--msa-bundle', self.valid_bundle()]
+                result = self.submit('boltz2', *arguments, BIO_MSA_CAPACITY_WAIT_SECONDS='7200')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in (self.root / 'gate-calls.jsonl').read_text().splitlines()]
+                self.assertTrue(calls)
+                for call in calls:
+                    self.assertEqual(call[call.index('--timeout') + 1], '7200')
+                    self.assertEqual(call[call.index('--capacity-wait-seconds') + 1], expected)
 
     def test_msa_convert_worker_failure_preserves_status_and_cleans_exact_worker(self):
         (self.msa_root / ".msa-databases.json").unlink()

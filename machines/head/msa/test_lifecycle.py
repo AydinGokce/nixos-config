@@ -406,6 +406,7 @@ class LifecycleTests(unittest.TestCase):
         start.assert_not_called()
 
     def test_startup_time_is_removed_from_search_timeout_and_success_emits_ready(self):
+        self.args.capacity_wait_seconds = 0
         state,intent,launch=self.registered()
         clock=[0.];sent=[]
         ready={'session_id':intent['session_id'],'created_epoch':1000,'deadline_epoch':10000,
@@ -432,6 +433,35 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sent[0]['deadline_epoch'],1300)
         self.assertEqual([c.args[0] for c in emit.call_args_list],['waiting','ready'])
         self.assertEqual(receipt['request_id'],sent[0]['request_id'])
+
+    def test_full_capacity_wait_allowance_preserves_native_search_limit(self):
+        state, intent, launch = self.registered()
+        clock = [0.]
+        ready = {'session_id': intent['session_id'], 'created_epoch': 1000, 'deadline_epoch': 20000,
+                 'tools': str(self.tools), 'state': '/tmp/fixture-session'}
+        sent = []
+        def ensure(args, deadline):
+            self.assertEqual(deadline, args.timeout + 7200)
+            clock[0] = 7200
+            return state, intent, launch, ready, 'd' * 64
+        def run(command, **kwargs):
+            if 'input' not in kwargs:
+                return subprocess.CompletedProcess(command, 0, b'', b'')
+            request = json.loads(kwargs['input']); sent.append(request)
+            bundle = Path(launch['remote_out']) / 'requests' / request['request_id'] / 'prepared'
+            session.atomic(bundle / 'search.json', {'fixture': True})
+            response = dict(status='complete', request_id=request['request_id'],
+                request_sha256=session.request_document(request, ready, 'd' * 64), ready_sha256='d' * 64,
+                bundle=str(bundle), bundle_manifest_sha256=session.sha(bundle / 'search.json'))
+            return subprocess.CompletedProcess(command, 0, session.canonical(response), b'')
+        with patch.object(client.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(client.time, 'time', side_effect=lambda: 1000 + clock[0]), \
+             patch.object(client, 'ensure_session', side_effect=ensure), \
+             patch.object(client, 'ssh', return_value=['fixture-ssh']), \
+             patch.object(client.subprocess, 'run', side_effect=run), patch.object(lifecycle, 'emit'):
+            client.prepare(self.args)
+        self.assertEqual(sent[0]['timeout_seconds'], self.args.timeout)
+        self.assertEqual(sent[0]['deadline_epoch'], 8500)
 
     def test_require_session_readiness_gets_the_same_absolute_deadline(self):
         self.args.require_session=True

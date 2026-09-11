@@ -43,11 +43,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--timeout", type=float, required=True)
+    parser.add_argument('--capacity-wait-seconds', type=int, default=0)
     args = parser.parse_args()
     if not 0 < args.timeout <= 85500:
         parser.error("timeout must be positive and at most 85500 seconds")
+    if not 0 <= args.capacity_wait_seconds <= 7200:
+        parser.error('capacity wait allowance must be 0..7200 seconds')
     try:
-        hold(args.state, args.timeout)
+        hold(args.state, args.timeout + args.capacity_wait_seconds)
     except (OSError, TimeoutError) as error:
         print(f"bio-submit: {error}", file=sys.stderr)
         raise SystemExit(2)

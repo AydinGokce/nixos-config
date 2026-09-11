@@ -9,6 +9,7 @@ import subprocess
 import sys
 
 from .common import canonical, file_sha, no_links, now, parse, read_json, require, write_json
+from msa.capacity import preparation_allowance
 
 
 def configuration(path=None):
@@ -66,6 +67,7 @@ class Daemon:
 
     def _start(self, kind, data):
         ident = data['batch_id' if kind == 'validation' else 'job_id']
+        capacity_allowance = 0 if kind == 'validation' else preparation_allowance(data['_prepared'])
         unit = 'bio-workbench-' + kind + '-' + ident + '.service'
         require(self.system(self.config, unit)['LoadState'] == 'not-found', 'Unit already exists without matching intent', 'conflict')
         folder = self.store.directory('operations', ident)
@@ -87,11 +89,16 @@ class Daemon:
                        (ident, kind, unit, 'intent', value, None, canonical(operation).decode(), now()))
             if kind == 'job':
                 current['state'] = 'starting'; self.store.put(db, object_kind, current)
-        seconds = min(36000, 650 * len(data['pairs']) + 120) if kind == 'validation' else data['_prepared']['timeout'] + 1800
+        seconds = (min(36000, 650 * len(data['pairs']) + 120) if kind == 'validation'
+                   else data['_prepared']['timeout'] + capacity_allowance + 1800)
         args = [self.config['systemd_run'], '--quiet', '--unit=' + unit, '--service-type=exec',
                 '--property=RemainAfterExit=yes', '--property=UMask=0077', '--property=TasksMax=4096',
                 '--property=RuntimeMaxSec=' + str(seconds), '--property=KillMode=' + ('control-group' if kind == 'validation' else 'mixed'),
                 '--property=TimeoutStopSec=' + ('20' if kind == 'validation' else '900')]
+        if kind == 'job' and data['_prepared'].get('msa_backend') == 'private' and data['_prepared'].get('msa_applicable'):
+            # Bind the same trusted policy in the owned unit, its runner, and
+            # the nested MSA caller even when systemd drops the daemon's env.
+            args += ['--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS=' + str(capacity_allowance)]
         if kind == 'validation':
             args += ['--property=MemoryMax=6G', '--property=MemorySwapMax=0', '--property=CPUQuota=200%', '--property=PrivateNetwork=yes']
         write_json(folder / 'systemd-command.json', {'argv': [*args, '--', *command]}, exclusive=True)

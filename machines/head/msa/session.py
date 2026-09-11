@@ -158,7 +158,7 @@ def sources(tools):
              "msa/databases.py", "recipes/_common.sh", "rf3/msa.py"]
     # Existing frozen sessions predate the head lifecycle helper. New snapshots
     # include and bind it without invalidating those immutable old tool trees.
-    for extra in ('msa/lifecycle.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'py/worker_progress.py'):
+    for extra in ('msa/lifecycle.py', 'msa/capacity.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'py/worker_progress.py'):
         if (tools / extra).exists(): names.append(extra)
     return {name: sha(tools/name) for name in names}
 

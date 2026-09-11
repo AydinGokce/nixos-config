@@ -1,5 +1,6 @@
 """Exercise RF3 pre-search replay with real parsers/cache and an offline API fixture."""
 from copy import deepcopy
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +155,57 @@ class RF3PreparationCacheTests(unittest.TestCase):
         self.assertEqual(self.calls[0][0],'bio-msa')
         self.assertFalse(list((self.args.shared/'inference/rf3-preparation-cache/entries').glob('*.json')))
         self.assertFalse(self.args.rf3_out.exists())
+
+    def test_private_capacity_allowance_extends_supervision_without_extending_search_timeout(self):
+        self.database(); self.args.backend = 'private'
+        clock = [1000.]
+        original = self.run_command
+        observations = []
+        def delayed_capacity(argv, **kwargs):
+            observations.append((list(argv), kwargs['timeout']))
+            result = original(argv, **kwargs)
+            if argv[0] == 'bio-msa':
+                clock[0] += 7200
+            return result
+        self.mock_run.side_effect = delayed_capacity
+        with patch.object(frontend, 'now', side_effect=lambda: clock[0]), \
+             patch.dict('os.environ', {'BIO_MSA_CAPACITY_WAIT_SECONDS': '7200'}):
+            first = self.next()
+        self.assertFalse(first['reused_preparation'])
+        command, outer_timeout = observations[0]
+        self.assertEqual(outer_timeout, 7260)
+        self.assertEqual(command[command.index('--timeout') + 1], '60')
+        self.assertEqual(command[command.index('--capacity-wait-seconds') + 1], '7200')
+        self.assertEqual(observations[1][1], 60)
+        self.mock_run.side_effect = AssertionError('A cached search must not wait for or start a session')
+        self.assertTrue(self.next()['reused_preparation'])
+
+    def test_private_cache_lock_wait_uses_capacity_allowance_before_native_work_budget(self):
+        self.database(); self.args.backend = 'private'
+        clock = [1000.]
+        @contextmanager
+        def busy_cache(*args):
+            clock[0] += 120
+            yield
+        with patch.object(frontend, 'rf3_search_lock', busy_cache), \
+             patch.object(frontend, 'now', side_effect=lambda: clock[0]), \
+             patch.dict('os.environ', {'BIO_MSA_CAPACITY_WAIT_SECONDS': '7200'}):
+            self.assertFalse(self.next()['reused_preparation'])
+        command = self.calls[0]
+        self.assertEqual(command[command.index('--timeout') + 1], '60')
+        self.assertEqual(command[command.index('--capacity-wait-seconds') + 1], '7080')
+
+    def test_public_and_nonprotein_preparation_keep_original_supervision_bound(self):
+        with patch.object(frontend, 'now', return_value=1000):
+            first = self.next()
+        request = read(Path(first['request_directory']) / 'request.json')
+        self.assertEqual(request['deadline_epoch'], 1060)
+        atomic_json(self.original, [{'name': 'ligand', 'components': [{'chain_id': 'L', 'smiles': 'CCO'}]}])
+        self.args.backend = 'private'
+        with patch.object(frontend, 'now', return_value=2000):
+            second = self.next()
+        request = read(Path(second['request_directory']) / 'request.json')
+        self.assertEqual(request['deadline_epoch'], 2060)
 
     def test_original_mutation_and_failed_search_never_publish(self):
         original=self.run_command

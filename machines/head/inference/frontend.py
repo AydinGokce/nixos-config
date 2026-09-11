@@ -31,6 +31,7 @@ from inference.cli import wait
 from inference.common import atomic_json, configuration_id, digest, inventory, now, read, sha256, verify_inventory
 from inference.job_queue import Queue
 from inference.pool import remote
+from msa.capacity import wait_seconds as capacity_wait_seconds
 
 
 class Unavailable(Exception):
@@ -448,8 +449,10 @@ def rf3_prepare_cached(args):
     """Replay a verified prepared search or capture one before any inference rental."""
     if args.model != 'rf3' or args.bundle or args.probe or not args.rf3_out:
         raise ValueError('RF3 preparation-only mode requires --rf3-out and no bundle/probe')
-    started, deadline = now(), now() + args.timeout
+    started = now()
     original, document, queries, identity = rf3_search_identity(args)
+    capacity_allowance = capacity_wait_seconds() if queries and args.backend == 'private' else 0
+    deadline = started + args.timeout + capacity_allowance
     output = _no_symlinks(args.rf3_out)
     receipt_path = output.with_name(output.name + '.preparation-cache.json')
     if output.exists() or receipt_path.exists() or receipt_path.is_symlink():
@@ -479,8 +482,12 @@ def rf3_prepare_cached(args):
                 if queries and args.backend == 'private':
                     # Preserve component/query order; canonical JSON sort_keys would change pairing order.
                     (work / 'queries.json').write_text(json.dumps(queries) + '\n')
+                    remaining = max(0, math.floor(deadline - now()))
+                    work_timeout = min(args.timeout, remaining)
+                    wait_allowance = min(capacity_allowance, max(0, remaining - work_timeout))
                     command(['bio-msa', 'prepare', '--model', 'rf3', '--json', str(work / 'queries.json'),
-                        '--timeout', str(max(1, math.ceil(deadline - now()))), '--bundle-result', str(work / 'search-result.json')], 'private-search')
+                        '--timeout', str(work_timeout), '--capacity-wait-seconds', str(wait_allowance),
+                        '--bundle-result', str(work / 'search-result.json')], 'private-search')
                     search_args = ['--search-bundle', rf3_modules()[0].read_json(work / 'search-result.json')['bundle']]
                 command([sys.executable, str(tools / 'rf3/msa.py'), 'prepare', *input_args, *search_args,
                          '--out', str(work / 'prepared'), '--name', args.rf3_name], 'prepare')
