@@ -128,6 +128,24 @@ Private progress files and mirrored job logs retain the evidence without changin
 RF3 preparation code or its cache key. See the protocol for emitter fields and
 the difference between startup time, stage time, and whole-job time.
 
+The dedicated BindCraft workflow accepts actor-owned PDB/mmCIF uploads or retained
+structure artifacts. It validates exact chain/crop/hotspot identities and queues
+through the same durable dispatcher with no review step. Its campaign seed and
+GPU-plus-OS spending cap are bound to the request; the per-run cap includes prior
+fallback attempts. Scientific defaults, native filters and existing global
+budget/cancellation machinery are preserved. Native stages and observed counts
+appear in normal job progress, while final candidate tables retain both accepted
+and rejected outcomes. Candidates can become standalone project proteins with
+structure/settings provenance and normal undo/redo.
+
+Original and submitted target structures are sealed before allocation. The
+`binder.context` endpoint supplies hash-bound residue correspondences for viewing
+cropped candidates against the full original target; it validates actual output
+residue identifiers instead of assuming numbering offsets. See `CONTRACT.md`
+for the RPC payloads, metric units and distinction between native filter counts
+and experimental binding evidence. CPU-only tests use temporary stores and fake
+owned systemd units, never cloud allocations.
+
 Useful operator commands:
 
 ```sh

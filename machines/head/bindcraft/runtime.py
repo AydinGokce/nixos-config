@@ -162,6 +162,13 @@ def run(bundle, shared, out):
                    "--settings", str(out / "effective-settings.json"),
                    "--advanced", str(out / "effective-advanced.json"),
                    "--filters", str(out / "input/filters.json")]
+        execution_path = out / 'input/execution.json'
+        if execution_path.is_file():
+            result['execution'] = read_json(execution_path.read_bytes())
+            result['seed_scope'] = 'Python/NumPy campaign RNG; native trajectory seeds retained in CSV; no bitwise reproducibility guarantee'
+            command = [str(root / 'env/bin/python'), '-u', str(HERE / 'native_entry.py'),
+                       '--source', str(source / 'bindcraft.py'), '--seed', str(result['execution']['seed']),
+                       *command[3:]]
         result["command"] = command
         process = subprocess.run(command, cwd=source, env=environment(root), check=False)
         result["exit_code"] = process.returncode

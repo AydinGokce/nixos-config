@@ -70,7 +70,15 @@ Results live in `/var/lib/bio-runs/bindcraft-DATE-TIME-PID` on the head and in
 the matching shared run directory. `bindcraft-result.json` distinguishes run
 completion from the count of accepted designs. PDBs, sequence/score CSVs,
 effective settings and logs remain available even when no design passes the
-filters. Existing console/Slack folding forms do not submit BindCraft jobs.
+filters. The Console has a dedicated binder-design workflow; ordinary folding
+forms remain separate. Head RPCs validate uploaded/retained structures, preserve
+crop/hotspot residue maps, and submit through the same managed launcher.
+
+`prepare --seed N` adds a hashed campaign RNG seed without changing native
+scientific settings or filters. `submit --max-cost-usd N` caps the freshly quoted
+GPU plus disposable OS reservation. The Console additionally keeps fallback
+attempts within one durable per-run cost scope. Native trajectory seeds, accepted
+and rejected candidates, and exact target/settings provenance remain in outputs.
 
 ## Installation and qualification
 

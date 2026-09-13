@@ -188,7 +188,7 @@ fn focus_tab(dock: &mut DockState<usize>, slot: usize) -> bool {
     }
 }
 
-fn move_to_split(dock: &mut DockState<usize>, slot: usize, direction: Split) -> bool {
+pub(super) fn move_to_split(dock: &mut DockState<usize>, slot: usize, direction: Split) -> bool {
     let Some(location @ (surface, node, _)) = dock.find_tab(&slot) else {
         return false;
     };
@@ -459,6 +459,16 @@ impl TabViewer for StructureTabs<'_> {
             ))
             .truncate(),
         );
+        ui.horizontal(|ui| {
+            ui.toggle_value(&mut view.hotspots.enabled, "Pick hotspots")
+                .on_hover_text("Click protein residues in the structure or sequence to toggle hotspots. Ctrl/Cmd-click also toggles; Shift-click the sequence selects a range. Drag still rotates.");
+            ui.small(format!("{} selected", view.hotspots.residues.len()));
+            if !view.hotspots.residues.is_empty() && ui.small_button("Clear hotspots").clicked() {
+                view.hotspots.residues.clear();
+                view.hotspots.anchor = None;
+            }
+        });
+        let mut sequence_pick = None;
         egui::ScrollArea::horizontal()
             .id_salt(("sequence", *slot))
             .max_height(22.)
@@ -469,6 +479,7 @@ impl TabViewer for StructureTabs<'_> {
                             continue;
                         }
                         let selected = view.selected.as_ref() == Some(&residue.key);
+                        let hotspot = view.hotspots.residues.contains(&residue.key);
                         if ui
                             .add(
                                 egui::Button::new(
@@ -476,6 +487,11 @@ impl TabViewer for StructureTabs<'_> {
                                         .monospace()
                                         .color(view.molecule.chains[residue.chain].color),
                                 )
+                                .fill(if hotspot {
+                                    Color32::from_rgb(145, 66, 31)
+                                } else {
+                                    ui.visuals().widgets.inactive.bg_fill
+                                })
                                 .min_size(Vec2::new(9., 17.))
                                 .selected(selected),
                             )
@@ -483,12 +499,22 @@ impl TabViewer for StructureTabs<'_> {
                             .clicked()
                         {
                             view.selected = Some(residue.key.clone());
+                            sequence_pick =
+                                Some((residue.key.clone(), ui.input(|input| input.modifiers)));
                             *self.selected = *slot;
                             self.focus = Some(*slot);
                         }
                     }
                 });
             });
+        if let Some((key, modifiers)) = sequence_pick {
+            view.hotspots.pick(
+                &view.molecule,
+                &key,
+                modifiers.ctrl || modifiers.command,
+                modifiers.shift && (view.hotspots.enabled || modifiers.ctrl || modifiers.command),
+            );
+        }
         let before = view.selected.clone();
         let changed = scene::viewport(
             ui,
@@ -498,6 +524,7 @@ impl TabViewer for StructureTabs<'_> {
             view.style,
             *slot,
             &mut view.selected,
+            &mut view.hotspots,
             view.visible,
             view.labels,
             self.show_axes,

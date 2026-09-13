@@ -468,6 +468,107 @@ The server verifies the sealed artifact before serving. The local proxy's
 `GET /api/v1/artifacts/{artifact_id}` uses these chunks and verifies the final
 SHA-256 before serving its cached download.
 
+## Binder design
+
+`catalog.workflows.bindcraft` advertises the dedicated workflow; it is not a
+folding-model checkbox. `binder.catalog {}` returns `schema:1`, `enabled`,
+`runtime_ready`, `runtime_status`, `defaults`, `limits`, `formats`,
+`msa_required:false`, `license_scope`, and descriptions of count/cost scope.
+Readiness here is an installation receipt observation; asynchronous submission
+performs complete native installation and input integrity checks before rental.
+Defaults are lengths `[65,150]`, `designs:100`, `timeout_seconds:7200`,
+`max_cost_usd:10.0`, and `seed:null` (upstream random campaign state).
+
+A Target is `{kind:"upload"|"artifact",id,sha256,source_ref?,project_ref?}`.
+Sources must be complete, owned by the trusted actor, and match the exact hash.
+Optional library references must be exact pinned revisions; their existence and
+record hashes are verified and retained as user-selected context. They do not
+silently assert that an uploaded structure was produced from that construct.
+A Residue is `{chain,number,insertion_code}`; blank original chain `""` and
+insertion code `""` are valid. Never substitute a viewer's array index for the
+original residue identifier.
+
+`binder.inspect {target:Target}` returns `{schema:1,target,target_name,format,
+chains:[{chain,residue_count,sequence,supported,residues:[{chain,number,
+insertion_code,name,amino_acid,position,supported,issues}]}],warnings,context}`.
+The strict PDB/mmCIF parser preserves author identities. Unsupported chemistry
+and incomplete backbone atoms are explicit; ambiguous models/conformers reject.
+
+`binder.run {request_key,name,target,chains:[string],hotspots?:[Residue],
+crop?:[Residue],lengths?,designs?,timeout_seconds?,max_cost_usd?,seed?}` immediately
+returns the ordinary durable auto-run batch envelope with `workflow:"bindcraft"`
+and `model:"bindcraft"`. No review/commit request follows. Missing crop means
+all selected chains; an explicit crop is an exact nonempty residue selection.
+Every selected residue requires canonical protein chemistry and N/CA/C/O atoms.
+Disjoint crop segments and true chain breaks become separate submitted fragments.
+The original-to-submitted map and selected hotspot correspondence are immutable.
+All native scientific defaults and production filters remain unchanged.
+`designs` is an accepted-design goal, not an attempt limit. The campaign seed
+controls Python/NumPy random state; native trajectory seeds remain in CSVs and
+bitwise GPU/Rosetta reproducibility is not claimed.
+
+The existing dispatcher owns validation, queueing, logs, cancellation and exact
+unit/receipt recovery. Use `batch.get`, `job.get`, `job.logs`, `job.cancel` and
+`batch.cancel`. Native stdout adds `job.progress.binder` observational counters:
+`attempts_started`, `trajectories_completed`, `candidates_accepted`,
+`candidates_rejected`, `current_trajectory`, `log_caught_up`, `counts_scope`.
+Exact base-AF2-screen and final-filter rejection messages contribute to the
+deduplicated rejected count; `rejection_screens` records their observed classes.
+Terminal jobs preserve these observations with the sealed native log artifact
+and SHA-256 in `provenance.binder_observations`. These counts can include screened
+candidates that upstream does not retain as complete CSV/structure rows.
+Counts can become `state:"unavailable"` when the log cannot support them. They
+never control execution or replace final native tables. No percentage is invented.
+Periodic worker inference heartbeats preserve the last observed native BindCraft
+substage only within the same active stage identity and with fresh telemetry.
+Stage transitions, completion/failure, stale heartbeats or unavailable log
+evidence suppress that retained substage.
+
+`max_cost_usd` bounds the freshly quoted GPU plus disposable OS reservation for
+the requested runtime plus the launcher's existing 900-second allowance. Earlier
+paid fallback attempts share one durable cost scope and consume the same cap.
+The exact quote, scope and cap enter the managed ledger before allocation; a
+later attempt cannot raise the original scoped cap. Shared head/storage costs
+remain covered by the separate authorized project budget. Provider teardown
+remains governed by the existing managed watchdog and cleanup machinery.
+
+`binder.candidates {job_id,limit?:100,cursor?}` returns `{schema:1,job_id,state,
+candidates,next_cursor,summary,warnings}`. Each candidate has `candidate_id`,
+`name`, `status` (`trajectory`, `accepted`, `rejected`, or `unclassified` when
+native acceptance evidence is missing), `sequence`, `sequence_sha256`, `length`,
+`seed`, `metrics`, `native_metrics`, `structure_artifacts`, and `provenance`.
+Normalized metric keys are `plddt`, `iptm`, `pae`, `interface_pae`, `rosetta_dg`,
+`interface_hbonds`, `interface_unsatisfied_hbonds`, `interface_sasa`, and
+`binder_rmsd`; missing/nonfinite values are null. `summary.filter_failures` is
+run-level native failure counts, not a guessed explanation for each candidate.
+Candidates appear after managed result transfer and archival. Every native CSV,
+PDB and log remains downloadable through the standard artifact RPCs.
+
+`binder.context {job_id,artifact_id?}` returns original/submitted structure
+receipts, `output_structure_artifact`, `target`, `target_context`, `residue_map`,
+ordered `submitted_chains:[{chain,sequence,residue_count}]`, and
+`output_mapping:{status:"available"|"unavailable",pairs:[{original,submitted,
+output}],reason?,artifact_id?,sha256?}`. Inputs are archived with role
+`target_structure` before allocation. For an available output map, the requested
+actor-owned output artifact SHA is verified, its native input manifest matches,
+and its actual target-chain sequence/order matches the submitted chain order.
+Pinned ColabDesign concatenates target chains into output A and writes binder B;
+output residue numbers can retain gaps and are read from the actual PDB.
+The viewer must bind both structure hashes and use these explicit residue pairs;
+it must not invent offsets or fall back to positional alignment on failure.
+Oversized mapping responses fail clearly; the complete map is also retained in
+the downloadable `binder-provenance.json` input artifact.
+
+`binder.save {job_id,candidate_id,project_ref,expected_sha256,request_key,
+alt_name?}` returns the ordinary library operation envelope. `expected_sha256`
+is the current PROJECT record hash. The backend derives the protein sequence
+from the sealed candidate CSV, checks it against output chain B, validates the
+output target mapping, and attaches the predicted complex, submitted target,
+description and complete settings/target/hotspot/mapping provenance. The write
+is idempotent, revision-preserving, and supports existing library undo/redo.
+Named hotspot patches are initially frontend-session state keyed by the exact
+original structure SHA; reusing a name never authorizes applying it to new bytes.
+
 ## Shared annotations
 
 `annotation.put {artifact_id,annotation_id?,expected_revision?,text,selection?}`

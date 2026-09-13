@@ -144,6 +144,7 @@ impl Workbench {
         self.library_failed(&pending.purpose, &message);
         self.library_runs_failed(&pending.purpose, &message);
         self.worker_failed(&pending.purpose, &message);
+        self.binder_failed(&pending.purpose, &message, error.uncertain);
         self.log(format!("{}: {message}", pending.label));
         if pending.purpose == Purpose::Catalog {
             self.connected = false;
@@ -256,7 +257,15 @@ impl Workbench {
                     metadata,
                     bytes,
                     molecule,
-                } => self.accept_molecule(slot, metadata, bytes, molecule),
+                } => {
+                    self.accept_molecule(slot, metadata, bytes, molecule);
+                    if self.binder.pending_view == Some(slot) {
+                        self.binder.pending_view = None;
+                        let source = self.binder.pending_source_ref.take();
+                        self.focus_view(slot);
+                        self.binder_activate_target(source);
+                    }
+                }
                 UiEvent::Text(name, value) => self.text_preview = Some((name, value)),
                 UiEvent::Exported(result) => match result {
                     Ok(path) => self.log(format!("Exported {}", path.display())),
@@ -271,12 +280,14 @@ impl Workbench {
             }
         }
         self.continue_run();
+        self.binder_finish_context();
         for event in self.pymol.poll() {
             self.log(event);
         }
     }
     fn received(&mut self, id: String, purpose: Purpose, value: Value, ctx: &egui::Context) {
         match purpose {
+            Purpose::Binder(request) => self.binder_received(request, value, ctx),
             Purpose::Catalog => {
                 self.catalog = value;
                 self.connected = true;
@@ -284,6 +295,11 @@ impl Workbench {
                 self.worker_refresh();
                 self.worker_refresh_capacity(false);
                 self.log("Connected; loaded the head model catalog.");
+                self.request(
+                    "binder.catalog",
+                    json!({}),
+                    Purpose::Binder(ui_binder::Request::Catalog),
+                );
                 if self.state.models.is_empty() {
                     for model in rows(&self.catalog, "models") {
                         if model["enabled"] == true && text(model, "workflow") == "folding" {
@@ -457,6 +473,7 @@ impl Workbench {
             self.last_poll = Instant::now();
             self.poll_job_tabs();
             self.library_runs_poll();
+            self.binder_poll();
             if !self.state.active_batch.is_empty() {
                 let id = self.state.active_batch.clone();
                 self.request("batch.get", json!({"batch_id":id}), Purpose::Batch(id));
@@ -488,6 +505,10 @@ impl Workbench {
         }
     }
     pub(super) fn persist(&mut self) {
+        self.binder_sync_selection();
+        self.state
+            .extra
+            .insert("binder_design".into(), json!(self.binder.draft));
         self.capture_views();
         self.state
             .extra
@@ -559,6 +580,9 @@ impl Workbench {
             if ui.add_enabled(!self.busy(&Purpose::Catalog),egui::Button::new("Save & connect")).clicked(){
                 if let Some(session)=self.session.as_mut(){let old_endpoint=session.connection.identity();let changed=session.connection.host!=self.connection.host||session.connection.user!=self.connection.user||session.connection.port!=self.connection.port;
                     let mut next_state=self.state.clone();let detached=if changed {
+                        let archive=next_state.extra.entry("detached_binder_drafts".into()).or_insert_with(||json!([]));
+                        if let Some(archive)=archive.as_array_mut(){archive.push(json!({"endpoint":old_endpoint,"draft":self.binder.draft}));}
+                        next_state.extra.insert("binder_design".into(),json!(binder_state::Draft::default()));
                         if let Some(run) = next_state.run.take() {
                             let archive = next_state.extra.entry("detached_run_intents".into()).or_insert_with(||json!([]));
                             if let Some(archive) = archive.as_array_mut() { archive.push(serde_json::to_value(run).unwrap_or(Value::Null)); }
@@ -566,7 +590,7 @@ impl Workbench {
                         next_state.detach_library_sources(&old_endpoint)
                     } else { 0 };
                     let saved=if changed { serde_json::to_value(&next_state).map_err(rpc::RpcError::from).and_then(|draft|session.save_connection_with_draft(self.connection.clone(),draft)) } else {session.save_connection(self.connection.clone())};match saved{
-                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.worker=ui_worker::Worker::default();self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
+                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.worker=ui_worker::Worker::default();self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.binder=ui_binder::Panel::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
                     if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before running."); }
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
                     self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before running.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),

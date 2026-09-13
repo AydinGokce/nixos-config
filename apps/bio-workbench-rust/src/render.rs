@@ -47,7 +47,8 @@ fn representation(value: &str) -> Result<scene::Representation, String> {
         "sticks" => Ok(scene::Representation::Sticks),
         "spheres" => Ok(scene::Representation::Spheres),
         "trace" => Ok(scene::Representation::Trace),
-        _ => Err("style must be cartoon, sticks, spheres, or trace".into()),
+        "surface" => Ok(scene::Representation::Surface),
+        _ => Err("style must be cartoon, sticks, spheres, trace, or surface".into()),
     }
 }
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
@@ -189,6 +190,12 @@ impl eframe::App for Capture {
                 self.finish(Err(error), ctx);
                 return;
             }
+            if self.style == scene::Representation::Surface
+                && let Some(error) = view.renderer.surface_error()
+            {
+                self.finish(Err(error), ctx);
+                return;
+            }
         }
         let screenshot = ctx.input(|input| {
             input.events.iter().find_map(|event| {
@@ -238,6 +245,7 @@ impl eframe::App for Capture {
                         self.style,
                         index,
                         &mut None,
+                        &mut scene::Hotspots::default(),
                         true,
                         false,
                         true,
@@ -245,9 +253,14 @@ impl eframe::App for Capture {
                     );
                 }
             });
-        self.frames += 1;
-        if self.frames == 3 {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames >= 3
+            && self.frames != usize::MAX
+            && (self.style != scene::Representation::Surface
+                || self.views.iter().all(|view| view.renderer.surface_ready()))
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            self.frames = usize::MAX;
         }
         ctx.request_repaint_after(Duration::from_millis(25));
     }

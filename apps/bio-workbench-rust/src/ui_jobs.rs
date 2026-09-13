@@ -247,6 +247,9 @@ impl Workbench {
                                 ui.colored_label(RED, error.to_string());
                             }
                             ui.horizontal(|ui| {
+                                if text(job, "model") == "bindcraft" && ui.small_button("Candidates").clicked() {
+                                    self.binder_open_candidates(id.clone());
+                                }
                                 if ui.small_button("Open tab").clicked() {
                                     self.open_job_new_tab(id.clone(),ctx);
                                 }

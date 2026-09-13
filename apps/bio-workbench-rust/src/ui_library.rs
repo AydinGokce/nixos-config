@@ -1288,6 +1288,11 @@ impl Workbench {
                         self.log(self.library.added.clone());
                         self.persist();
                     }
+                    if text(&record["identity"], "molecule_type") == "protein"
+                        && ui.button("Design binders…").clicked()
+                    {
+                        self.binder_library_target(text(&detail, "ref"));
+                    }
                     if let Err(reason) = input { ui.colored_label(AMBER, reason); }
                 });
                 if !self.library.added.is_empty() { ui.colored_label(GREEN, &self.library.added); }

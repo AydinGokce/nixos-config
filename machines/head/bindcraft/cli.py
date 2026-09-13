@@ -19,6 +19,7 @@ def main():
     prepare.add_argument("--hotspots")
     prepare.add_argument("--lengths", type=int, nargs=2, default=[65, 150], metavar=("MIN", "MAX"))
     prepare.add_argument("--designs", type=int, default=100)
+    prepare.add_argument('--seed', type=int, help='Campaign RNG seed; native trajectory seeds are retained in output CSVs')
     prepare.add_argument("--advanced", type=Path, help="Complete native advanced JSON; defaults to pinned upstream 4-stage settings")
     prepare.add_argument("--filters", type=Path, help="Complete native filter JSON; defaults to pinned upstream filters")
     prepare.add_argument("--out", type=Path, required=True)
@@ -36,6 +37,7 @@ def main():
     submit.add_argument("--gpu")
     submit.add_argument("--spot", action="store_true")
     submit.add_argument("--name")
+    submit.add_argument('--max-cost-usd', type=float, help='Maximum quoted GPU plus disposable OS reservation')
     test = commands.add_parser("test", help="Run real GPU component checks on the pinned public fixture")
     test.add_argument("--out", type=Path, required=True, help="New directory for the immutable test input")
     test.add_argument("--shared", type=Path, default=Path("/mnt/bio-shared"))
@@ -50,7 +52,8 @@ def main():
                         "number_of_final_designs": args.designs}
             advanced = read_json(args.advanced.read_bytes()) if args.advanced else defaults("advanced")
             filters = read_json(args.filters.read_bytes()) if args.filters else defaults("filters")
-            result = create(args.pdb, settings, advanced, filters, args.out)
+            result = create(args.pdb, settings, advanced, filters, args.out,
+                            execution={'seed': args.seed} if args.seed is not None else None)
         elif args.command == "defaults":
             result = defaults(args.kind)
         elif args.command == "doctor":
@@ -76,6 +79,12 @@ def main():
                 argv.append("--spot")
             if args.name:
                 argv += ["--name", args.name]
+            if getattr(args, 'max_cost_usd', None) is not None:
+                import math
+                if not math.isfinite(args.max_cost_usd) or not 0 < args.max_cost_usd <= 750:
+                    raise ValueError('Maximum cost must be finite and in (0,750] USD')
+                prior = float(os.environ.get('DC_MAX_JOB_COST_USD', args.max_cost_usd))
+                os.environ['DC_MAX_JOB_COST_USD'] = str(min(prior, args.max_cost_usd))
             if args.command == "test":
                 argv += ["--sub", "smoke"]
             os.execvp(argv[0], argv)

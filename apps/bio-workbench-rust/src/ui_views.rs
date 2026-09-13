@@ -7,6 +7,7 @@ pub(super) struct View {
     pub camera: scene::Camera,
     pub style: scene::Representation,
     pub selected: Option<scene::ResidueKey>,
+    pub hotspots: scene::Hotspots,
     pub measurement: Option<scene::ResidueKey>,
     pub chains: Vec<bool>,
     pub labels: bool,
@@ -14,6 +15,7 @@ pub(super) struct View {
     pub metadata: Value,
     pub bytes: Arc<Vec<u8>>,
 }
+
 pub(super) fn short_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
@@ -50,17 +52,91 @@ pub(super) fn display_name(metadata: &Value) -> String {
 fn view_token(metadata: &Value) -> String {
     text(metadata, "load_token").into()
 }
-pub(super) fn view_state(view: &View) -> Value {
-    json!({"camera":{"yaw":view.camera.yaw,"pitch":view.camera.pitch,"zoom":view.camera.zoom,"pan":[view.camera.pan.x,view.camera.pan.y],"ambient":view.camera.ambient,"bloom":view.camera.bloom},"style":view.style.name(),"selected":view.selected,"chains":view.chains,"labels":view.labels,"visible":view.visible})
+const ALIGNMENT_KEYS: [&str; 4] = [
+    "binder_alignment",
+    "binder_alignment_source_sha256",
+    "binder_alignment_reference_sha256",
+    "binder_alignment_center",
+];
+fn capture_display_alignment(metadata: &Value, state: &mut Value) {
+    // Keep the display frame per tab. Artifact metadata is shared by duplicate
+    // tabs, while each tab may have a different fit or use original coordinates.
+    for key in ALIGNMENT_KEYS {
+        state[key] = metadata[key].clone();
+    }
 }
-fn restore_view(view: &mut View, value: &Value) {
-    let camera = &value["camera"];
+fn clear_display_alignment(metadata: &mut Value, reset_camera: bool) {
+    if let Some(object) = metadata.as_object_mut() {
+        for key in ALIGNMENT_KEYS {
+            object.remove(key);
+        }
+    }
+    if let Some(state) = metadata["view_state"].as_object_mut() {
+        for key in ALIGNMENT_KEYS {
+            state.remove(key);
+        }
+        if reset_camera {
+            state.remove("camera");
+        }
+    }
+}
+fn restore_display_alignment(
+    molecule: &mut scene::Molecule,
+    metadata: &mut Value,
+    actual_sha: &str,
+) -> Result<bool, String> {
+    let saved = &metadata["view_state"];
+    let source = if saved.get("binder_alignment").is_some() {
+        saved
+    } else {
+        &*metadata
+    };
+    if ALIGNMENT_KEYS.iter().all(|key| source[*key].is_null()) {
+        clear_display_alignment(metadata, false);
+        return Ok(false);
+    }
+    let digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let source_sha = text(source, "binder_alignment_source_sha256");
+    if !digest(source_sha) || !source_sha.eq_ignore_ascii_case(actual_sha) {
+        return Err("Saved alignment does not match the original structure SHA-256".into());
+    }
+    if !digest(text(source, "binder_alignment_reference_sha256")) {
+        return Err("Saved alignment has no valid reference structure identity".into());
+    }
+    let receipt = &source["binder_alignment"];
+    if text(receipt, "status") != "aligned" {
+        return Err("Saved alignment receipt does not describe a completed fit".into());
+    }
+    let rotation = serde_json::from_value(receipt["rotation"].clone())
+        .map_err(|_| "Saved alignment rotation must be a finite 3 × 3 matrix".to_owned())?;
+    let translation =
+        serde_json::from_value(receipt["translation_angstrom"].clone()).map_err(|_| {
+            "Saved alignment translation must contain three finite coordinates".to_owned()
+        })?;
+    let center =
+        serde_json::from_value(source["binder_alignment_center"].clone()).map_err(|_| {
+            "Saved alignment display center must contain three finite coordinates".to_owned()
+        })?;
+    let restored = ALIGNMENT_KEYS.map(|key| (key, source[key].clone()));
+    alignment::apply_display_transform(molecule, rotation, translation, center)?;
+    for (key, value) in restored {
+        metadata[key] = value;
+    }
+    Ok(true)
+}
+pub(super) fn view_state(view: &View) -> Value {
+    let mut state = json!({"camera":{"yaw":view.camera.yaw,"pitch":view.camera.pitch,"zoom":view.camera.zoom,"pan":[view.camera.pan.x,view.camera.pan.y],"ambient":view.camera.ambient,"bloom":view.camera.bloom,"distance":view.camera.distance,"span":view.camera.span},"style":view.style.name(),"selected":view.selected,"hotspots":view.hotspots,"chains":view.chains,"labels":view.labels,"visible":view.visible});
+    capture_display_alignment(&view.metadata, &mut state);
+    state
+}
+fn restore_camera(camera: &mut scene::Camera, value: &Value) {
     for (name, dest) in [
-        ("yaw", &mut view.camera.yaw),
-        ("pitch", &mut view.camera.pitch),
-        ("zoom", &mut view.camera.zoom),
+        ("yaw", &mut camera.yaw),
+        ("pitch", &mut camera.pitch),
+        ("zoom", &mut camera.zoom),
     ] {
-        if let Some(n) = camera[name]
+        if let Some(n) = value[name]
             .as_f64()
             .map(|n| n as f32)
             .filter(|n| n.is_finite())
@@ -68,24 +144,41 @@ fn restore_view(view: &mut View, value: &Value) {
             *dest = n;
         }
     }
-    view.camera.zoom = view.camera.zoom.clamp(0.25, 4.);
+    camera.zoom = camera.zoom.clamp(0.25, 4.);
     if let (Some(x), Some(y)) = (
-        camera["pan"][0].as_f64().map(|n| n as f32),
-        camera["pan"][1].as_f64().map(|n| n as f32),
+        value["pan"][0].as_f64().map(|n| n as f32),
+        value["pan"][1].as_f64().map(|n| n as f32),
     ) && x.is_finite()
         && y.is_finite()
     {
-        view.camera.pan = Vec2::new(x, y);
+        camera.pan = Vec2::new(x, y);
     }
-    view.camera.ambient = camera["ambient"].as_bool().unwrap_or(true);
-    view.camera.bloom = camera["bloom"].as_bool().unwrap_or(true);
+    for (name, dest) in [
+        ("distance", &mut camera.distance),
+        ("span", &mut camera.span),
+    ] {
+        if let Some(n) = value[name]
+            .as_f64()
+            .filter(|n| n.is_finite() && (0.01..=100_000_000.).contains(n))
+        {
+            *dest = n as f32;
+        }
+    }
+    camera.ambient = value["ambient"].as_bool().unwrap_or(true);
+    camera.bloom = value["bloom"].as_bool().unwrap_or(true);
+}
+fn restore_view(view: &mut View, value: &Value) {
+    restore_camera(&mut view.camera, &value["camera"]);
     view.style = match text(value, "style") {
         "sticks" => scene::Representation::Sticks,
         "spheres" => scene::Representation::Spheres,
         "backbone trace" => scene::Representation::Trace,
+        "surface" => scene::Representation::Surface,
         _ => scene::Representation::Cartoon,
     };
     view.selected = serde_json::from_value(value["selected"].clone()).ok();
+    view.hotspots = serde_json::from_value(value["hotspots"].clone()).unwrap_or_default();
+    view.hotspots.retain_existing(&view.molecule);
     if view
         .selected
         .as_ref()
@@ -109,9 +202,12 @@ impl Workbench {
         let Some(original) = self.views.get(&source) else {
             return false;
         };
-        let Some(metadata) = self.view_reference(target).cloned() else {
+        let Some(mut metadata) = self.view_reference(target).cloned() else {
             return false;
         };
+        // The copy already has live transformed coordinates. Its receipt must
+        // follow that same live view, even before the next state capture.
+        capture_display_alignment(&original.metadata, &mut metadata);
         let renderer = match scene::Renderer::new(&self.gl, &original.molecule) {
             Ok(renderer) => renderer,
             Err(error) => {
@@ -127,6 +223,7 @@ impl Workbench {
             camera: original.camera,
             style: original.style,
             selected: original.selected.clone(),
+            hotspots: original.hotspots.clone(),
             measurement: original.measurement.clone(),
             chains: original.chains.clone(),
             labels: original.labels,
@@ -224,7 +321,7 @@ impl Workbench {
             return;
         }
         self.view_loading.remove(&slot);
-        let molecule = match molecule {
+        let mut molecule = match molecule {
             Ok(molecule) => molecule,
             Err(error) => {
                 let message = format!("Cannot display {}: {error}", text(&metadata, "name"));
@@ -245,6 +342,13 @@ impl Workbench {
             return;
         }
         metadata["sha256"] = json!(actual_sha);
+        if let Err(error) = restore_display_alignment(&mut molecule, &mut metadata, &actual_sha) {
+            clear_display_alignment(&mut metadata, true);
+            self.log(format!(
+                "{}: {error}. Opened the original structure; display alignment requires a refit.",
+                display_name(&metadata)
+            ));
+        }
         let renderer = match scene::Renderer::new(&self.gl, &molecule) {
             Ok(renderer) => renderer,
             Err(error) => {
@@ -262,6 +366,7 @@ impl Workbench {
             camera,
             style: scene::Representation::Cartoon,
             selected: None,
+            hotspots: scene::Hotspots::default(),
             measurement: None,
             chains,
             labels: false,
@@ -439,6 +544,11 @@ impl Workbench {
         }
     }
     pub(super) fn capture_views(&mut self) {
+        // A hidden tab may finish its CPU surface. Upload/dispose that bounded
+        // result too, so it cannot stall another tab's background builder.
+        for view in self.views.values() {
+            view.renderer.poll_surface(&self.gl);
+        }
         if self.restoring_views {
             return;
         }
@@ -483,6 +593,9 @@ impl Workbench {
                     object.remove("slot");
                     object.remove("view_state");
                     object.remove("load_token");
+                    for key in ALIGNMENT_KEYS {
+                        object.remove(key);
+                    }
                 }
                 self.artifact_metadata.insert(artifact.clone(), shared);
                 self.request_artifact(&artifact, ArtifactTarget::View(slot));
@@ -679,5 +792,161 @@ impl Workbench {
             ui.small(format!("SHA256 {}", text(&view.metadata, "sha256")));
         });
         self.annotations_panel(ui, ctx);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use sha2::Digest;
+
+    const SOURCE: &[u8] = b"ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00 80.00           C\nATOM      2  CA  GLY A   2       3.000   2.000   3.000  1.00 80.00           C\nATOM      3  CA  SER A   3       1.000   5.000   4.000  1.00 80.00           C\nEND\n";
+
+    fn source() -> (scene::Molecule, String) {
+        (
+            scene::Molecule::parse(SOURCE, "pdb", "saved candidate").unwrap(),
+            format!("{:x}", sha2::Sha256::digest(SOURCE)),
+        )
+    }
+    fn metadata(sha: &str) -> Value {
+        json!({
+            "sha256": sha,
+            "binder_alignment": {
+                "status": "aligned",
+                "rotation": [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]],
+                "translation_angstrom": [10., -20., 30.]
+            },
+            "binder_alignment_source_sha256": sha,
+            "binder_alignment_reference_sha256": "abcdef0123456789".repeat(4),
+            "binder_alignment_center": [5., 7., 11.]
+        })
+    }
+    #[test]
+    fn per_tab_saved_fit_restores_source_coordinates_identity_and_camera_scale() {
+        let (mut molecule, sha) = source();
+        let original = molecule.clone();
+        let fitted_metadata = metadata(&sha);
+        let mut state = json!({"camera":{
+            "yaw": 0.3, "pitch": -0.2, "zoom": 1.8,
+            "pan": [0.05, -0.03], "distance": 500., "span": 370.
+        }});
+        capture_display_alignment(&fitted_metadata, &mut state);
+        // Artifact delivery supplies fresh metadata; the per-tab view_state is
+        // the only retained display frame and must recreate its full receipt.
+        let mut downloaded = json!({"sha256":sha,"view_state":state});
+        assert!(restore_display_alignment(&mut molecule, &mut downloaded, &sha).unwrap());
+        for (before, after) in original.atoms.iter().zip(&molecule.atoms) {
+            assert_eq!(
+                after.p,
+                scene::V3(-before.p.1 + 10., before.p.0 - 20., before.p.2 + 30.)
+            );
+            assert_eq!(after.name, before.name);
+        }
+        assert_eq!(molecule.center, scene::V3(5., 7., 11.));
+        for key in ALIGNMENT_KEYS {
+            assert_eq!(downloaded[key], fitted_metadata[key]);
+        }
+        let mut camera = scene::Camera::fit(&molecule);
+        restore_camera(&mut camera, &downloaded["view_state"]["camera"]);
+        assert_eq!(
+            (camera.distance, camera.span, camera.zoom),
+            (500., 370., 1.8)
+        );
+        assert_eq!((camera.yaw, camera.pitch), (0.3, -0.2));
+        assert_eq!(camera.pan, Vec2::new(0.05, -0.03));
+        // Restoring is always from original retained bytes, never from an
+        // already fitted copy that would compound a transform after restart.
+        let (mut again, _) = source();
+        restore_display_alignment(&mut again, &mut downloaded, &sha).unwrap();
+        assert_eq!(
+            again.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+            molecule.atoms.iter().map(|a| a.p).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn saved_fit_rejects_changed_source_and_missing_reference_identity() {
+        let (original, sha) = source();
+        for (key, value) in [
+            ("binder_alignment_source_sha256", json!("1".repeat(64))),
+            ("binder_alignment_source_sha256", json!("")),
+            ("binder_alignment_reference_sha256", json!("not-a-sha")),
+            ("binder_alignment_reference_sha256", Value::Null),
+        ] {
+            let mut state = metadata(&sha);
+            state[key] = value;
+            let mut reopened = original.clone();
+            assert!(restore_display_alignment(&mut reopened, &mut state, &sha).is_err());
+            assert_eq!(
+                reopened.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+                original.atoms.iter().map(|a| a.p).collect::<Vec<_>>()
+            );
+            assert_eq!(reopened.center, original.center);
+        }
+    }
+    #[test]
+    fn invalid_or_legacy_fit_is_removed_without_discarding_structure_or_display_preferences() {
+        let (original, sha) = source();
+        let mut bad_matrix = metadata(&sha);
+        bad_matrix["binder_alignment"]["rotation"] =
+            json!([[2., 0., 0.], [0., 1., 0.], [0., 0., 1.]]);
+        let mut missing_center = metadata(&sha);
+        missing_center["binder_alignment_center"] = Value::Null;
+        let legacy = json!({"binder_alignment":metadata(&sha)["binder_alignment"]});
+        for mut invalid in [bad_matrix, missing_center, legacy] {
+            let mut state =
+                json!({"camera":{"yaw":2.,"distance":500.},"style":"surface","visible":false});
+            capture_display_alignment(&invalid, &mut state);
+            invalid["view_state"] = state;
+            let mut molecule = original.clone();
+            assert!(restore_display_alignment(&mut molecule, &mut invalid, &sha).is_err());
+            clear_display_alignment(&mut invalid, true);
+            for key in ALIGNMENT_KEYS {
+                assert!(invalid.get(key).is_none());
+                assert!(invalid["view_state"].get(key).is_none());
+            }
+            assert!(invalid["view_state"].get("camera").is_none());
+            assert_eq!(invalid["view_state"]["style"], "surface");
+            assert_eq!(invalid["view_state"]["visible"], false);
+            assert_eq!(
+                molecule.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+                original.atoms.iter().map(|a| a.p).collect::<Vec<_>>()
+            );
+            let fitted = scene::Camera::fit(&molecule);
+            let mut restored = fitted;
+            restore_camera(&mut restored, &invalid["view_state"]["camera"]);
+            assert_eq!(
+                (restored.yaw, restored.distance),
+                (fitted.yaw, fitted.distance)
+            );
+        }
+    }
+    #[test]
+    fn an_unaligned_duplicate_tab_does_not_inherit_another_tabs_artifact_fit() {
+        let (mut molecule, sha) = source();
+        let before = molecule.atoms.iter().map(|a| a.p).collect::<Vec<_>>();
+        let mut shared_metadata = metadata(&sha);
+        let mut unaligned_state = json!({"camera":{"distance":120.,"span":90.}});
+        capture_display_alignment(&json!({}), &mut unaligned_state);
+        shared_metadata["view_state"] = unaligned_state;
+        assert!(!restore_display_alignment(&mut molecule, &mut shared_metadata, &sha).unwrap());
+        assert_eq!(
+            molecule.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+            before
+        );
+        assert!(shared_metadata.get("binder_alignment").is_none());
+        assert_eq!(shared_metadata["view_state"]["camera"]["distance"], 120.);
+    }
+    #[test]
+    fn invalid_saved_camera_scales_keep_the_fitted_projection() {
+        let (molecule, _) = source();
+        let fitted = scene::Camera::fit(&molecule);
+        for invalid in [json!(-1.), json!(0.), json!(1e300), Value::Null] {
+            let mut camera = fitted;
+            restore_camera(&mut camera, &json!({"distance":invalid,"span":invalid}));
+            assert_eq!(
+                (camera.distance, camera.span),
+                (fitted.distance, fitted.span)
+            );
+        }
     }
 }

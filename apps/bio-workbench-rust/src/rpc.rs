@@ -33,6 +33,12 @@ const REMOTE: &str =
     "env BIO_WORKBENCH_ACTOR=harrison /run/current-system/sw/bin/bio-workbench rpc";
 const METHODS: &[&str] = &[
     "catalog",
+    "binder.catalog",
+    "binder.inspect",
+    "binder.run",
+    "binder.candidates",
+    "binder.context",
+    "binder.save",
     "worker.status",
     "worker.capacity",
     "worker.extend",
@@ -332,6 +338,8 @@ pub fn mutating(method: &str) -> bool {
             | "worker.shutdown"
             | "upload.chunk"
             | "upload.finish"
+            | "binder.run"
+            | "binder.save"
             | "batch.run"
             | "batch.validate"
             | "batch.create"

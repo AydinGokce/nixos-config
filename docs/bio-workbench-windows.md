@@ -49,7 +49,7 @@ Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing work
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/bindcraft-install-20260913/project-editor/gc-protein-engineering-console-0.3.0-source.tar.gz
+/home/aydin/bio-runs/bindcraft-console-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -83,6 +83,12 @@ the renamed app uses the same connection settings, saved inputs and results.
 The MSA indicators distinguish current Verda capacity from a connected worker.
 Capacity refreshes at startup and every five seconds; the worker dialog includes
 available GPUs, a manual Refresh button and the last-update age.
+
+**Inputs → Binder design** opens the BindCraft workflow: load a target structure
+or use a library folding result, select chains and hotspot residues in the 3D
+surface or sequence, and submit with runtime and cost limits. Results include a
+candidate table, target-aligned comparisons and **Save to project**. BindCraft
+runs on the cloud GPU worker and does not need the shared MSA worker.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem

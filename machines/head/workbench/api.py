@@ -45,6 +45,9 @@ class API:
             'md.catalog': self.md_catalog, 'md.validate': self.md_validate, 'md.plan': self.md_plan,
             'md.resume': self.md_resume,
             'md.compare': self.md_compare,
+            'binder.catalog': self.binder_catalog, 'binder.inspect': self.binder_inspect,
+            'binder.run': self.binder_run, 'binder.candidates': self.binder_candidates,
+            'binder.save': self.binder_save, 'binder.context': self.binder_context,
             'upload.chunk': self.upload_chunk, 'upload.finish': self.upload_finish,
             'batch.validate': self.batch_validate, 'batch.create': self.batch_create,
             'batch.run': self.batch_run,
@@ -64,6 +67,30 @@ class API:
             # Workbench job fields to strip.
             return function(params)
         return public(function(params))
+
+    def binder_catalog(self, params):
+        from .binder_api import catalog
+        return catalog(self, params)
+
+    def binder_inspect(self, params):
+        from .binder_api import inspect_target
+        return inspect_target(self, params)
+
+    def binder_run(self, params):
+        from .binder_api import request
+        return request(self, params)
+
+    def binder_candidates(self, params):
+        from .binder_results import candidates
+        return candidates(self, params)
+
+    def binder_save(self, params):
+        from .binder_results import save
+        return save(self, params)
+
+    def binder_context(self, params):
+        from .binder_results import context
+        return context(self, params)
 
     def worker_status(self, params):
         from .worker_api import status
@@ -136,7 +163,9 @@ class API:
     def catalog(self, params):
         keys(params)
         from md.gateway import catalog as md_catalog
-        return {**catalog.catalog(), 'molecular_dynamics': md_catalog()}
+        return {**catalog.catalog(), 'molecular_dynamics': md_catalog(),
+                'workflows': {'bindcraft': {'enabled': True, 'catalog_method': 'binder.catalog',
+                                           'submit_method': 'binder.run'}}}
 
     def md_catalog(self, params):
         keys(params)
@@ -402,7 +431,7 @@ class API:
         page = all_items[:limit]
         with self.store.connection() as db:
             batches = [{k: v for k, v in self._batch(item['batch_id'], db).items()
-                        if k in {'batch_id', 'name', 'mode', 'state', 'created_at', 'updated_at', 'msa_backend', 'execution', 'models', 'counts', 'auto_run'}} for item in page]
+                        if k in {'batch_id', 'name', 'mode', 'workflow', 'state', 'created_at', 'updated_at', 'msa_backend', 'execution', 'models', 'counts', 'auto_run'}} for item in page]
         return {'batches': batches, 'next_cursor': page[-1]['batch_id'] if len(all_items) > limit else None}
 
     def job_get(self, params):

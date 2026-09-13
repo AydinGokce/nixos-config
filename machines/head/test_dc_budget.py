@@ -301,6 +301,54 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertEqual(self.api.created, 0)
 
+    def test_job_cost_cap_includes_os_and_full_reserved_duration_before_any_post(self):
+        self.init()
+        rate, os_rate = self.c.quote('GPU', False, self.args().os_size)
+        self.assertGreater(os_rate, 0)
+        before = copy.deepcopy(self.state()['jobs'])
+        with patch.dict(os.environ, DC_MAX_JOB_COST_USD=str(rate)):
+            with self.assertRaisesRegex(dc.Error, 'GPU plus OS reservation'):
+                self.c.launch(self.args())
+        self.assertEqual(self.state()['jobs'], before)
+        self.assertEqual(self.api.created, 0)
+        with patch.dict(os.environ, DC_MAX_JOB_COST_USD=str(rate + os_rate)):
+            ident = self.c.launch(self.args())
+        job = next(j for j in self.state()['jobs'].values() if j.get('id') == ident)
+        self.assertEqual(job['quoted_reservation_cost_usd'], rate + os_rate)
+        self.assertEqual(job['max_cost_usd'], rate + os_rate)
+        self.c.remove(ident)
+
+    def test_invalid_job_cap_or_scope_never_reaches_provider(self):
+        self.init()
+        for value in ('nan', 'inf', '-1', '0', ''):
+            self.api.calls.clear()
+            with self.subTest(value=value), patch.dict(os.environ, DC_MAX_JOB_COST_USD=value):
+                with self.assertRaisesRegex(dc.LaunchBlocked, 'DC_MAX_JOB_COST_USD'):
+                    self.c.launch(self.args())
+            self.assertEqual(self.api.calls, [])
+        with patch.dict(os.environ, DC_MAX_JOB_COST_USD='10', DC_JOB_COST_SCOPE='../another'):
+            with self.assertRaisesRegex(dc.LaunchBlocked, 'DC_JOB_COST_SCOPE'):
+                self.c.launch(self.args())
+        self.assertEqual(self.api.created, 0)
+
+    def test_scoped_cap_counts_previous_paid_attempt_and_cannot_be_raised(self):
+        self.init()
+        rate, os_rate = self.c.quote('GPU', False, self.args().os_size)
+        limit = (rate + os_rate) * 1.01
+        with patch.dict(os.environ, DC_MAX_JOB_COST_USD=str(limit), DC_JOB_COST_SCOPE='binder-test'):
+            ident = self.c.launch(self.args())
+        self.clock.sleep(360)
+        self.c.remove(ident)
+        self.init()
+        created = self.api.created
+        with patch.dict(os.environ, DC_MAX_JOB_COST_USD='100', DC_JOB_COST_SCOPE='binder-test'):
+            with self.assertRaisesRegex(dc.Error, 'including earlier attempts'):
+                self.c.launch(self.args())
+        self.assertEqual(self.api.created, created)
+        paid, retained_limit = dc.scoped_job_cost(self.state(), 'binder-test', self.clock())
+        self.assertGreater(paid, 0)
+        self.assertEqual(retained_limit, limit)
+
     def test_hourly_ceiling_allows_exact_boundary_and_uses_requested_contract(self):
         self.init()
         for spot, ceiling in ((False, "2"), (True, "1"), (True, "0")):

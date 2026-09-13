@@ -10,6 +10,7 @@ import tarfile
 HERE = Path(__file__).resolve().parent
 PIN = "efb5bfeb8b4b1a5944256f979c34e0c8e6a82d9d"
 ASSETS = {"target.pdb", "settings.json", "advanced.json", "filters.json"}
+OPTIONAL_ASSETS = {"execution.json"}
 MAX_BYTES = 32 << 20
 AMINO_ACIDS = set("ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split())
 
@@ -154,8 +155,13 @@ def validate_filters(value):
 
 
 def validate_assets(assets):
-    if set(assets) != ASSETS:
+    if not ASSETS <= set(assets) or not set(assets) <= ASSETS | OPTIONAL_ASSETS:
         raise ValueError("Unexpected input bundle assets")
+    if 'execution.json' in assets:
+        execution = read_json(assets['execution.json'])
+        if (not isinstance(execution, dict) or set(execution) != {'seed'} or
+                type(execution['seed']) is not int or not 0 <= execution['seed'] <= 2147483647):
+            raise ValueError('Execution settings require one integer campaign seed in 0..2147483647')
     settings = read_json(assets["settings.json"])
     validate_settings(settings, assets["target.pdb"])
     validate_advanced(read_json(assets["advanced.json"]))
@@ -163,9 +169,11 @@ def validate_assets(assets):
     return settings
 
 
-def create(pdb, settings, advanced, filters, out):
+def create(pdb, settings, advanced, filters, out, *, execution=None):
     assets = {"target.pdb": Path(pdb).read_bytes(), "settings.json": encoded(settings),
               "advanced.json": encoded(advanced), "filters.json": encoded(filters)}
+    if execution is not None:
+        assets['execution.json'] = encoded(execution)
     validate_assets(assets)
     if sum(map(len, assets.values())) > MAX_BYTES:
         raise ValueError("BindCraft input exceeds 32 MiB")
@@ -190,7 +198,7 @@ def inspect(path):
         raise ValueError("Invalid BindCraft gzip/tar input bundle") from error
     with archive:
         for member in archive:
-            if not member.isfile() or member.name not in ASSETS | {"manifest.json"} or member.name in assets:
+            if not member.isfile() or member.name not in ASSETS | OPTIONAL_ASSETS | {"manifest.json"} or member.name in assets:
                 raise ValueError("Unexpected, duplicate or unsafe bundle member")
             total += member.size
             if total > MAX_BYTES:

@@ -441,6 +441,31 @@ def reserve(state, token, rate, os_rate, hours, now, ceiling, margin, persistent
                             "rate": rate, "os_rate": os_rate, "os_id": None, "status": "pending"}
 
 
+def scoped_job_cost(state, scope, now):
+    """Include earlier attempts and any live reservation in one caller's cap."""
+    total, seen, limits = 0.0, set(), []
+    for job in state['jobs'].values():
+        if job.get('cost_scope') != scope:
+            continue
+        limits.append(number(job.get('max_cost_usd'), 'retained scoped job cap'))
+        if job['status'] != 'closed':
+            total += (job['rate'] + job['os_rate']) * max(0, job['deadline'] - now) / 3600
+        for kind, ident, rate in (('instance', job.get('id'), job['rate']),
+                                  ('volume', job.get('os_id'), job['os_rate'])):
+            key = kind + ':' + str(ident)
+            if ident and key not in seen:
+                seen.add(key)
+                resource = state['resources'].get(key)
+                if resource is None:
+                    raise LaunchBlocked('Scoped job accounting is incomplete; reconcile it before another launch')
+                total += resource['cost']
+                if resource['active']:
+                    total += resource['rate'] * max(0, now - resource['last']) / 3600
+            elif ident is None and job['status'] != 'closed':
+                total += rate * max(0, now - job['created']) / 3600
+    return total, min(limits) if limits else None
+
+
 def launch_not_before(state, seconds):
     """Use observed cleanup completion, never creation/reconciliation times."""
     if seconds == 0:
@@ -651,6 +676,18 @@ class Controller:
         if not args.image.startswith("ubuntu-"):
             raise Error("Ephemeral launches require an Ubuntu image type, not an existing OS volume")
         maximum_hourly = None
+        maximum_job_cost = None
+        if 'DC_MAX_JOB_COST_USD' in os.environ:
+            try:
+                maximum_job_cost = number(os.environ['DC_MAX_JOB_COST_USD'], 'DC_MAX_JOB_COST_USD')
+                if maximum_job_cost <= 0:
+                    raise Error('DC_MAX_JOB_COST_USD must be positive')
+            except Error as exc:
+                raise LaunchBlocked(str(exc)) from None
+        cost_scope = os.environ.get('DC_JOB_COST_SCOPE')
+        if cost_scope is not None and (maximum_job_cost is None or
+                not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', cost_scope)):
+            raise LaunchBlocked('DC_JOB_COST_SCOPE requires a valid bounded identity and DC_MAX_JOB_COST_USD')
         if "DC_MAX_INSTANCE_HOURLY" in os.environ:
             try:
                 maximum_hourly = number(os.environ["DC_MAX_INSTANCE_HOURLY"], "DC_MAX_INSTANCE_HOURLY")
@@ -674,6 +711,13 @@ class Controller:
                     if maximum_hourly is not None and rate > maximum_hourly:
                         raise LaunchBlocked(f"Instance quote ${rate:g}/h exceeds DC_MAX_INSTANCE_HOURLY="
                                             f"${maximum_hourly:g}/h; launch refused")
+                    reservation_cost = (rate + os_rate) * args.max_hours
+                    if maximum_job_cost is not None and reservation_cost > maximum_job_cost:
+                        # A cheaper GPU may fit, so permit the existing launcher
+                        # to try its next candidate. No reservation or POST has
+                        # happened for this unaffordable quote.
+                        raise Error(f'GPU plus OS reservation ${reservation_cost:.4f} exceeds '
+                                    f'DC_MAX_JOB_COST_USD=${maximum_job_cost:g}; launch refused')
                     keys = self.api.request("GET", "/sshkeys")
                     now = self.clock()
                     with self.store.locked(now) as state:
@@ -682,9 +726,22 @@ class Controller:
                         if launch_not_before(state, cooldown) > now:
                             continue  # Cleanup advanced while admission waited.
                         check_storage_lifetime(self.store.root, args.volume, now)
+                        if cost_scope is not None:
+                            committed_cost, previous_limit = scoped_job_cost(state, cost_scope, now)
+                            effective_limit = min(maximum_job_cost, previous_limit) if previous_limit is not None else maximum_job_cost
+                            if committed_cost + reservation_cost > effective_limit:
+                                raise Error(f'Run cost including earlier attempts and new reservation '
+                                            f'${committed_cost + reservation_cost:.4f} exceeds '
+                                            f'DC_MAX_JOB_COST_USD=${effective_limit:g}; launch refused')
+                            maximum_job_cost = effective_limit
                         reserve(state, token, rate, os_rate, args.max_hours, now,
                                 self.ceiling, self.margin, self.persistent_hours)
                         state["jobs"][token]["volumes"] = list(args.volume)
+                        if maximum_job_cost is not None:
+                            state['jobs'][token].update(max_cost_usd=maximum_job_cost,
+                                                       quoted_reservation_cost_usd=reservation_cost)
+                            if cost_scope is not None:
+                                state['jobs'][token]['cost_scope'] = cost_scope
                     body = {"instance_type": args.type, "image": args.image,
                             "hostname": args.name or "bio-" + token[:12],
                             "description": f"bio-dc:{token} ephemeral deadline={int(now + args.max_hours * 3600)}",

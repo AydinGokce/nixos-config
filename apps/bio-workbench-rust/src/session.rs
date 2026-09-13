@@ -267,7 +267,9 @@ impl Session {
         let endpoint = self.connection.identity();
         if matches!(
             method,
-            "batch.run"
+            "binder.run"
+                | "binder.save"
+                | "batch.run"
                 | "worker.extend"
                 | "worker.shutdown"
                 | "batch.validate"
@@ -460,7 +462,7 @@ impl Session {
         let Ok(journal) = self.journal.lock() else {
             return Vec::new();
         };
-        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"batch.run"|"batch.validate"|"batch.create"|"local.upload"|"worker.extend"|"worker.shutdown")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
+        journal.operations.values().filter(|op| op.status!="complete" || matches!(op.method.as_str(),"binder.run"|"binder.save"|"batch.run"|"batch.validate"|"batch.create"|"local.upload"|"worker.extend"|"worker.shutdown")).map(|op| json!({"id":op.id,"method":op.method,"params":op.params,"status":op.status,"error":op.error,"result":op.result,"endpoint":op.endpoint,"current_connection":op.endpoint==self.connection.identity()})).collect()
     }
     pub fn drain_events(&mut self) -> Vec<Event> {
         self.events.try_iter().map(|delivery| {
@@ -938,7 +940,7 @@ mod tests {
         fn call(&self, method: &str, p: Value) -> Result<Value, RpcError> {
             self.calls.lock().unwrap().push((method.into(), p.clone()));
             match method {
-                "batch.run" | "batch.validate" | "batch.create" => {
+                "binder.run" | "binder.save" | "batch.run" | "batch.validate" | "batch.create" => {
                     if self.fail_first.swap(0, Ordering::SeqCst) > 0 {
                         Err(RpcError::new("ssh", "lost response").uncertain(true))
                     } else {
@@ -1139,6 +1141,47 @@ mod tests {
         session.retry(&id).unwrap();
         assert!(next_result(&mut session).1.is_ok());
         assert_eq!(mock.calls.lock().unwrap().len(), count);
+    }
+    #[test]
+    fn binder_mutations_recover_the_pre_enqueue_intent_key_without_an_operation_id() {
+        for method in ["binder.run", "binder.save"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mock = Arc::new(Mock::new());
+            mock.fail_first.store(1, Ordering::SeqCst);
+            let params = json!({"request_key":"captured-before-ui-receipt","target":{"sha256":"exact"},"candidate_id":"candidate","project_ref":"project:test@1"});
+            let mut session = Session::open_internal(
+                egui::Context::default(),
+                dir.path().into(),
+                Some(mock.clone()),
+                false,
+            )
+            .unwrap();
+            let operation = session.request(method, params.clone()).unwrap();
+            assert!(next_result(&mut session).1.unwrap_err().uncertain);
+            drop(session);
+            let mut session = Session::open_internal(
+                egui::Context::default(),
+                dir.path().into(),
+                Some(mock.clone()),
+                false,
+            )
+            .unwrap();
+            assert_eq!(mock.calls.lock().unwrap().len(), 1);
+            // UI operation-ID persistence was lost: submit its already saved
+            // request key, which must recover the same journal operation.
+            assert_eq!(session.request(method, params.clone()).unwrap(), operation);
+            assert!(next_result(&mut session).1.is_ok());
+            let calls = mock.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].1, calls[1].1);
+            drop(calls);
+            let mut changed = params;
+            changed["target"]["sha256"] = json!("changed");
+            assert_eq!(
+                session.request(method, changed).unwrap_err().code,
+                "conflict"
+            );
+        }
     }
     #[test]
     fn automatic_runs_use_fresh_keys_and_never_call_manual_submission_apis() {

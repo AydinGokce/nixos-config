@@ -36,7 +36,8 @@ def validation(store, batch_id, config, compiler=inputs.native_compile):
     if batch['state'] != 'validating':
         return
     is_md = batch.get('_workflow') == 'md'
-    combinations = batch['pairs'] if is_md else inputs.pairs(store, store.actor(batch_id), batch['_request'])
+    is_binder = batch.get('_workflow') == 'bindcraft'
+    combinations = batch['pairs'] if is_md or is_binder else inputs.pairs(store, store.actor(batch_id), batch['_request'])
     with store.transaction() as db:
         batch = store.get(db, 'batch', batch_id)
         if batch['state'] != 'validating':
@@ -51,7 +52,10 @@ def validation(store, batch_id, config, compiler=inputs.native_compile):
             entry = next(p for p in current['pairs'] if p['pair_id'] == pair['pair_id'])
             entry['state'] = 'validating'; store.put(db, 'batch', current)
         try:
-            if is_md:
+            if is_binder:
+                from .binder_api import validate_batch
+                prepared = validate_batch(store, batch, config)
+            elif is_md:
                 from md.gateway import validate_batch
                 prepared = validate_batch(store, batch, config)
             else:
@@ -150,6 +154,18 @@ def native_phase(text, generic_msa=True):
         (MSA_LOG_PREFIX, telemetry.MIRROR_PREFIX, telemetry.PREFIX)))
     if 'resident request' in text:
         return 'resident inference', 'Native resident request submitted; waiting for its durable result'
+    binder_stages = []
+    for pattern, phase in (
+            (r'^Starting trajectory: [^\r\n]{1,250}$', 'binder design'),
+            (r'^Stage [1-4]: (?:Test Logits|Additional Logits Optimisation|Softmax Optimisation|One-hot Optimisation|PSSM Semigreedy Optimisation)$', 'binder design'),
+            (r'^Fixing interface residues: [^\r\n]{1,4096}$', 'binder redesign and validation'),
+            (r'^Unmet filter conditions for [^\r\n]{1,250}$', 'binder candidate filtering'),
+            (r'^Base AF2 filters not passed for [A-Za-z0-9_.-]{1,250}, skipping interface scoring$', 'binder candidate filtering'),
+            (r'^Found [0-9]+ MPNN designs passing filters$', 'binder candidate filtering')):
+        binder_stages.extend((match.start(), phase, match.group(0)) for match in re.finditer(pattern, text, re.M))
+    if binder_stages:
+        _, phase, message = max(binder_stages)
+        return phase, message
     md_phases = re.findall(r'BIO_MD_STAGE ([A-Za-z0-9_.-]+) (starting|complete|failed|interrupted)', text)
     if md_phases:
         name, state = md_phases[-1]
@@ -185,6 +201,80 @@ def observe_phase(log, msa_progress=None, *, native_modified=None):
     return 'running', 'Managed submission is running; native logs are available'
 
 
+class BinderProgress:
+    """Accumulate bounded observations from complete native stdout lines."""
+    def __init__(self):
+        self.offset, self.partial = 0, b''
+        self.current = None
+        self.unavailable = None
+        self.native_stage = None
+        self.stage_event = None
+        self.stage_identity = None
+        self.started, self.completed, self.rejected, self.accepted = set(), set(), set(), {}
+        self.rejection_screens = {'base_af2': set(), 'final_filters': set()}
+
+    def observe(self, log):
+        if self.unavailable:
+            return {'source': 'native_stdout', 'state': 'unavailable', 'message': self.unavailable}
+        with safe_file(log).open('rb') as stream:
+            size = stream.seek(0, 2)
+            if size < self.offset:
+                self.unavailable = 'Native log was truncated; counters are unavailable'
+                self.native_stage = None
+                return {'source': 'native_stdout', 'state': 'unavailable', 'message': self.unavailable}
+            stream.seek(self.offset); raw = stream.read(65536); self.offset += len(raw)
+        lines = (self.partial + raw).split(b'\n')
+        self.partial = lines.pop()[-8192:]
+        for raw_line in lines:
+            if len(raw_line) > 8192:
+                continue
+            line = raw_line.decode(errors='replace')
+            events = telemetry.events(line + '\n')
+            if events:
+                event = events[-1]
+                if self.stage_event is None or event['timestamp_ns'] >= self.stage_event['timestamp_ns']:
+                    identity = tuple(event.get(key) for key in ('scope', 'stage', 'stage_id'))
+                    if (identity != self.stage_identity or event['state'] != 'running' or
+                            identity[:2] != ('gpu', 'inference')):
+                        self.native_stage = None
+                    self.stage_event, self.stage_identity = event, identity
+                continue
+            match = re.fullmatch(r'Starting trajectory: ([A-Za-z0-9_.-]{1,250})', line)
+            if match:
+                self.current = match.group(1); self.started.add(self.current)
+            match = re.fullmatch(r'Unmet filter conditions for ([A-Za-z0-9_.-]{1,250})', line)
+            if match:
+                self.rejected.add(match.group(1))
+                self.rejection_screens['final_filters'].add(match.group(1))
+            match = re.fullmatch(r'Base AF2 filters not passed for ([A-Za-z0-9_.-]{1,250}), skipping interface scoring', line)
+            if match:
+                self.rejected.add(match.group(1))
+                self.rejection_screens['base_af2'].add(match.group(1))
+            match = re.fullmatch(r'Found ([0-9]{1,6}) MPNN designs passing filters', line)
+            if match and self.current:
+                self.accepted[self.current] = max(self.accepted.get(self.current, 0), int(match.group(1)))
+            match = re.fullmatch(r'Design and validation of trajectory ([A-Za-z0-9_.-]{1,250}) took: .{1,200}', line)
+            if match:
+                self.completed.add(match.group(1))
+            native = native_phase(line, generic_msa=False)
+            if (self.current and native and native[0].startswith('binder ') and
+                    self.stage_identity and self.stage_identity[:2] == ('gpu', 'inference') and
+                    self.stage_event['state'] == 'running'):
+                self.native_stage = native
+            if len(self.started) + len(self.rejected) > 100000:
+                self.unavailable = 'Native progress exceeds counter bounds; inspect final tables'
+                self.native_stage = None
+                return {'source': 'native_stdout', 'state': 'unavailable', 'message': self.unavailable}
+        if not self.started:
+            return None
+        return {'source': 'native_stdout', 'attempts_started': len(self.started),
+                'trajectories_completed': len(self.completed), 'candidates_accepted': sum(self.accepted.values()),
+                'candidates_rejected': len(self.rejected), 'current_trajectory': self.current,
+                'rejection_screens': {key: len(values) for key, values in self.rejection_screens.items()},
+                'log_caught_up': self.offset == size,
+                'counts_scope': 'Observed native milestones; final sealed candidate tables are authoritative'}
+
+
 class JobProgress:
     """Expose nested preparation progress without treating our log mirror as
     new native work. A child append changes the size and releases that override.
@@ -196,6 +286,7 @@ class JobProgress:
         self.last_worker_event = None
         self.mirror_signature = None
         self.native_modified = 0
+        self.binder = BinderProgress()
 
     def _main_stat(self):
         stat = safe_file(self.log).stat()
@@ -209,6 +300,23 @@ class JobProgress:
         return phase, detail['message']
 
     def details(self):
+        phase, detail = self._details()
+        binder = self.binder.observe(self.log)
+        if binder:
+            detail['binder'] = binder
+            # The enclosing worker heartbeat proves inference is still active;
+            # it must not erase the last explicit native BindCraft substage.
+            # Retain it only for that exact, fresh stage identity, after the
+            # incremental reader caught up. Completion, another stage/run,
+            # stale telemetry or unavailable log evidence cannot inherit it.
+            if (binder.get('log_caught_up') and self.binder.native_stage and
+                    tuple(detail.get(key) for key in ('scope', 'stage', 'stage_id')) == self.binder.stage_identity and
+                    detail.get('stage_state') == 'running' and detail.get('stale') is False):
+                phase, message = self.binder.native_stage
+                detail.update(message=message, eta=telemetry.unknown('No measured native substage duration is available'))
+        return phase, detail
+
+    def _details(self):
         self._main_stat()
         phase, message = observe_phase(self.log, self.msa_progress, native_modified=self.native_modified)
         text, _, _, msa = log_observation(self.log, self.msa_progress)
@@ -452,10 +560,13 @@ def seal_results(store, job, root, source='native'):
         excluded = {'prepared', 'prepared-bundle', 'features', 'template_data', 'template_structures', 'templates', 'library-input', 'native-input', 'input-bundle', 'inputs'}
         input_file = any(part in excluded for part in Path(relative).parts[:-1]) or original.stem.lower() in {'input', 'source', 'native-input'}
         known_output = (job['model'] == 'rf3' or 'predictions' in original.parts or
+                        (job['model'] == 'bindcraft' and 'designs' in Path(relative).parts) or
                         (job['model'] == 'md' and original.name == 'final.pdb' and 'simulation' in original.parts) or
                         (job['model'] == 'openfold3' and re.search(r'_seed_\d+_sample_\d+_model$', original.stem)) or
                         (job['model'] == 'rfdiffusion' and original.stem.startswith('design')))
-        role = 'structure' if extension in {'cif', 'mmcif', 'pdb'} and not input_file and known_output else 'log' if extension == 'log' else 'confidence' if 'confidence' in original.name else 'provenance' if extension == 'json' else 'data'
+        role = ('target_structure' if source == 'binder-input' and extension in {'pdb', 'cif', 'mmcif'} else
+                'structure' if extension in {'cif', 'mmcif', 'pdb'} and not input_file and known_output else
+                'log' if extension == 'log' else 'confidence' if 'confidence' in original.name else 'provenance' if extension == 'json' else 'data')
         artifact = {'artifact_id': ident, 'job_id': job['job_id'], 'name': relative, 'size': expected['size'],
                     'sha256': expected['sha256'], 'media_type': mimetypes.guess_type(original.name)[0] or 'application/octet-stream',
                     'format': extension, 'role': role, 'model': job['model'],
@@ -478,6 +589,9 @@ def run_job(store, job_id, config):
     root = store.directory('jobs', job_id)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     prepared = job['_prepared']; verify_prepared(prepared)
+    if job['model'] == 'bindcraft':
+        from .binder_results import seal_inputs
+        seal_inputs(store, job, root)
     results = root / 'results'; results.mkdir(mode=0o700, exist_ok=False)
     log = root / 'run.log'
     msa_progress = root / 'msa-session-progress.log'
@@ -592,7 +706,9 @@ def run_job(store, job_id, config):
         head = root / 'head-evidence'; head.mkdir(mode=0o700)
         for name in ('run.log', 'submission.json', 'head-process.json', 'msa-session-progress.log', 'worker-progress.log'):
             shutil.copyfile(root / name, head / name)
-        artifacts += seal_results(store, job, head, 'head')
+        head_artifacts = seal_results(store, job, head, 'head')
+        artifacts += head_artifacts
+        binder_observations = progress.binder.observe(log) if job['model'] == 'bindcraft' else None
         state = 'complete' if status == 0 else 'cancelled' if cancelled else 'failed'
         error = None if status == 0 else ({'message': 'Submission cancelled', 'automatic_retry': False}
                                         if cancelled else submission_error(log, status, msa_progress, worker_progress))
@@ -604,6 +720,12 @@ def run_job(store, job_id, config):
                 current['progress'] = {'message': error['message'], 'observed_at': now()}
             else:
                 current['progress'] = {'message': 'Run completed; outputs retained', 'observed_at': now()}
+            if binder_observations:
+                current['progress']['binder'] = binder_observations
+                log_artifact = next(a for a in head_artifacts if a['name'] == 'run.log')
+                current['provenance']['binder_observations'] = {
+                    **binder_observations, 'log_artifact_id': log_artifact['artifact_id'],
+                    'log_sha256': log_artifact['sha256']}
             if cancelled and status == 0:
                 current['provenance']['cancel_requested_but_prediction_finished'] = True
             current['provenance']['artifacts_sha256'] = digest(artifacts)

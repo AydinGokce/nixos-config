@@ -80,6 +80,52 @@ upload ID; the client retains the uncertain operation and explains when a new
 explicit upload is required. Requests from a different head/user/port cannot be
 replayed against the current connection.
 
+## Design binders with BindCraft
+
+Choose **Inputs → Binder design**, then **Use active structure** or **Load target…**
+for a PDB/mmCIF target. A library protein also has **Design binders…**, which lets
+you choose a retained folding result for that exact construct revision. A
+sequence-only protein needs a folding result first. BindCraft does not require
+the shared MSA worker.
+
+Select the submitted protein chains. Optional crops use original author
+identifiers, such as `A:100-250, B:12-80`; insertion codes and chain remapping are
+retained in the run's provenance. Unsupported chemistry is identified during
+inspection and rejected if included in the submitted region. Molecules merely
+displayed in the viewer are not automatically included in design.
+
+Enable **Pick hotspot residues**, then click the structure or its sequence.
+Ctrl/Cmd-click toggles a residue, and Shift-click extends a sequence range.
+The right-hand **Binding patch** panel supports manual positions/ranges,
+removable residue chips, Undo/Redo, and named patches saved for the exact target
+SHA256. Empty hotspots allow exploration of binding sites. **Surface** renders
+a shaded triangulated solvent-accessible envelope with a 1.4 Å probe; generation
+is lazy, runs off the UI thread and has adaptive resource bounds.
+
+Set binder lengths, the desired number of accepted designs, runtime and worker
+cost limits, then press **Design binders**. The starter settings request one
+accepted design within 60 minutes and a $10 GPU/OS reservation ceiling. This
+does not guarantee acceptance or replace the separate cumulative project budget.
+Standard native optimization and filters remain in effect. The status window
+shows stages, observed design counters, logs and cancellation. Queued jobs
+continue on the head after closing the desktop. Submission and library-save
+receipts recover their exact keys after interrupted replies or application exits.
+
+Open **Candidates** from the run to browse paginated sequences, acceptance
+status and native confidence/interface metrics. **Align open candidates** fits
+their common target only, preserving differences in binder poses. **Full target**
+uses verified residue correspondences to compare a cropped-target complex with
+the full original structure in a linked split view. This is a display comparison,
+not a new calculation against omitted context. Fitted display transforms retain
+their source identities across restarts.
+
+**Save to project** creates a standalone protein with its sequence, predicted
+complex, submitted target, description and complete design provenance. Publication
+uses immutable library revisions and participates in the existing Undo/Redo.
+Acceptance and confidence scores are computational evidence, not experimentally
+measured binding affinity. Native rejection counts are shown at run level when
+the output does not establish a per-candidate reason.
+
 ## Explore the molecular library
 
 Open **Library** beside Inputs and Runs, or choose **Browse library** from the

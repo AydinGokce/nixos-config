@@ -37,6 +37,16 @@ impl Workbench {
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             match &kind {
+                Pick::BinderTarget => {
+                    self.binder.pending_source_ref = None;
+                    let (format, _) = infer_file(&path);
+                    let metadata = json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"format":format,"source_kind":"local","local_path":path});
+                    self.open_local_tab(path, metadata, ctx);
+                    self.binder.pending_view = Some(self.state.selected_view);
+                    self.binder.draft.enabled = true;
+                    self.sidebar_tab = 0;
+                    break;
+                }
                 Pick::Key => self.connection.key_path = path.to_string_lossy().into_owned(),
                 Pick::Labels(model) => {
                     if self.busy(&Purpose::Upload(UploadTarget::Labels(model.clone()))) {
@@ -123,7 +133,7 @@ impl Workbench {
             }
         }
     }
-    fn start_upload(&mut self, path: PathBuf, target: UploadTarget) {
+    pub(super) fn start_upload(&mut self, path: PathBuf, target: UploadTarget) {
         if self.busy(&Purpose::Upload(target.clone())) {
             return;
         }
@@ -159,6 +169,10 @@ impl Workbench {
         }
     }
     pub(super) fn uploaded(&mut self, target: UploadTarget, receipt: Value) {
+        if let UploadTarget::Binder(token) = &target {
+            self.binder_uploaded(token, receipt);
+            return;
+        }
         if let UploadTarget::Run(run_id, index) = &target {
             if let Some(mut run) = self.state.run.take() {
                 let result = if &run.id == run_id {
@@ -208,10 +222,11 @@ impl Workbench {
                     .entry(model)
                     .or_insert_with(|| json!({}))["labels_upload_id"] = json!(id);
             }
-            UploadTarget::Run(_, _) => unreachable!(),
+            UploadTarget::Run(_, _) | UploadTarget::Binder(_) => unreachable!(),
         }
     }
     pub(super) fn flash_input(&mut self, id: &str) {
+        self.binder.draft.enabled = false;
         self.input_flash = Some((id.into(), Instant::now(), true));
         self.sidebar_tab = 0;
     }
@@ -387,6 +402,27 @@ impl Workbench {
         }
     }
     pub(super) fn inputs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            let changed = ui
+                .selectable_value(&mut self.binder.draft.enabled, false, "Prediction")
+                .changed()
+                | ui.selectable_value(&mut self.binder.draft.enabled, true, "Binder design")
+                    .changed();
+            if changed
+                && let Some(view) = self
+                    .binder
+                    .draft
+                    .target_slot
+                    .and_then(|slot| self.views.get_mut(&slot))
+            {
+                view.hotspots.enabled = self.binder.draft.enabled;
+            }
+        });
+        ui.separator();
+        if self.binder.draft.enabled {
+            self.binder_left(ui, ctx);
+            return;
+        }
         Self::section(ui, "INPUT DRAFT");
         ui.horizontal(|ui| {
             ui.label("Run name");

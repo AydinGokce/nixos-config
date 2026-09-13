@@ -28,6 +28,18 @@ def pdb_fixture():
 
 
 class BundleTests(unittest.TestCase):
+    def test_optional_campaign_seed_is_hashed_validated_and_materialized(self):
+        bundle.create(self.pdb, self.settings, self.advanced, self.filters, self.path, execution={'seed': 42})
+        manifest, assets = bundle.inspect(self.path)
+        self.assertEqual(json.loads(assets['execution.json']), {'seed': 42})
+        self.assertEqual(manifest['files']['execution.json'], bundle.digest(assets['execution.json']))
+        bundle.materialize(self.path, self.root / 'with-seed')
+        self.assertEqual(json.loads((self.root / 'with-seed/execution.json').read_text()), {'seed': 42})
+        for execution in ({'seed': True}, {'seed': -1}, {'seed': 2**31}, {'seed': 3, 'command': 'other'}):
+            with self.subTest(execution=execution), self.assertRaisesRegex(ValueError, 'campaign seed'):
+                bundle.create(self.pdb, self.settings, self.advanced, self.filters,
+                              self.root / 'bad-seed.tar.gz', execution=execution)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

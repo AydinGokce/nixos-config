@@ -1,4 +1,6 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 #[path = "scene_geometry.rs"]
 mod geometry;
@@ -6,7 +8,82 @@ mod geometry;
 mod gpu;
 #[path = "structure.rs"]
 mod structure;
+#[path = "scene_surface.rs"]
+mod surface;
 pub use structure::{Atom, Molecule, MoleculeKind, ResidueKey, Secondary};
+
+/// A design selection is separate from the ordinary single-residue inspector.
+/// Exact source residue identities survive view restoration; array offsets do not.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hotspots {
+    pub enabled: bool,
+    pub residues: BTreeSet<ResidueKey>,
+    pub anchor: Option<ResidueKey>,
+    #[serde(skip)]
+    pending: Option<PickGesture>,
+}
+#[derive(Clone, Copy)]
+struct PickGesture {
+    toggle: bool,
+    range: bool,
+}
+impl Hotspots {
+    pub fn retain_existing(&mut self, molecule: &Molecule) {
+        self.residues.retain(|key| {
+            molecule
+                .residue(key)
+                .is_some_and(|residue| residue.kind == MoleculeKind::Protein)
+        });
+        if self
+            .anchor
+            .as_ref()
+            .is_some_and(|key| molecule.residue(key).is_none())
+        {
+            self.anchor = None;
+        }
+    }
+    pub fn pick(&mut self, molecule: &Molecule, key: &ResidueKey, toggle: bool, range: bool) {
+        let Some(residue) = molecule.residue(key) else {
+            return;
+        };
+        // BindCraft's input contract is a protein target. Nucleotides and ligands
+        // can still be inspected, but never become silently accepted hotspots.
+        if residue.kind != MoleculeKind::Protein {
+            return;
+        }
+        if range
+            && let Some(anchor) = self.anchor.as_ref().and_then(|key| molecule.residue(key))
+            && anchor.chain == residue.chain
+        {
+            let chain = &molecule.chains[residue.chain];
+            let positions = chain
+                .residues
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &id)| {
+                    let candidate = &molecule.residues[id];
+                    (candidate.key == *key || candidate.key == anchor.key).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if let (Some(&start), Some(&end)) = (positions.first(), positions.last()) {
+                for &id in &chain.residues[start..=end] {
+                    let candidate = &molecule.residues[id];
+                    if candidate.kind == MoleculeKind::Protein {
+                        self.residues.insert(candidate.key.clone());
+                    }
+                }
+            }
+        } else if toggle || self.enabled {
+            if !self.residues.remove(key) {
+                self.residues.insert(key.clone());
+            }
+        } else {
+            return;
+        }
+        self.anchor = Some(key.clone());
+    }
+}
 
 pub struct Renderer(Arc<egui::mutex::Mutex<gpu::Renderer>>);
 impl Renderer {
@@ -16,6 +93,34 @@ impl Renderer {
     }
     pub fn error(&self) -> Option<String> {
         self.0.lock().error.clone()
+    }
+    pub fn surface_ready(&self) -> bool {
+        self.0.lock().surface_ready()
+    }
+    pub fn surface_error(&self) -> Option<String> {
+        self.0.lock().surface_error().map(str::to_owned)
+    }
+    pub fn poll_surface(&self, gl: &eframe::glow::Context) {
+        self.0.lock().accept_surface(gl);
+    }
+    /// Resolve the previous GPU frame's click before a caller captures a design
+    /// intent. The input panel is drawn before the viewer, so consuming only in
+    /// viewport() would otherwise omit a just-clicked hotspot from Run.
+    pub fn consume_pick(
+        &self,
+        molecule: &Molecule,
+        selected: &mut Option<ResidueKey>,
+        hotspots: &mut Hotspots,
+    ) -> bool {
+        if let Some(picked) = self.0.lock().take_pick()
+            && let Some(gesture) = hotspots.pending.take()
+            && let Some(residue) = picked.and_then(|id| molecule.residues.get(id))
+        {
+            *selected = Some(residue.key.clone());
+            hotspots.pick(molecule, &residue.key, gesture.toggle, gesture.range);
+            return true;
+        }
+        false
     }
     pub fn destroy(&self, gl: &eframe::glow::Context) {
         self.0.lock().destroy(gl);
@@ -56,6 +161,7 @@ pub enum Representation {
     Sticks,
     Spheres,
     Trace,
+    Surface,
 }
 impl Representation {
     pub fn name(self) -> &'static str {
@@ -64,6 +170,7 @@ impl Representation {
             Self::Sticks => "sticks",
             Self::Spheres => "spheres",
             Self::Trace => "backbone trace",
+            Self::Surface => "surface",
         }
     }
 }
@@ -129,6 +236,7 @@ pub fn viewport(
     representation: Representation,
     index: usize,
     selected: &mut Option<ResidueKey>,
+    hotspots: &mut Hotspots,
     visible: bool,
     labels: bool,
     axes: bool,
@@ -141,6 +249,16 @@ pub fn viewport(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0, Color32::from_rgb(3, 5, 7));
     let mut changed = false;
+    if representation == Representation::Surface {
+        renderer.0.lock().request_surface(molecule);
+        if !renderer.surface_ready() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+    if renderer.consume_pick(molecule, selected, hotspots) {
+        ui.ctx().request_repaint();
+    }
     if response.dragged() {
         let delta = ui.input(|i| i.pointer.delta());
         if response.dragged_by(egui::PointerButton::Secondary) || ui.input(|i| i.modifiers.shift) {
@@ -158,7 +276,10 @@ pub fn viewport(
             changed = true;
         }
     }
-    if response.double_clicked() {
+    if response.double_clicked()
+        && !hotspots.enabled
+        && !ui.input(|input| input.modifiers.ctrl || input.modifiers.command)
+    {
         *camera = Camera::fit(molecule);
         changed = true;
     }
@@ -178,6 +299,15 @@ pub fn viewport(
         }
     });
     let draw = Rect::from_min_max(rect.min + Vec2::new(8., 43.), rect.max - Vec2::new(8., 32.));
+    if representation == Representation::Surface && !renderer.surface_ready() {
+        painter.text(
+            draw.center(),
+            Align2::CENTER_CENTER,
+            renderer.0.lock().surface_message(),
+            FontId::proportional(13.),
+            Color32::from_gray(180),
+        );
+    }
     if draw.is_positive() && visible {
         let gpu = renderer.0.clone();
         let camera = *camera;
@@ -186,6 +316,12 @@ pub fn viewport(
             .and_then(|key| molecule.residues.iter().position(|r| &r.key == key))
             .map_or(0, |index| index + 1);
         let chains = chains.to_vec();
+        let hotspot_ids: Vec<_> = molecule
+            .residues
+            .iter()
+            .enumerate()
+            .filter_map(|(id, residue)| hotspots.residues.contains(&residue.key).then_some(id + 1))
+            .collect();
         let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
             gpu.lock().paint(
                 painter.gl(),
@@ -196,6 +332,7 @@ pub fn viewport(
                 index,
                 selected,
                 &chains,
+                &hotspot_ids,
             );
         });
         painter.add(egui::PaintCallback {
@@ -206,27 +343,18 @@ pub fn viewport(
     if visible && draw.is_positive() {
         if response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
+            && draw.contains(pointer)
         {
-            let nearest = molecule
-                .residues
-                .iter()
-                .filter(|r| chains.get(r.chain).copied().unwrap_or(false))
-                .map(|r| {
-                    let (point, depth) =
-                        camera.project(molecule.atoms[r.anchor].p, draw, molecule.center);
-                    (r, point.distance(pointer), depth)
-                })
-                .filter(|(_, distance, _)| *distance < 18.)
-                .min_by(|a, b| {
-                    if (a.1 - b.1).abs() < 2. {
-                        b.2.total_cmp(&a.2)
-                    } else {
-                        a.1.total_cmp(&b.1)
-                    }
-                });
-            if let Some((residue, _, _)) = nearest {
-                *selected = Some(residue.key.clone());
-            }
+            let modifiers = ui.input(|input| input.modifiers);
+            hotspots.pending = Some(PickGesture {
+                toggle: modifiers.ctrl || modifiers.command || hotspots.enabled,
+                range: modifiers.shift && hotspots.enabled,
+            });
+            renderer.0.lock().request_pick([
+                (pointer.x - draw.left()) / draw.width(),
+                (pointer.y - draw.top()) / draw.height(),
+            ]);
+            ui.ctx().request_repaint();
         }
         if (labels || selected.is_some())
             && let Some(key) = selected.as_ref()
@@ -293,21 +421,25 @@ pub fn viewport(
     painter.text(
         rect.left_bottom() + Vec2::new(12., -12.),
         Align2::LEFT_BOTTOM,
-        format!(
-            "{} atoms   /   {}",
-            molecule.atoms.len(),
-            if representation == Representation::Cartoon {
-                if molecule.secondary_source.starts_with("File annotations") {
-                    "file annotations + backbone approximation"
+        if representation == Representation::Surface {
+            renderer.0.lock().surface_message().to_owned()
+        } else {
+            format!(
+                "{} atoms   /   {}",
+                molecule.atoms.len(),
+                if representation == Representation::Cartoon {
+                    if molecule.secondary_source.starts_with("File annotations") {
+                        "file annotations + backbone approximation"
+                    } else {
+                        "backbone approximation (not DSSP)"
+                    }
+                } else if molecule.warnings.is_empty() {
+                    "source coordinates"
                 } else {
-                    "backbone approximation (not DSSP)"
+                    "see structure notes"
                 }
-            } else if molecule.warnings.is_empty() {
-                "source coordinates"
-            } else {
-                "see structure notes"
-            }
-        ),
+            )
+        },
         FontId::monospace(10.),
         Color32::from_gray(135),
     );
@@ -331,4 +463,54 @@ pub fn viewport(
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+    #[test]
+    fn hotspot_toggle_range_and_restore_preserve_exact_identity() {
+        let molecule = Molecule::reference();
+        let protein = &molecule
+            .chains
+            .iter()
+            .find(|chain| chain.kind == MoleculeKind::Protein)
+            .unwrap()
+            .residues;
+        let a = molecule.residues[protein[10]].key.clone();
+        let b = molecule.residues[protein[15]].key.clone();
+        let mut selection = Hotspots::default();
+        selection.pick(&molecule, &a, false, false);
+        assert!(selection.residues.is_empty());
+        selection.pick(&molecule, &a, true, false);
+        selection.pick(&molecule, &b, true, true);
+        assert_eq!(selection.residues.len(), 6);
+        selection.pick(&molecule, &a, true, false);
+        assert_eq!(selection.residues.len(), 5);
+        let mut restored: Hotspots =
+            serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();
+        let mut missing = a.clone();
+        missing.sequence = "999999".into();
+        restored.residues.insert(missing);
+        restored.retain_existing(&molecule);
+        assert_eq!(restored.residues, selection.residues);
+    }
+    #[test]
+    fn nucleotide_clicks_never_become_protein_hotspots() {
+        let molecule = Molecule::reference();
+        let nucleotide = molecule
+            .residues
+            .iter()
+            .find(|residue| matches!(residue.kind, MoleculeKind::Rna | MoleculeKind::Dna))
+            .unwrap();
+        let mut selection = Hotspots {
+            enabled: true,
+            ..Default::default()
+        };
+        selection.pick(&molecule, &nucleotide.key, true, false);
+        assert!(selection.residues.is_empty());
+        selection.residues.insert(nucleotide.key.clone());
+        selection.retain_existing(&molecule);
+        assert!(selection.residues.is_empty());
+    }
 }

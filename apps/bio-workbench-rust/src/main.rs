@@ -1,4 +1,5 @@
 mod alignment;
+mod binder_state;
 mod library_cache;
 mod navigation;
 mod pymol;
@@ -7,6 +8,9 @@ mod rpc;
 mod scene;
 mod session;
 mod ui_annotations;
+mod ui_binder;
+mod ui_binder_context;
+mod ui_binder_results;
 mod ui_capacity;
 mod ui_dock;
 mod ui_inputs;
@@ -36,6 +40,7 @@ enum UploadTarget {
     Attachment(String, String),
     Labels(String),
     Run(String, usize),
+    Binder(String),
 }
 #[derive(Clone, PartialEq)]
 enum ArtifactTarget {
@@ -45,6 +50,7 @@ enum ArtifactTarget {
 }
 #[derive(Clone, PartialEq)]
 enum Purpose {
+    Binder(ui_binder::Request),
     Catalog,
     History,
     WorkerStatus(u64),
@@ -86,6 +92,7 @@ struct Failure {
 }
 #[derive(Clone)]
 enum Pick {
+    BinderTarget,
     Inputs,
     Structure,
     Key,
@@ -117,6 +124,7 @@ struct Workbench {
     failures: Vec<Failure>,
     library: ui_library::Explorer,
     library_runs: ui_library_runs::RunControls,
+    binder: ui_binder::Panel,
     connection_open: bool,
     preview_open: bool,
     help_open: bool,
@@ -175,7 +183,8 @@ impl Workbench {
         let (ui_tx, ui_rx) = mpsc::channel();
         let library = ui_library::Explorer::restore(&state.extra);
         let library_runs = ui_library_runs::RunControls::default();
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["GC Protein Engineering Console — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let binder = ui_binder::Panel::restore(&state);
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,binder,connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["GC Protein Engineering Console — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
@@ -230,6 +239,13 @@ impl Workbench {
                         }
                         if ui.button("Open local structure…").clicked() {
                             self.choose_files(Pick::Structure, ctx);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Design binders against active structure")
+                            .clicked()
+                        {
+                            self.binder_use_active();
                             ui.close();
                         }
                         if ui.button("Library archive").clicked() {
@@ -346,6 +362,7 @@ impl Workbench {
                                     scene::Representation::Cartoon,
                                     scene::Representation::Sticks,
                                     scene::Representation::Spheres,
+                                    scene::Representation::Surface,
                                     scene::Representation::Trace,
                                 ] {
                                     ui.selectable_value(&mut view.style, style, style.name());
@@ -417,6 +434,7 @@ impl Workbench {
                         ("cartoon", "Show the selected structure as a cartoon."),
                         ("sticks", "Show the selected structure as sticks."),
                         ("spheres", "Show the selected structure as spheres."),
+                        ("surface", "Show the solvent-accessible molecular surface."),
                         ("trace", "Show the selected structure as a backbone trace."),
                         ("help", "Open GC Protein Engineering Console help."),
                     ] {
@@ -483,13 +501,14 @@ impl Workbench {
             "reset" => self.reset_view(),
             "help" => {
                 self.help_open = true;
-                self.log("View commands: reset, cartoon, sticks, spheres, trace, help. Start cloud jobs with the Run button.");
+                self.log("View commands: reset, cartoon, sticks, spheres, surface, trace, help. Start cloud jobs with the Run button.");
             }
             name => {
                 if let Some(style) = [
                     scene::Representation::Cartoon,
                     scene::Representation::Sticks,
                     scene::Representation::Spheres,
+                    scene::Representation::Surface,
                     scene::Representation::Trace,
                 ]
                 .into_iter()
@@ -529,6 +548,7 @@ impl eframe::App for Workbench {
         }
         self.top(ctx);
         self.console_panel(ctx);
+        self.binder_results_panel(ctx);
         egui::SidePanel::left("inputs")
             .resizable(true)
             .default_width(270.)
@@ -565,7 +585,12 @@ impl eframe::App for Workbench {
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("right-scroll")
-                        .show(ui, |ui| self.inspector(ui, ctx));
+                        .show(ui, |ui| {
+                            if self.binder.draft.enabled {
+                                self.binder_inspector(ui);
+                            }
+                            self.inspector(ui, ctx);
+                        });
                 });
         }
         egui::CentralPanel::default()
@@ -584,6 +609,9 @@ impl eframe::App for Workbench {
         self.connection_dialog(ctx);
         self.worker_dialog(ctx);
         self.run_dialog(ctx);
+        self.binder_progress_dialog(ctx);
+        self.binder_save_dialog(ctx);
+        self.binder_target_dialog(ctx);
         self.settings_dialog(ctx);
         self.text_dialog(ctx);
         let mut help = self.help_open;
@@ -592,7 +620,7 @@ impl eframe::App for Workbench {
             ui.label("Jobs and artifacts live on the head. Closing this client does not cancel them. Use the explicit job/batch Cancel controls.");
             ui.label("Click a run or structure under Runs / results to open its tab. Drag tabs to reorder, onto another tab bar to group, or to a viewer edge to split. Close a tab with its left X. Linking cameras does not align structures.");
             ui.label("Left drag rotates; right drag pans; wheel zooms; double-click fits. Right-click for lighting. Annotation edits remain local until Save to head.");
-            ui.label("The bottom-bar buttons and bio> commands change the selected structure: cartoon, sticks, spheres, or trace. Reset fits the selected structure and any linked cameras; help opens this window.");
+            ui.label("The bottom-bar buttons and bio> commands change the selected structure: cartoon, sticks, spheres, surface, or trace. Reset fits the selected structure and any linked cameras; help opens this window.");
             ui.label("Startup Cas9 is experimental 4OO8, not a prediction. GPU lighting uses rasterization; confidence/chemistry QA comes only from native metadata.");
         });
         self.help_open = help;

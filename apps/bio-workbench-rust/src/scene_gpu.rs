@@ -1,8 +1,24 @@
 //! Native OpenGL rasterizer. The UI callback owns no transient molecular meshes.
 //! Lighting/contact shading are presentation effects, not ray tracing or analysis.
-use super::{Camera, Molecule, Representation, V3, geometry};
+use super::{Camera, Molecule, Representation, V3, geometry, surface};
 use eframe::{egui, egui_glow, glow};
 use glow::HasContext as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+
+// Only one CPU surface builder runs in this process. Other visible surface tabs
+// retry without allocating a grid or spawning waiting threads.
+static SURFACE_BUILDING: AtomicBool = AtomicBool::new(false);
+struct SurfacePermit;
+impl Drop for SurfacePermit {
+    fn drop(&mut self) {
+        SURFACE_BUILDING.store(false, Ordering::Release);
+    }
+}
+struct SurfaceWork {
+    receiver: mpsc::Receiver<(Result<surface::Surface, String>, SurfacePermit)>,
+    cancel: Arc<AtomicBool>,
+}
 
 struct Mesh {
     vao: glow::VertexArray,
@@ -26,6 +42,7 @@ struct Target {
     fbo: glow::Framebuffer,
     color: glow::Texture,
     normal_depth: glow::Texture,
+    residue: glow::Texture,
     depth: glow::Renderbuffer,
     size: [i32; 2],
 }
@@ -35,6 +52,15 @@ pub(super) struct Renderer {
     post_program: glow::Program,
     empty_vao: glow::VertexArray,
     chains: Vec<Chain>,
+    surface: Option<Vec<Mesh>>,
+    surface_work: Option<SurfaceWork>,
+    surface_message: String,
+    surface_failed: bool,
+    highlights: glow::Texture,
+    highlight_ids: Vec<usize>,
+    residue_count: usize,
+    pick_request: Option<[f32; 2]>,
+    pick_result: Option<Option<usize>>,
     target: Option<Target>,
     pub(super) error: Option<String>,
     destroyed: bool,
@@ -221,6 +247,7 @@ impl Target {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             let color = pending.texture()?;
             let normal_depth = pending.texture()?;
+            let residue = pending.texture()?;
             for (texture, attachment, filter) in [
                 (color, glow::COLOR_ATTACHMENT0, glow::LINEAR),
                 (normal_depth, glow::COLOR_ATTACHMENT1, glow::NEAREST),
@@ -257,6 +284,35 @@ impl Target {
                     0,
                 );
             }
+            gl.bind_texture(glow::TEXTURE_2D, Some(residue));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R32F as i32,
+                size[0],
+                size[1],
+                0,
+                glow::RED,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT2,
+                glow::TEXTURE_2D,
+                Some(residue),
+                0,
+            );
             let depth = pending.renderbuffer()?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
             gl.renderbuffer_storage(
@@ -271,11 +327,16 @@ impl Target {
                 glow::RENDERBUFFER,
                 Some(depth),
             );
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
+            gl.draw_buffers(&[
+                glow::COLOR_ATTACHMENT0,
+                glow::COLOR_ATTACHMENT1,
+                glow::COLOR_ATTACHMENT2,
+            ]);
             let result = Self {
                 fbo,
                 color,
                 normal_depth,
+                residue,
                 depth,
                 size,
             };
@@ -294,6 +355,7 @@ impl Target {
             gl.delete_framebuffer(self.fbo);
             gl.delete_texture(self.color);
             gl.delete_texture(self.normal_depth);
+            gl.delete_texture(self.residue);
             gl.delete_renderbuffer(self.depth);
         }
     }
@@ -306,9 +368,9 @@ fn program(
 ) -> Result<glow::Program, String> {
     let embedded = egui_glow::ShaderVersion::get(gl).is_embedded();
     let version = if embedded {
-        "#version 300 es\nprecision highp float;\n#define OUT0 layout(location=0)\n#define OUT1 layout(location=1)\n"
+        "#version 300 es\nprecision highp float;\nprecision highp int;\n#define OUT0 layout(location=0)\n#define OUT1 layout(location=1)\n#define OUT2 layout(location=2)\n"
     } else {
-        "#version 140\n#define OUT0\n#define OUT1\n"
+        "#version 140\n#define OUT0\n#define OUT1\n#define OUT2\n"
     };
     unsafe {
         let program = gl.create_program()?;
@@ -334,6 +396,7 @@ fn program(
         if !embedded {
             gl.bind_frag_data_location(program, 0, "out_color");
             gl.bind_frag_data_location(program, 1, "out_normal");
+            gl.bind_frag_data_location(program, 2, "out_residue");
         }
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
@@ -375,6 +438,33 @@ impl Renderer {
         let post_program = program(gl, POST_VERTEX, POST_FRAGMENT, &[])?;
         pending.keep_program(post_program);
         let empty_vao = pending.vao()?;
+        let highlights = pending.texture()?;
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(highlights));
+            let rows = (molecule.residues.len() + 1).div_ceil(256).max(1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R8 as i32,
+                256,
+                rows as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&vec![0; 256 * rows])),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
         pending.committed = true;
         Ok(Self {
             mesh_program,
@@ -382,14 +472,135 @@ impl Renderer {
             post_program,
             empty_vao,
             chains,
+            surface: None,
+            surface_work: None,
+            surface_message: "Surface has not been requested".into(),
+            surface_failed: false,
+            highlights,
+            highlight_ids: Vec::new(),
+            residue_count: molecule.residues.len(),
+            pick_request: None,
+            pick_result: None,
             target: None,
             error: None,
             destroyed: false,
         })
     }
+    pub(super) fn request_surface(&mut self, molecule: &Molecule) {
+        if self.destroyed
+            || self.surface.is_some()
+            || self.surface_work.is_some()
+            || self.surface_failed
+        {
+            return;
+        }
+        if SURFACE_BUILDING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.surface_message = "Waiting for the molecular surface builder…".into();
+            return;
+        }
+        let input = match surface::Input::new(molecule) {
+            Ok(input) => input,
+            Err(error) => {
+                SURFACE_BUILDING.store(false, Ordering::Release);
+                self.surface_message = error;
+                self.surface_failed = true;
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        match std::thread::Builder::new()
+            .name("molecular-surface".into())
+            .spawn(move || {
+                let permit = SurfacePermit;
+                let result = surface::build(input, &flag);
+                // Retain the permit until upload/disposal, bounding completed CPU
+                // meshes as well as active grids even if the user hides this tab.
+                let _ = sender.send((result, permit));
+            }) {
+            Ok(_) => {
+                self.surface_work = Some(SurfaceWork { receiver, cancel });
+                self.surface_message = "Building molecular surface…".into();
+            }
+            Err(error) => {
+                SURFACE_BUILDING.store(false, Ordering::Release);
+                self.surface_failed = true;
+                self.surface_message = format!("Cannot start molecular surface builder: {error}");
+            }
+        }
+    }
+    pub(super) fn surface_ready(&self) -> bool {
+        self.surface.is_some()
+    }
+    pub(super) fn surface_message(&self) -> &str {
+        &self.surface_message
+    }
+    pub(super) fn surface_error(&self) -> Option<&str> {
+        self.surface_failed.then_some(&self.surface_message)
+    }
+    pub(super) fn request_pick(&mut self, at: [f32; 2]) {
+        self.pick_request = Some(at);
+    }
+    pub(super) fn take_pick(&mut self) -> Option<Option<usize>> {
+        self.pick_result.take()
+    }
+    pub(super) fn accept_surface(&mut self, gl: &glow::Context) {
+        let Some(work) = self.surface_work.as_ref() else {
+            return;
+        };
+        let (result, _permit) = match work.receiver.try_recv() {
+            Ok((result, permit)) => (result, Some(permit)),
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => (
+                Err("Molecular surface builder stopped before returning geometry".into()),
+                None,
+            ),
+        };
+        self.surface_work = None;
+        match result {
+            Ok(surface) => {
+                let mut pending = Pending::new(gl);
+                let meshes: Result<Vec<_>, _> = surface
+                    .chains
+                    .iter()
+                    .map(|mesh| Mesh::new(gl, mesh, &mut pending))
+                    .collect();
+                match meshes {
+                    Ok(meshes) => {
+                        pending.committed = true;
+                        self.surface = Some(meshes);
+                        self.surface_message = format!(
+                            "SAS · 1.4 Å probe · {:.2} Å grid · {} triangles",
+                            surface.spacing, surface.triangles
+                        );
+                    }
+                    Err(error) => {
+                        self.surface_failed = true;
+                        self.surface_message = format!("Surface GPU upload: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                self.surface_failed = true;
+                self.surface_message = error;
+            }
+        }
+    }
     pub(super) fn destroy(&mut self, gl: &glow::Context) {
         if self.destroyed {
             return;
+        }
+        if let Some(work) = self.surface_work.take() {
+            work.cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(surface) = self.surface.take() {
+            for mesh in surface {
+                mesh.destroy(gl);
+            }
         }
         for chain in &self.chains {
             chain.cartoon.destroy(gl);
@@ -406,6 +617,7 @@ impl Renderer {
             gl.delete_program(self.atom_program);
             gl.delete_program(self.post_program);
             gl.delete_vertex_array(self.empty_vao);
+            gl.delete_texture(self.highlights);
         }
         self.destroyed = true;
     }
@@ -420,17 +632,23 @@ impl Renderer {
         _index: usize,
         selected: usize,
         chains: &[bool],
+        hotspots: &[usize],
     ) {
         if self.destroyed || self.error.is_some() {
             return;
         }
+        self.accept_surface(gl);
         let viewport = info.viewport_in_pixels();
         if viewport.width_px < 1 || viewport.height_px < 1 {
             return;
         }
         // Two samples per axis, bounded for unusually large/HiDPI windows.
         let max_side = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) }.min(4096) as f32;
-        let scale = 2.0_f32.min(max_side / viewport.width_px.max(viewport.height_px) as f32);
+        let pixel_budget =
+            (4_194_304. / (viewport.width_px as f32 * viewport.height_px as f32)).sqrt();
+        let scale = 2.0_f32
+            .min(max_side / viewport.width_px.max(viewport.height_px) as f32)
+            .min(pixel_budget);
         let size = [
             (viewport.width_px as f32 * scale).max(1.) as i32,
             (viewport.height_px as f32 * scale).max(1.) as i32,
@@ -473,6 +691,29 @@ impl Renderer {
             basis[2].1, basis[2].2,
         ];
         unsafe {
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.highlights));
+            if hotspots != self.highlight_ids {
+                let rows = (self.residue_count + 1).div_ceil(256).max(1);
+                let mut data = vec![0u8; 256 * rows];
+                for &id in hotspots {
+                    if id > 0 && id <= self.residue_count {
+                        data[id] = 255;
+                    }
+                }
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    256,
+                    rows as i32,
+                    glow::RED,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&data)),
+                );
+                self.highlight_ids = hotspots.to_vec();
+            }
             gl.disable(glow::SCISSOR_TEST);
             gl.disable(glow::BLEND);
             gl.disable(glow::CULL_FACE);
@@ -483,6 +724,7 @@ impl Renderer {
             gl.depth_mask(true);
             gl.clear_buffer_f32_slice(glow::COLOR, 0, &[0., 0., 0., 0.]);
             gl.clear_buffer_f32_slice(glow::COLOR, 1, &[0., 0., 0., 0.]);
+            gl.clear_buffer_f32_slice(glow::COLOR, 2, &[0., 0., 0., 0.]);
             gl.clear_depth_f32(1.);
             gl.clear(glow::DEPTH_BUFFER_BIT);
             for program in [self.mesh_program, self.atom_program] {
@@ -515,9 +757,12 @@ impl Renderer {
                     gl.get_uniform_location(program, "u_selected").as_ref(),
                     selected as f32,
                 );
+                gl.uniform_1_i32(gl.get_uniform_location(program, "u_hotspots").as_ref(), 2);
             }
             gl.use_program(Some(self.mesh_program));
-            for (chain, visible) in self.chains.iter().zip(chains.iter().copied()) {
+            for (index, (chain, visible)) in
+                self.chains.iter().zip(chains.iter().copied()).enumerate()
+            {
                 if !visible {
                     continue;
                 }
@@ -526,6 +771,11 @@ impl Renderer {
                     Representation::Trace => chain.trace.draw(gl),
                     Representation::Sticks => chain.sticks.draw(gl),
                     Representation::Spheres => {}
+                    Representation::Surface => {
+                        if let Some(meshes) = &self.surface {
+                            meshes[index].draw(gl);
+                        }
+                    }
                 }
             }
             gl.use_program(Some(self.atom_program));
@@ -542,9 +792,30 @@ impl Renderer {
                 if visible {
                     match representation {
                         Representation::Spheres | Representation::Sticks => chain.atoms.draw(gl),
+                        Representation::Surface => {}
                         _ => chain.details.draw(gl),
                     }
                 }
+            }
+            if let Some(at) = self.pick_request.take() {
+                let x = (at[0] * size[0] as f32).floor() as i32;
+                let y = ((1. - at[1]) * size[1] as f32).floor() as i32;
+                let mut residue = 0f32;
+                gl.read_buffer(glow::COLOR_ATTACHMENT2);
+                gl.read_pixels(
+                    x.clamp(0, size[0] - 1),
+                    y.clamp(0, size[1] - 1),
+                    1,
+                    1,
+                    glow::RED,
+                    glow::FLOAT,
+                    glow::PixelPackData::Slice(Some(bytemuck::bytes_of_mut(&mut residue))),
+                );
+                gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                self.pick_result = Some(
+                    (residue.is_finite() && residue >= 1. && residue <= self.residue_count as f32)
+                        .then(|| residue as usize - 1),
+                );
             }
             // Return to egui's destination before compositing. Its painter will
             // restore program, viewport, VAO, blend and scissor state afterwards.
@@ -610,6 +881,8 @@ impl Renderer {
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
@@ -630,7 +903,7 @@ vec4 project(vec3 p) {
 "#;
 const MESH_VERTEX: &str = r#"
 in vec3 a_position; in vec3 a_normal; in vec3 a_color; in float a_residue;
-out vec3 v_position; out vec3 v_normal; out vec3 v_color; out float v_residue;
+out vec3 v_position; out vec3 v_normal; out vec3 v_color; flat out float v_residue;
 void main() {
     v_position=u_rotation*a_position-vec3(0.,0.,u_distance);
     v_normal=u_rotation*a_normal;v_color=a_color;v_residue=a_residue;
@@ -640,8 +913,10 @@ void main() {
 const SURFACE: &str = r#"
 uniform float u_selected;
 uniform float u_atmosphere;
+uniform sampler2D u_hotspots;
 OUT0 out vec4 out_color;
 OUT1 out vec4 out_normal;
+OUT2 out float out_residue;
 void surface(vec3 p,vec3 normal,vec3 color,float residue) {
     vec3 n=normalize(normal);vec3 view=normalize(-p);
     if(dot(n,view)<0.) n=-n;
@@ -655,14 +930,18 @@ void surface(vec3 p,vec3 normal,vec3 color,float residue) {
     vec3 lit=color*diffuse+vec3(1.,0.97,0.92)*specular;
     lit+=vec3(0.13,0.26,0.32)*max(dot(n,rim),0.)*fresnel;
     float selected=step(0.5,u_selected)*(1.-smoothstep(0.25,0.75,abs(residue-u_selected)));
-    lit=mix(lit,lit*0.45+vec3(0.68,0.47,0.13),selected*0.55);
+    int identity=int(floor(residue+0.5));
+    float hotspot=texelFetch(u_hotspots,ivec2(identity%256,identity/256),0).r;
+    lit=mix(lit,lit*0.10+vec3(0.78,0.115,0.016)*diffuse,hotspot*0.90);
+    lit=mix(lit,lit*0.45+vec3(0.68,0.47,0.13),selected*0.55*(1.-hotspot*0.8));
     // Mild atmospheric attenuation makes the interior less visually crowded.
     lit*=mix(1.06,0.74,smoothstep(0.76*u_atmosphere,1.26*u_atmosphere,-p.z));
     out_color=vec4(lit,1.);out_normal=vec4(n,-p.z/u_atmosphere);
+    out_residue=float(identity);
 }
 "#;
 const MESH_FRAGMENT: &str = r#"
-in vec3 v_position;in vec3 v_normal;in vec3 v_color;in float v_residue;
+in vec3 v_position;in vec3 v_normal;in vec3 v_color;flat in float v_residue;
 void main() {surface(v_position,v_normal,v_color,v_residue);}
 "#;
 const ATOM_VERTEX: &str = r#"

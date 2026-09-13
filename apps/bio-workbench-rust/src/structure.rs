@@ -36,7 +36,7 @@ impl fmt::Display for MoleculeKind {
         f.write_str(self.name())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ResidueKey {
     pub model: String,
     pub chain: String,

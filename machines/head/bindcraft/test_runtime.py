@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -93,6 +94,40 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "head-validated"):
                     function(input_path, self.shared, self.shared / "out")
         self.assertFalse((self.shared / "out").exists())
+
+    def test_campaign_seed_is_bound_to_bundle_without_changing_upstream_defaults(self):
+        import bundle
+        from test_bundle import pdb_fixture
+        pdb = self.shared / 'target.pdb'; pdb.write_bytes(pdb_fixture())
+        settings = {'binder_name': 'test', 'chains': 'A', 'target_hotspot_residues': 'A5',
+                    'lengths': [65, 65], 'number_of_final_designs': 1}
+        for seed in (None, 42):
+            with self.subTest(seed=seed):
+                archive = self.shared / ('input-' + str(seed) + '.tar.gz')
+                out = self.shared / ('out-' + str(seed))
+                bundle.create(pdb, settings, bundle.defaults('advanced'), bundle.defaults('filters'), archive,
+                              execution={'seed': seed} if seed is not None else None)
+                calls = []
+                def native(command, **kwargs):
+                    calls.append(command)
+                    path = out / 'designs/Trajectory/Relaxed/test.pdb'
+                    path.parent.mkdir(parents=True); path.write_bytes(pdb.read_bytes())
+                    return subprocess.CompletedProcess(command, 0)
+                with patch.dict(runtime.os.environ, {'BIO_BINDCRAFT_BUNDLE_SHA256': runtime.file_digest(archive)}), \
+                        patch.object(runtime, 'gpu_check', return_value={'status': 'passed', 'versions': {}}), \
+                        patch.object(runtime.subprocess, 'run', side_effect=native):
+                    result = runtime.run(archive, self.shared, out)
+                self.assertEqual(result['status'], 'completed')
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(json.loads((out / 'input/advanced.json').read_text()), bundle.defaults('advanced'))
+                self.assertEqual(json.loads((out / 'input/filters.json').read_text()), bundle.defaults('filters'))
+                if seed is None:
+                    self.assertTrue(calls[0][2].endswith('/bindcraft.py'))
+                    self.assertNotIn('execution', result)
+                else:
+                    self.assertTrue(calls[0][2].endswith('/native_entry.py'))
+                    self.assertEqual(calls[0][calls[0].index('--seed') + 1], '42')
+                    self.assertEqual(result['execution'], {'seed': 42})
 
 
 if __name__ == "__main__":

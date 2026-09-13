@@ -4,13 +4,84 @@
 //! https://people.csail.mit.edu/bkph/papers/Absolute_Orientation_Scanned.pdf
 //! Correspondence is deliberately conservative: unique, exactly equal ordered
 //! polymer component sequences. We never invent homomer chain correspondences.
-use crate::scene::{Molecule, MoleculeKind, V3};
+use crate::scene::{Molecule, MoleculeKind, ResidueKey, V3};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 type Point = [f64; 3];
 type Rotation = [[f64; 3]; 3];
 const IDENTITY: Rotation = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+// Source parsers already limit coordinates to 10^6 Å. Leave room for rigid
+// transformations between their coordinate frames without accepting arbitrary
+// finite values that overflow GPU calculations or destroy camera precision.
+const MAX_DISPLAY_COORDINATE: f64 = 10_000_000.;
+
+/// Restore a display fit onto freshly parsed, unchanged source coordinates.
+/// The caller verifies source/reference identities separately. Reject scaling,
+/// reflection, shear, non-finite values and unsafe bounds before any mutation.
+pub fn apply_display_transform(
+    molecule: &mut Molecule,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    display_center: [f64; 3],
+) -> Result<(), String> {
+    if rotation.iter().flatten().any(|v| !v.is_finite()) {
+        return Err("Saved alignment rotation contains a non-finite value".into());
+    }
+    for i in 0..3 {
+        for j in 0..3 {
+            let dot: f64 = (0..3).map(|k| rotation[i][k] * rotation[j][k]).sum();
+            if (dot - if i == j { 1. } else { 0. }).abs() > 1e-6 {
+                return Err("Saved alignment rotation is not orthonormal (scale or shear)".into());
+            }
+        }
+    }
+    let [[a, b, c], [d, e, f], [g, h, i]] = rotation;
+    let determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (determinant - 1.).abs() > 1e-6 {
+        return Err("Saved alignment rotation is not a proper rotation (reflection)".into());
+    }
+    let bounded = |values: &[f64]| {
+        values
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= MAX_DISPLAY_COORDINATE)
+    };
+    if !bounded(&translation) || !bounded(&display_center) {
+        return Err(
+            "Saved alignment translation or display center is outside finite bounds".into(),
+        );
+    }
+    if molecule.atoms.is_empty() {
+        return Err("Saved alignment cannot be applied to an empty structure".into());
+    }
+    let positions = molecule
+        .atoms
+        .iter()
+        .map(|atom| {
+            let p = add(multiply(rotation, xyz(atom.p)), translation);
+            if bounded(&p) {
+                Ok(V3(p[0] as f32, p[1] as f32, p[2] as f32))
+            } else {
+                Err("Saved alignment produces coordinates outside finite bounds".to_owned())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let center = V3(
+        display_center[0] as f32,
+        display_center[1] as f32,
+        display_center[2] as f32,
+    );
+    let radius = positions
+        .iter()
+        .map(|&p| norm2(sub(xyz(p), xyz(center))).sqrt())
+        .fold(1., f64::max) as f32;
+    for (atom, position) in molecule.atoms.iter_mut().zip(positions) {
+        atom.p = position;
+    }
+    molecule.center = center;
+    molecule.radius = radius;
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ChainMatch {
@@ -191,6 +262,110 @@ pub fn align_to_reference(
             }
         ));
     }
+    fit_pairs(reference, moving, &pairs, receipt)
+}
+
+/// Fit a cropped target using an externally verified source-to-output residue
+/// map. Neither residue numbering nor a similar sequence invents correspondence.
+/// All mapped residues must exist, occur once, and retain the same chemistry.
+/// Caller retains this map with the exact source/output artifact hashes.
+pub fn align_with_residue_pairs(
+    reference: &Molecule,
+    moving: &mut Molecule,
+    residue_pairs: &[(ResidueKey, ResidueKey)],
+) -> Result<AlignmentReceipt, String> {
+    if residue_pairs.len() < 3
+        || residue_pairs.len() > reference.residues.len().min(moving.residues.len())
+    {
+        return Err("Explicit alignment requires at least three distinct paired residues within both structures".into());
+    }
+    let reference_ids: BTreeMap<_, _> = reference
+        .residues
+        .iter()
+        .enumerate()
+        .map(|(id, residue)| (&residue.key, id))
+        .collect();
+    let moving_ids: BTreeMap<_, _> = moving
+        .residues
+        .iter()
+        .enumerate()
+        .map(|(id, residue)| (&residue.key, id))
+        .collect();
+    let mut used_reference = BTreeSet::new();
+    let mut used_moving = BTreeSet::new();
+    let mut groups: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
+    let mut pairs = Vec::with_capacity(residue_pairs.len());
+    let mut receipt = AlignmentReceipt {
+        status: "aligned",
+        method: "horn_quaternion_rigid_least_squares",
+        correspondence: "explicit_exact_residue_identity_pairs",
+        ..AlignmentReceipt::reference()
+    };
+    for (rkey, mkey) in residue_pairs {
+        let &r = reference_ids
+            .get(rkey)
+            .ok_or_else(|| format!("Explicit reference residue does not exist: {rkey}"))?;
+        let &m = moving_ids
+            .get(mkey)
+            .ok_or_else(|| format!("Explicit moving residue does not exist: {mkey}"))?;
+        if !used_reference.insert(r) || !used_moving.insert(m) {
+            return Err(
+                "Explicit alignment map must contain one-to-one residue pairs without duplicates"
+                    .into(),
+            );
+        }
+        let (fixed, source) = (&reference.residues[r], &moving.residues[m]);
+        if !fixed.kind.polymer() || fixed.kind != source.kind || fixed.name != source.name {
+            return Err(format!(
+                "Explicit residue pair has different polymer chemistry: {rkey} / {mkey}"
+            ));
+        }
+        let group = groups.entry((fixed.chain, source.chain)).or_default();
+        group.0 += 1;
+        if let Some((ra, ma, name)) = paired_anchor(reference, r, moving, m) {
+            pairs.push((ra, ma));
+            group.1 += 1;
+            *receipt.anchor_atoms.entry(name.into()).or_default() += 1;
+        } else {
+            receipt.skipped_missing_anchors += 1;
+        }
+    }
+    let reference_chains: BTreeSet<_> = groups.keys().map(|&(r, _)| r).collect();
+    let moving_chains: BTreeSet<_> = groups.keys().map(|&(_, m)| m).collect();
+    let polymer_count = |molecule: &Molecule| {
+        molecule
+            .chains
+            .iter()
+            .filter(|chain| {
+                chain
+                    .residues
+                    .iter()
+                    .any(|&r| molecule.residues[r].kind.polymer())
+            })
+            .count()
+    };
+    receipt.unmatched_reference_polymer_chains = polymer_count(reference) - reference_chains.len();
+    receipt.unmatched_moving_polymer_chains = polymer_count(moving) - moving_chains.len();
+    receipt.chain_matches = groups
+        .into_iter()
+        .map(|((r, m), (residues, matched_anchors))| ChainMatch {
+            reference_chain_index: r,
+            moving_chain_index: m,
+            reference_chain: reference.chains[r].id.clone(),
+            moving_chain: moving.chains[m].id.clone(),
+            residues,
+            matched_anchors,
+        })
+        .collect();
+    fit_pairs(reference, moving, &pairs, receipt)
+}
+
+fn fit_pairs(
+    reference: &Molecule,
+    moving: &mut Molecule,
+    pairs: &[(usize, usize)],
+    mut receipt: AlignmentReceipt,
+) -> Result<AlignmentReceipt, String> {
     let fixed: Vec<_> = pairs
         .iter()
         .map(|&(r, _)| xyz(reference.atoms[r].p))
@@ -471,6 +646,127 @@ mod tests {
         }
     }
     #[test]
+    fn explicit_map_aligns_a_crop_and_moves_unmapped_binder_rigidly() {
+        let reference = molecule(&protein_rows("full_author_chain", 1, &POINTS, None, true));
+        let moved = shifted(&POINTS, TURN, [11., -7., 4.]);
+        let crop = protein_rows("native_target", 1, &moved, None, false)
+            .lines()
+            .skip(2)
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let binder_points = shifted(&POINTS[..3], IDENTITY, [20., 0., 0.]);
+        let binder_moved = shifted(&binder_points, TURN, [11., -7., 4.]);
+        let mut moving = molecule(&format!(
+            "{crop}\n{}",
+            protein_rows("native_binder", 100, &binder_moved, None, false)
+        ));
+        let original_keys = moving
+            .residues
+            .iter()
+            .map(|residue| residue.key.clone())
+            .collect::<Vec<_>>();
+        let pairs = reference.residues[1..5]
+            .iter()
+            .zip(&moving.residues[..4])
+            .map(|(r, m)| (r.key.clone(), m.key.clone()))
+            .collect::<Vec<_>>();
+        assert!(align_to_reference(&reference, &mut moving.clone()).is_err());
+        let receipt = align_with_residue_pairs(&reference, &mut moving, &pairs).unwrap();
+        assert_eq!(
+            receipt.correspondence,
+            "explicit_exact_residue_identity_pairs"
+        );
+        assert_eq!(receipt.matched_anchors, 4);
+        assert_eq!(receipt.unmatched_moving_polymer_chains, 1);
+        assert!(receipt.rmsd_angstrom.unwrap() < 1e-5);
+        for (index, expected) in binder_points.iter().enumerate() {
+            let atom = named_atom(&moving, index + 4, &["CA"]).unwrap();
+            assert!(norm2(sub(xyz(moving.atoms[atom].p), *expected)) < 1e-8);
+        }
+        assert_eq!(
+            moving
+                .residues
+                .iter()
+                .map(|r| r.key.clone())
+                .collect::<Vec<_>>(),
+            original_keys
+        );
+    }
+    #[test]
+    fn explicit_maps_reject_missing_duplicates_and_different_chemistry_atomically() {
+        let reference = molecule(&protein_rows("A", 1, &POINTS, None, true));
+        let moved = shifted(&POINTS, TURN, [11., -7., 4.]);
+        let moving = molecule(&protein_rows("B", 1, &moved, None, false));
+        let pairs = reference
+            .residues
+            .iter()
+            .zip(&moving.residues)
+            .map(|(r, m)| (r.key.clone(), m.key.clone()))
+            .collect::<Vec<_>>();
+        let original = moving
+            .atoms
+            .iter()
+            .map(|atom| xyz(atom.p))
+            .collect::<Vec<_>>();
+        let mut missing = pairs.clone();
+        missing[0].0.chain = "absent".into();
+        let mut duplicate = pairs.clone();
+        duplicate[1] = duplicate[0].clone();
+        let mut chemistry = pairs.clone();
+        chemistry.swap(0, 1);
+        let original_first = chemistry[1].1.clone();
+        chemistry[1].1 = chemistry[0].1.clone();
+        chemistry[0].1 = original_first;
+        for invalid in [missing, duplicate, chemistry] {
+            let mut candidate = moving.clone();
+            assert!(align_with_residue_pairs(&reference, &mut candidate, &invalid).is_err());
+            assert_eq!(
+                candidate
+                    .atoms
+                    .iter()
+                    .map(|atom| xyz(atom.p))
+                    .collect::<Vec<_>>(),
+                original
+            );
+        }
+    }
+    #[test]
+    fn explicit_collinear_map_does_not_partly_transform_output() {
+        let reference = molecule(&protein_rows("A", 1, &POINTS[..3], None, false));
+        let mut moving = molecule(&protein_rows(
+            "B",
+            1,
+            &[[1., 0., 0.], [2., 0., 0.], [3., 0., 0.]],
+            None,
+            false,
+        ));
+        let pairs = reference
+            .residues
+            .iter()
+            .zip(&moving.residues)
+            .map(|(r, m)| (r.key.clone(), m.key.clone()))
+            .collect::<Vec<_>>();
+        let original = moving
+            .atoms
+            .iter()
+            .map(|atom| xyz(atom.p))
+            .collect::<Vec<_>>();
+        assert!(
+            align_with_residue_pairs(&reference, &mut moving, &pairs)
+                .unwrap_err()
+                .contains("collinear")
+        );
+        assert_eq!(
+            moving
+                .atoms
+                .iter()
+                .map(|atom| xyz(atom.p))
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+    #[test]
     fn sequence_correspondence_ignores_chain_labels_and_insertion_numbering() {
         let reference = molecule(&protein_rows("author_reference", 1, &POINTS, None, true));
         let moved = shifted(&POINTS, TURN, [11., -7., 4.]);
@@ -614,6 +910,81 @@ mod tests {
                 .map(|(&a, &b)| norm2(sub(a, b)))
                 .sum::<f64>();
             assert!(residual > 0.1);
+        }
+    }
+    #[test]
+    fn saved_display_transform_restores_fresh_source_coordinates_and_reference_origin() {
+        let reference = molecule(&protein_rows("A", 1, &POINTS, None, true));
+        let source = cif(&protein_rows(
+            "B",
+            1,
+            &shifted(&POINTS, TURN, [11., -7., 4.]),
+            None,
+            false,
+        ));
+        let mut fitted = Molecule::parse(&source, "cif", "candidate").unwrap();
+        let receipt = align_to_reference(&reference, &mut fitted).unwrap();
+        let mut reopened = Molecule::parse(&source, "cif", "candidate").unwrap();
+        // A cropped target's reference origin need not be its own centroid.
+        let origin = [reference.center.0 as f64 + 12., -23., 7.5];
+        apply_display_transform(
+            &mut reopened,
+            receipt.rotation.unwrap(),
+            receipt.translation_angstrom.unwrap(),
+            origin,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+            fitted.atoms.iter().map(|a| a.p).collect::<Vec<_>>()
+        );
+        assert_eq!(xyz(reopened.center), origin.map(|v| v as f32 as f64));
+        assert!(reopened.atoms.iter().all(|a| {
+            norm2(sub(xyz(a.p), xyz(reopened.center))).sqrt() <= reopened.radius as f64 + 1e-5
+        }));
+        assert_eq!(
+            reopened.residues.iter().map(|r| &r.key).collect::<Vec<_>>(),
+            fitted.residues.iter().map(|r| &r.key).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn corrupted_saved_display_transforms_never_partly_mutate_a_structure() {
+        let original = molecule(&protein_rows("A", 1, &POINTS, None, false));
+        let invalid = [
+            ([[2., 0., 0.], [0., 2., 0.], [0., 0., 2.]], [0.; 3], [0.; 3]),
+            (
+                [[1., 0.1, 0.], [0., 1., 0.], [0., 0., 1.]],
+                [0.; 3],
+                [0.; 3],
+            ),
+            (
+                [[-1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                [0.; 3],
+                [0.; 3],
+            ),
+            (
+                [[f64::NAN, 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                [0.; 3],
+                [0.; 3],
+            ),
+            (IDENTITY, [f64::INFINITY, 0., 0.], [0.; 3]),
+            (IDENTITY, [0.; 3], [f64::NAN, 0., 0.]),
+            (IDENTITY, [0.; 3], [1e30, 0., 0.]),
+            // The translation itself is permitted, but later transformed atoms
+            // exceed the coordinate ceiling: even earlier atoms stay unchanged.
+            (IDENTITY, [MAX_DISPLAY_COORDINATE, 0., 0.], [0.; 3]),
+        ];
+        for (rotation, translation, center) in invalid {
+            let mut candidate = original.clone();
+            assert!(
+                apply_display_transform(&mut candidate, rotation, translation, center).is_err()
+            );
+            assert_eq!(
+                candidate.atoms.iter().map(|a| a.p).collect::<Vec<_>>(),
+                original.atoms.iter().map(|a| a.p).collect::<Vec<_>>()
+            );
+            assert_eq!(candidate.center, original.center);
+            assert_eq!(candidate.radius, original.radius);
         }
     }
 }

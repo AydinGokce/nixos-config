@@ -19,6 +19,7 @@ def configuration(path=None):
                 'inference_state': '/var/lib/bio-inference', 'max_jobs': 1,
                 'msa_sessions_root': '/var/lib/dc/msa-sessions',
                 'capacity_helper': '/run/current-system/sw/bin/bio-msa-capacity',
+                'bindcraft_shared': '/mnt/bio-shared',
                 'md_runtime': '/var/lib/bio-md/runtime-cpu',
                 'md_admissions': '/var/lib/bio-md/admissions',
                 'md_runtime_archives': '/mnt/bio-shared/md-runtime',
