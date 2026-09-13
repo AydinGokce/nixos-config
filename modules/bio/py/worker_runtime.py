@@ -57,7 +57,11 @@ def source_size(source, *, shared=None, selected=(), digest=None):
     while pending:
         path, info = pending.pop()
         if digest is not None:
-            metadata = [str(path.relative_to(shared)), info.st_mode, info.st_size,
+            # NFS may update a directory's accounting size after reads without
+            # changing its entries or timestamps. Descendant records identify
+            # its contents; only file/link sizes belong in the fingerprint.
+            size = 0 if stat.S_ISDIR(info.st_mode) else info.st_size
+            metadata = [str(path.relative_to(shared)), info.st_mode, size,
                         info.st_mtime_ns, info.st_ctime_ns,
                         os.readlink(path) if stat.S_ISLNK(info.st_mode) else None]
             digest.update(json.dumps(metadata, separators=(",", ":")).encode() + b"\n")

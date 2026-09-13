@@ -1,10 +1,12 @@
 """Real archive round trips, immutable reuse, corruption and extraction fences."""
+from contextlib import contextmanager
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -16,6 +18,39 @@ SOURCE = Path(__file__).parents[1] / "py"
 sys.path.insert(0, str(SOURCE))
 import runtime_package as package
 import worker_runtime as runtime
+
+
+@contextmanager
+def reported_entry_stat(path, override):
+    """Model an NFS attribute response without changing any local fixture bytes."""
+    real_scandir = os.scandir
+
+    class StatView:
+        def __init__(self, info):
+            self.info = info
+
+        def __getattr__(self, name):
+            changes = override(self.info)
+            return changes[name] if name in changes else getattr(self.info, name)
+
+    class EntryView:
+        def __init__(self, entry):
+            self.entry = entry
+
+        def __getattr__(self, name):
+            return getattr(self.entry, name)
+
+        def stat(self, *, follow_symlinks=True):
+            info = self.entry.stat(follow_symlinks=follow_symlinks)
+            return StatView(info) if Path(self.entry.path) == path else info
+
+    @contextmanager
+    def scandir(directory):
+        with real_scandir(directory) as entries:
+            yield (EntryView(entry) for entry in entries)
+
+    with patch.object(runtime.os, "scandir", scandir):
+        yield
 
 
 @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "GNU tar and zstd required")
@@ -59,6 +94,50 @@ class PackageTests(unittest.TestCase):
         with patch.object(package.subprocess, "Popen", side_effect=AssertionError("Must not rebuild")):
             two = self.plan()
         self.assertEqual(one["package"], two["package"])
+
+    def test_volatile_nfs_directory_size_does_not_invalidate_bindcraft_archive(self):
+        generated = self.shared / "bindcraft/src/colabdesign/build/lib/colabdesign"
+        generated.mkdir(parents=True)
+        payload = generated / "model.py"
+        payload.write_bytes(b"immutable scientific source fixture\n")
+        reported = {"size": 214_676}
+        observed_plans = []
+        before_metadata = generated.stat()
+        with reported_entry_stat(generated, lambda _: {"st_size": reported["size"]}):
+            before = runtime.plan(self.shared, "bindcraft", fingerprint=True)
+
+            def after_archive():
+                # Observed provider behavior: accounting changes after reads,
+                # but directory mode/times and every descendant remain equal.
+                reported["size"] = 54_033_125
+                after = runtime.plan(self.shared, "bindcraft", fingerprint=True)
+                observed_plans.append(after)
+                return after
+
+            value = package.publish(self.shared, before, after_archive)
+            self.assertEqual(observed_plans, [before])
+            with patch.object(package.subprocess, "Popen", side_effect=AssertionError("Must reuse archive")):
+                reused = runtime.packaged_plan(self.shared, "bindcraft")
+            self.assertEqual(value["package"], reused["package"])
+        after_metadata = generated.stat()
+        self.assertEqual((before_metadata.st_mode, before_metadata.st_mtime_ns, before_metadata.st_ctime_ns),
+                         (after_metadata.st_mode, after_metadata.st_mtime_ns, after_metadata.st_ctime_ns))
+        runtime.stage(self.shared, self.root / "nfs-size-worker", value)
+        extracted = self.root / "nfs-size-worker" / payload.relative_to(self.shared)
+        self.assertEqual(extracted.read_bytes(), payload.read_bytes())
+
+    def test_fingerprint_still_tracks_directory_mode_times_and_file_or_link_sizes(self):
+        before = runtime.plan(self.shared, "boltz2", fingerprint=True)
+        cases = [(self.bin, "st_mode", lambda value: value ^ stat.S_IXOTH),
+                 (self.bin, "st_mtime_ns", lambda value: value + 1),
+                 (self.bin, "st_ctime_ns", lambda value: value + 1),
+                 (self.payload, "st_size", lambda value: value + 1),
+                 (self.bin / "python", "st_size", lambda value: value + 1)]
+        for target, field, change in cases:
+            with self.subTest(target=target.name, field=field), \
+                 reported_entry_stat(target, lambda info: {field: change(getattr(info, field))}):
+                after = runtime.plan(self.shared, "boltz2", fingerprint=True)
+                self.assertNotEqual(before["source_fingerprint"], after["source_fingerprint"])
 
     def test_bindcraft_archive_contains_only_its_pinned_tree_and_is_private_per_worker(self):
         prefix = self.shared / 'bindcraft'
