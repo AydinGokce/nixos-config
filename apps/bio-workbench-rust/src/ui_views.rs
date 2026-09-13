@@ -8,12 +8,19 @@ pub(super) struct View {
     pub style: scene::Representation,
     pub selected: Option<scene::ResidueKey>,
     pub hotspots: scene::Hotspots,
+    pub domains: domain_state::Editor,
     pub measurement: Option<scene::ResidueKey>,
     pub chains: Vec<bool>,
     pub labels: bool,
     pub visible: bool,
     pub metadata: Value,
     pub bytes: Arc<Vec<u8>>,
+}
+impl View {
+    pub(super) fn refresh_domain_colors(&self) {
+        self.renderer
+            .set_residue_colors(&self.molecule, &self.domains.colors(&self.molecule));
+    }
 }
 
 pub(super) fn short_name(name: &str) -> &str {
@@ -127,6 +134,7 @@ fn restore_display_alignment(
 }
 pub(super) fn view_state(view: &View) -> Value {
     let mut state = json!({"camera":{"yaw":view.camera.yaw,"pitch":view.camera.pitch,"zoom":view.camera.zoom,"pan":[view.camera.pan.x,view.camera.pan.y],"ambient":view.camera.ambient,"bloom":view.camera.bloom,"distance":view.camera.distance,"span":view.camera.span},"style":view.style.name(),"selected":view.selected,"hotspots":view.hotspots,"chains":view.chains,"labels":view.labels,"visible":view.visible});
+    state["protein_domains"] = json!(view.domains.data);
     capture_display_alignment(&view.metadata, &mut state);
     state
 }
@@ -179,6 +187,12 @@ fn restore_view(view: &mut View, value: &Value) {
     view.selected = serde_json::from_value(value["selected"].clone()).ok();
     view.hotspots = serde_json::from_value(value["hotspots"].clone()).unwrap_or_default();
     view.hotspots.retain_existing(&view.molecule);
+    view.domains = domain_state::Editor::restore(
+        &value["protein_domains"],
+        &view.molecule,
+        text(&view.metadata, "sha256"),
+    );
+    view.refresh_domain_colors();
     if view
         .selected
         .as_ref()
@@ -224,6 +238,7 @@ impl Workbench {
             style: original.style,
             selected: original.selected.clone(),
             hotspots: original.hotspots.clone(),
+            domains: original.domains.clone(),
             measurement: original.measurement.clone(),
             chains: original.chains.clone(),
             labels: original.labels,
@@ -231,6 +246,7 @@ impl Workbench {
             metadata,
             bytes: original.bytes.clone(),
         };
+        view.refresh_domain_colors();
         self.views.insert(target, view);
         true
     }
@@ -360,6 +376,7 @@ impl Workbench {
         };
         let chains = vec![true; molecule.chains.len()];
         let camera = scene::Camera::fit(&molecule);
+        let domains = domain_state::Editor::new(&molecule, &actual_sha);
         let mut view = View {
             molecule,
             renderer,
@@ -367,6 +384,7 @@ impl Workbench {
             style: scene::Representation::Cartoon,
             selected: None,
             hotspots: scene::Hotspots::default(),
+            domains,
             measurement: None,
             chains,
             labels: false,

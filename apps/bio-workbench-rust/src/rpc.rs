@@ -70,6 +70,7 @@ const METHODS: &[&str] = &[
     "library.redo",
     "library.runs",
     "library.sequence",
+    "library.protein_domains",
     "library.product_preview",
     "library.product_create",
     "library.create",

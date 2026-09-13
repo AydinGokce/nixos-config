@@ -236,6 +236,7 @@ impl Workbench {
                             view.metadata["binder_alignment_center"] =
                                 json!([reference.center.0, reference.center.1, reference.center.2]);
                             let old = std::mem::replace(&mut view.renderer, renderer);
+                            view.refresh_domain_colors();
                             self.retire_renderer(old);
                         }
                         Err(error) => self.log(format!("Candidate renderer: {error}")),

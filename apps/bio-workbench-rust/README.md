@@ -128,6 +128,26 @@ the output does not establish a per-candidate reason.
 
 ## Explore the molecular library
 
+### Color protein domains
+
+Open a protein structure, then use **Protein domains** in the right inspector.
+**Add range** colors named, 1-based protein positions in a selected chain; these
+positions are independent of the residue numbers in a PDB file. Layers have
+editable names and colors, visibility toggles, removal and Undo/Redo. Colors apply
+to every rendering style and the viewer's sequence strip. They are saved with
+each structure tab, so duplicate tabs can use independent domain colors.
+
+**Import plasmid annotations…** loads curated annotations for an exact library
+protein revision. The library protein's **Color domains in viewer…** button
+opens the same importer. Select the matching structure chain and the features
+to color. The head maps the parent plasmid's annotations through the protein's
+saved translation, including its strand, frame and crop. Automatically detected
+CDSs and ORFs are excluded. Sequence matching must be exact and unambiguous;
+missing or cropped structure residues are counted explicitly. Original feature
+labels do not establish preserved domain function after sequence or frame edits.
+
+### Browse and edit constructs
+
 Open **Library** beside Inputs and Runs, or choose **Browse library** from the
 input editor. This native workspace reads the shared head library; switching
 back to **Molecular viewer** retains every structure tab and its display state.

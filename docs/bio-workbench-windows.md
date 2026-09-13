@@ -49,7 +49,7 @@ Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing work
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/bindcraft-console-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
+/home/aydin/bio-runs/domain-annotations-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -89,6 +89,12 @@ or use a library folding result, select chains and hotspot residues in the 3D
 surface or sequence, and submit with runtime and cost limits. Results include a
 candidate table, target-aligned comparisons and **Save to project**. BindCraft
 runs on the cloud GPU worker and does not need the shared MSA worker.
+
+The viewer's **Protein domains** inspector colors named residue ranges and imports
+curated plasmid annotations through the selected protein's saved translation.
+Autodetected CDSs and ORFs are excluded. Domain colors persist independently in
+each structure tab and support Undo/Redo. Plasmid selections also highlight the
+full height of their map region.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem

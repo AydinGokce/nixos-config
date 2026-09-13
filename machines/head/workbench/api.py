@@ -39,6 +39,7 @@ class API:
             'library.undo': self.library_undo, 'library.redo': self.library_redo,
             'library.runs': self.library_runs,
             'library.sequence': self.library_sequence,
+            'library.protein_domains': self.library_protein_domains,
             'library.product_preview': self.library_product_preview,
             'library.product_create': self.library_product_create,
             'library.create': self.library_create,
@@ -59,7 +60,7 @@ class API:
         require(function is not None, 'Unknown method')
         if method in {'library.list', 'library.get', 'library.attachment',
                       'library.edit', 'library.history', 'library.undo', 'library.redo',
-                      'library.runs', 'library.sequence', 'library.product_preview',
+                      'library.runs', 'library.sequence', 'library.protein_domains', 'library.product_preview',
                       'library.product_create', 'library.create'}:
             # The explorer returns published user records, including their
             # exact identity/provenance keys and record hashes. These methods
@@ -123,6 +124,10 @@ class API:
     def library_sequence(self, params):
         from .library_sequence import get_view
         return get_view(self, params)
+
+    def library_protein_domains(self, params):
+        from .library_domains import get_domains
+        return get_domains(self, params)
 
     def library_product_preview(self, params):
         from .library_sequence import preview

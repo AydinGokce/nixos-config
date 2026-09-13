@@ -146,6 +146,7 @@ impl Workbench {
             candidate.metadata["binder_alignment_reference_sha256"] = reference_sha;
             candidate.metadata["binder_alignment_center"] = json!([center.0, center.1, center.2]);
             let old = std::mem::replace(&mut candidate.renderer, renderer);
+            candidate.refresh_domain_colors();
             self.retire_renderer(old);
             self.focus_view(source_slot);
             ui_dock::move_to_split(&mut self.dock, candidate_slot, egui_dock::Split::Right);

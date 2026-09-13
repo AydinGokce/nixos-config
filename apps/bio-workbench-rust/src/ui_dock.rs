@@ -474,23 +474,36 @@ impl TabViewer for StructureTabs<'_> {
             .max_height(22.)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for residue in &view.molecule.residues {
+                    for (residue_index, residue) in view.molecule.residues.iter().enumerate() {
                         if !view.chains[residue.chain] {
                             continue;
                         }
                         let selected = view.selected.as_ref() == Some(&residue.key);
                         let hotspot = view.hotspots.residues.contains(&residue.key);
+                        let domain = view.renderer.residue_color(residue_index);
+                        let text_color = if hotspot || selected {
+                            Color32::from_gray(245)
+                        } else if let Some(color) = domain {
+                            let brightness = u32::from(color.r()) * 299
+                                + u32::from(color.g()) * 587
+                                + u32::from(color.b()) * 114;
+                            Color32::from_gray(if brightness >= 128_000 { 15 } else { 245 })
+                        } else {
+                            view.molecule.chains[residue.chain].color
+                        };
                         if ui
                             .add(
                                 egui::Button::new(
                                     RichText::new(residue.letter.to_string())
                                         .monospace()
-                                        .color(view.molecule.chains[residue.chain].color),
+                                        .color(text_color),
                                 )
                                 .fill(if hotspot {
                                     Color32::from_rgb(145, 66, 31)
+                                } else if selected {
+                                    ui.visuals().selection.bg_fill
                                 } else {
-                                    ui.visuals().widgets.inactive.bg_fill
+                                    domain.unwrap_or(ui.visuals().widgets.inactive.bg_fill)
                                 })
                                 .min_size(Vec2::new(9., 17.))
                                 .selected(selected),

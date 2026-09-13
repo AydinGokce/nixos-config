@@ -1,6 +1,6 @@
 //! Native OpenGL rasterizer. The UI callback owns no transient molecular meshes.
 //! Lighting/contact shading are presentation effects, not ray tracing or analysis.
-use super::{Camera, Molecule, Representation, V3, geometry, surface};
+use super::{Camera, Molecule, Representation, ResidueColors, V3, geometry, surface};
 use eframe::{egui, egui_glow, glow};
 use glow::HasContext as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +46,53 @@ struct Target {
     depth: glow::Renderbuffer,
     size: [i32; 2],
 }
+struct ResiduePalette {
+    // Index zero is background; all geometry uses one-based residue IDs. A
+    // transparent texel means preserve the original chain/element material.
+    texels: Vec<[u8; 4]>,
+    count: usize,
+    active: bool,
+    dirty: bool,
+}
+impl ResiduePalette {
+    fn new(count: usize) -> Self {
+        Self {
+            texels: vec![[0; 4]; (count + 1).div_ceil(256).max(1) * 256],
+            count,
+            active: false,
+            dirty: false,
+        }
+    }
+    fn update(&mut self, molecule: &Molecule, colors: &ResidueColors) {
+        if colors.is_empty() || molecule.residues.len() != self.count {
+            if self.active {
+                self.texels.fill([0; 4]);
+                self.active = false;
+                self.dirty = true;
+            }
+            return;
+        }
+        let mut active = false;
+        for (residue, texel) in molecule.residues.iter().zip(&mut self.texels[1..]) {
+            let color = colors
+                .get(&residue.key)
+                .map_or([0; 4], |&[r, g, b]| [r, g, b, 255]);
+            active |= color[3] != 0;
+            if *texel != color {
+                *texel = color;
+                self.dirty = true;
+            }
+        }
+        self.active = active;
+    }
+    fn color(&self, index: usize) -> Option<[u8; 3]> {
+        if index >= self.count {
+            return None;
+        }
+        let [r, g, b, alpha] = self.texels[index + 1];
+        (alpha != 0).then_some([r, g, b])
+    }
+}
 pub(super) struct Renderer {
     mesh_program: glow::Program,
     atom_program: glow::Program,
@@ -58,6 +105,8 @@ pub(super) struct Renderer {
     surface_failed: bool,
     highlights: glow::Texture,
     highlight_ids: Vec<usize>,
+    colors: glow::Texture,
+    palette: ResiduePalette,
     residue_count: usize,
     pick_request: Option<[f32; 2]>,
     pick_result: Option<Option<usize>>,
@@ -439,6 +488,8 @@ impl Renderer {
         pending.keep_program(post_program);
         let empty_vao = pending.vao()?;
         let highlights = pending.texture()?;
+        let colors = pending.texture()?;
+        let palette = ResiduePalette::new(molecule.residues.len());
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(highlights));
             let rows = (molecule.residues.len() + 1).div_ceil(256).max(1);
@@ -452,6 +503,28 @@ impl Renderer {
                 glow::RED,
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(&vec![0; 256 * rows])),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(colors));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                256,
+                rows as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&palette.texels))),
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -478,6 +551,8 @@ impl Renderer {
             surface_failed: false,
             highlights,
             highlight_ids: Vec::new(),
+            colors,
+            palette,
             residue_count: molecule.residues.len(),
             pick_request: None,
             pick_result: None,
@@ -547,6 +622,14 @@ impl Renderer {
     }
     pub(super) fn take_pick(&mut self) -> Option<Option<usize>> {
         self.pick_result.take()
+    }
+    pub(super) fn set_residue_colors(&mut self, molecule: &Molecule, colors: &ResidueColors) {
+        if !self.destroyed {
+            self.palette.update(molecule, colors);
+        }
+    }
+    pub(super) fn residue_color(&self, index: usize) -> Option<[u8; 3]> {
+        self.palette.color(index)
     }
     pub(super) fn accept_surface(&mut self, gl: &glow::Context) {
         let Some(work) = self.surface_work.as_ref() else {
@@ -618,6 +701,7 @@ impl Renderer {
             gl.delete_program(self.post_program);
             gl.delete_vertex_array(self.empty_vao);
             gl.delete_texture(self.highlights);
+            gl.delete_texture(self.colors);
         }
         self.destroyed = true;
     }
@@ -714,6 +798,22 @@ impl Renderer {
                 );
                 self.highlight_ids = hotspots.to_vec();
             }
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.colors));
+            if self.palette.dirty {
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    256,
+                    (self.palette.texels.len() / 256) as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&self.palette.texels))),
+                );
+                self.palette.dirty = false;
+            }
             gl.disable(glow::SCISSOR_TEST);
             gl.disable(glow::BLEND);
             gl.disable(glow::CULL_FACE);
@@ -758,6 +858,11 @@ impl Renderer {
                     selected as f32,
                 );
                 gl.uniform_1_i32(gl.get_uniform_location(program, "u_hotspots").as_ref(), 2);
+                gl.uniform_1_i32(
+                    gl.get_uniform_location(program, "u_residue_colors")
+                        .as_ref(),
+                    3,
+                );
             }
             gl.use_program(Some(self.mesh_program));
             for (index, (chain, visible)) in
@@ -883,6 +988,8 @@ impl Renderer {
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.bind_vertex_array(None);
@@ -914,10 +1021,16 @@ const SURFACE: &str = r#"
 uniform float u_selected;
 uniform float u_atmosphere;
 uniform sampler2D u_hotspots;
+uniform sampler2D u_residue_colors;
 OUT0 out vec4 out_color;
 OUT1 out vec4 out_normal;
 OUT2 out float out_residue;
 void surface(vec3 p,vec3 normal,vec3 color,float residue) {
+    int identity=int(floor(residue+0.5));
+    vec4 material=texelFetch(u_residue_colors,ivec2(identity%256,identity/256),0);
+    // Match the existing chain palette's sRGB-to-linear material conversion.
+    // Keep its exact original value when no explicit domain color is present.
+    if(material.a>0.5) color=pow(material.rgb,vec3(2.2));
     vec3 n=normalize(normal);vec3 view=normalize(-p);
     if(dot(n,view)<0.) n=-n;
     vec3 key=normalize(vec3(-0.6,0.85,1.2));
@@ -930,7 +1043,6 @@ void surface(vec3 p,vec3 normal,vec3 color,float residue) {
     vec3 lit=color*diffuse+vec3(1.,0.97,0.92)*specular;
     lit+=vec3(0.13,0.26,0.32)*max(dot(n,rim),0.)*fresnel;
     float selected=step(0.5,u_selected)*(1.-smoothstep(0.25,0.75,abs(residue-u_selected)));
-    int identity=int(floor(residue+0.5));
     float hotspot=texelFetch(u_hotspots,ivec2(identity%256,identity/256),0).r;
     lit=mix(lit,lit*0.10+vec3(0.78,0.115,0.016)*diffuse,hotspot*0.90);
     lit=mix(lit,lit*0.45+vec3(0.68,0.47,0.13),selected*0.55*(1.-hotspot*0.8));
@@ -1021,3 +1133,81 @@ void main() {
     out_color=vec4(color,1.);
 }
 "#;
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    fn molecule() -> Molecule {
+        Molecule::parse(
+            b"data_colors\nloop_\n_atom_site.group_PDB\n_atom_site.id\n_atom_site.type_symbol\n_atom_site.label_atom_id\n_atom_site.label_comp_id\n_atom_site.label_asym_id\n_atom_site.label_seq_id\n_atom_site.auth_asym_id\n_atom_site.auth_seq_id\n_atom_site.pdbx_PDB_ins_code\n_atom_site.Cartn_x\n_atom_site.Cartn_y\n_atom_site.Cartn_z\nATOM 1 C CA ALA A 1 A 42 ? 0 0 0\nATOM 2 C CA GLY A 2 A 42 A 3 0 0\nATOM 3 C CA ALA B 1 B 42 ? 0 5 0\n",
+            "cif",
+            "palette identities",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn domain_colors_require_exact_chain_insertion_and_component_identity() {
+        let molecule = molecule();
+        let mut palette = ResiduePalette::new(molecule.residues.len());
+        let key = molecule.residues[1].key.clone();
+        let mut absent = key.clone();
+        absent.component = "ALA".into();
+        let colors = ResidueColors::from([(key, [12, 220, 43]), (absent, [250, 0, 0])]);
+        palette.update(&molecule, &colors);
+        assert_eq!(palette.color(0), None);
+        assert_eq!(palette.color(1), Some([12, 220, 43]));
+        assert_eq!(palette.color(2), None);
+        assert_eq!(palette.color(usize::MAX), None);
+        assert_eq!(palette.texels[0], [0; 4]);
+        assert!(palette.texels[4..].iter().all(|texel| *texel == [0; 4]));
+        assert!(palette.dirty);
+    }
+
+    #[test]
+    fn palette_edits_reuse_storage_and_upload_only_when_display_colors_change() {
+        let molecule = molecule();
+        let mut palette = ResiduePalette::new(molecule.residues.len());
+        let address = palette.texels.as_ptr();
+        let capacity = palette.texels.capacity();
+        let key = molecule.residues[0].key.clone();
+        let mut colors = ResidueColors::from([(key.clone(), [0, 0, 0])]);
+        palette.update(&molecule, &colors);
+        // Black is an explicit material, distinct from a transparent fallback.
+        assert_eq!(palette.color(0), Some([0, 0, 0]));
+        assert!(palette.dirty);
+        palette.dirty = false; // simulate completed GPU upload
+        for _ in 0..1000 {
+            palette.update(&molecule, &colors);
+            assert!(!palette.dirty);
+        }
+        for color in 0..=255 {
+            colors.insert(key.clone(), [color, 50, 100]);
+            palette.update(&molecule, &colors);
+            assert!(palette.dirty);
+            palette.dirty = false;
+            assert_eq!(palette.texels.as_ptr(), address);
+            assert_eq!(palette.texels.capacity(), capacity);
+        }
+        palette.update(&molecule, &ResidueColors::new());
+        assert!(palette.dirty);
+        assert!(palette.texels.iter().all(|texel| *texel == [0; 4]));
+        palette.dirty = false;
+        palette.update(&molecule, &ResidueColors::new());
+        assert!(!palette.dirty);
+        assert_eq!(palette.texels.as_ptr(), address);
+    }
+
+    #[test]
+    fn unrelated_residue_colors_do_not_change_the_default_palette() {
+        let molecule = molecule();
+        let mut palette = ResiduePalette::new(molecule.residues.len());
+        let mut key = molecule.residues[0].key.clone();
+        key.chain = "unrelated".into();
+        palette.update(&molecule, &ResidueColors::from([(key, [255, 0, 0])]));
+        assert!(!palette.active);
+        assert!(!palette.dirty);
+        assert!(palette.texels.iter().all(|texel| *texel == [0; 4]));
+    }
+}

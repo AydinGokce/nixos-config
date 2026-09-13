@@ -33,6 +33,12 @@ through the ordinary artifact viewer. See `CONTRACT.md` for the exact API.
 
 Plasmid-derived proteins use the same protein construct type as standalone
 proteins but store source coordinates rather than a duplicate peptide.
+`library.protein_domains` projects curated parent annotations through the exact
+saved protein codons for 3D domain coloring. It binds protein/parent revisions and
+attachment hashes, preserves frame, crop, strand and circular joins, and reports
+excluded or partially covered annotations. It neither discovers ORFs nor infers
+domain boundaries from names; the viewer separately verifies structure alignment.
+
 `library.sequence` supplies bounded annotations, six-frame ORFs and exact-revision
 translations. `library.product_preview` resolves a proposed definition without
 writing; `library.product_create` adds a protein to its parent's projects.

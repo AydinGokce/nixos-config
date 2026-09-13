@@ -1247,6 +1247,88 @@ fn segment_distance(point: Pos2, start: Pos2, end: Pos2) -> f32 {
     point.distance(start + along * fraction)
 }
 
+fn clip_selection_edge(polygon: Vec<Pos2>, origin: Pos2, normal: Vec2) -> Vec<Pos2> {
+    let Some(&last) = polygon.last() else {
+        return polygon;
+    };
+    let mut clipped = Vec::with_capacity(polygon.len() + 1);
+    let mut previous = last;
+    let mut previous_distance = (previous - origin).dot(normal);
+    for current in polygon {
+        let distance = (current - origin).dot(normal);
+        if (distance >= 0.) != (previous_distance >= 0.) {
+            let fraction = previous_distance / (previous_distance - distance);
+            clipped.push(previous + (current - previous) * fraction);
+        }
+        if distance >= 0. {
+            clipped.push(current);
+        }
+        previous = current;
+        previous_distance = distance;
+    }
+    clipped
+}
+
+fn selection_background(geometry: MapGeometry, selection: &Selection) -> egui::epaint::Mesh {
+    let mut spans: Vec<_> = selection
+        .segments
+        .iter()
+        .flat_map(|&(start, end)| geometry.spans(start, end))
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (start, end) in spans {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    let color = Color32::from_rgba_unmultiplied(AMBER.r(), AMBER.g(), AMBER.b(), 38);
+    for (start, end) in merged {
+        // Convex angular pieces shade rays through every track. At zero curvature
+        // the same clipping becomes full-height genomic columns. Using points on
+        // the backbone avoids an enormous, unstable circle center near linear mode.
+        let pieces = (((end - start) * geometry.angular) / std::f32::consts::FRAC_PI_2)
+            .ceil()
+            .max(1.) as usize;
+        for piece in 0..pieces {
+            let a = egui::lerp(start..=end, piece as f32 / pieces as f32);
+            let b = egui::lerp(start..=end, (piece + 1) as f32 / pieces as f32);
+            let normal = |base| {
+                if geometry.curve < 0.0001 {
+                    Vec2::X
+                } else {
+                    geometry.tangent(base)
+                }
+            };
+            let polygon = vec![
+                geometry.rect.left_top(),
+                geometry.rect.right_top(),
+                geometry.rect.right_bottom(),
+                geometry.rect.left_bottom(),
+            ];
+            let polygon = clip_selection_edge(polygon, geometry.position(a, 0.), normal(a));
+            let polygon = clip_selection_edge(polygon, geometry.position(b, 0.), -normal(b));
+            if polygon.len() < 3 {
+                continue;
+            }
+            let first = mesh.vertices.len() as u32;
+            for point in &polygon {
+                mesh.colored_vertex(*point, color);
+            }
+            // One mesh avoids translucent anti-alias fringes at internal seams.
+            for index in 1..polygon.len() as u32 - 1 {
+                mesh.add_triangle(first, first + index, first + index + 1);
+            }
+        }
+    }
+    mesh
+}
+
 fn draw_map(
     p: &egui::Painter,
     geometry: MapGeometry,
@@ -1258,6 +1340,9 @@ fn draw_map(
 ) -> Option<Selection> {
     let (rna, reading_frame) = preview;
     let (left, right) = geometry.window();
+    if let Some(selection) = selected {
+        p.add(selection_background(geometry, selection));
+    }
     p.add(egui::Shape::line(
         geometry.path(left, right, 0.),
         Stroke::new(2., Color32::from_rgb(109, 121, 129)),
@@ -2135,11 +2220,274 @@ mod tests {
         assert!(linear.spans(980, 1000).is_empty());
     }
 
+    fn background_contains(mesh: &egui::epaint::Mesh, point: Pos2) -> bool {
+        mesh.indices.chunks_exact(3).any(|triangle| {
+            let [a, b, c] = std::array::from_fn(|i| mesh.vertices[triangle[i] as usize].pos);
+            let cross = |u: Vec2, v: Vec2| u.x * v.y - u.y * v.x;
+            let sides = [
+                cross(b - a, point - a),
+                cross(c - b, point - b),
+                cross(a - c, point - c),
+            ];
+            cross(b - a, c - a).abs() > 0.001
+                && (sides.iter().all(|side| *side >= -0.001)
+                    || sides.iter().all(|side| *side <= 0.001))
+        })
+    }
+
+    #[test]
+    fn selection_background_spans_every_linear_track_and_preserves_unselected_gaps() {
+        let geometry = map(4., 2, 0.);
+        let selection = Selection {
+            // An origin-spanning feature with a second, discontinuous segment.
+            segments: vec![(980, 1000), (0, 12), (30, 42)],
+            ..Default::default()
+        };
+        let mesh = selection_background(geometry, &selection);
+        for base in [-15., 5., 35.] {
+            for y in [1., 51., 73., 205., 277., 303., 331., 419.] {
+                assert!(
+                    background_contains(&mesh, Pos2::new(geometry.position(base, 0.).x, y)),
+                    "selected base {base} should stay shaded at y={y}"
+                );
+            }
+        }
+        for base in [-21., 15., 29., 43.] {
+            for y in [1., 150., 310., 419.] {
+                assert!(!background_contains(
+                    &mesh,
+                    Pos2::new(geometry.position(base, 0.).x, y)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn circular_selection_shades_radially_without_inverting_past_the_center() {
+        let geometry = map(1., 1, 990.);
+        let mesh = selection_background(
+            geometry,
+            &Selection {
+                segments: vec![(965, 1000), (0, 20)],
+                ..Default::default()
+            },
+        );
+        // The same genomic identity is shaded outside the ring and through its
+        // inward annotation tracks. Its opposite ray must remain unselected.
+        for base in [970., 995., 1015.] {
+            for offset in [-40., 0., 22., 100., 130.] {
+                let point = geometry.position(base + 0.25, offset);
+                assert!(geometry.rect.contains(point));
+                assert!(background_contains(&mesh, point));
+                assert_eq!(geometry.base_at(point), base as usize % 1000);
+            }
+        }
+        for base in [950., 1030., 1240., 1490.] {
+            assert!(!background_contains(&mesh, geometry.position(base, 22.)));
+        }
+    }
+
+    #[test]
+    fn circular_full_selection_and_overlapping_segments_do_not_double_tint() {
+        let geometry = map(1., 1, 250.);
+        let mesh = selection_background(
+            geometry,
+            &Selection {
+                segments: vec![(0, 1000), (20, 700), (800, 1000)],
+                ..Default::default()
+            },
+        );
+        let area: f32 = mesh
+            .indices
+            .chunks_exact(3)
+            .map(|triangle| {
+                let [a, b, c] = std::array::from_fn(|i| mesh.vertices[triangle[i] as usize].pos);
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() / 2.
+            })
+            .sum();
+        assert!((area - geometry.rect.area()).abs() < 1.);
+        for y in [1., 100., 200., 419.] {
+            for x in [1., 225., 450., 899.] {
+                assert!(background_contains(&mesh, Pos2::new(x, y)));
+            }
+        }
+    }
+
+    #[test]
+    fn selection_background_stays_clipped_and_tracks_bases_during_auto_unroll() {
+        for width in [300., 900., 1800.] {
+            for zoom in [1., 1.3, 1.6, 2., 2.5, 3.9, 3.9999, 4., 10.] {
+                let geometry = MapGeometry::new(
+                    Rect::from_min_size(Pos2::new(17., 80.), Vec2::new(width, 420.)),
+                    1000,
+                    990.,
+                    zoom,
+                    0,
+                    true,
+                );
+                let mesh = selection_background(
+                    geometry,
+                    &Selection {
+                        segments: vec![(980, 1000), (0, 10)],
+                        ..Default::default()
+                    },
+                );
+                assert!(!mesh.indices.is_empty());
+                assert!(mesh.vertices.iter().all(|vertex| {
+                    vertex.pos.is_finite() && geometry.rect.expand(0.001).contains(vertex.pos)
+                }));
+                for base in [985., 1005.] {
+                    for offset in [-20., 0., 22., 60.] {
+                        let point = geometry.position(base, offset);
+                        if geometry.rect.contains(point) {
+                            assert!(
+                                background_contains(&mesh, point),
+                                "width={width} zoom={zoom} base={base} offset={offset}"
+                            );
+                        }
+                    }
+                }
+                for base in [978., 1012.] {
+                    let point = geometry.position(base, 22.);
+                    assert!(!background_contains(&mesh, point));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selection_paints_behind_map_tracks_without_changing_feature_hit_testing() {
+        let context = egui::Context::default();
+        for (mode, zoom) in [(1, 1.), (0, 2.5), (2, 4.)] {
+            let geometry = map(zoom, mode, 990.);
+            let selection = Selection {
+                segments: vec![(980, 1000), (0, 20)],
+                label: "Origin-spanning CDS".into(),
+                kind: "CDS".into(),
+                strand: 1,
+                ..Default::default()
+            };
+            let output = context.run(screen(), |context| {
+                let painter = context
+                    .layer_painter(egui::LayerId::background())
+                    .with_clip_rect(geometry.rect);
+                let hit = draw_map(
+                    &painter,
+                    geometry,
+                    std::slice::from_ref(&selection),
+                    Some(&selection),
+                    &"ACGT".repeat(250),
+                    (false, 1),
+                    Some(geometry.position(985., egui::lerp(14. ..=22., 1. - geometry.curve))),
+                )
+                .expect("selection shading must not intercept the annotation");
+                assert_eq!(hit.label, selection.label);
+                assert_eq!(hit.segments, selection.segments);
+            });
+            assert_eq!(
+                output.shapes[0].clip_rect,
+                geometry.rect.intersect(screen().screen_rect.unwrap())
+            );
+            assert!(matches!(output.shapes[0].shape, egui::Shape::Mesh(_)));
+            assert!(output.shapes.iter().skip(1).any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Path(path) if path.stroke.color == egui::epaint::ColorMode::Solid(AMBER)
+            )));
+        }
+    }
+
     fn screen() -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700., 600.))),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn dragging_selection_across_origin_updates_background_before_mouse_release() {
+        let context = egui::Context::default();
+        let reference = "construct:selection-proof@1";
+        let mut viewer = Viewer::default();
+        viewer.accept(
+            reference,
+            json!({"ref":reference,"molecule_type":"dna","length":1000,"circular":true}),
+            &"ACGT".repeat(250),
+        );
+        viewer.mode = 2;
+        viewer.zoom = 4.;
+        viewer.center = 0.;
+        let detail = json!({"ref":reference,"is_latest":true});
+        let draw = |viewer: &mut Viewer, events| {
+            let mut input = screen();
+            input.events = events;
+            context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    viewer.show(ui, &detail, false, &[]);
+                });
+            })
+        };
+        let first = draw(&mut viewer, vec![]);
+        let rect = first
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(25, 29, 32) => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let geometry = MapGeometry::new(rect, 1000, 0., 4., 2, true);
+        let start = geometry.position(-20.25, 120.);
+        draw(
+            &mut viewer,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        draw(
+            &mut viewer,
+            vec![egui::Event::PointerMoved(geometry.position(-15.25, 120.))],
+        );
+        let end = geometry.position(10.25, 120.);
+        let dragging = draw(&mut viewer, vec![egui::Event::PointerMoved(end)]);
+        let selection = viewer.selection.as_ref().expect("drag selects bases");
+        assert_eq!(selection.segments.len(), 2);
+        assert_eq!(selection.segments[0].1, 1000);
+        assert_eq!(selection.segments[1], (0, 11));
+        let painted = dragging.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Mesh(mesh) if !mesh.vertices.is_empty() => Some(mesh),
+            _ => None,
+        });
+        let painted = painted.expect("selection is painted during the drag");
+        for y in [rect.top() + 2., rect.bottom() - 2.] {
+            assert!(background_contains(
+                painted,
+                Pos2::new(geometry.position(5., 0.).x, y)
+            ));
+            assert!(!background_contains(
+                painted,
+                Pos2::new(geometry.position(15., 0.).x, y)
+            ));
+        }
+        let saved = selection.segments.clone();
+        draw(
+            &mut viewer,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(viewer.anchor.is_none());
+        assert_eq!(viewer.selection.as_ref().unwrap().segments, saved);
     }
 
     #[test]

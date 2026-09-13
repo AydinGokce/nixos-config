@@ -141,6 +141,7 @@ impl Workbench {
         if let Purpose::Job(job) = &pending.purpose {
             self.job_tab_error(job, &message);
         }
+        self.domains_failed(&pending.purpose, &message);
         self.library_failed(&pending.purpose, &message);
         self.library_runs_failed(&pending.purpose, &message);
         self.worker_failed(&pending.purpose, &message);
@@ -287,6 +288,7 @@ impl Workbench {
     }
     fn received(&mut self, id: String, purpose: Purpose, value: Value, ctx: &egui::Context) {
         match purpose {
+            Purpose::ProteinDomains(request) => self.domains_received(request, value),
             Purpose::Binder(request) => self.binder_received(request, value, ctx),
             Purpose::Catalog => {
                 self.catalog = value;
@@ -590,7 +592,7 @@ impl Workbench {
                         next_state.detach_library_sources(&old_endpoint)
                     } else { 0 };
                     let saved=if changed { serde_json::to_value(&next_state).map_err(rpc::RpcError::from).and_then(|draft|session.save_connection_with_draft(self.connection.clone(),draft)) } else {session.save_connection(self.connection.clone())};match saved{
-                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.worker=ui_worker::Worker::default();self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.binder=ui_binder::Panel::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
+                    Ok(())=>{self.state=next_state;if changed{self.connected=false;self.worker=ui_worker::Worker::default();self.batches.clear();self.batch=None;self.catalog=Value::Null;self.library=ui_library::Explorer::default();self.library_runs=ui_library_runs::RunControls::default();self.binder=ui_binder::Panel::default();self.domain_import=ui_domains::Import::default();self.state.preview=None;self.run_batch=None;self.run_after_uploads=false;self.state.active_batch.clear();self.annotation_records.clear();self.artifact_metadata.clear();self.selected_artifacts.clear();self.pending.clear();self.detach_head_views();self.focused_job.clear();self.job_log.clear();
                     if detached>0 { self.log("Library references were detached from the previous head and retained in the local draft archive. Select them again from the new head's Library before running."); }
                     for input in &mut self.state.inputs{if text(&input.source,"kind")=="upload"{input.source["upload_id"]=json!("");input.source.as_object_mut().map(|m|m.remove("attachments"));}}for settings in self.state.settings.values_mut(){if let Some(settings)=settings.as_object_mut(){settings.remove("labels_upload_id");}}
                     self.log("Connection changed. Prior structures remain local; their annotations are detached from the new head. Re-upload files before running.");}self.request("catalog",json!({}),Purpose::Catalog);},Err(error)=>self.log(error.to_string()),

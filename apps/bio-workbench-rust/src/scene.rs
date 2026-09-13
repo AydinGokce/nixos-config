@@ -1,6 +1,6 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 #[path = "scene_geometry.rs"]
 mod geometry;
@@ -11,6 +11,10 @@ mod structure;
 #[path = "scene_surface.rs"]
 mod surface;
 pub use structure::{Atom, Molecule, MoleculeKind, ResidueKey, Secondary};
+
+/// Optional sRGB material colors keyed by exact source residue identities.
+/// Empty maps leave the normal chain/element palette unchanged.
+pub type ResidueColors = BTreeMap<ResidueKey, [u8; 3]>;
 
 /// A design selection is separate from the ordinary single-residue inspector.
 /// Exact source residue identities survive view restoration; array offsets do not.
@@ -102,6 +106,20 @@ impl Renderer {
     }
     pub fn poll_surface(&self, gl: &eframe::glow::Context) {
         self.0.lock().accept_surface(gl);
+    }
+    /// Set colors for this renderer's molecule. Geometry remains unchanged;
+    /// only a bounded lookup texture is updated at the next draw, if needed.
+    /// Unmatched identities are ignored. Selection and hotspots remain visible.
+    pub fn set_residue_colors(&self, molecule: &Molecule, colors: &ResidueColors) {
+        self.0.lock().set_residue_colors(molecule, colors);
+    }
+    /// Read the exact mapped color for a zero-based index in this molecule's
+    /// residue array, so the sequence strip shares the 3D material palette.
+    pub fn residue_color(&self, residue_index: usize) -> Option<Color32> {
+        self.0
+            .lock()
+            .residue_color(residue_index)
+            .map(|[r, g, b]| Color32::from_rgb(r, g, b))
     }
     /// Resolve the previous GPU frame's click before a caller captures a design
     /// intent. The input panel is drawn before the viewer, so consuming only in

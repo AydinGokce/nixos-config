@@ -1293,6 +1293,11 @@ impl Workbench {
                     {
                         self.binder_library_target(text(&detail, "ref"));
                     }
+                    if text(&record["identity"], "molecule_type") == "protein"
+                        && ui.button("Color domains in viewer…").clicked()
+                    {
+                        self.domains_open(Some(text(&detail, "ref").into()));
+                    }
                     if let Err(reason) = input { ui.colored_label(AMBER, reason); }
                 });
                 if !self.library.added.is_empty() { ui.colored_label(GREEN, &self.library.added); }
