@@ -60,6 +60,24 @@ class PackageTests(unittest.TestCase):
             two = self.plan()
         self.assertEqual(one["package"], two["package"])
 
+    def test_bindcraft_archive_contains_only_its_pinned_tree_and_is_private_per_worker(self):
+        prefix = self.shared / 'bindcraft'
+        (prefix / 'env/bin').mkdir(parents=True)
+        (prefix / 'env/bin/python').write_bytes(b'portable interpreter fixture')
+        (prefix / 'params').mkdir()
+        (prefix / 'params/weights.npz').write_bytes(b'BindCraft parameter fixture')
+        (prefix / 'install-manifest.json').write_text('{"fixture":true}')
+        value = runtime.packaged_plan(self.shared, 'bindcraft')
+        self.assertEqual(value['paths'], ['bindcraft'])
+        for name in ('bindcraft-one', 'bindcraft-two'):
+            runtime.stage(self.shared, self.root / name, value)
+            self.assertEqual((self.root / name / 'bindcraft/params/weights.npz').read_bytes(),
+                             b'BindCraft parameter fixture')
+            self.assertFalse((self.root / name / 'cache/boltz/weights').exists())
+        (self.root / 'bindcraft-one/bindcraft/params/weights.npz').write_bytes(b'private worker change')
+        self.assertEqual((self.root / 'bindcraft-two/bindcraft/params/weights.npz').read_bytes(),
+                         (prefix / 'params/weights.npz').read_bytes())
+
     def test_same_size_changed_bytes_invalidate_snapshot_even_if_mtime_restored(self):
         before = self.plan()
         info = self.payload.stat()

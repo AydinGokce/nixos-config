@@ -75,6 +75,28 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "escapes selected assets"):
             runtime.plan(self.shared, "boltz2")
 
+    def test_bindcraft_requires_a_nonempty_installed_root_without_other_model_assets(self):
+        self.assertIn('bindcraft', runtime.ROOTS)
+        with self.assertRaisesRegex(ValueError, 'must be installed'):
+            runtime.plan(self.shared, 'bindcraft')
+        prefix = self.shared / 'bindcraft'
+        prefix.mkdir()
+        with self.assertRaisesRegex(ValueError, 'runtime is empty'):
+            runtime.plan(self.shared, 'bindcraft')
+        (prefix / 'env/bin').mkdir(parents=True)
+        (prefix / 'env/bin/python').write_bytes(b'portable interpreter fixture')
+        (prefix / 'params').mkdir()
+        (prefix / 'params/weights.npz').write_bytes(b'pinned weight fixture')
+        (prefix / 'install-manifest.json').write_text('{"fixture":true}')
+        value = runtime.plan(self.shared, 'bindcraft')
+        self.assertEqual(value['paths'], ['bindcraft'])
+        runtime.stage(self.shared, self.root / 'worker', value)
+        self.assertEqual((self.root / 'worker/bindcraft/params/weights.npz').read_bytes(),
+                         b'pinned weight fixture')
+        self.assertFalse((self.root / 'worker/cache/boltz/weights').exists())
+        (self.root / 'worker/bindcraft/params/weights.npz').write_bytes(b'private worker mutation')
+        self.assertEqual((prefix / 'params/weights.npz').read_bytes(), b'pinned weight fixture')
+
 
 class PreparationGateTests(unittest.TestCase):
     def setUp(self):

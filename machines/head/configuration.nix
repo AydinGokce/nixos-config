@@ -76,6 +76,11 @@ in
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/md/cli.py "$@"
     '')
+    (pkgs.writeShellScriptBin "bio-bindcraft" ''
+      export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      umask 077
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/bindcraft/cli.py "$@"
+    '')
     (pkgs.writeShellScriptBin "bio-inference" ''
       set -euo pipefail
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
@@ -163,6 +168,7 @@ in
     "bio-tools/library".source = ./library;
     "bio-tools/workbench".source = ./workbench;
     "bio-tools/md".source = ./md;
+    "bio-tools/bindcraft".source = ./bindcraft;
     # Bursty interactive use: allocate temporary workers for up to ten jobs,
     # then return to zero GPU workers as their managed runs finish.
     "bio-tools/workbench-config.json".source = workbenchConfig;

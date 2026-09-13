@@ -1,0 +1,48 @@
+{
+  "schema": "bio-bindcraft-pins.v1",
+  "platform": "linux-64",
+  "micromamba": {
+    "filename": "micromamba-2.9.0-0.tar.bz2",
+    "url": "https://conda.anaconda.org/conda-forge/linux-64/micromamba-2.9.0-0.tar.bz2",
+    "sha256": "8761c382127e6363bd9e0a2451aa3ef90d071a79133f736e2f759a3bf13040dd",
+    "size": 6988090,
+    "version": "2.9.0",
+    "license": "BSD-3-Clause"
+  },
+  "sources": {
+    "bindcraft": {
+      "filename": "bindcraft-efb5bfeb.tar.gz",
+      "url": "https://codeload.github.com/martinpacesa/BindCraft/tar.gz/efb5bfeb8b4b1a5944256f979c34e0c8e6a82d9d",
+      "sha256": "08c36d83dcf1d4d705ffe465e1a1359cd582d9ffe7055fc6b551b69bcdf39e91",
+      "size": 1307762,
+      "commit": "efb5bfeb8b4b1a5944256f979c34e0c8e6a82d9d",
+      "license": "MIT"
+    },
+    "colabdesign": {
+      "filename": "colabdesign-e31a56fe.tar.gz",
+      "url": "https://codeload.github.com/sokrypton/ColabDesign/tar.gz/e31a56fe1d9b4de25c8697f3a28b75892941cc72",
+      "sha256": "26c948e5e577c65d5b3e908cc11eece435eb0f05729b1e227926d671c463d37f",
+      "size": 50276715,
+      "commit": "e31a56fe1d9b4de25c8697f3a28b75892941cc72",
+      "version": "1.1.3",
+      "license": "Beerware"
+    }
+  },
+  "af2": {
+    "filename": "alphafold_params_2022-12-06.tar",
+    "url": "https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar",
+    "sha256": "36d4b0220f3c735f3296d301152b738c9776d16981d054845a68a1370b26cfe3",
+    "size": 5587968000,
+    "license": "CC-BY-4.0",
+    "provider_md5": "5cc59a561e80601862948ff36c6b040b"
+  },
+  "pyrosetta": {
+    "filename": "pyrosetta-2026.29+releasequarterly.80a0635615-cp310-cp310-linux_x86_64.whl",
+    "url": "https://west.rosettacommons.org/pyrosetta/quarterly/release.cxx11thread.serialization/pyrosetta-2026.29%2Breleasequarterly.80a0635615-cp310-cp310-linux_x86_64.whl",
+    "sha256": "4383d8d1a14fd3aff52983de936908791cc77bc6ac418e3bc53bb963a42c5242",
+    "size": 1667097173,
+    "version": "2026.29+releasequarterly.80a0635615",
+    "license": "PyRosetta; commercial license pending",
+    "requires_explicit_evaluation": true
+  }
+}

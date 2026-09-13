@@ -274,6 +274,143 @@ except (OSError, ValueError, KeyError, AssertionError):
     def msa_settings(self, **settings):
         return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
 
+    def bindcraft_fixture(self, *, ready=True):
+        """Only the orchestration boundary is mocked; no scientific code runs."""
+        bundle = self.root / "target and settings with 'quote.bundle.tar.gz"
+        bundle.write_bytes(b'immutable fixture target and design settings')
+        installed = self.root / 'shared/bindcraft'
+        installed.mkdir(parents=True)
+        (installed / 'install-manifest.json').write_text(json.dumps({'ready': ready}))
+        (installed / 'env/bin').mkdir(parents=True)
+        (installed / 'env/bin/python').symlink_to(sys.executable)
+        helper = self.root / 'tools/bindcraft'
+        helper.mkdir()
+        (helper / 'runtime.py').write_text('''import argparse, hashlib, json, os
+from pathlib import Path
+p = argparse.ArgumentParser()
+p.add_argument('command', choices=['preflight'])
+p.add_argument('--bundle', required=True)
+p.add_argument('--shared', required=True)
+a = p.parse_args()
+root = Path(os.environ['AUDIT'])
+bundle = Path(a.bundle)
+with (root/'events').open('a') as stream: stream.write('bindcraft-preflight\\n')
+with (root/'bindcraft-preflights.jsonl').open('a') as stream:
+    stream.write(json.dumps({'bundle': str(bundle), 'shared': a.shared,
+        'sha256': hashlib.sha256(bundle.read_bytes()).hexdigest()})+'\\n')
+manifest = Path(a.shared)/'bindcraft/install-manifest.json'
+if not manifest.is_file() or not json.loads(manifest.read_text()).get('ready'):
+    raise SystemExit('BindCraft runtime is not ready; no worker launched')
+mutation = os.environ.get('MUTATE_BINDCRAFT_PREFLIGHT')
+if mutation == '1' or mutation == 'staged' and len((root/'bindcraft-preflights.jsonl').read_text().splitlines()) == 2:
+    bundle.write_bytes(b'changed after validation')
+print('{"preflight":"passed","native_executed":false}')
+''')
+        (self.root / 'tools/recipes/bindcraft.sh').write_text('# authoritative BindCraft recipe\n')
+        return bundle
+
+    def test_bindcraft_bundle_is_preflighted_staged_and_bound_before_managed_launch(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, '--timeout', '600', '--name', "design 'one")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = (self.root / 'events').read_text().splitlines()
+        checks = [json.loads(line) for line in (self.root / 'bindcraft-preflights.jsonl').read_text().splitlines()]
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(checks[0]['bundle'], str(bundle))
+        self.assertNotEqual(checks[0]['bundle'], checks[1]['bundle'])
+        self.assertEqual(checks[0]['sha256'], checks[1]['sha256'])
+        self.assertLess(max(n for n, event in enumerate(events) if event == 'bindcraft-preflight'),
+                        next(n for n, event in enumerate(events) if event.startswith('launch:')))
+        output = next((self.root / 'results').iterdir())
+        self.assertEqual((output / 'bindcraft-input.sha256').read_text().strip(), checks[0]['sha256'])
+        plan = json.loads((output / 'runtime-plan.json').read_text())
+        self.assertEqual(plan['paths'], ['bindcraft'])
+        self.assertGreater(plan['source_bytes'], 0)
+        with tarfile.open(output / 'tools.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('bindcraft/runtime.py').read(),
+                             (self.root / 'tools/bindcraft/runtime.py').read_bytes())
+        transmitted = (self.root / 'transmitted.sh').read_text()
+        self.assertIn('source "$BIO_TOOLS_DIR/recipes/bindcraft.sh"', transmitted)
+        self.assertIn('export BIO_BINDCRAFT_BUNDLE_SHA256=' + checks[0]['sha256'], transmitted)
+        self.assertIn('designing\\ binders', transmitted)
+        self.assertNotIn('BIO_PUBLIC_MSA_PROXY=', transmitted)
+        self.assertFalse((self.root / 'preparation-calls').exists())
+        self.assertEqual((self.root / 'removals').read_text().count('rm '), 1)
+
+    def test_bindcraft_missing_or_unready_runtime_stops_before_allocation(self):
+        bundle = self.bindcraft_fixture(ready=False)
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                if missing:
+                    (self.root / 'shared/bindcraft/install-manifest.json').unlink()
+                result = self.submit('bindcraft', '--in', bundle)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('runtime is not ready', result.stdout + result.stderr)
+                self.assertFalse((self.root / 'launch-args').exists())
+                self.assertFalse((self.root / 'results').exists())
+
+    def test_bindcraft_changed_input_during_preflight_stops_before_allocation(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, MUTATE_BINDCRAFT_PREFLIGHT='1')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('bundle changed during preflight', result.stdout + result.stderr)
+        self.assertFalse((self.root / 'launch-args').exists())
+
+    def test_bindcraft_changed_staged_input_stops_before_allocation(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, MUTATE_BINDCRAFT_PREFLIGHT='staged')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('staged BindCraft bundle changed during preflight', result.stdout + result.stderr)
+        self.assertFalse((self.root / 'launch-args').exists())
+
+    def test_bindcraft_rejects_unbundled_settings_msa_resident_and_unsupported_workers(self):
+        bundle = self.bindcraft_fixture()
+        forbidden = [('--labels', self.input), ('--model', 'override'), ('--sub', 'override'),
+                     ('--contigs', '[50-50]'), ('--num', '2'), ('--temp', '0.1'),
+                     ('--construct', 'construct:one@1'), ('--msa-backend', 'public'),
+                     ('--msa-backend', 'private'), ('--msa-bundle', '/tmp/bundle'),
+                     ('--bundle-result', '/tmp/result'), ('--execution', 'resident'),
+                     ('--', '--settings', '/tmp/unbundled.json'),
+                     ('--gpu', '1RTXPRO6000.30V'), ('--gpu', 'CPU.16V.64G'),
+                     ('--gpu', 'arbitrary-instance')]
+        for arguments in forbidden:
+            with self.subTest(arguments=arguments):
+                result = self.submit('bindcraft', '--in', bundle, *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse((self.root / 'launch-args').exists())
+        for flag in ('--pdb', '--json', '--fasta'):
+            with self.subTest(flag=flag):
+                result = self.submit('bindcraft', flag, bundle)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse((self.root / 'bindcraft-preflights.jsonl').exists())
+
+    def test_bindcraft_gpu_fallback_uses_only_supported_architectures(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, NO_GPU_CAPACITY='1')
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'launches').read_text().splitlines(),
+                         ['1A100.22V', '1L40S.20V', '1H100.80S.32V', '1A100.40S.22V', '1A6000.10V'])
+        self.assertFalse((self.root / 'transmitted.sh').exists())
+
+    def test_bindcraft_native_failure_preserves_exit_and_deletes_owned_worker(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, '--worker', '1A6000.10V', MODEL_EXIT='17')
+        self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
+        self.assertNotIn('DONE', result.stdout)
+        self.assertIn('--image ubuntu-24.04-cuda-12.6-docker', (self.root / 'launch-args').read_text())
+        self.assertEqual((self.root / 'removals').read_text().count('rm '), 1)
+        self.assertEqual(json.loads(next((self.root / 'results').glob('*/job.json')).read_text())['exit_status'], 17)
+
+    def test_bindcraft_component_smoke_uses_same_validated_bundle_and_managed_worker(self):
+        bundle = self.bindcraft_fixture()
+        result = self.submit('bindcraft', '--in', bundle, '--sub', 'smoke', '--timeout', '600')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        transmitted = (self.root / 'transmitted.sh').read_text()
+        self.assertIn('SUB=smoke', transmitted)
+        self.assertIn('Testing\\ the\\ installed\\ BindCraft\\ components', transmitted)
+        self.assertEqual(len((self.root / 'bindcraft-preflights.jsonl').read_text().splitlines()), 2)
+        self.assertEqual((self.root / 'removals').read_text().count('rm '), 1)
+
     def managed_startup_fixture(self):
         """Use the real receipt protocol with a fake systemd identity and cloud."""
         ident = 'c' * 32

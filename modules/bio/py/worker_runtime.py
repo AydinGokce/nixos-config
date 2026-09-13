@@ -10,7 +10,7 @@ import stat
 import sys
 
 
-ROOTS = ("envs", "src", "python", "weights", "protenix", "openfold3", "rf3",
+ROOTS = ("envs", "src", "python", "weights", "protenix", "openfold3", "rf3", "bindcraft",
          "cache/hf", "cache/torch", "cache/uv", "cache/boltz", "cache/rfaa")
 FOUNDRY = "b02eed6a6bdf8f44d14a80cc36e3da13c9f2291c"
 GIB = 1024 ** 3
@@ -25,6 +25,7 @@ def paths_for(recipe, model="", sub=""):
                 "rf3/installed.txt", "rf3/versions.json"],
         "mpnn": ["envs/proteinmpnn", "src/proteinmpnn"],
         "rfdiffusion": ["envs/rfdiffusion", "src/rfdiffusion", "python/py310", "weights/rfdiffusion"],
+        "bindcraft": ["bindcraft"],
         "rfaa": ["envs/rfaa", "src/rfaa", "python/py310"],
         "af3": ["envs/alphafold3", "src/alphafold3", "weights/alphafold3"],
         "esm": ["envs/esm2"],
@@ -89,7 +90,11 @@ def plan(shared, recipe, model="", sub="", *, fingerprint=False):
         # Never allow a source root to redirect copying outside its named tree.
         if source.resolve() != source:
             raise ValueError(f"runtime source contains a symlink: {source}")
+        if recipe == "bindcraft" and not source.is_dir():
+            raise ValueError("BindCraft runtime must be installed and preflighted before packaging; no worker launched")
         size, count = source_size(source, shared=shared, selected=paths, digest=digest)
+        if recipe == "bindcraft" and (not size or not count):
+            raise ValueError("BindCraft runtime is empty; no worker launched")
         total += size
         files += count
     # Local package setup/downloads need headroom beyond the existing assets.

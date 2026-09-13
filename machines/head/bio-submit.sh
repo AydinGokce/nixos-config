@@ -11,7 +11,7 @@ LOC=FIN-02
 [ ! -r "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}" ] || source "${BIO_CLUSTER_CONFIG:-/etc/bio-tools/cluster.sh}"
 usage() { cat <<'USAGE'
 bio-submit MODEL --fasta FILE [options]
-Models: boltz2, openfold3, protenix, rf3, rfaa, rfdiffusion, mpnn, esm, evolvepro, md
+Models: boltz2, openfold3, protenix, rf3, rfaa, rfdiffusion, bindcraft, mpnn, esm, evolvepro, md
 Inputs: --fasta FILE | --pdb FILE | --json FILE | --contigs '[50-50]'
 Library: --construct REF | --assembly REF (pinned and checked before GPU rental)
 Options: --labels CSV (EVOLVEpro), --sub CMD, --model NAME, --num N,
@@ -24,6 +24,7 @@ Database jobs: bio-submit msa --sub install|convert|panel|prepare|serve|session 
 Panel preparation: bio-submit msa --sub panel --json MANIFEST.json [--worker TYPE]
 Install then prepare: bio-submit msa --sub install --json MANIFEST.json [--worker TYPE]
 RFAA: --sub full (default) or --sub single-seq; full needs bio-rfaa-databases.
+BindCraft: --in BUNDLE.tar.gz [--sub smoke]; target and design settings belong in the validated bundle.
 EVOLVEpro: --sub rank (default) or --sub embed; --labels measured.csv for ranking.
 Results: /var/lib/bio-runs/JOB on the head, including run.log and job.json.
 USAGE
@@ -33,6 +34,7 @@ case "$tool" in
   esm|esm2) recipe=esm; inkind=fasta; tier=modern ;;
   mpnn|proteinmpnn) recipe=mpnn; inkind=pdb; tier=modern ;;
   rfdiffusion|rfd) recipe=rfdiffusion; inkind=optpdb; tier=ampere ;;
+  bindcraft) recipe=bindcraft; inkind=bundle; tier=bindcraft ;;
   rf3) recipe=rf3; inkind=fasta; tier=cuda128 ;;
   rfaa) recipe=rfaa; inkind=fasta; tier=ampere ;;
   evolvepro) recipe=evolvepro; inkind=fasta; tier=modern ;;
@@ -49,12 +51,19 @@ gpu=""; spot=""; infile=""; labels=""; model=""; sub=""; contigs=""; num=""; tem
 msa_backend="${BIO_MSA_DEFAULT_BACKEND:-public}"; msa_bundle=""; bundle_result=""
 library_ref=""; library_kind=""; library_bundle=""; library_sha=""; library_format=""; library_has_protein=""; input_flag=""
 panel_manifest_sha=""
+bindcraft_bundle_sha=""
 execution=auto; rf3_refresh_preparation=0; rf3_preparation_receipt=""
 case "$recipe" in openfold3|boltz2|protenix|rf3) ;; *) msa_backend=public;; esac
 if [[ "$recipe" = esm || "$recipe" = evolvepro ]]; then
   case "${1:-}" in ""|-*) ;; *) sub="$1"; shift ;; esac
 fi
 while [ $# -gt 0 ]; do
+  if [ "$recipe" = bindcraft ]; then
+    case "$1" in
+      --in|--gpu|--worker|--name|--timeout|--execution|--spot|--sub|-h|--help|--) ;;
+      *) echo 'bio-submit: BindCraft accepts --in BUNDLE, worker, timeout and name; target and settings must be bundled' >&2; exit 2 ;;
+    esac
+  fi
   case "$1" in
     --gpu|--worker|--model|--fasta|--pdb|--json|--in|--input-pdb|--labels|--sub|--contigs|--num-designs|--num|--num-seqs|--temp|--name|--timeout|--msa-backend|--msa-bundle|--bundle-result|--construct|--assembly|--execution)
       [ $# -ge 2 ] || { echo "bio-submit: $1 needs a value" >&2; exit 2; }
@@ -92,6 +101,17 @@ if [ "$recipe" = md ]; then
   }
   [ "$execution" != resident ] || { echo 'bio-submit: MD uses managed ephemeral workers' >&2; exit 2; }
   PYTHONPATH="$TOOLS_SRC" python3 -m md.bundle "$infile" >/dev/null
+fi
+if [ "$recipe" = bindcraft ]; then
+  [ "$input_flag" = --in ] && [ -n "$infile" ] && [ -z "$labels$model$contigs$num$temp$library_ref$msa_bundle$bundle_result" ] && [ "${#extra[@]}" -eq 0 ] || {
+    echo 'bio-submit: BindCraft requires one validated --in bundle without extra arguments' >&2; exit 2;
+  }
+  case "$sub" in ""|smoke) ;; *) echo 'bio-submit: BindCraft only supports --sub smoke or its default design workflow' >&2; exit 2;; esac
+  [ "$execution" != resident ] || { echo 'bio-submit: BindCraft uses managed ephemeral workers' >&2; exit 2; }
+  case "$gpu" in
+    ""|1A100.22V|1A100.40S.22V|1L40S.20V|1H100.80S.32V|1A6000.10V) ;;
+    *) echo 'bio-submit: BindCraft requires a supported A100, L40S, H100 or A6000 worker with at least 32 GiB VRAM' >&2; exit 2 ;;
+  esac
 fi
 [ -n "$infile$library_ref" ] || [[ "$inkind" = opt* ]] || { echo 'bio-submit: input required' >&2; exit 2; }
 [ -z "$library_ref" ] || [ -z "$infile$contigs$msa_bundle" ] || { echo 'bio-submit: library references conflict with raw input, contigs or prepared bundles' >&2; exit 2; }
@@ -139,6 +159,13 @@ if [ "$recipe" = md ]; then
   [[ "$gpu" != CPU.* ]] || md_variant=cpu
   PYTHONPATH="$TOOLS_SRC" python3 -m md.launch --check --variant "$md_variant" \
     --runtime-root "${BIO_MD_RUNTIME_ARCHIVES:-/mnt/bio-shared/md-runtime}"
+fi
+if [ "$recipe" = bindcraft ]; then
+  bindcraft_bundle_sha=$(sha256sum "$infile" | cut -d ' ' -f1)
+  python3 "$TOOLS_SRC/bindcraft/runtime.py" preflight --bundle "$infile" --shared "$SHARED_MNT"
+  [ "$(sha256sum "$infile" | cut -d ' ' -f1)" = "$bindcraft_bundle_sha" ] || {
+    echo 'bio-submit: BindCraft bundle changed during preflight; no worker launched' >&2; exit 2;
+  }
 fi
 if [ -n "$library_ref" ]; then
   case "$recipe" in boltz2|openfold3|protenix|rf3|rfaa|esm|evolvepro) ;; *) echo 'bio-submit: this model requires a structure/raw input, not a construct sequence' >&2; exit 2;; esac
@@ -444,6 +471,16 @@ fi
 run="$SHARED_MNT/runs/$jobid"; mkdir -p "$run/in" "$run/out"
 RIN=""; RLABELS=""; RPREP=""; RNATIVE=""; native_has_protein=""
 if [ -n "$infile" ]; then cp "$infile" "$run/in/input.${infile##*.}"; RIN="$run/in/input.${infile##*.}"; fi
+if [ "$recipe" = bindcraft ]; then
+  [ "$(sha256sum "$RIN" | cut -d ' ' -f1)" = "$bindcraft_bundle_sha" ] || {
+    echo 'bio-submit: staged BindCraft bundle differs from its preflight; no worker launched' >&2; exit 2;
+  }
+  python3 "$TOOLS_SRC/bindcraft/runtime.py" preflight --bundle "$RIN" --shared "$SHARED_MNT"
+  [ "$(sha256sum "$RIN" | cut -d ' ' -f1)" = "$bindcraft_bundle_sha" ] || {
+    echo 'bio-submit: staged BindCraft bundle changed during preflight; no worker launched' >&2; exit 2;
+  }
+  printf '%s\n' "$bindcraft_bundle_sha" > "$LOCALOUT/bindcraft-input.sha256"
+fi
 if [ -n "$panel_manifest_sha" ]; then
   python3 "$TOOLS_SRC/msa/panel.py" validate --manifest "$RIN" --expected-sha256 "$panel_manifest_sha"
   cp "$RIN" "$LOCALOUT/panel-manifest.json"
@@ -511,6 +548,7 @@ bundle_dirs=(recipes py requirements rfaa)
 [ ! -d "$TOOLS_SRC/library" ] || bundle_dirs+=(library)
 [ ! -d "$TOOLS_SRC/rf3" ] || bundle_dirs+=(rf3)
 [ "$recipe" != md ] || bundle_dirs+=(md)
+[ "$recipe" != bindcraft ] || bundle_dirs+=(bindcraft)
 tar -czhf "$bundle" -C "$TOOLS_SRC" "${bundle_dirs[@]}"
 bundle_sha256=$(sha256sum "$bundle" | cut -d ' ' -f1)
 # printf %q preserves argument boundaries and prevents input text becoming code.
@@ -533,6 +571,7 @@ remote_msa_bundle="$RPREP"
   if [ "$recipe" = msa ]; then printf 'MSA_DB_NFS=%q\n' "$db_nfs"; else printf 'MSA_DB_NFS=""\n'; fi
   printf 'export MSA_DB_ROOT=%q BIO_MSA_BUNDLE=%q\n' "${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}" "$remote_msa_bundle"
   if [ "$recipe" = rf3 ]; then printf 'export BIO_RF3_INPUT=%q\n' "$RPREP/input.json"; fi
+  if [ "$recipe" = bindcraft ]; then printf 'export BIO_BINDCRAFT_BUNDLE_SHA256=%q\n' "$bindcraft_bundle_sha"; fi
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
   printf 'export BIO_MSA_SESSION_ID=%q BIO_MSA_SESSION_IDLE_SECONDS=%q BIO_MSA_SESSION_WARM=%q\n' \
     "${BIO_MSA_SESSION_ID:-}" "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" "${BIO_MSA_SESSION_WARM:-report}"
@@ -661,8 +700,10 @@ REMOTE
   if [ "$recipe" = msa ]; then
     printf 'bash "$BIO_TOOLS_DIR/run-recipe.sh"\n'
   else
-    printf 'python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage inference --scope gpu --message %q -- bash "$BIO_TOOLS_DIR/run-recipe.sh"\n' \
-      'Loading the model and running the prediction'
+    recipe_message='Loading the model and running the prediction'
+    [ "$recipe" != bindcraft ] || recipe_message='Loading BindCraft and designing binders'
+    if [ "$recipe" = bindcraft ] && [ "$sub" = smoke ]; then recipe_message='Testing the installed BindCraft components'; fi
+    printf 'python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage inference --scope gpu --message %q -- bash "$BIO_TOOLS_DIR/run-recipe.sh"\n' "$recipe_message"
   fi
   printf 'sync\n'
 } > "$remote_file"
@@ -788,6 +829,7 @@ else
     ampere) candidates=(1A100.22V 1A6000.10V 1A100.40S.22V) ;;
     cuda128) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V) ;;
     modern) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V 1A6000.10V) ;;
+    bindcraft) candidates=(1A100.22V 1L40S.20V 1H100.80S.32V 1A100.40S.22V 1A6000.10V) ;;
     latest) candidates=(1A100.22V 1L40S.20V 1RTXPRO6000.30V 1H100.80S.32V) ;;
     msa) candidates=(CPU.360V.1440G) ;;
     msa_convert) candidates=(CPU.16V.64G) ;;
