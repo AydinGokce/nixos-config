@@ -267,8 +267,8 @@ def export_directory(registry, ref, destination):
         project = snapshot['project_record']
         brief_path = paths[snapshot['project_ref']]['attachments'][project['identity']['objectives_file']]['path']
         brief = (stage/brief_path).read_bytes()
-        state = r.projects.markdown_state(brief)
-        if state == 'incomplete_scaffold':
+        state = r.projects.markdown_state(brief, allow_empty=True)
+        if state in {'incomplete_scaffold', 'incomplete_empty'}:
             warnings.append({'ref': snapshot['project_ref'], 'code': 'incomplete_project_brief', 'path': 'project.md'})
         if not members:
             warnings.append({'ref': snapshot['project_ref'], 'code': 'no_project_members'})
@@ -379,10 +379,10 @@ def _validate_semantics(manifest, read_json, read_bytes):
         expected_files.add(entry['snapshot'])
     brief = manifest['records'][manifest['project_ref']]['attachments'][project['identity']['objectives_file']]
     require(manifest['files'].get('project.md') == {key: brief[key] for key in ('bytes','sha256')}, 'Readable project brief differs from its original attachment')
-    state = r.projects.markdown_state(read_bytes(brief['path']))
+    state = r.projects.markdown_state(read_bytes(brief['path']), allow_empty=True)
     require(manifest['project_brief_state'] == state, 'Project brief completeness classification changed')
     warnings = []
-    if state == 'incomplete_scaffold':
+    if state in {'incomplete_scaffold', 'incomplete_empty'}:
         warnings.append({'ref': manifest['project_ref'], 'code': 'incomplete_project_brief', 'path': 'project.md'})
     if not members:
         warnings.append({'ref': manifest['project_ref'], 'code': 'no_project_members'})

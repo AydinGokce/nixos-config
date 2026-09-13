@@ -67,6 +67,120 @@ class LibraryCurationTests(unittest.TestCase):
                   'request_key': request_key or f'{action}-{self.counter}'}
         return getattr(edits, action)(api, params), params
 
+    def test_project_description_rpc_preserves_exact_utf8_old_revision_and_replay(self):
+        self.protein(); project = self.project()
+        old_record = self.registry._path('project:study@1').read_bytes()
+        old_path = self.registry.attachment_path('project:study@1', 'attachments/project.md')
+        old_bytes = old_path.read_bytes()
+        text = '# Revised objectives\r\n\r\nα < 2; retain Markdown and CRLF. 🧬\r\n'
+        params = {'ref': 'project:study@1', 'expected_sha256': project['sha256'],
+                  'request_key': 'project-description-rpc', 'patch': {'description': text}}
+        result = self.api.call('library.edit', params)
+        detail = self.api.call('library.get', {'ref': result['ref']})
+        self.assertTrue(result['changed'])
+        self.assertEqual(result['changed_refs'], [{'before_ref': 'project:study@1', 'after_ref': 'project:study@2'}])
+        self.assertEqual(detail['description']['text'], text)
+        self.assertEqual(detail['description']['sha256'], hashlib.sha256(text.encode()).hexdigest())
+        self.assertEqual(detail['record']['identity'], project['identity'])
+        self.assertEqual(old_path.read_bytes(), old_bytes)
+        self.assertEqual(self.registry._path('project:study@1').read_bytes(), old_record)
+        new_path = self.registry.attachment_path(result['ref'], 'attachments/project.md')
+        self.assertNotEqual(old_path.stat().st_ino, new_path.stat().st_ino)
+        self.assertEqual(self.api.call('library.edit', params), result)
+        self.assertEqual(self.registry.verify()['records'], 3)
+        self.assertEqual(list((self.registry.root / '.staging').iterdir()), [])
+
+    def test_project_description_stale_reference_and_sha_cannot_publish(self):
+        self.protein(); project = self.project()
+        result, params = self.request({'description': '# New brief\n'}, 'study')
+        current = self.registry.show(result['ref'])
+        for changes in ({'request_key': 'stale-ref'},
+                        {'request_key': 'wrong-sha', 'ref': result['ref'], 'expected_sha256': project['sha256']}):
+            with self.subTest(changes=changes), self.assertRaises(Error) as raised:
+                edits.edit(self.api, {**params, **changes})
+            self.assertEqual(raised.exception.code, 'conflict')
+        self.assertEqual(self.registry.show('study'), current)
+        self.assertEqual(self.registry.verify()['records'], 3)
+
+    def test_project_description_undo_redo_keeps_other_actor_name_and_current_member_pins(self):
+        self.protein(); self.project()
+        self.request({'description': '# Alice brief\n'}, 'study')
+        self.request({'name': 'Bob project name'}, 'study', api=self.bob)
+        self.request({'alt_name': 'Bob member'}, api=self.bob)
+        self.reverse()
+        project = self.registry.show('study')
+        self.assertEqual(project['name'], 'Bob project name')
+        self.assertEqual(project['identity']['members'][0]['source_ref'], 'construct:editor@2')
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_bytes(), self.purpose.read_bytes())
+        self.reverse('redo')
+        project = self.registry.show('study')
+        self.assertEqual(project['name'], 'Bob project name')
+        self.assertEqual(project['identity']['members'][0]['source_ref'], 'construct:editor@2')
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_text(), '# Alice brief\n')
+
+    def test_project_description_conflict_and_actor_owned_reversal(self):
+        self.protein(); self.project()
+        first, _ = self.request({'description': 'Alice'}, 'study')
+        with self.assertRaisesRegex(Error, 'history changed'):
+            edits.undo(self.bob, {'operation_id': first['operation_id'], 'request_key': 'foreign-undo'})
+        self.request({'description': 'Bob'}, 'study', api=self.bob)
+        before = self.registry.verify()['records']
+        with self.assertRaisesRegex(Error, 'description has another edit'):
+            self.reverse()
+        self.assertEqual(self.registry.verify()['records'], before)
+        self.reverse(api=self.bob); self.reverse()
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_bytes(), self.purpose.read_bytes())
+        self.reverse('redo')
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_text(), 'Alice')
+
+    def test_project_name_undo_retains_other_actor_description(self):
+        self.protein(); self.project()
+        self.request({'name': 'Alice project name'}, 'study')
+        self.request({'description': 'Bob brief'}, 'study', api=self.bob)
+        self.reverse()
+        self.assertEqual(self.registry.show('study')['name'], 'Research objective')
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_text(), 'Bob brief')
+        self.reverse('redo')
+        self.assertEqual(self.registry.show('study')['name'], 'Alice project name')
+        self.assertEqual(self.registry.attachment_path('study', 'attachments/project.md').read_text(), 'Bob brief')
+
+    def test_empty_project_description_is_durable_and_undoable_after_backup_restore(self):
+        self.protein(); self.project()
+        unchanged, _ = self.request({'description': self.purpose.read_bytes().decode()}, 'study')
+        self.assertFalse(unchanged['changed'])
+        self.assertIsNone(unchanged['history']['undo'])
+        result, params = self.request({'description': ''}, 'study')
+        detail = self.api.call('library.get', {'ref': result['ref']})
+        self.assertEqual(detail['description']['text'], '')
+        self.assertTrue(detail['description']['incomplete'])
+        archive = self.base / 'blank-project-backup.tar.gz'
+        self.registry.export_snapshot(archive)
+        restored = self.base / 'restored-description'
+        self.module.restore_backup(archive, restored)
+        api = API(Store(self.base / 'restored-service'), 'alice',
+                  library_config={**self.config, 'library_root': str(restored)})
+        self.assertEqual(api.call('library.edit', params), result)
+        api.call('library.undo', {'operation_id': result['operation_id'], 'request_key': 'restore-description'})
+        registry = self.module.Registry(restored)
+        self.assertEqual(registry.attachment_path('study', 'attachments/project.md').read_bytes(), self.purpose.read_bytes())
+        api.call('library.redo', {'operation_id': result['operation_id'], 'request_key': 'clear-description-again'})
+        self.assertEqual(registry.attachment_path('study', 'attachments/project.md').read_bytes(), b'')
+        registry.verify()
+
+    def test_project_description_limit_counts_utf8_bytes_and_rejects_invalid_content(self):
+        self.protein(); self.project()
+        for value in (None, 2, '\x00', '\ud800', 'α' * (edits.MAX_DESCRIPTION_BYTES // 2 + 1)):
+            with self.subTest(value_type=type(value).__name__), self.assertRaises(Error):
+                self.request({'description': value}, 'study')
+        with self.assertRaisesRegex(Error, 'projects only'):
+            self.request({'description': 'Not a project'})
+        self.assertEqual(self.registry.verify()['records'], 2)
+        limit = 'α' * (edits.MAX_DESCRIPTION_BYTES // 2)
+        result, _ = self.request({'description': limit}, 'study')
+        self.assertEqual(self.registry.attachment_path(result['ref'], 'attachments/project.md').stat().st_size,
+                         edits.MAX_DESCRIPTION_BYTES)
+        self.assertEqual(self.api.call('library.get', {'ref': result['ref']})['description']['text'], limit)
+
     def test_presentation_exact_source_values_empty_override_and_nondict_inventory(self):
         record = self.protein()
         self.assertEqual(edits.presentation(record), {'inventory_id': 'pGC077', 'alt_name': 'Editor',

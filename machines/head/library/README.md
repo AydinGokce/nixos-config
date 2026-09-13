@@ -118,6 +118,11 @@ and exportable even when these models cannot predict it.
 
 ## Research objectives and construct purpose
 
+The Console project pane has a pencil beside **Copy document** for editing the
+project brief. **Save document** publishes a new immutable revision; **Cancel**
+discards the draft. Library undo/redo can restore previous text. Clearing an
+existing project brief is supported and marks it incomplete in context exports.
+
 Each newly published construct or assembly carries `attachments/description.md`.
 Supply your own Markdown with `--description` at import, or use `describe` to
 publish a new immutable revision. Otherwise, the library creates an explicitly

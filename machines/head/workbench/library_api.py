@@ -163,7 +163,7 @@ def get_record(api, params):
             except UnicodeError as exc:
                 raise Error('library', 'Purpose document is not UTF-8') from exc
             description = {'text': text, 'path': path, 'sha256': receipt['sha256'],
-                           'incomplete': '<!-- bio-library:purpose-scaffold:v1 incomplete -->' in text}
+                           'incomplete': not text.strip() or '<!-- bio-library:purpose-scaffold:v1 incomplete -->' in text}
         members = []
         if record['kind'] == 'project':
             members = [{**summary(records[m['source_ref']], records), **m} for m in record['identity']['members']]

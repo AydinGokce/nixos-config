@@ -436,7 +436,8 @@ class Registry:
             require(relative in names, 'Project objectives are missing their Markdown attachment')
             require((path.parent/relative).stat().st_size <= projects.MAX_MARKDOWN_BYTES,
                     'Project Markdown is larger than 1 MiB')
-            projects.markdown_bytes((path.parent/relative).read_bytes(), require=require)
+            projects.markdown_bytes((path.parent/relative).read_bytes(), require=require,
+                                    allow_empty=document['revision'] > 1)
         return document
 
     def _records_locked(self):
@@ -666,7 +667,8 @@ class Registry:
                         os.fsync(handle.fileno())
                     output['attachments'].append({'path': 'attachments/'+purpose_name,
                         'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
-                projects.markdown_bytes(purpose_path.read_bytes(), require=require)
+                projects.markdown_bytes(purpose_path.read_bytes(), require=require,
+                                        allow_empty=output['kind'] == 'project' and output['revision'] > 1)
                 output['attachments'].sort(key=lambda item: item['path'])
             if output["identity"].get("structure_file"):
                 require(output["identity"]["structure_file"] in [x["path"] for x in output["attachments"]],
@@ -985,8 +987,8 @@ class Registry:
         """Publish purpose text as a new revision while keeping chemical identity."""
         source = no_symlinks(markdown_path, regular=True)
         require(source.stat().st_size <= projects.MAX_MARKDOWN_BYTES, 'Purpose Markdown is larger than 1 MiB')
-        projects.markdown_bytes(source.read_bytes(), require=require)
         record = self.show(ref)
+        projects.markdown_bytes(source.read_bytes(), require=require, allow_empty=record['kind'] == 'project')
         name = projects.filename(record['kind'])
         require(name is not None, 'Purpose documents apply to constructs, assemblies or projects')
         # Pin the source revision; concurrent edits must fail as stale, not be replaced.
@@ -1406,7 +1408,8 @@ def main(argv=None):
             name = projects.filename(record['kind'])
             require(name is not None, 'Purpose documents apply to constructs, assemblies or projects')
             path = registry.attachment_path(reference(record), 'attachments/'+name)
-            sys.stdout.write(projects.markdown_bytes(path.read_bytes(), require=require).decode('utf-8'))
+            sys.stdout.write(projects.markdown_bytes(path.read_bytes(), require=require,
+                                                    allow_empty=record['kind'] == 'project').decode('utf-8'))
             return
     elif args.command in {'context', 'context-verify'}:
         import importlib.util

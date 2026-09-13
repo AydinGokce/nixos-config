@@ -51,6 +51,15 @@ class ContextTests(unittest.TestCase):
         c.export_archive(self.library,'study',path)
         return path
 
+    def test_cleared_project_brief_exports_and_verifies_as_incomplete(self):
+        self.brief.write_bytes(b'')
+        project = self.library.describe('study', self.brief)
+        path, manifest = self.export('cleared-project')
+        self.assertEqual((path / 'project.md').read_bytes(), b'')
+        self.assertEqual(manifest['project_brief_state'], 'incomplete_empty')
+        self.assertIn({'ref': r.reference(project), 'code': 'incomplete_project_brief', 'path': 'project.md'}, manifest['warnings'])
+        c.verify_directory(path)
+
     def rewrite_archive(self, source, name, transform):
         entries=[]
         with tarfile.open(source,'r:gz') as archive:

@@ -1,6 +1,8 @@
 //! Project library curation with immutable revisions and durable head undo/redo.
 use super::*;
 
+const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+
 #[derive(Default)]
 pub(super) struct Explorer {
     pub records: Vec<Value>,
@@ -41,6 +43,46 @@ struct Edit {
     value: String,
     original: String,
     focus: bool,
+}
+
+impl Edit {
+    fn new(detail: &Value, field: &str) -> Self {
+        let value = edit_value(detail, field);
+        Self {
+            reference: text(detail, "ref").into(),
+            sha256: presentation(detail, "sha256").into(),
+            field: field.into(),
+            value: value.into(),
+            original: value.into(),
+            focus: true,
+        }
+    }
+
+    fn can_save(&self) -> bool {
+        !self.sha256.is_empty()
+            && self.value != self.original
+            && (matches!(self.field.as_str(), "alt_name" | "description") || !self.value.is_empty())
+            && (self.field != "description" || self.value.len() <= MAX_DOCUMENT_BYTES)
+    }
+
+    fn save_params(&self) -> Option<Value> {
+        if !self.can_save() {
+            return None;
+        }
+        let mut patch = json!({});
+        patch[&self.field] = json!(self.value);
+        Some(json!({"ref":self.reference,"expected_sha256":self.sha256,"patch":patch}))
+    }
+}
+
+fn edit_value<'a>(detail: &'a Value, field: &str) -> &'a str {
+    match field {
+        "sequence" => text(&detail["record"]["identity"], "sequence"),
+        "description" => detail["description"]
+            .as_str()
+            .unwrap_or_else(|| text(&detail["description"], "text")),
+        _ => presentation(detail, field),
+    }
 }
 
 impl Explorer {
@@ -126,11 +168,7 @@ impl Explorer {
             .filter(|edit| edit.reference == reference && edit.sha256.is_empty())
         {
             edit.sha256 = presentation(&value, "sha256").into();
-            edit.original = if edit.field == "sequence" {
-                text(&value["record"]["identity"], "sequence").into()
-            } else {
-                presentation(&value, &edit.field).into()
-            };
+            edit.original = edit_value(&value, &edit.field).into();
         }
         let identity = &value["record"]["identity"];
         let view = if value["sequence_view"].is_object() {
@@ -494,36 +532,23 @@ impl Workbench {
         if self.library_writing() || detail["is_latest"] == false {
             return;
         }
-        let value = if field == "sequence" {
-            text(&detail["record"]["identity"], "sequence")
-        } else {
-            presentation(detail, field)
-        };
-        self.library.edit = Some(Edit {
-            reference: text(detail, "ref").into(),
-            sha256: presentation(detail, "sha256").into(),
-            field: field.into(),
-            value: value.into(),
-            original: value.into(),
-            focus: true,
-        });
+        if self
+            .library
+            .edit
+            .as_ref()
+            .is_some_and(|edit| edit.field == "description" && edit.value != edit.original)
+        {
+            self.library.write_error =
+                "Save or cancel the project description before editing another field.".into();
+            return;
+        }
+        self.library.edit = Some(Edit::new(detail, field));
         self.library.write_error.clear();
     }
 
     fn library_save_edit(&mut self) {
-        if let Some(edit) = self.library.edit.clone() {
-            if edit.sha256.is_empty() {
-                return;
-            }
-            if edit.value == edit.original || (edit.field != "alt_name" && edit.value.is_empty()) {
-                return;
-            }
-            let mut patch = json!({});
-            patch[&edit.field] = json!(edit.value);
-            self.library_write(
-                "library.edit",
-                json!({"ref":edit.reference,"expected_sha256":edit.sha256,"patch":patch}),
-            );
+        if let Some(params) = self.library.edit.as_ref().and_then(Edit::save_params) {
+            self.library_write("library.edit", params);
         }
     }
 
@@ -1469,12 +1494,17 @@ impl Workbench {
 
     fn library_purpose(&mut self, ui: &mut egui::Ui, detail: &Value, ctx: &egui::Context) {
         let description = &detail["description"];
-        let document = description
-            .as_str()
-            .unwrap_or_else(|| text(description, "text"));
-        ui.horizontal(|ui| {
+        let document = edit_value(detail, "description");
+        let project = text(&detail["record"], "kind") == "project";
+        let editing = self.library.edit.as_ref().is_some_and(|edit| {
+            edit.field == "description" && edit.reference == text(detail, "ref")
+        });
+        let writing = self.library_writing();
+        let editable = detail["is_latest"] != false && !writing && self.library.edit.is_none();
+        let mut begin_edit = false;
+        ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new(if text(&detail["record"], "kind") == "project" {
+                RichText::new(if project {
                     "PROJECT BRIEF"
                 } else {
                     "CONSTRUCT PURPOSE"
@@ -1482,25 +1512,53 @@ impl Workbench {
                 .strong()
                 .color(AMBER),
             );
-            ui.checkbox(&mut self.library.source_document, "Markdown source");
-            if ui.small_button("Copy document").clicked() {
-                ctx.copy_text(document.into());
+            if !editing {
+                ui.checkbox(&mut self.library.source_document, "Markdown source");
             }
+            let (copy, pencil) = document_buttons(ui, project, editable);
+            if copy.clicked() {
+                let value = self
+                    .library
+                    .edit
+                    .as_ref()
+                    .filter(|_| editing)
+                    .map_or(document, |edit| edit.value.as_str());
+                ctx.copy_text(value.into());
+            }
+            begin_edit = pencil.is_some_and(|pencil| pencil.clicked());
         });
-        if description["incomplete"] == true
-            || document.contains("bio-library:purpose-scaffold:v1 incomplete")
-        {
-            ui.colored_label(
-                AMBER,
-                "Purpose document is incomplete. This record still needs manual context.",
-            );
+        if begin_edit {
+            self.library_begin_edit(detail, "description");
         }
-        if document.is_empty() {
-            ui.weak("No purpose document is attached to this revision.");
-        } else if self.library.source_document {
-            readonly(ui, document);
+        if let Some(edit) = self
+            .library
+            .edit
+            .as_mut()
+            .filter(|edit| edit.field == "description" && edit.reference == text(detail, "ref"))
+        {
+            let (save, cancel) = document_editor(ui, edit, writing);
+            if cancel {
+                self.library.edit = None;
+                self.library.write_error.clear();
+            } else if save {
+                self.library_save_edit();
+            }
         } else {
-            markdown(ui, document);
+            if description["incomplete"] == true
+                || document.contains("bio-library:purpose-scaffold:v1 incomplete")
+            {
+                ui.colored_label(
+                    AMBER,
+                    "Purpose document is incomplete. This record still needs manual context.",
+                );
+            }
+            if document.is_empty() {
+                ui.weak("No purpose document is attached to this revision.");
+            } else if self.library.source_document {
+                readonly(ui, document);
+            } else {
+                markdown(ui, document);
+            }
         }
         if !rows(detail, "members").is_empty() {
             ui.add_space(10.);
@@ -1769,6 +1827,81 @@ enum Icon {
     Pencil,
 }
 
+fn document_buttons(
+    ui: &mut egui::Ui,
+    project: bool,
+    editable: bool,
+) -> (egui::Response, Option<egui::Response>) {
+    ui.scope(|ui| {
+        // Text and drawn-icon buttons share one height, including custom font sizes.
+        let height = (ui.text_style_height(&egui::TextStyle::Button)
+            + 2. * ui.spacing().button_padding.y)
+            .max(ui.spacing().interact_size.y)
+            .max(23.);
+        ui.spacing_mut().interact_size.y = height;
+        let copy = ui.add(egui::Button::new("Copy document").min_size(Vec2::new(0., height)));
+        let pencil = project.then(|| {
+            icon_button(
+                ui,
+                Icon::Pencil,
+                editable,
+                "Edit project description (current revision)",
+            )
+        });
+        (copy, pencil)
+    })
+    .inner
+}
+
+fn document_editor(ui: &mut egui::Ui, edit: &mut Edit, writing: bool) -> (bool, bool) {
+    let mut save = false;
+    let mut cancel = false;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            save = ui
+                .add_enabled(
+                    !writing && edit.can_save(),
+                    egui::Button::new("Save document"),
+                )
+                .clicked();
+            cancel = ui
+                .add_enabled(!writing, egui::Button::new("Cancel"))
+                .clicked();
+            if writing {
+                ui.spinner();
+                ui.weak("Saving…");
+            } else {
+                ui.weak("Markdown · saves a new revision");
+            }
+        });
+        if edit.value.len() > MAX_DOCUMENT_BYTES {
+            ui.colored_label(
+                RED,
+                "Project descriptions must be at most 1 MiB of UTF-8 text.",
+            );
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("edit-document-scroll", &edit.reference))
+            .max_height(320.)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let response = ui.add_enabled(
+                    !writing,
+                    egui::TextEdit::multiline(&mut edit.value)
+                        .id_salt(("edit-project-document", &edit.reference))
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(12),
+                );
+                if edit.focus {
+                    response.request_focus();
+                    edit.focus = false;
+                }
+            });
+    });
+    (save, cancel)
+}
+
 fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
     let response = ui
         .add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(23.)))
@@ -2023,6 +2156,165 @@ fn inline_markdown(value: &str) -> egui::text::LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_detail(reference: &str, document: &str) -> Value {
+        json!({"ref":reference,"sha256":"a".repeat(64),"is_latest":true,
+            "record":{"kind":"project","name":"Project","identity":{}},
+            "description":{"text":document,"sha256":"b".repeat(64),"path":"attachments/project.md"}})
+    }
+
+    #[test]
+    fn project_document_save_preserves_markdown_and_record_revision_precondition() {
+        let detail = project_detail("project:example@7", "# Original\n\nProject purpose.\n");
+        let mut edit = Edit::new(&detail, "description");
+        assert_eq!(edit.value, detail["description"]["text"]);
+        assert!(edit.save_params().is_none(), "unchanged text is a no-op");
+        let markdown = "# Updated purpose\r\n\r\n- Low pH ≤ 2\r\n- α / β\r\n\r\n```text\n  preserved whitespace  \n```\n";
+        edit.value = markdown.into();
+        assert_eq!(
+            edit.save_params().unwrap(),
+            json!({"ref":"project:example@7","expected_sha256":"a".repeat(64),
+                "patch":{"description":markdown}})
+        );
+        edit.value.clear();
+        assert_eq!(edit.save_params().unwrap()["patch"]["description"], "");
+        edit.sha256.clear();
+        assert!(
+            edit.save_params().is_none(),
+            "wait for the new revision digest"
+        );
+    }
+
+    #[test]
+    fn project_document_limit_counts_utf8_bytes_and_missing_attachment_can_be_added() {
+        let detail = json!({"ref":"project:empty@1","sha256":"a".repeat(64),
+            "record":{"kind":"project"},"description":null});
+        let mut edit = Edit::new(&detail, "description");
+        assert_eq!(edit.value, "");
+        edit.value = "é".repeat(MAX_DOCUMENT_BYTES / 2);
+        assert!(edit.can_save());
+        edit.value.push('é');
+        assert!(edit.save_params().is_none());
+        edit.value = "New project description".into();
+        assert!(edit.can_save());
+    }
+
+    #[test]
+    fn project_document_recovery_retains_new_typing_and_refreshes_its_saved_baseline() {
+        let before = "project:example@1";
+        let after = "project:example@2";
+        let mut edit = Edit::new(&project_detail(before, "Original"), "description");
+        edit.value = "New typing\n".into();
+        let mut explorer = Explorer {
+            selected: before.into(),
+            edit: Some(edit),
+            ..Default::default()
+        };
+        let changed = json!({"changed_refs":[{"before_ref":before,"after_ref":after}]});
+        explorer.reconcile_edit(
+            &changed,
+            &json!({"ref":before,"patch":{"description":"Earlier submitted draft"}}),
+        );
+        let pending = explorer.edit.as_ref().unwrap();
+        assert_eq!(pending.reference, after);
+        assert_eq!(pending.value, "New typing\n");
+        assert!(pending.save_params().is_none());
+        explorer.selected = after.into();
+        let mut received = project_detail(after, "Earlier submitted draft");
+        received["sha256"] = json!("c".repeat(64));
+        assert!(explorer.accept_detail(after, received));
+        let retained = explorer.edit.as_ref().unwrap();
+        assert_eq!(retained.original, "Earlier submitted draft");
+        assert_eq!(retained.value, "New typing\n");
+        let params = retained.save_params().unwrap();
+        assert_eq!(params["expected_sha256"], "c".repeat(64));
+        explorer.reconcile_edit(
+            &json!({"changed_refs":[{"before_ref":after,"after_ref":"project:example@3"}]}),
+            &params,
+        );
+        assert!(
+            explorer.edit.is_none(),
+            "successful current draft closes the editor"
+        );
+    }
+
+    #[test]
+    fn copy_document_and_pencil_share_height_at_regular_and_large_font_sizes() {
+        for font_size in [14., 26.] {
+            let context = egui::Context::default();
+            context.style_mut(|style| {
+                style.text_styles.insert(
+                    egui::TextStyle::Button,
+                    egui::FontId::proportional(font_size),
+                );
+            });
+            let _ = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let (copy, pencil) = document_buttons(ui, true, true);
+                        let pencil = pencil.unwrap();
+                        assert!((copy.rect.height() - pencil.rect.height()).abs() < 0.1);
+                        assert!((copy.rect.center().y - pencil.rect.center().y).abs() < 0.1);
+                        assert!(pencil.rect.left() > copy.rect.right());
+                        assert!(pencil.enabled());
+                    });
+                    ui.horizontal(|ui| {
+                        let (_, pencil) = document_buttons(ui, true, false);
+                        assert!(!pencil.unwrap().enabled());
+                    });
+                    ui.horizontal(|ui| {
+                        assert!(document_buttons(ui, false, true).1.is_none());
+                    });
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn long_project_document_keeps_save_and_cancel_above_scrolling_markdown() {
+        let context = egui::Context::default();
+        let mut edit = Edit::new(
+            &project_detail("project:large@1", "Original"),
+            "description",
+        );
+        edit.value = "Research goals and constraints.\n\n".repeat(500);
+        edit.focus = false;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(640., 420.),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let top = ui.cursor().top();
+                    assert_eq!(document_editor(ui, &mut edit, false), (false, false));
+                    assert!(ui.cursor().top() - top < 380.);
+                });
+            },
+        );
+        fn find(shape: &egui::Shape, label: &str) -> Option<f32> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => Some(text.pos.y),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        for label in ["Save document", "Cancel"] {
+            let y = output
+                .shapes
+                .iter()
+                .find_map(|shape| find(&shape.shape, label))
+                .expect("document action is rendered");
+            assert!(y < 80., "{label} stays above the long document");
+        }
+        assert_eq!(
+            edit.value,
+            "Research goals and constraints.\n\n".repeat(500)
+        );
+    }
 
     #[test]
     fn long_sequence_editor_keeps_actions_above_bounded_text() {

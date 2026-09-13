@@ -18,14 +18,17 @@ def _require(condition, message):
         raise ValueError(message)
 
 
-def markdown_bytes(raw, *, require=_require):
-    require(isinstance(raw, bytes) and 0 < len(raw) <= MAX_MARKDOWN_BYTES,
+def markdown_bytes(raw, *, require=_require, allow_empty=False):
+    require(isinstance(raw, bytes) and (allow_empty or len(raw) > 0) and len(raw) <= MAX_MARKDOWN_BYTES,
+            'Purpose Markdown must be no larger than 1 MiB' if allow_empty else
             'Purpose Markdown must be nonempty and no larger than 1 MiB')
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError:
         require(False, 'Purpose Markdown must be UTF-8')
-    require(text.strip() and '\x00' not in text, 'Purpose Markdown must contain text and no NUL bytes')
+    require((allow_empty or text.strip()) and '\x00' not in text,
+            'Purpose Markdown must contain no NUL bytes' if allow_empty else
+            'Purpose Markdown must contain text and no NUL bytes')
     return raw  # Preserve original newlines and bytes, including CRLF.
 
 
@@ -85,9 +88,11 @@ function. Record evidence against the exact construct/assembly revision.
     return (INCOMPLETE_MARKER+'\n\n'+text).encode('utf-8')
 
 
-def markdown_state(raw):
+def markdown_state(raw, *, allow_empty=False):
     """A non-scaffold document is unassessed, never automatically complete."""
-    markdown_bytes(raw)
+    markdown_bytes(raw, allow_empty=allow_empty)
+    if not raw.decode('utf-8').strip():
+        return 'incomplete_empty'
     return 'incomplete_scaffold' if INCOMPLETE_MARKER.encode() in raw else 'unassessed'
 
 

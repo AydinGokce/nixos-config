@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import os
+from pathlib import Path
+import tempfile
 
 from .common import Error, digest, identifier, keys, require, sha, string, uid
 
@@ -17,6 +19,7 @@ MAX_SEQUENCE = 1_000_000
 MAX_EVENTS = 10_000
 MAX_RECORDS = 100_000
 MAX_CHANGED_RECORDS = 1000
+MAX_DESCRIPTION_BYTES = 1024 * 1024
 SIMPLE_SEQUENCE_FIELDS = {'molecule_type', 'sequence', 'circular', 'strand_count', 'molecular_form',
                           'encoded_by', 'product_review'}
 
@@ -147,8 +150,36 @@ def _current(module, registry, records, ref, expected_sha256=None):
     return old
 
 
+def _description_bytes(value):
+    require(isinstance(value, str), 'Project description must be Markdown text')
+    try:
+        raw = value.encode('utf-8')
+    except UnicodeEncodeError as exc:
+        raise Error('invalid', 'Project description must be UTF-8') from exc
+    require(len(raw) <= MAX_DESCRIPTION_BYTES, 'Project description must be no larger than 1 MiB', 'limit')
+    require('\x00' not in value, 'Project description must contain no NUL bytes')
+    return raw
+
+
+def _description_receipt(record):
+    return next((item for item in record['attachments'] if item['path'] == 'attachments/project.md'), None)
+
+
+@contextmanager
+def _description_attachment(registry, raw):
+    if raw is None:
+        yield {}
+        return
+    # The registry transaction copies/fsyncs replacement bytes before publishing
+    # its durable journal. The disposable input never becomes a library revision.
+    with tempfile.TemporaryDirectory(prefix='project-description-', dir=registry.root / '.staging') as temporary:
+        path = Path(temporary) / 'project.md'
+        path.write_bytes(raw)
+        yield {'project.md': path}
+
+
 def _patch(module, record, patch, records=None, registry=None):
-    keys(patch, optional=('alt_name', 'name', 'sequence', 'sequence_edit', 'archived', 'translation', 'parent_ref', 'frame_offset'))
+    keys(patch, optional=('alt_name', 'name', 'description', 'sequence', 'sequence_edit', 'archived', 'translation', 'parent_ref', 'frame_offset'))
     require(patch, 'An edit must contain at least one field')
     require(record['kind'] in {'construct', 'assembly', 'project'}, 'This library entry is not editable')
     document = {key: deepcopy(value) for key, value in record.items() if key in module.USER_FIELDS}
@@ -186,6 +217,12 @@ def _patch(module, record, patch, records=None, registry=None):
         if value != record['name']:
             document['name'] = value
             labels.append('Change project name')
+    if 'description' in patch:
+        require(record['kind'] == 'project', 'Description editing is available for projects only')
+        raw = _description_bytes(patch['description'])
+        receipt = _description_receipt(record)
+        if receipt is None or receipt['sha256'] != hashlib.sha256(raw).hexdigest():
+            labels.append('Change project description')
     if 'archived' in patch:
         require(type(patch['archived']) is bool, 'archived must be boolean')
         if patch['archived'] != presentation(record)['archived']:
@@ -453,11 +490,14 @@ def _commit_operation(api, module, registry, records, events, changes, *, before
 
 
 def _publish(api, module, registry, records, events, old, document, *, method, params, action,
-             label, original_operation_id=None, dependent_changes=None, splices=None, additions=None, removals=None):
+             label, original_operation_id=None, dependent_changes=None, splices=None, additions=None, removals=None,
+             attachments=None):
     before_ref = module.reference(old)
     after_ref = f"{old['kind']}:{old['id']}@{old['revision'] + 1}"
     changes = [{'ref': before_ref, 'expected_sha256': old['sha256'], 'patch': document},
                *(dependent_changes or [])]
+    if attachments:
+        changes[0]['attachments'] = attachments
     return _commit_operation(api, module, registry, records, events, changes,
         before_ref=before_ref, after_ref=after_ref, method=method, params=params, action=action,
         label=label, original_operation_id=original_operation_id, splices=splices, additions=additions, removals=removals)
@@ -469,6 +509,7 @@ def edit(api, params):
     string(params['request_key'], 'request_key', 200)
     # Cap before canonical hashing: RPC already has a 2 MiB wire limit.
     require(isinstance(params['patch'], dict), 'patch must be an object')
+    raw_description = _description_bytes(params['patch']['description']) if 'description' in params['patch'] else None
     with _opened(api, write=True) as (module, registry, records):
         events = _events(module, records)
         replay = _replay(events, api.actor, 'library.edit', params['request_key'], params)
@@ -476,7 +517,9 @@ def edit(api, params):
             return replay
         old = _current(module, registry, records, params['ref'], params['expected_sha256'])
         document, label = _patch(module, old, params['patch'], records, registry)
-        changed = _effective(module, old) != _effective(module, document)
+        description_changed = (raw_description is not None and
+                               _description_receipt(old)['sha256'] != hashlib.sha256(raw_description).hexdigest())
+        changed = _effective(module, old) != _effective(module, document) or description_changed
         splice = document['provenance'].get('workbench', {}).get('sequence_edit', {}).get('splice')
         splices = {module.reference(old): splice} if 'sequence_edit' in params['patch'] and changed and splice else None
         additions = {}
@@ -485,9 +528,10 @@ def edit(api, params):
             for project in _current_projects(records):
                 if any(member['source_ref'] == module.reference(old) for member in project['identity']['members']):
                     additions[module.reference(project)] = [parent_ref]
-        return _publish(api, module, registry, records, events, old, document,
-                        method='library.edit', params=params, action='edit' if changed else 'noop', label=label,
-                        splices=splices, additions=additions)
+        with _description_attachment(registry, raw_description if description_changed else None) as attachments:
+            return _publish(api, module, registry, records, events, old, document,
+                            method='library.edit', params=params, action='edit' if changed else 'noop', label=label,
+                            splices=splices, additions=additions, attachments=attachments)
 
 
 def _comparable(module, record):
@@ -632,6 +676,7 @@ def _reverse(api, params, action):
         restored = before if action == 'undo' else after
         current_ref = registry._resolve(f"{target['kind']}:{target['id']}", records)
         old = records[current_ref]
+        attachments = {}
         if old['kind'] == 'project':
             # Member edits advance project snapshots automatically. Reversing
             # a project label/archive action must preserve those memberships,
@@ -652,12 +697,22 @@ def _reverse(api, params, action):
                         curated['archived'] = _workbench(restored)['archived']
                     else:
                         curated.pop('archived', None)
+            if _description_receipt(before) != _description_receipt(after):
+                require(_description_receipt(old) == _description_receipt(target),
+                        'This project description has another edit. Undo or redo would overwrite it; refresh the library.', 'conflict')
+                attachments['project.md'] = registry._path(module.reference(restored)).parent / 'attachments/project.md'
+            # Description is an independently editable project field. Reversing
+            # a label/archive action must retain another actor's newer brief.
+            def other_attachments(record):
+                return [item for item in record['attachments'] if item['path'] != 'attachments/project.md']
+            require(other_attachments(old) == other_attachments(target),
+                    'This entry has different source attachments; undo or redo cannot overwrite them.', 'conflict')
         else:
             require(_comparable(module, old) == _comparable(module, target),
                     'This entry has another edit. Undo or redo would overwrite it; refresh the library.', 'conflict')
             document = {key: deepcopy(value) for key, value in restored.items() if key in module.USER_FIELDS}
-        require(old['attachments'] == target['attachments'],
-                'This entry has different source attachments; undo or redo cannot overwrite them.', 'conflict')
+            require(old['attachments'] == target['attachments'],
+                    'This entry has different source attachments; undo or redo cannot overwrite them.', 'conflict')
         document['parents'] = deepcopy(old['parents'])
         _current_parent_pin(module, registry, records, document)
         # Reverse the actual last transaction, which may have included products
@@ -672,7 +727,7 @@ def _reverse(api, params, action):
         return _publish(api, module, registry, records, events, old, document,
                         method=method, params=params, action=action, label=original['label'],
                         original_operation_id=original['operation_id'], dependent_changes=dependents,
-                        additions=additions, removals=removals)
+                        additions=additions, removals=removals, attachments=attachments)
 
 
 def undo(api, params):

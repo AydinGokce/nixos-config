@@ -227,9 +227,14 @@ work. Molecular model compatibility remains part of the existing run preview.
   bytes. The size and SHA describe the complete original file; clients verify
   both before publishing an export. Arbitrary filesystem paths are rejected.
 * `library.edit {ref,expected_sha256,request_key,patch}` publishes a new revision.
+  A project `description` patch replaces `attachments/project.md` in that new
+  revision, preserving exact UTF-8 text up to 1 MiB. Empty text is allowed for an
+  existing project and marks its brief incomplete. Current reference/SHA checks
+  prevent stale writes; undo/redo restores the prior brief while preserving
+  independently changed project names and member references.
   The reference must be pinned and current, with its exact displayed SHA.
-  Supported patch fields are `alt_name` for molecular records, `name` for
-  projects, `archived` (boolean), and `sequence` for explicit protein/DNA/RNA
+  Supported patch fields are `alt_name` for molecular records, `name` and
+  `description` for projects, `archived` (boolean), and `sequence` for explicit protein/DNA/RNA
   constructs. `sequence_edit:{start,end,replacement}` expresses an exact splice
   instead of replacing the whole sequence. Derived proteins use `translation`
   and optionally `parent_ref`; direct peptide editing is rejected.
