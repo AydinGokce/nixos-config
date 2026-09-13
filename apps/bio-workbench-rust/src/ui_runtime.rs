@@ -75,6 +75,11 @@ impl Workbench {
         }
     }
     pub(super) fn retry(&mut self, id: &str, purpose: Purpose, label: String) {
+        if matches!(purpose, Purpose::WorkerCapacity(_)) {
+            self.failures.retain(|failure| failure.id != id);
+            self.worker_refresh_capacity(true);
+            return;
+        }
         if matches!(purpose, Purpose::Library(_)) {
             self.failures.retain(|failure| failure.id != id);
             self.library_refresh();
@@ -277,6 +282,7 @@ impl Workbench {
                 self.connected = true;
                 self.connection_open = false;
                 self.worker_refresh();
+                self.worker_refresh_capacity(false);
                 self.log("Connected; loaded the head model catalog.");
                 if self.state.models.is_empty() {
                     for model in rows(&self.catalog, "models") {
@@ -296,6 +302,7 @@ impl Workbench {
                 sort_batch_history(&mut self.batches);
             }
             Purpose::WorkerStatus(serial) => self.worker_received_status(serial, value),
+            Purpose::WorkerCapacity(request) => self.worker_received_capacity(&request, value),
             Purpose::WorkerControl(_) | Purpose::WorkerReceipt(_) => {
                 self.worker_received_control(value);
             }

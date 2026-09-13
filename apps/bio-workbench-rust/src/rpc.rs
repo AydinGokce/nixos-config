@@ -34,6 +34,7 @@ const REMOTE: &str =
 const METHODS: &[&str] = &[
     "catalog",
     "worker.status",
+    "worker.capacity",
     "worker.extend",
     "worker.shutdown",
     "worker.control_get",

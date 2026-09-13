@@ -7,6 +7,7 @@ mod rpc;
 mod scene;
 mod session;
 mod ui_annotations;
+mod ui_capacity;
 mod ui_dock;
 mod ui_inputs;
 mod ui_jobs;
@@ -47,6 +48,7 @@ enum Purpose {
     Catalog,
     History,
     WorkerStatus(u64),
+    WorkerCapacity(ui_capacity::Request),
     WorkerControl(String),
     WorkerReceipt(String),
     Batch(String),

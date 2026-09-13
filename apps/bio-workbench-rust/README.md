@@ -323,12 +323,23 @@ use the same viewer code as the desktop.
 
 ## Shared MSA worker
 
-The **MSA** indicator beside **HEAD CONNECTED** shows whether the shared private
-MSA worker is offline, starting, warming, online, busy, closing, or stale. Click
-it to inspect measured startup stages and the shutdown countdown. Private runs
+Beside **HEAD CONNECTED**, **MSA available** / **MSA unavailable** reports whether
+Verda currently advertises capacity to launch the configured private MSA worker.
+The console checks at startup and every five seconds. **MSA connected** separately
+identifies an existing ready or busy session; other session stages remain visible.
+Click either indicator to inspect measured startup stages and the shutdown countdown. Private runs
 also show this service status in **Run status**. An ETA is labeled for its stage,
 startup, or run scope; unavailable estimates remain unknown. A stage estimate
 does not imply an estimate for the whole prediction.
+
+The **Shared MSA worker** dialog lists available Verda GPUs by region and rental
+type, with GPU memory, system RAM, hourly price and MSA eligibility. Small GPUs
+can be available even when no machine satisfies the MSA worker's RAM, region,
+image and price requirements. CPU capacity also contributes to MSA availability.
+**Refresh** checks capacity immediately, and **Last update X sec ago** shows the
+age of the provider snapshot. Incomplete, failed and stale checks are identified
+explicitly. Availability is an observation, not a reservation or budget approval.
+Provider credentials stay on the head. These capacity checks do not rent compute.
 
 **+15 minutes** adds idle keep-warm time inside the worker's original paid runtime
 limit, including credit for when an active search finishes. **Shut down now**

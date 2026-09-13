@@ -49,7 +49,7 @@ Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing work
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/gc-console-rename-20260910/gc-protein-engineering-console-0.3.0-source.tar.gz
+/home/aydin/bio-runs/msa-availability-ui-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -80,6 +80,9 @@ and the console resize fix. To update an existing installation, close the app,
 extract over its source directory and rebuild with the same command.
 Existing `bio-workbench` and `bio-workbench-rust` launch commands still work;
 the renamed app uses the same connection settings, saved inputs and results.
+The MSA indicators distinguish current Verda capacity from a connected worker.
+Capacity refreshes at startup and every five seconds; the worker dialog includes
+available GPUs, a manual Refresh button and the last-update age.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem

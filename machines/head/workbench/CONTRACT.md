@@ -23,6 +23,56 @@ are rejected. IDs are opaque strings. Times are UTC ISO 8601. Error codes includ
 
 ## Shared MSA worker and startup progress
 
+`worker.capacity {refresh?:bool}` reads Verda capacity separately from the running
+worker. It never allocates a worker, reserves spend, or changes an existing
+session. The Console checks on startup and on its existing five-second polling
+cadence. A shared disk cache survives SSH/RPC process restarts and deduplicates
+all operators: successful checks cache for five seconds; partial/failed checks
+back off for 30 seconds. `refresh:true` bypasses those ages. A concurrent check
+returns the existing observation with `refreshing:true`; the next ordinary poll
+reads its result. Refresh does not create a durable write request.
+
+Its response is `{schema:1,server_epoch,checked_epoch,observed_epoch,state,
+stale,stale_after_seconds:120,refresh_after_seconds,refreshing,msa_available,
+msa_message,gpus,error?}`. `state` is `ready|partial|error`; `checked_epoch` is
+the last **complete successful** snapshot, or null. It is never advanced by a
+cache read or failed refresh. `observed_epoch` timestamps the current attempted
+snapshot, including partial evidence. All times are epoch seconds. An old full
+snapshot cannot claim current availability after 120 seconds. Partial evidence
+may contain a current known MSA result if both FIN-02 contract lookups and the
+catalog succeeded; failures of those essential lookups set `msa_available:null`,
+never false. Missing regions, malformed or incomplete responses are explicit
+partial/error states, not empty capacity.
+
+`msa_available` means capacity to **launch** the currently configured private
+MSA worker, independent of whether one is already connected. CPU-only offers
+also participate in this decision. The endpoint reuses `msa/worker.py` and its
+reviewed build-queue policy: FIN-02, supported x86 worker family/image, at least
+768 GiB conservatively converted host RAM, and regular/spot price at most
+$13/hour. It does not claim that account budget or a later fresh launch quote
+has been approved. A connected worker remains represented by `worker.status`.
+
+`gpus` lists currently advertised available GPU offers across Verda locations,
+including offers unsuitable for private MSA. Rows are
+`{instance_type,name,location,contract,gpu_count,gpu_memory_gib,ram_gib,
+price_hourly,msa_eligible,reason}`. `contract` is `regular|spot`; price is USD per
+hour for the entire instance. `gpu_memory_gib` is total aggregate VRAM, or null
+if provider metadata is absent. RAM and VRAM are decimal provider GB converted
+to GiB (`GB * 10^9 / 2^30`); GPU count does not multiply the provider's already
+aggregate VRAM. Eligibility reasons explain the region, RAM, price, or supported
+worker/image restriction. The list is not a count of physical GPUs in stock and
+is not a reservation. Partial lists carry an explicit `error` summary.
+
+The trusted `capacity_helper` default is
+`/run/current-system/sw/bin/bio-msa-capacity`; clients cannot choose its path,
+credentials, provider URL or endpoints. The private wrapper supplies existing
+dc credentials. Its isolated process is killed after 20 seconds and responses
+are bounded to 1 MiB. Resource access is four GETs (catalog, locations, regular
+capacity, spot capacity), with the existing client's OAuth authentication.
+Provider response bodies, private configuration and transport exceptions are
+never exposed. This cache has no dependency on the five-second worker lifecycle
+observation and does not open the budget ledger or modify launch controls.
+
 `worker.status {}` reads the existing shared worker; it does not allocate, ensure,
 extend, or retire one. Its bounded response includes `schema:1`, `shared:true`,
 `state` (`absent|starting|warming|ready|busy|idle|closing|failed|uncertain`),

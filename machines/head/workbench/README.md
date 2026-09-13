@@ -103,6 +103,23 @@ extension cannot be applied twice. `worker.control_get` exposes the retained
 outcome without changing the worker. Trusted configuration can set
 `msa_sessions_root`; clients cannot choose it.
 
+`worker.capacity` separately observes available Verda CPU/GPU capacity on
+startup and every five seconds. The head shares a durable five-second cache
+between operators, with a 30-second backoff after incomplete or failed checks.
+Manual Refresh bypasses the cache age; overlapping requests share one provider
+check. The read-only credential wrapper `bio-msa-capacity` uses the existing dc
+API client and fixed catalog/location/capacity GETs. Its process is bounded to
+20 seconds and it never touches the budget ledger, launches a worker, or changes
+a session. Trusted configuration may override `capacity_helper`.
+
+The Console distinguishes capacity to launch an MSA worker from a connected
+worker. Eligibility reuses the current FIN-02/RAM/image/$13-hour policy, includes
+CPU-only offers, and reports failed essential lookups as unknown. Its shared
+worker dialogue lists available GPU offers across locations, with prices,
+aggregate VRAM, conservatively converted host RAM and eligibility reasons.
+The last-complete-update timestamp survives failed refreshes and cache reads;
+partial/error evidence is visible. See the protocol for row units and freshness.
+
 Per-job startup telemetry exposes actual stages, optional byte/item/step
 counters, and explicitly scoped ETAs. Transfer estimates use observed throughput;
 unmeasured phases remain unknown, and observations older than 30 seconds lose

@@ -7,6 +7,7 @@ const POLL_SECONDS: u64 = 5;
 #[derive(Default)]
 pub(super) struct Worker {
     pub open: bool,
+    capacity: ui_capacity::Capacity,
     status: Value,
     received: Option<Instant>,
     last_poll: Option<Instant>,
@@ -270,8 +271,7 @@ impl Worker {
             }
             "starting" => ("MSA STARTING", AMBER),
             "warming" => ("MSA WARMING", AMBER),
-            "ready" | "idle" => ("MSA ONLINE", GREEN),
-            "busy" => ("MSA BUSY", GREEN),
+            "ready" | "idle" | "busy" => ("MSA connected", GREEN),
             "closing" => ("MSA CLOSING", AMBER),
             "failed" => ("MSA FAILED", RED),
             _ => ("MSA UNKNOWN", AMBER),
@@ -326,6 +326,55 @@ impl Workbench {
         );
     }
 
+    pub(super) fn worker_refresh_capacity(&mut self, refresh: bool) {
+        if !self.connected {
+            return;
+        }
+        let endpoint = self.run_endpoint();
+        let Some(request) = self
+            .worker
+            .capacity
+            .begin(endpoint.clone(), refresh, Instant::now())
+        else {
+            return;
+        };
+        let params = if refresh {
+            json!({"refresh":true})
+        } else {
+            json!({})
+        };
+        if self
+            .request(
+                "worker.capacity",
+                params,
+                Purpose::WorkerCapacity(request.clone()),
+            )
+            .is_none()
+        {
+            self.worker.capacity.fail(
+                &request,
+                &endpoint,
+                "Capacity check could not be sent. See the console.",
+            );
+        }
+    }
+
+    pub(super) fn worker_received_capacity(
+        &mut self,
+        request: &ui_capacity::Request,
+        value: Value,
+    ) {
+        let endpoint = self.run_endpoint();
+        if self
+            .worker
+            .capacity
+            .receive(request, &endpoint, value, Instant::now())
+        {
+            self.failures
+                .retain(|failure| !matches!(failure.purpose, Purpose::WorkerCapacity(_)));
+        }
+    }
+
     fn worker_operation(&self) -> Option<Value> {
         self.session
             .as_ref()?
@@ -335,6 +384,7 @@ impl Workbench {
     }
 
     pub(super) fn worker_poll(&mut self) {
+        self.worker_refresh_capacity(false);
         if self
             .worker
             .last_poll
@@ -405,6 +455,10 @@ impl Workbench {
             Purpose::WorkerStatus(serial) if *serial == self.worker.serial => {
                 self.worker.read_error = message.into();
             }
+            Purpose::WorkerCapacity(request) => {
+                let endpoint = self.run_endpoint();
+                self.worker.capacity.fail(request, &endpoint, message);
+            }
             Purpose::WorkerControl(_) | Purpose::WorkerReceipt(_) => {
                 self.worker.command_message = message.into();
                 self.worker.command_failed = true;
@@ -449,6 +503,16 @@ impl Workbench {
     }
 
     pub(super) fn worker_indicator(&mut self, ui: &mut egui::Ui) {
+        let (availability, availability_color) =
+            self.worker.capacity.label(self.connected, Instant::now());
+        if ui.small_button(RichText::new(availability).color(availability_color).strong())
+            .on_hover_text("Capacity to provision the configured private MSA worker. Checks Verda on startup and every 5 seconds; connection is shown separately.")
+            .clicked()
+        {
+            self.worker.open = !self.worker.open;
+            self.worker_refresh();
+            self.worker_refresh_capacity(false);
+        }
         let epoch = self.worker.epoch(self.connected);
         let (label, color) = self.worker.state_label(self.connected);
         let suffix = if epoch.is_none() && self.worker.received.is_some() {
@@ -475,6 +539,9 @@ impl Workbench {
             ui.horizontal_wrapped(|ui| {
                 let (label, color) = self.worker.state_label(self.connected);
                 ui.colored_label(color, label);
+                let (availability, color) =
+                    self.worker.capacity.label(self.connected, Instant::now());
+                ui.colored_label(color, availability);
                 ui.small(deadline_label(
                     &self.worker.status,
                     self.worker.epoch(self.connected),
@@ -549,16 +616,28 @@ impl Workbench {
         }
         let mut open = self.worker.open;
         egui::Window::new("Shared MSA worker").id(egui::Id::new("msa-worker-controls"))
-            .open(&mut open).default_width(510.).resizable(true).show(ctx, |ui| {
+            .open(&mut open).default_width(900.).max_height((ctx.content_rect().height()-60.).max(260.)).vscroll(true).resizable(true).show(ctx, |ui| {
             let epoch = self.worker.epoch(self.connected);
             let (label,color) = self.worker.state_label(self.connected);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (availability, availability_color) = self.worker.capacity.label(self.connected, Instant::now());
+                ui.colored_label(availability_color, RichText::new(availability).strong());
+                ui.separator();
                 ui.colored_label(color, RichText::new(label).strong());
-                if ui.add_enabled(!self.pending.values().any(|p| matches!(p.purpose,Purpose::WorkerStatus(_))),egui::Button::new("Refresh")).clicked() { self.worker_refresh(); }
+                if ui.add_enabled(self.connected && !self.worker.capacity.pending(),egui::Button::new("Refresh"))
+                    .on_hover_text("Check Verda capacity and the shared worker now.").clicked() {
+                    self.worker_refresh();
+                    self.worker_refresh_capacity(true);
+                }
+                if self.worker.capacity.refreshing() { ui.spinner(); ui.weak("Checking Verda…"); }
             });
-            ui.small(self.worker.age_label());
+            ui.horizontal_wrapped(|ui| {
+                ui.small(self.worker.capacity.age_label(Instant::now()));
+                ui.weak("· automatic check every 5 sec");
+            });
             ui.separator();
             ui.strong(deadline_label(&self.worker.status, epoch));
+            ui.weak(self.worker.age_label());
             if let (Some(now),Some(end)) = (epoch, seconds(&self.worker.status["hard_deadline_epoch"])) {
                 ui.small(if end > now { format!("Fixed runtime limit in {}", duration(end-now)) } else { "Fixed runtime limit elapsed; awaiting observation".into() });
             }
@@ -594,6 +673,8 @@ impl Workbench {
                     self.retry(&id,Purpose::WorkerControl(text(&op,"method").into()),text(&op,"method").into());
                 }
             }
+            ui.separator();
+            ui_capacity::gpu_table(ui, &self.worker.capacity, self.connected);
         });
         self.worker.open = open;
     }
@@ -606,6 +687,35 @@ mod tests {
         json!({"schema":1,"state":"idle","server_epoch":1000.,"checked_epoch":998.,"stale_after_seconds":30,
             "shutdown_epoch":1100.,"shutdown_reason":"idle","hard_deadline_epoch":2000.,"target":{"session_id":"exact","invocation_id":"one","intent_sha256":"a","launch_sha256":"b"},
             "controls":{"extend":{"enabled":true},"shutdown":{"enabled":true}}})
+    }
+    #[test]
+    fn connected_msa_session_is_independent_of_capacity_for_another_worker() {
+        let now = Instant::now();
+        let mut worker = Worker {
+            status: status(),
+            received: Some(now),
+            ..Worker::default()
+        };
+        let request = worker.capacity.begin("head".into(), false, now).unwrap();
+        worker.capacity.receive(
+            &request,
+            "head",
+            json!({
+                "schema":1,"server_epoch":1000.,"checked_epoch":1000.,"state":"ready",
+                "msa_available":false,"gpus":[]
+            }),
+            now,
+        );
+        for state in ["ready", "idle", "busy"] {
+            worker.status["state"] = json!(state);
+            assert_eq!(worker.state_label(true), ("MSA connected", GREEN));
+            assert_eq!(worker.capacity.label(true, now).0, "MSA unavailable");
+        }
+        assert_eq!(worker.state_label(false), ("MSA STALE", AMBER));
+        assert_eq!(
+            worker.capacity.label(false, now).0,
+            "MSA availability unknown"
+        );
     }
     #[test]
     fn countdown_uses_head_clock_and_expires_observation_without_local_wall_clock() {

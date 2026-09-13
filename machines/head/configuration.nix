@@ -126,6 +126,14 @@ in
       export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/msa/worker.py "$@"
     '')
+    (pkgs.writeShellScriptBin "bio-msa-capacity" ''
+      set -euo pipefail
+      # Read provider capacity without opening a worker or changing its lease.
+      # Credentials remain on the head and never enter the desktop RPC reply.
+      source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+      export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/capacity_provider.py "$@"
+    '')
     (pkgs.writeShellScriptBin "bio-msa-build-queue" ''
       set -euo pipefail
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd util-linux coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}

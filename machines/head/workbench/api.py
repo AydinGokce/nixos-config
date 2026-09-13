@@ -30,7 +30,8 @@ class API:
         require(isinstance(method, str), 'Method must be a string')
         function = {
             'catalog': self.catalog, 'upload.begin': self.upload_begin, 'upload.get': self.upload_get,
-            'worker.status': self.worker_status, 'worker.extend': self.worker_extend,
+            'worker.status': self.worker_status, 'worker.capacity': self.worker_capacity,
+            'worker.extend': self.worker_extend,
             'worker.shutdown': self.worker_shutdown, 'worker.control_get': self.worker_control_get,
             'library.list': self.library_list, 'library.get': self.library_get,
             'library.attachment': self.library_attachment,
@@ -67,6 +68,10 @@ class API:
     def worker_status(self, params):
         from .worker_api import status
         return status(self, params)
+
+    def worker_capacity(self, params):
+        from .capacity_api import capacity
+        return capacity(self, params)
 
     def worker_extend(self, params):
         from .worker_api import submit

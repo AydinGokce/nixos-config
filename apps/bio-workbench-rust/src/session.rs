@@ -988,6 +988,32 @@ mod tests {
         }
     }
     #[test]
+    fn repeated_capacity_polls_and_manual_refresh_do_not_accumulate_durable_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = Arc::new(Mock::new());
+        let mut session = Session::open_internal(
+            egui::Context::default(),
+            directory.path().into(),
+            Some(backend.clone()),
+            false,
+        )
+        .unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        for params in [json!({}), json!({}), json!({"refresh":true})] {
+            let id = session.request("worker.capacity", params.clone()).unwrap();
+            assert!(ids.insert(id.clone()));
+            let (returned_id, result) = next_result(&mut session);
+            assert_eq!(returned_id, id);
+            assert!(result.is_ok());
+            assert_eq!(
+                backend.calls.lock().unwrap().last(),
+                Some(&("worker.capacity".into(), params))
+            );
+        }
+        assert!(session.journal.lock().unwrap().operations.is_empty());
+        assert!(session.retryable_operations().is_empty());
+    }
+    #[test]
     fn endpoint_change_requires_durable_detachment_before_profile_publication() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = Session::open_internal(
@@ -1265,6 +1291,7 @@ mod tests {
             assert_eq!(backend.0.lock().unwrap().len(), 2);
         }
         assert!(rpc::allowed("worker.status") && !rpc::mutating("worker.status"));
+        assert!(rpc::allowed("worker.capacity") && !rpc::mutating("worker.capacity"));
         assert!(rpc::allowed("worker.control_get") && !rpc::mutating("worker.control_get"));
     }
 

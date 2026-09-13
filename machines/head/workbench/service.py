@@ -18,6 +18,7 @@ def configuration(path=None):
                 'library_root': '/var/lib/bio-library', 'runtime_config': '/etc/bio-tools/library-runtime.json',
                 'inference_state': '/var/lib/bio-inference', 'max_jobs': 1,
                 'msa_sessions_root': '/var/lib/dc/msa-sessions',
+                'capacity_helper': '/run/current-system/sw/bin/bio-msa-capacity',
                 'md_runtime': '/var/lib/bio-md/runtime-cpu',
                 'md_admissions': '/var/lib/bio-md/admissions',
                 'md_runtime_archives': '/mnt/bio-shared/md-runtime',
@@ -33,7 +34,7 @@ def configuration(path=None):
         deployed = Path('/run/current-system').resolve() / 'etc/bio-tools'
         require(deployed.is_dir(), 'Current deployed toolkit hierarchy is unavailable', 'unavailable')
         defaults['tools_dir'] = str(deployed)
-    for key in ('bio_submit', 'runtime_config', 'systemd_run', 'systemctl'):
+    for key in ('bio_submit', 'runtime_config', 'systemd_run', 'systemctl', 'capacity_helper'):
         defaults[key] = str(Path(defaults[key]).resolve())
     defaults['tools_dir'] = str(Path(defaults['tools_dir']).absolute())
     return defaults

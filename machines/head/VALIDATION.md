@@ -4,6 +4,37 @@ Executed checks are recorded below with their input and execution scope.
 Production RFAA database installation is tracked separately from tests with
 miniature databases.
 
+## Console MSA capacity monitoring — 2026-09-13
+
+The Console checks capacity at startup and on the existing five-second cadence.
+Provider capacity is independent of the connected shared MSA worker. A read-only
+head endpoint shares cached catalog and regional regular/spot availability,
+includes CPU offers in MSA eligibility, and lists GPU offers with RAM, aggregate
+VRAM, price and eligibility reasons. Refresh bypasses the normal cache age;
+partial or failed checks never become a false claim of exhausted capacity.
+
+The 65 targeted backend tests passed, including 15 capacity cases covering the
+existing worker policy, missing/invalid provider evidence, concurrent callers,
+cache expiry, manual refresh, timestamp preservation and credential isolation.
+The final Nix desktop package passed 153 desktop and 18 renderer tests, including
+single-line GPU table layout at narrow and wide sizes. Formatting and strict
+Clippy passed. All 40 packaged source files and the portable source archive were
+verified against the checkout.
+
+The deployed RPC returned complete live Verda evidence, reused an immediate
+ordinary read without advancing its timestamp, and fetched new evidence for a
+manual refresh. Observed fresh checks took 1.27–1.97 seconds; the cached head RPC
+took 0.088 seconds, excluding desktop SSH overhead. No run or worker-control
+record was created. Head activation preserved all 287 library records, saved
+session files and immutable job sources. Scientific input preparation and MSA
+selection policy files were unchanged. Systemd collected one already-failed
+transient MSA unit during activation; its saved state remains intact.
+
+Receipts, source archive, native screenshots and RPC audits are retained under
+`/home/aydin/bio-runs/msa-availability-ui-20260913/`; head receipts are under
+`/var/lib/bio-runs/msa-availability-ui-20260913/`. No prediction or compute rental
+was started for this change.
+
 ## Packaged runtimes and parallel MSA loading — 2026-09-10
 
 A fresh managed worker prepared the original 1,726-residue RF3 input using the
