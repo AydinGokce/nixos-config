@@ -8,6 +8,7 @@ pub(super) struct View {
     pub style: scene::Representation,
     pub selected: Option<scene::ResidueKey>,
     pub hotspots: scene::Hotspots,
+    pub selection_range: scene::SelectionRange,
     pub domains: domain_state::Editor,
     pub measurement: Option<scene::ResidueKey>,
     pub chains: Vec<bool>,
@@ -135,6 +136,7 @@ fn restore_display_alignment(
 pub(super) fn view_state(view: &View) -> Value {
     let mut state = json!({"camera":{"yaw":view.camera.yaw,"pitch":view.camera.pitch,"zoom":view.camera.zoom,"pan":[view.camera.pan.x,view.camera.pan.y],"ambient":view.camera.ambient,"bloom":view.camera.bloom,"distance":view.camera.distance,"span":view.camera.span},"style":view.style.name(),"selected":view.selected,"hotspots":view.hotspots,"chains":view.chains,"labels":view.labels,"visible":view.visible});
     state["protein_domains"] = json!(view.domains.data);
+    state["selection_range"] = json!(view.selection_range);
     capture_display_alignment(&view.metadata, &mut state);
     state
 }
@@ -187,6 +189,14 @@ fn restore_view(view: &mut View, value: &Value) {
     view.selected = serde_json::from_value(value["selected"].clone()).ok();
     view.hotspots = serde_json::from_value(value["hotspots"].clone()).unwrap_or_default();
     view.hotspots.retain_existing(&view.molecule);
+    view.selection_range =
+        serde_json::from_value(value["selection_range"].clone()).unwrap_or_default();
+    if value.get("selection_range").is_none()
+        && let Some(key) = view.selected.as_ref()
+    {
+        view.selection_range.pick(&view.molecule, key, false);
+    }
+    view.selection_range.retain_existing(&view.molecule);
     view.domains = domain_state::Editor::restore(
         &value["protein_domains"],
         &view.molecule,
@@ -238,6 +248,7 @@ impl Workbench {
             style: original.style,
             selected: original.selected.clone(),
             hotspots: original.hotspots.clone(),
+            selection_range: original.selection_range.clone(),
             domains: original.domains.clone(),
             measurement: original.measurement.clone(),
             chains: original.chains.clone(),
@@ -384,6 +395,7 @@ impl Workbench {
             style: scene::Representation::Cartoon,
             selected: None,
             hotspots: scene::Hotspots::default(),
+            selection_range: scene::SelectionRange::default(),
             domains,
             measurement: None,
             chains,
@@ -692,6 +704,9 @@ impl Workbench {
                                 .residues
                                 .first()
                                 .map(|&index| view.molecule.residues[index].key.clone());
+                            if let Some(key) = &view.selected {
+                                view.selection_range.pick(&view.molecule, key, false);
+                            }
                             ui.close();
                         }
                         if ui.button("Isolate chain").clicked() {
@@ -752,6 +767,7 @@ impl Workbench {
                 }
                 if ui.small_button("Clear selection").clicked() {
                     view.selected = None;
+                    view.selection_range = scene::SelectionRange::default();
                 }
             });
             if let Some(origin) = view.measurement.as_ref() {
@@ -764,7 +780,7 @@ impl Workbench {
                 }
             }
         } else {
-            ui.weak("Click a residue in the structure or sequence strip.");
+            ui.weak("Click a residue, then Shift-click another to select an inclusive range.");
         }
         Self::section(ui, "SOURCE / QUALITY");
         ui.label(&view.molecule.name);

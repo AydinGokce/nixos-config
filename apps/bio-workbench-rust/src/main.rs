@@ -19,9 +19,11 @@ mod ui_inputs;
 mod ui_jobs;
 mod ui_library;
 mod ui_library_runs;
+mod ui_library_structures;
 mod ui_runtime;
 mod ui_sequence;
 mod ui_state;
+mod ui_structure_uploads;
 mod ui_style;
 mod ui_views;
 mod ui_worker;
@@ -43,6 +45,7 @@ enum UploadTarget {
     Labels(String),
     Run(String, usize),
     Binder(String),
+    LibraryStructure(String, String),
 }
 #[derive(Clone, PartialEq)]
 enum ArtifactTarget {
@@ -52,6 +55,7 @@ enum ArtifactTarget {
 }
 #[derive(Clone, PartialEq)]
 enum Purpose {
+    LibraryStructures(ui_library_structures::Request),
     ProteinDomains(ui_domains::Request),
     Binder(ui_binder::Request),
     Catalog,
@@ -95,6 +99,7 @@ struct Failure {
 }
 #[derive(Clone)]
 enum Pick {
+    LibraryStructures(String),
     BinderTarget,
     Inputs,
     Structure,
@@ -129,6 +134,7 @@ struct Workbench {
     library_runs: ui_library_runs::RunControls,
     binder: ui_binder::Panel,
     domain_import: ui_domains::Import,
+    library_structures: ui_library_structures::Panel,
     connection_open: bool,
     preview_open: bool,
     help_open: bool,
@@ -189,7 +195,7 @@ impl Workbench {
         let library_runs = ui_library_runs::RunControls::default();
         let binder = ui_binder::Panel::restore(&state);
         let domain_import = ui_domains::Import::default();
-        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,binder,domain_import,connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["GC Protein Engineering Console — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
+        let mut app=Self{session,state,connection,catalog:Value::Null,batches:Vec::new(),batch:None,connected:false,worker:ui_worker::Worker::default(),pending:BTreeMap::new(),failures:Vec::new(),library,library_runs,binder,domain_import,library_structures:ui_library_structures::Panel::default(),connection_open:false,preview_open:false,help_open:false,settings_model:None,run_after_uploads:false,run_batch:None,run_input_error:String::new(),input_flash:None,sidebar_tab:0,focused_job:String::new(),job_log:String::new(),log_offset:0,console:vec!["GC Protein Engineering Console — native cloud client".into(),"Cas9 demo: experimental 4OO8. Open a run tab to inspect its retained model result.".into()],console_input:String::new(),console_tab:0,selected_artifacts:BTreeSet::new(),artifact_metadata:BTreeMap::new(),annotation_records:BTreeMap::new(),text_preview:None,views:BTreeMap::new(),view_loading:BTreeMap::new(),view_errors:BTreeMap::new(),dock:egui_dock::DockState::new(Vec::new()),next_view_id:0,retired_renderers:Vec::new(),gl:cc.gl.as_ref().expect("OpenGL renderer required").clone(),pymol:pymol::Launcher::default(),ui_tx,ui_rx,navigation,last_poll:Instant::now(),last_history:Instant::now(),last_save:Instant::now(),saved_state:String::new(),save_error:String::new(),restoring_views:true};
         for notice in notices {
             app.log(notice);
         }
@@ -594,6 +600,7 @@ impl eframe::App for Workbench {
                             if self.binder.draft.enabled {
                                 self.binder_inspector(ui);
                             }
+                            self.structure_links_panel(ui);
                             self.domains_panel(ui);
                             self.inspector(ui, ctx);
                         });
@@ -619,6 +626,7 @@ impl eframe::App for Workbench {
         self.binder_save_dialog(ctx);
         self.binder_target_dialog(ctx);
         self.domains_dialog(ctx);
+        self.library_structure_dialog(ctx);
         self.settings_dialog(ctx);
         self.text_dialog(ctx);
         let mut help = self.help_open;

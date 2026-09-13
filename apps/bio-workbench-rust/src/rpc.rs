@@ -64,6 +64,13 @@ const METHODS: &[&str] = &[
     "library.list",
     "library.get",
     "library.attachment",
+    "library.structures",
+    "library.structure_attach",
+    "library.structure_visibility",
+    "library.structure_read",
+    "library.structure_links",
+    "library.structure_thumbnail",
+    "library.structure_thumbnail_read",
     "library.edit",
     "library.history",
     "library.undo",
@@ -350,6 +357,8 @@ pub fn mutating(method: &str) -> bool {
             | "local.upload"
             | "library.product_create"
             | "library.create"
+            | "library.structure_attach"
+            | "library.structure_visibility"
             | "library.edit"
             | "library.undo"
             | "library.redo"
@@ -917,6 +926,271 @@ fn text_hash(receipt: &Value) -> Result<&str, RpcError> {
         })
 }
 
+const GALLERY_CHUNK: usize = 262_144;
+// The gallery protocol and molecular parser both cap structure sources at 32 MiB.
+const MAX_GALLERY_STRUCTURE: u64 = 32 * 1024 * 1024;
+const MAX_THUMBNAIL: u64 = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum GalleryFile {
+    Structure,
+    Thumbnail,
+}
+
+fn pinned_protein(reference: &str) -> bool {
+    let Some((id, revision)) = reference
+        .strip_prefix("construct:")
+        .and_then(|value| value.split_once('@'))
+    else {
+        return false;
+    };
+    !id.is_empty()
+        && id.len() <= 64
+        && id.as_bytes()[0].is_ascii_lowercase()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+        && revision
+            .parse::<u64>()
+            .is_ok_and(|n| n > 0 && n.to_string() == revision)
+}
+
+fn gallery_protein_context(receipt: &Value) -> bool {
+    let protein = &receipt["protein"];
+    if protein["ref"] != receipt["source_ref"]
+        || protein["sequence_sha256"] != receipt["source_sequence_sha256"]
+        || !valid_hash(protein["sha256"].as_str().unwrap_or(""))
+    {
+        return false;
+    }
+    match protein["derivation_kind"].as_str() {
+        Some("explicit") => protein.get("parent") == Some(&Value::Null),
+        Some("derived") => {
+            let parent = &protein["parent"];
+            pinned_protein(parent["ref"].as_str().unwrap_or(""))
+                && valid_hash(parent["sha256"].as_str().unwrap_or(""))
+                && matches!(parent["molecule_type"].as_str(), Some("dna" | "rna"))
+                && parent
+                    .get("molecular_form")
+                    .is_some_and(|v| v.is_null() || v.is_string())
+        }
+        _ => false,
+    }
+}
+
+fn gallery_chunk(value: &Value, identity: &Value, offset: u64) -> Result<Vec<u8>, RpcError> {
+    let encoded = value["data_base64"]
+        .as_str()
+        .filter(|s| s.len() <= GALLERY_CHUNK.div_ceil(3) * 4)
+        .ok_or_else(|| RpcError::new("integrity", "Missing or oversized gallery chunk."))?;
+    let raw = STANDARD
+        .decode(encoded)
+        .map_err(|_| RpcError::new("integrity", "Invalid gallery chunk encoding."))?;
+    let size = field_u64(identity, "size")?;
+    let next = offset
+        .checked_add(raw.len() as u64)
+        .ok_or_else(|| RpcError::new("integrity", "Gallery offset overflow."))?;
+    if identity
+        .as_object()
+        .unwrap()
+        .iter()
+        .any(|(key, expected)| value.get(key) != Some(expected))
+        || field_u64(value, "offset")? != offset
+        || field_u64(value, "next_offset")? != next
+        || raw.len() > GALLERY_CHUNK
+        || next > size
+        || value["eof"].as_bool() != Some(next == size)
+        || (raw.is_empty() && next < size)
+    {
+        return Err(RpcError::new(
+            "integrity",
+            "Gallery source, renderer, checksum, size or offset changed; refresh the gallery.",
+        ));
+    }
+    Ok(raw)
+}
+
+/// Download only after the head confirms the pinned gallery association, even on cache hits.
+pub fn download_library_structure(
+    backend: &dyn Backend,
+    cache: &Path,
+    reference: &str,
+    entry_id: &str,
+    receipt: &Value,
+    progress: impl FnMut(u64, u64),
+) -> Result<(PathBuf, Value), RpcError> {
+    download_gallery_file(
+        backend,
+        cache,
+        (reference, entry_id),
+        receipt,
+        GalleryFile::Structure,
+        progress,
+    )
+}
+
+pub fn download_library_structure_thumbnail(
+    backend: &dyn Backend,
+    cache: &Path,
+    reference: &str,
+    entry_id: &str,
+    receipt: &Value,
+    progress: impl FnMut(u64, u64),
+) -> Result<(PathBuf, Value), RpcError> {
+    download_gallery_file(
+        backend,
+        cache,
+        (reference, entry_id),
+        receipt,
+        GalleryFile::Thumbnail,
+        progress,
+    )
+}
+
+fn download_gallery_file(
+    backend: &dyn Backend,
+    cache: &Path,
+    (reference, entry_id): (&str, &str),
+    receipt: &Value,
+    kind: GalleryFile,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<(PathBuf, Value), RpcError> {
+    let size = field_u64(receipt, "size")?;
+    let sha = text_hash(receipt)?;
+    if !pinned_protein(reference)
+        || entry_id.is_empty()
+        || entry_id.len() > 160
+        || !entry_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        || receipt["entry_id"].as_str() != Some(entry_id)
+        || size == 0
+    {
+        return Err(RpcError::new(
+            "request",
+            "Choose a pinned protein structure with a valid receipt.",
+        ));
+    }
+    let mut identity = json!({"ref":reference,"entry_id":entry_id,"sha256":sha,"size":size});
+    let mut params = json!({"ref":reference,"entry_id":entry_id,"offset":0,"length":GALLERY_CHUNK});
+    let (method, filename) = match kind {
+        GalleryFile::Structure => {
+            let source_ref = receipt["source_ref"].as_str().unwrap_or("");
+            let format = receipt["format"].as_str().unwrap_or("");
+            if size > MAX_GALLERY_STRUCTURE
+                || !pinned_protein(source_ref)
+                || source_ref.split('@').next() != reference.split('@').next()
+                || !valid_hash(receipt["source_sequence_sha256"].as_str().unwrap_or(""))
+                || !matches!(format, "pdb" | "cif" | "mmcif")
+                || !gallery_protein_context(receipt)
+            {
+                return Err(RpcError::new(
+                    "request",
+                    "Choose a PDB/mmCIF structure no larger than 32 MiB with its exact source protein receipt.",
+                ));
+            }
+            for key in ["source_ref", "source_sequence_sha256", "format", "protein"] {
+                identity[key] = receipt[key].clone();
+            }
+            ("library.structure_read", format!("{sha}.{format}"))
+        }
+        GalleryFile::Thumbnail => {
+            if size > MAX_THUMBNAIL
+                || receipt["schema"] != 1
+                || receipt["ref"].as_str() != Some(reference)
+                || receipt["state"] != "ready"
+                || receipt["width"] != 640
+                || receipt["height"] != 480
+                || receipt["style"] != "cartoon"
+                || ["source_sha256", "renderer_fingerprint", "cache_key"]
+                    .iter()
+                    .any(|key| !valid_hash(receipt[key].as_str().unwrap_or("")))
+            {
+                return Err(RpcError::new(
+                    "request",
+                    "Choose a ready gallery preview no larger than 2 MiB with its source and renderer receipt.",
+                ));
+            }
+            for key in [
+                "schema",
+                "state",
+                "source_sha256",
+                "renderer_fingerprint",
+                "cache_key",
+                "width",
+                "height",
+                "style",
+            ] {
+                identity[key] = receipt[key].clone();
+            }
+            params["cache_key"] = receipt["cache_key"].clone();
+            params["sha256"] = receipt["sha256"].clone();
+            (
+                "library.structure_thumbnail_read",
+                format!("{}-{sha}.png", receipt["cache_key"].as_str().unwrap()),
+            )
+        }
+    };
+    let first = backend.call(method, params.clone())?;
+    let initial = gallery_chunk(&first, &identity, 0)?;
+    if matches!(kind, GalleryFile::Structure) {
+        let name = first["name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 1024 && !name.chars().any(|c| c < ' '))
+            .ok_or_else(|| RpcError::new("integrity", "Structure response has no valid name."))?;
+        identity["name"] = json!(name);
+    }
+    let mut metadata = first;
+    metadata.as_object_mut().unwrap().remove("data_base64");
+    private_dir(cache)?;
+    let destination = cache.join(filename);
+    if let Ok(meta) = fs::symlink_metadata(&destination) {
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err(RpcError::new(
+                "local_io",
+                "Gallery cache entry is not a regular file.",
+            ));
+        }
+        if meta.len() == size && file_hash(&destination)? == (size, sha.to_owned()) {
+            let mut prefix = vec![0; initial.len()];
+            File::open(&destination)?.read_exact(&mut prefix)?;
+            if prefix != initial {
+                return Err(RpcError::new(
+                    "integrity",
+                    "The authorized gallery bytes differ from their checksum-verified cache entry.",
+                ));
+            }
+            progress(size, size);
+            return Ok((destination, metadata));
+        }
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(cache)?;
+    let mut hasher = Sha256::new();
+    let mut raw = initial;
+    let mut offset = 0;
+    loop {
+        tmp.write_all(&raw)?;
+        hasher.update(&raw);
+        offset += raw.len() as u64;
+        progress(offset, size);
+        if offset == size {
+            break;
+        }
+        params["offset"] = json!(offset);
+        raw = gallery_chunk(&backend.call(method, params.clone())?, &identity, offset)?;
+    }
+    if format!("{:x}", hasher.finalize()) != sha {
+        return Err(RpcError::new(
+            "integrity",
+            "Downloaded gallery bytes do not match their pinned SHA-256.",
+        ));
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(&destination)
+        .map_err(|error| RpcError::from(error.error))?;
+    Ok((destination, metadata))
+}
+
 /// Hydrate paginated results without silently omitting jobs or artifacts.
 pub fn workflow_call(
     backend: &dyn Backend,
@@ -1044,6 +1318,326 @@ mod tests {
         );
     }
     use std::sync::Mutex;
+
+    struct GalleryMock {
+        receipt: Value,
+        data: Vec<u8>,
+        calls: Mutex<Vec<(String, Value)>>,
+        tamper: Option<(&'static str, Value)>,
+        from_offset: u64,
+        denied: bool,
+    }
+    impl GalleryMock {
+        fn new(thumbnail: bool) -> Self {
+            let data = vec![73; GALLERY_CHUNK + 19];
+            let mut receipt = json!({"entry_id":"m-0123456789abcdef0123456789abcdef","size":data.len(),
+                "sha256":format!("{:x}",Sha256::digest(&data))});
+            let fields = if thumbnail {
+                json!({"schema":1,"ref":"construct:example@3","source_sha256":"a".repeat(64),
+                    "renderer_fingerprint":"b".repeat(64),"cache_key":"c".repeat(64),
+                    "state":"ready","width":640,"height":480,"style":"cartoon"})
+            } else {
+                json!({"source_ref":"construct:example@2","source_sequence_sha256":"d".repeat(64),
+                    "format":"mmcif","label":"Retained model", "protein":{
+                        "ref":"construct:example@2","sha256":"e".repeat(64),
+                        "sequence_sha256":"d".repeat(64),"derivation_kind":"derived",
+                        "parent":{"ref":"construct:plasmid@1","sha256":"f".repeat(64),
+                            "molecule_type":"dna","molecular_form":"plasmid"}}})
+            };
+            receipt
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            Self {
+                receipt,
+                data,
+                calls: Mutex::default(),
+                tamper: None,
+                from_offset: 1,
+                denied: false,
+            }
+        }
+        fn download(&self, cache: &Path, thumbnail: bool) -> Result<(PathBuf, Value), RpcError> {
+            download_gallery_file(
+                self,
+                cache,
+                (
+                    "construct:example@3",
+                    self.receipt["entry_id"].as_str().unwrap(),
+                ),
+                &self.receipt,
+                if thumbnail {
+                    GalleryFile::Thumbnail
+                } else {
+                    GalleryFile::Structure
+                },
+                |_, _| {},
+            )
+        }
+    }
+    impl Backend for GalleryMock {
+        fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.into(), params.clone()));
+            if self.denied {
+                return Err(RpcError::new("not_found", "Association unavailable"));
+            }
+            assert!(matches!(
+                method,
+                "library.structure_read" | "library.structure_thumbnail_read"
+            ));
+            assert_eq!(params["length"], GALLERY_CHUNK);
+            if method == "library.structure_thumbnail_read" {
+                assert_eq!(params["cache_key"], self.receipt["cache_key"]);
+                assert_eq!(params["sha256"], self.receipt["sha256"]);
+            }
+            let offset = params["offset"].as_u64().unwrap() as usize;
+            let next = (offset + GALLERY_CHUNK).min(self.data.len());
+            let mut result = self.receipt.clone();
+            for (key, value) in json!({"ref":params["ref"],"name":"Retained model","offset":offset,
+                "next_offset":next,"eof":next==self.data.len(),"data_base64":STANDARD.encode(&self.data[offset..next])}).as_object().unwrap() {
+                result[key] = value.clone();
+            }
+            if offset as u64 >= self.from_offset
+                && let Some((key, value)) = &self.tamper
+            {
+                result[key] = value.clone();
+            }
+            Ok(result)
+        }
+        fn library(&self) -> Result<Value, RpcError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn gallery_downloads_reauthorize_and_verify_cached_source_bytes() {
+        for thumbnail in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let mut backend = GalleryMock::new(thumbnail);
+            let (path, metadata) = backend.download(cache.path(), thumbnail).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), backend.data);
+            assert_eq!(metadata["ref"], "construct:example@3");
+            assert_eq!(metadata["entry_id"], backend.receipt["entry_id"]);
+            if !thumbnail {
+                assert_eq!(metadata["protein"], backend.receipt["protein"]);
+            }
+            assert!(metadata.get("data_base64").is_none());
+            assert_eq!(backend.calls.lock().unwrap().len(), 2);
+            backend.download(cache.path(), thumbnail).unwrap();
+            assert_eq!(
+                backend.calls.lock().unwrap().len(),
+                3,
+                "cache reuse still authorizes offset zero"
+            );
+            backend.denied = true;
+            assert_eq!(
+                backend.download(cache.path(), thumbnail).unwrap_err().code,
+                "not_found"
+            );
+            backend.denied = false;
+            backend.from_offset = 0;
+            backend.tamper = Some((
+                if thumbnail {
+                    "renderer_fingerprint"
+                } else {
+                    "protein"
+                },
+                Value::Null,
+            ));
+            assert_eq!(
+                backend.download(cache.path(), thumbnail).unwrap_err().code,
+                "integrity"
+            );
+            backend.tamper = Some((
+                "data_base64",
+                json!(STANDARD.encode(vec![99; GALLERY_CHUNK])),
+            ));
+            assert_eq!(
+                backend.download(cache.path(), thumbnail).unwrap_err().code,
+                "integrity"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                backend.data,
+                "failed authorization bytes cannot replace a valid cache"
+            );
+            backend.tamper = None;
+            fs::write(&path, vec![0; backend.data.len()]).unwrap();
+            backend.download(cache.path(), thumbnail).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                backend.data,
+                "corrupt regular cache files are replaced only after a complete verified download"
+            );
+        }
+    }
+
+    #[test]
+    fn gallery_keeps_full_unicode_labels_and_historical_parent_identity() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut backend = GalleryMock::new(false);
+        let label = "🧬".repeat(200);
+        backend.from_offset = 0;
+        backend.tamper = Some(("name", json!(label)));
+        let (_, metadata) = backend.download(cache.path(), false).unwrap();
+        assert_eq!(metadata["name"], label);
+        assert_eq!(metadata["protein"]["parent"]["ref"], "construct:plasmid@1");
+        let mut changed = backend.receipt["protein"].clone();
+        changed["parent"]["ref"] = json!("construct:plasmid@2");
+        backend.tamper = Some(("protein", changed));
+        assert_eq!(
+            backend.download(cache.path(), false).unwrap_err().code,
+            "integrity",
+            "A parent updated after the structure was associated must not silently replace its historical backlink"
+        );
+    }
+
+    #[test]
+    fn gallery_streams_reject_source_renderer_and_chunk_changes_without_publishing() {
+        for thumbnail in [false, true] {
+            let mut fields = vec![
+                ("ref", json!("construct:other@3")),
+                ("entry_id", json!("p-different")),
+                ("sha256", json!("f".repeat(64))),
+                ("size", json!(1)),
+                ("offset", json!(0)),
+                ("next_offset", json!(u64::MAX)),
+                ("eof", json!(false)),
+                ("data_base64", json!(STANDARD.encode([0; 19]))),
+            ];
+            if thumbnail {
+                fields.extend([
+                    ("source_sha256", json!("e".repeat(64))),
+                    ("renderer_fingerprint", json!("e".repeat(64))),
+                    ("cache_key", json!("e".repeat(64))),
+                    ("width", json!(1)),
+                    ("height", json!(1)),
+                    ("style", json!("spheres")),
+                    ("state", json!("rendering")),
+                ]);
+            } else {
+                fields.extend([
+                    ("source_ref", json!("construct:example@1")),
+                    ("source_sequence_sha256", json!("e".repeat(64))),
+                    ("format", json!("pdb")),
+                    ("name", json!("Another model")),
+                    ("protein", Value::Null),
+                ]);
+            }
+            for (field, value) in fields {
+                let cache = tempfile::tempdir().unwrap();
+                let mut backend = GalleryMock::new(thumbnail);
+                backend.tamper = Some((field, value));
+                assert_eq!(
+                    backend.download(cache.path(), thumbnail).unwrap_err().code,
+                    "integrity",
+                    "{field}"
+                );
+                assert_eq!(
+                    fs::read_dir(cache.path()).unwrap().count(),
+                    0,
+                    "failed {field} must leave no partial file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gallery_rejects_invalid_receipts_before_network_or_cache_access() {
+        for thumbnail in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let mut cases = vec![
+                ("size", json!(0)),
+                ("sha256", json!("invalid")),
+                ("entry_id", json!("../entry")),
+            ];
+            cases.push((
+                "size",
+                json!(if thumbnail {
+                    MAX_THUMBNAIL + 1
+                } else {
+                    MAX_GALLERY_STRUCTURE + 1
+                }),
+            ));
+            if thumbnail {
+                cases.extend([
+                    ("state", json!("queued")),
+                    ("renderer_fingerprint", Value::Null),
+                    ("source_sha256", Value::Null),
+                    ("cache_key", json!("../cache")),
+                    ("ref", json!("construct:example@2")),
+                ]);
+            } else {
+                cases.extend([
+                    ("source_ref", json!("construct:other@2")),
+                    ("source_sequence_sha256", Value::Null),
+                    ("format", json!("exe")),
+                    ("protein", Value::Null),
+                ]);
+            }
+            for (field, value) in cases {
+                let mut backend = GalleryMock::new(thumbnail);
+                backend.receipt[field] = value;
+                assert!(
+                    backend.download(cache.path(), thumbnail).is_err(),
+                    "{field}"
+                );
+                assert!(backend.calls.lock().unwrap().is_empty(), "{field}");
+                assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 0);
+            }
+            let backend = GalleryMock::new(thumbnail);
+            for reference in [
+                "construct:example",
+                "construct:example@0",
+                "construct:example@03",
+                "project:example@3",
+                "construct:../example@3",
+            ] {
+                assert!(
+                    download_gallery_file(
+                        &backend,
+                        cache.path(),
+                        (reference, backend.receipt["entry_id"].as_str().unwrap()),
+                        &backend.receipt,
+                        if thumbnail {
+                            GalleryFile::Thumbnail
+                        } else {
+                            GalleryFile::Structure
+                        },
+                        |_, _| {}
+                    )
+                    .is_err()
+                );
+            }
+            assert!(backend.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn gallery_read_methods_and_durable_mutations_are_explicitly_allowed() {
+        for method in [
+            "library.structures",
+            "library.structure_read",
+            "library.structure_links",
+            "library.structure_thumbnail",
+            "library.structure_thumbnail_read",
+        ] {
+            assert!(allowed(method));
+            assert!(!mutating(method));
+        }
+        for method in [
+            "library.structure_attach",
+            "library.structure_visibility",
+            "library.create",
+        ] {
+            assert!(allowed(method));
+            assert!(mutating(method));
+        }
+    }
+
     struct LibraryMock {
         data: Vec<u8>,
         tamper: Option<&'static str>,

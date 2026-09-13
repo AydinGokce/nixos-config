@@ -40,6 +40,13 @@ class API:
             'library.runs': self.library_runs,
             'library.sequence': self.library_sequence,
             'library.protein_domains': self.library_protein_domains,
+            'library.structures': self.library_structures,
+            'library.structure_attach': self.library_structure_attach,
+            'library.structure_visibility': self.library_structure_visibility,
+            'library.structure_read': self.library_structure_read,
+            'library.structure_links': self.library_structure_links,
+            'library.structure_thumbnail': self.library_structure_thumbnail,
+            'library.structure_thumbnail_read': self.library_structure_thumbnail_read,
             'library.product_preview': self.library_product_preview,
             'library.product_create': self.library_product_create,
             'library.create': self.library_create,
@@ -128,6 +135,34 @@ class API:
     def library_protein_domains(self, params):
         from .library_domains import get_domains
         return get_domains(self, params)
+
+    def library_structures(self, params):
+        from .library_structures import list_structures
+        return list_structures(self, params)
+
+    def library_structure_attach(self, params):
+        from .library_structures import attach
+        return attach(self, params)
+
+    def library_structure_visibility(self, params):
+        from .library_structures import visibility
+        return visibility(self, params)
+
+    def library_structure_read(self, params):
+        from .library_structures import read_structure
+        return read_structure(self, params)
+
+    def library_structure_links(self, params):
+        from .library_structures import structure_links
+        return structure_links(self, params)
+
+    def library_structure_thumbnail(self, params):
+        from .library_structure_thumbnails import status
+        return status(self, params)
+
+    def library_structure_thumbnail_read(self, params):
+        from .library_structure_thumbnails import read
+        return read(self, params)
 
     def library_product_preview(self, params):
         from .library_sequence import preview

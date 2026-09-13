@@ -137,14 +137,43 @@ editable names and colors, visibility toggles, removal and Undo/Redo. Colors app
 to every rendering style and the viewer's sequence strip. They are saved with
 each structure tab, so duplicate tabs can use independent domain colors.
 
-**Import plasmid annotations…** loads curated annotations for an exact library
-protein revision. The library protein's **Color domains in viewer…** button
-opens the same importer. Select the matching structure chain and the features
-to color. The head maps the parent plasmid's annotations through the protein's
-saved translation, including its strand, frame and crop. Automatically detected
-CDSs and ORFs are excluded. Sequence matching must be exact and unambiguous;
-missing or cropped structure residues are counted explicitly. Original feature
-labels do not establish preserved domain function after sequence or frame edits.
+Click a residue in the structure or sequence, then Shift-click another to select
+the inclusive range in that protein chain. **Create annotation…** opens the name
+and color editor with those positions prefilled. Clicking in 3D also centers that
+residue in the horizontal sequence strip. Scroll the mouse wheel while hovering
+over the strip to move along it; its scrollbar has a separate gutter below the
+residue blocks. Range selection remains separate from BindCraft hotspots.
+
+Structures opened from the library gallery or a linked prediction show exact
+protein backlinks, plus the nucleotide parent for derived proteins. For a linked
+plasmid-derived protein, **Import plasmid annotations…** automatically lists its
+curated annotations that have not yet been imported into the selected chain.
+The head maps them through the saved translation, including strand, frame and
+crop. Automatically detected CDSs and ORFs are excluded. Sequence matching must
+be exact and unambiguous; missing or cropped structure residues are counted
+explicitly. Original feature labels do not establish preserved domain function
+after sequence or frame edits.
+
+### Protein structures
+
+Each library protein has a **Structures** tab with render thumbnails. Click a
+thumbnail to open the original PDB/mmCIF in a new viewer tab. Prediction outputs
+appear automatically through their exact library input references, including
+retained earlier runs. Cards identify their source revision; results for an older
+protein sequence are labeled accordingly. Runs submitted only by pasted sequence
+are not assigned by name or similarity.
+
+**Upload PDBs…** adds one or more manually supplied structures. The **New
+standalone protein** form also has an optional upload control; protein creation
+and attachment publication happen together after uploads finish. Protein records
+may have no structures, and both standalone and plasmid-derived proteins support
+the same gallery. Files are retained with immutable byte receipts.
+
+The trash icon at a card's top right removes it from the gallery. **Undo/Redo**
+and **Show removed → Restore** recover the association; original prediction files
+and retained library attachments remain available. Thumbnails use the same studio
+renderer, generated lazily by a bounded CPU worker on bio-head and cached. The
+desktop displays static images with a bounded texture cache.
 
 ### Browse and edit constructs
 
@@ -203,7 +232,12 @@ arc into a linear map, then individual bases, complementary bases and one
 selectable translation track. **Circular** retains curved magnification;
 **Linear** and **Fit** provide explicit controls. Scroll over the map to move
 left/right in Linear or rotate in Circular. **Ctrl+scroll** zooms. Right-drag
-also pans, and left-drag selects a range. Click an annotation or detected
+also pans, and left-drag selects a range in either direction. With the map
+focused, Left/Right moves the nucleotide cursor and Shift+Left/Right extends or
+shrinks a selection. Ctrl adds a three-nucleotide step to either action. An arrow
+without Shift clears an existing selection and moves from its original anchor.
+Right-click the map for **Copy nucleotides**
+or **Copy translation**; both are disabled without a selection. Click an annotation or detected
 ORF to inspect its strand and ranges. Imported annotations carry historical,
 fuzzy or unsupported-coordinate flags; the original attachments remain intact.
 Annotated plasmids initially show their annotation tracks. **ORFs** exposes the

@@ -260,8 +260,12 @@ impl Workbench {
         if view.metadata["sha256"] != self.binder.draft.target["sha256"] {
             return;
         }
-        view.renderer
-            .consume_pick(&view.molecule, &mut view.selected, &mut view.hotspots);
+        view.renderer.consume_pick(
+            &view.molecule,
+            &mut view.selected,
+            &mut view.hotspots,
+            &mut view.selection_range,
+        );
         let selection = view
             .hotspots
             .residues

@@ -246,6 +246,7 @@ impl eframe::App for Capture {
                         index,
                         &mut None,
                         &mut scene::Hotspots::default(),
+                        &mut scene::SelectionRange::default(),
                         true,
                         false,
                         true,

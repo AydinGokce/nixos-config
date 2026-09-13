@@ -552,7 +552,9 @@ if ui.add_enabled(op["current_connection"]==true&&!self.pending.contains_key(id)
             | "library.undo"
             | "library.redo"
             | "library.product_create"
-            | "library.create" => Purpose::LibraryWrite(params.clone()),
+            | "library.create"
+            | "library.structure_attach"
+            | "library.structure_visibility" => Purpose::LibraryWrite(params.clone()),
             "batch.cancel" => Purpose::CancelBatch,
             "job.cancel" => Purpose::CancelJob,
             "annotation.put" => Purpose::SaveNote(

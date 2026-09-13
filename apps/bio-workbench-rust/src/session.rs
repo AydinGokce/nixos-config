@@ -279,6 +279,8 @@ impl Session {
                 | "library.redo"
                 | "library.product_create"
                 | "library.create"
+                | "library.structure_attach"
+                | "library.structure_visibility"
         ) {
             let explicit = params.get("request_key").is_some();
             if !explicit {
@@ -348,6 +350,30 @@ impl Session {
         self.enqueue_new(
             "local.library_attachment",
             json!({"ref":reference,"name":name,"receipt":receipt}),
+            false,
+        )
+    }
+    pub fn library_structure(
+        &mut self,
+        reference: &str,
+        entry_id: &str,
+        receipt: &Value,
+    ) -> Result<String, RpcError> {
+        self.enqueue_new(
+            "local.library_structure",
+            json!({"ref":reference,"entry_id":entry_id,"receipt":receipt}),
+            false,
+        )
+    }
+    pub fn library_structure_thumbnail(
+        &mut self,
+        reference: &str,
+        entry_id: &str,
+        receipt: &Value,
+    ) -> Result<String, RpcError> {
+        self.enqueue_new(
+            "local.library_structure_thumbnail",
+            json!({"ref":reference,"entry_id":entry_id,"receipt":receipt}),
             false,
         )
     }
@@ -559,6 +585,34 @@ fn run_task(
                     &operation.params["receipt"],
                     progress,
                 )?;
+                Ok(json!({"local_path":path,"metadata":metadata}))
+            }
+            "local.library_structure" | "local.library_structure_thumbnail" => {
+                let reference = operation.params["ref"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new("request", "Missing library reference."))?;
+                let entry_id = operation.params["entry_id"]
+                    .as_str()
+                    .ok_or_else(|| RpcError::new("request", "Missing structure entry ID."))?;
+                let (path, metadata) = if method == "local.library_structure" {
+                    rpc::download_library_structure(
+                        backend.as_ref(),
+                        &directory.join("library-structures"),
+                        reference,
+                        entry_id,
+                        &operation.params["receipt"],
+                        progress,
+                    )?
+                } else {
+                    rpc::download_library_structure_thumbnail(
+                        backend.as_ref(),
+                        &directory.join("library-thumbnails"),
+                        reference,
+                        entry_id,
+                        &operation.params["receipt"],
+                        progress,
+                    )?
+                };
                 Ok(json!({"local_path":path,"metadata":metadata}))
             }
             "local.artifact" => {
@@ -914,6 +968,7 @@ fn migrate_molecular_state(state: &Value) -> Result<Value, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
         time::{Duration, Instant},
@@ -1014,6 +1069,94 @@ mod tests {
         }
         assert!(session.journal.lock().unwrap().operations.is_empty());
         assert!(session.retryable_operations().is_empty());
+    }
+    #[test]
+    fn gallery_helpers_deliver_verified_files_without_journaling_and_reject_old_endpoint_replies() {
+        struct GalleryRead(Value);
+        impl Backend for GalleryRead {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                assert!(matches!(
+                    method,
+                    "library.structure_read" | "library.structure_thumbnail_read"
+                ));
+                assert_eq!(params["ref"], "construct:example@3");
+                assert_eq!(params["entry_id"], self.0["entry_id"]);
+                assert_eq!(params["offset"], 0);
+                let mut response = self.0.clone();
+                for (key, value) in
+                    json!({"ref":params["ref"],"name":"Verified fixture", "offset":0,
+                    "next_offset":4,"eof":true,"data_base64":STANDARD.encode(b"END\n")})
+                    .as_object()
+                    .unwrap()
+                {
+                    response[key] = value.clone();
+                }
+                Ok(response)
+            }
+            fn library(&self) -> Result<Value, RpcError> {
+                unreachable!()
+            }
+        }
+        for thumbnail in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut receipt = json!({"entry_id":"p-0123456789abcdef0123456789abcdef", "size":4,
+                "sha256":format!("{:x}",Sha256::digest(b"END\n"))});
+            let fields = if thumbnail {
+                json!({"schema":1,"ref":"construct:example@3","source_sha256":"a".repeat(64),
+                    "renderer_fingerprint":"b".repeat(64),"cache_key":"c".repeat(64),
+                    "state":"ready","width":640,"height":480,"style":"cartoon"})
+            } else {
+                json!({"source_ref":"construct:example@2","source_sequence_sha256":"d".repeat(64),"format":"pdb",
+                    "protein":{"ref":"construct:example@2","sha256":"e".repeat(64),
+                        "sequence_sha256":"d".repeat(64),"derivation_kind":"explicit","parent":null}})
+            };
+            receipt
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let mut session = Session::open_internal(
+                egui::Context::default(),
+                directory.path().into(),
+                Some(Arc::new(GalleryRead(receipt.clone()))),
+                false,
+            )
+            .unwrap();
+            let submit = |session: &mut Session| {
+                let entry_id = receipt["entry_id"].as_str().unwrap();
+                if thumbnail {
+                    session.library_structure_thumbnail("construct:example@3", entry_id, &receipt)
+                } else {
+                    session.library_structure("construct:example@3", entry_id, &receipt)
+                }
+            };
+            let operation = submit(&mut session).unwrap();
+            let (returned, result) = next_result(&mut session);
+            assert_eq!(returned, operation);
+            let value = result.unwrap();
+            assert_eq!(
+                fs::read(value["local_path"].as_str().unwrap()).unwrap(),
+                b"END\n"
+            );
+            assert_eq!(value["metadata"]["ref"], "construct:example@3");
+            if thumbnail {
+                assert_eq!(
+                    value["metadata"]["renderer_fingerprint"],
+                    receipt["renderer_fingerprint"]
+                );
+            } else {
+                assert_eq!(value["metadata"]["protein"], receipt["protein"]);
+            }
+            assert!(session.journal.lock().unwrap().operations.is_empty());
+            assert!(session.retryable_operations().is_empty());
+            submit(&mut session).unwrap();
+            // Even a completed cache response is scoped to the connection that
+            // authorized it, so changing the active head cannot populate its UI.
+            session.connection.host = "another-head.example".into();
+            assert_eq!(
+                next_result(&mut session).1.unwrap_err().code,
+                "connection_changed"
+            );
+        }
     }
     #[test]
     fn endpoint_change_requires_durable_detachment_before_profile_publication() {
@@ -1230,6 +1373,8 @@ mod tests {
             "library.redo",
             "library.product_create",
             "library.create",
+            "library.structure_attach",
+            "library.structure_visibility",
         ] {
             let directory = tempfile::tempdir().unwrap();
             let backend = Arc::new(LibraryWrites(Mutex::new(Vec::new()), AtomicUsize::new(0)));
@@ -1240,7 +1385,24 @@ mod tests {
                 false,
             )
             .unwrap();
-            let params = json!({"request_key":"exact-key","ref":"construct:example@1","expected_sha256":"a".repeat(64),"patch":{"alt_name":"","sequence":"ACGT"}});
+            let structures = json!([{"source":{"kind":"upload","id":"upload-one","sha256":"b".repeat(64)},"label":"Exact model"}]);
+            let params = match method {
+                "library.structure_attach" => {
+                    json!({"request_key":"exact-key","ref":"construct:example@1",
+                    "expected_sha256":"a".repeat(64),"structures":structures})
+                }
+                "library.structure_visibility" => {
+                    json!({"request_key":"exact-key","ref":"construct:example@1",
+                    "expected_sha256":"a".repeat(64),"entry_id":"m-0123456789abcdef0123456789abcdef","hidden":true})
+                }
+                "library.create" => {
+                    json!({"request_key":"exact-key","project_ref":"project:example@1",
+                    "expected_sha256":"a".repeat(64),"alt_name":"Example","sequence":"MAG","structures":structures})
+                }
+                _ => {
+                    json!({"request_key":"exact-key","ref":"construct:example@1","expected_sha256":"a".repeat(64),"patch":{"alt_name":"","sequence":"ACGT"}})
+                }
+            };
             let id = session.request(method, params.clone()).unwrap();
             assert!(next_result(&mut session).1.unwrap_err().uncertain);
             drop(session);
@@ -1253,7 +1415,8 @@ mod tests {
             .unwrap();
             assert_eq!(backend.0.lock().unwrap().len(), 1);
             assert_eq!(session.retryable_operations()[0]["params"], params);
-            session.retry(&id).unwrap();
+            // A lost UI operation ID is recovered with the original intent key.
+            assert_eq!(session.request(method, params.clone()).unwrap(), id);
             next_result(&mut session).1.unwrap();
             {
                 let calls = backend.0.lock().unwrap();
@@ -1263,7 +1426,13 @@ mod tests {
             next_result(&mut session).1.unwrap();
             assert_eq!(backend.0.lock().unwrap().len(), 2);
             let mut changed = params.clone();
-            changed["patch"]["sequence"] = json!("ACGA");
+            match method {
+                "library.structure_attach" | "library.create" => {
+                    changed["structures"][0]["source"]["sha256"] = json!("c".repeat(64))
+                }
+                "library.structure_visibility" => changed["hidden"] = json!(false),
+                _ => changed["patch"]["sequence"] = json!("ACGA"),
+            }
             assert_eq!(
                 session.request(method, changed).unwrap_err().code,
                 "conflict"

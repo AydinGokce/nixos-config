@@ -37,6 +37,11 @@ impl Workbench {
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             match &kind {
+                Pick::LibraryStructures(token) => {
+                    if let Some(files) = self.library_structure_files(token) {
+                        files.add(vec![path]);
+                    }
+                }
                 Pick::BinderTarget => {
                     self.binder.pending_source_ref = None;
                     let (format, _) = infer_file(&path);
@@ -169,6 +174,12 @@ impl Workbench {
         }
     }
     pub(super) fn uploaded(&mut self, target: UploadTarget, receipt: Value) {
+        if let UploadTarget::LibraryStructure(group, id) = &target {
+            if let Some(files) = self.library_structure_files(group) {
+                files.accept(id, receipt);
+            }
+            return;
+        }
         if let UploadTarget::Binder(token) = &target {
             self.binder_uploaded(token, receipt);
             return;
@@ -222,7 +233,9 @@ impl Workbench {
                     .entry(model)
                     .or_insert_with(|| json!({}))["labels_upload_id"] = json!(id);
             }
-            UploadTarget::Run(_, _) | UploadTarget::Binder(_) => unreachable!(),
+            UploadTarget::Run(_, _)
+            | UploadTarget::Binder(_)
+            | UploadTarget::LibraryStructure(_, _) => unreachable!(),
         }
     }
     pub(super) fn flash_input(&mut self, id: &str) {

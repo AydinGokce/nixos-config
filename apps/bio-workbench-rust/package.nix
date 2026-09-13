@@ -39,6 +39,7 @@ in rustPlatform.buildRustPackage {
         --set LIBGL_ALWAYS_SOFTWARE 1 \
         --set GALLIUM_DRIVER llvmpipe \
         --set LIBGL_DRIVERS_PATH ${mesa.drivers}/lib/dri \
+        --prefix LD_LIBRARY_PATH : ${mesa.drivers}/lib \
         --set __EGL_VENDOR_LIBRARY_FILENAMES ${mesa.drivers}/share/glvnd/egl_vendor.d/50_mesa.json
       ln -s bio-workbench-software $out/bin/gc-protein-engineering-console-software
       mkdir -p $out/share/applications

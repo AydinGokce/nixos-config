@@ -10,6 +10,7 @@ pub(super) enum Action {
     Write(&'static str, Value),
     Parent(String),
     EditSequence,
+    PickStructures(String),
 }
 
 #[derive(Clone, Default)]
@@ -23,6 +24,13 @@ struct Selection {
     warning: String,
 }
 
+#[derive(Clone, Copy)]
+struct NucleotideCursor {
+    // Unwrapped coordinates retain both drag direction and origin crossings.
+    anchor: i64,
+    active: i64,
+}
+
 #[derive(Default)]
 pub(super) struct Viewer {
     reference: String,
@@ -32,6 +40,7 @@ pub(super) struct Viewer {
     mode: usize,
     selection: Option<Selection>,
     anchor: Option<usize>,
+    nucleotide_cursor: Option<NucleotideCursor>,
     protein_anchor: Option<usize>,
     focus_residue: Option<usize>,
     translation_frame: i64,
@@ -74,6 +83,7 @@ struct Standalone {
     sha256: String,
     alt_name: String,
     sequence: String,
+    structures: ui_structure_uploads::Files,
 }
 
 impl Viewer {
@@ -96,6 +106,7 @@ impl Viewer {
             self.mode = 0;
             self.selection = None;
             self.anchor = None;
+            self.nucleotide_cursor = None;
             self.protein_anchor = None;
             self.focus_residue = None;
             self.translation_frame = 1;
@@ -172,7 +183,12 @@ impl Viewer {
             sha256: sha256.into(),
             alt_name: String::new(),
             sequence: String::new(),
+            structures: ui_structure_uploads::Files::default(),
         });
+    }
+
+    pub fn standalone_structure_files(&mut self) -> Option<&mut ui_structure_uploads::Files> {
+        self.standalone.as_mut().map(|form| &mut form.structures)
     }
 
     pub fn received_preview(&mut self, sent: &Value, value: Value) {
@@ -414,9 +430,14 @@ impl Viewer {
                 ui.add_enabled_ui(!writing,|ui|{
                     ui.horizontal(|ui|{ui.label("Alt name");ui.text_edit_singleline(&mut form.alt_name);});
                     ui.add(egui::TextEdit::multiline(&mut form.sequence).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(5).hint_text("Exact uppercase amino-acid sequence"));
-                    let valid=!form.sha256.is_empty() && !form.sequence.is_empty() && form.sequence.bytes().all(|b|b"ACDEFGHIKLMNPQRSTVWYBXZJUO".contains(&b));
+                    if form.structures.show(ui,writing) {actions.push(Action::PickStructures(form.structures.token.clone()));}
+                    let valid=!form.sha256.is_empty() && !form.sequence.is_empty() && form.sequence.bytes().all(|b|b"ACDEFGHIKLMNPQRSTVWYBXZJUO".contains(&b)) && form.structures.ready();
                     ui.horizontal(|ui|{
-                        if ui.add_enabled(valid,egui::Button::new("Create protein")).clicked(){actions.push(Action::Write("library.create",json!({"project_ref":form.project,"expected_sha256":form.sha256,"sequence":form.sequence,"alt_name":form.alt_name})));}
+                        if ui.add_enabled(valid,egui::Button::new("Create protein")).clicked(){
+                            let mut params=json!({"project_ref":form.project,"expected_sha256":form.sha256,"sequence":form.sequence,"alt_name":form.alt_name});
+                            if !form.structures.rows.is_empty(){params["structures"]=form.structures.descriptors();}
+                            actions.push(Action::Write("library.create",params));
+                        }
                         close=ui.button("Cancel").clicked();ui.weak(format!("{} amino acids",form.sequence.len()));
                     });
                 });
@@ -468,9 +489,10 @@ impl Viewer {
             {
                 actions.push(Action::EditSequence);
             }
-            if ui
-                .add_enabled(!sequence.is_empty(), egui::Button::new("Copy sequence"))
-                .clicked()
+            if !matches!(molecule.as_str(), "dna" | "rna")
+                && ui
+                    .add_enabled(!sequence.is_empty(), egui::Button::new("Copy sequence"))
+                    .clicked()
             {
                 ui.ctx().copy_text(sequence.clone());
             }
@@ -744,7 +766,8 @@ impl Viewer {
                 .request_repaint_after(std::time::Duration::from_secs_f64((due - now).max(0.)));
         }
         let cyclic = self.view["circular"] == true || self.mode == 1;
-        ui.weak("Scroll to pan / rotate · Ctrl/Cmd + scroll to zoom · Drag to select · Right-drag to pan");
+        ui.weak("Scroll to pan / rotate · Ctrl/Cmd + scroll to zoom · Drag to select · Right-drag to pan")
+            .on_hover_text("← / → moves the nucleotide cursor; Ctrl moves 3 bases. Hold Shift to extend the selection. Right-click to copy nucleotides or translation.");
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width().max(300.), 420.),
             Sense::click_and_drag(),
@@ -780,26 +803,62 @@ impl Viewer {
         if response.dragged_by(egui::PointerButton::Secondary) {
             self.center -= response.drag_delta().x / previous.scale;
         }
-        let geometry = MapGeometry::new(rect, length, self.center, self.zoom, self.mode, cyclic);
+        let mut geometry =
+            MapGeometry::new(rect, length, self.center, self.zoom, self.mode, cyclic);
         self.center = geometry.center;
-        let base_at = |pos| geometry.base_at(pos);
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(p) = pointer
         {
-            self.anchor = Some(base_at(p));
+            let origin = p - response.total_drag_delta().unwrap_or_default();
+            let anchor = geometry.unwrapped_base_at(origin);
+            self.anchor = Some(geometry.base_at(origin));
+            self.nucleotide_cursor = Some(NucleotideCursor {
+                anchor,
+                active: anchor,
+            });
+            response.request_focus();
         }
         if response.dragged_by(egui::PointerButton::Primary)
-            && let (Some(start), Some(p)) = (self.anchor, pointer)
+            && let (Some(cursor), Some(p)) = (&mut self.nucleotide_cursor, pointer)
         {
-            self.selection = Some(Selection {
-                segments: selection_ranges(start, base_at(p), length, cyclic),
-                strand: 1,
-                label: "Selected range".into(),
-                ..Default::default()
-            });
+            let mut active = geometry.unwrapped_base_at(p);
+            if cyclic {
+                active += ((cursor.active - active) as f64 / length as f64).round() as i64
+                    * length as i64;
+            }
+            cursor.active = active.clamp(
+                cursor.anchor - length as i64 + 1,
+                cursor.anchor + length as i64 - 1,
+            );
+            self.selection = Some(cursor.selection(length, cyclic));
         }
         if response.drag_stopped() {
             self.anchor = None;
+        }
+        if response.has_focus() && !response.context_menu_opened() {
+            let steps = ui.input_mut(nucleotide_key_steps);
+            for &(direction, extend) in &steps {
+                if let Some(cursor) = &mut self.nucleotide_cursor {
+                    cursor.step(direction, extend, length, cyclic);
+                    self.selection = extend.then(|| cursor.selection(length, cyclic));
+                }
+            }
+            if !steps.is_empty()
+                && let Some(cursor) = self.nucleotide_cursor
+            {
+                let mut active = cursor.active as f32 + 0.5;
+                if cyclic {
+                    active += ((geometry.center - active) / length as f32).round() * length as f32;
+                }
+                let (left, right) = geometry.window();
+                let margin = ((right - left) * 0.08).min(3.);
+                if active < left + margin || active > right - margin {
+                    self.center = active;
+                    geometry =
+                        MapGeometry::new(rect, length, self.center, self.zoom, self.mode, cyclic);
+                    self.center = geometry.center;
+                }
+            }
         }
         let hit = draw_map(
             &painter,
@@ -811,10 +870,16 @@ impl Viewer {
             pointer,
         );
         if response.clicked() {
+            response.request_focus();
             if let Some(item) = hit {
+                self.nucleotide_cursor = NucleotideCursor::from_selection(&item, length);
                 self.selection = Some(item);
             } else if let Some(p) = pointer {
-                let base = base_at(p);
+                let base = geometry.base_at(p);
+                self.nucleotide_cursor = Some(NucleotideCursor {
+                    anchor: base as i64,
+                    active: base as i64,
+                });
                 self.selection = Some(Selection {
                     segments: vec![(base, base + 1)],
                     strand: 1,
@@ -823,6 +888,19 @@ impl Viewer {
                 });
             }
         }
+        if let Some(cursor) = self.nucleotide_cursor {
+            draw_nucleotide_cursor(&painter, geometry, cursor.active);
+        }
+        response.context_menu(|ui| {
+            let copy = map_copy_text(
+                &self.view,
+                &sequence,
+                self.selection.as_ref(),
+                self.translation_frame,
+                self.genetic_code,
+            );
+            map_copy_menu(ui, &copy);
+        });
         if let Some(selection) = self.selection.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&selection.label);ui.monospace(range_label(&selection.segments));ui.label(if selection.strand<0{"reverse strand"}else{"forward strand"});
@@ -831,7 +909,7 @@ impl Viewer {
                     let definition=selection.translation.clone().unwrap_or_else(||json!({"schema":1,"segments":selection.segments.iter().map(|(start,end)|json!({"start":start,"end":end})).collect::<Vec<_>>(),"strand":selection.strand,"genetic_code":self.genetic_code,"codon_start":1,"initiation":"literal","residue_start":0,"residue_end":null}));
                     if let Some(action)=self.begin_definition(detail,definition,false){actions.push(action);}
                 }
-                if ui.button("Clear selection").clicked(){self.selection=None;}
+                if ui.button("Clear selection").clicked(){self.selection=None;self.nucleotide_cursor=None;}
             });
             if !selection.warning.is_empty() {
                 ui.colored_label(AMBER, &selection.warning);
@@ -858,7 +936,10 @@ impl Viewer {
                                     )
                                     .clicked()
                                 {
+                                    self.nucleotide_cursor =
+                                        NucleotideCursor::from_selection(item, length);
                                     self.selection = Some(item.clone());
+                                    response.request_focus();
                                 }
                                 ui.monospace(range_label(&item.segments));
                                 ui.weak(if item.strand < 0 { "−" } else { "+" });
@@ -1014,17 +1095,395 @@ fn range_label(segments: &[(usize, usize)]) -> String {
         .collect::<Vec<_>>()
         .join(" / ")
 }
-fn selection_ranges(
-    start: usize,
-    end: usize,
-    length: usize,
-    circular: bool,
-) -> Vec<(usize, usize)> {
-    if circular && end < start {
-        vec![(start, length), (0, end + 1)]
+fn selection_ranges(start: i64, end: i64, length: usize, circular: bool) -> Vec<(usize, usize)> {
+    let left = start.min(end);
+    let count = (start.abs_diff(end) as usize + 1).min(length);
+    if circular {
+        let start = left.rem_euclid(length as i64) as usize;
+        if start + count > length {
+            vec![(start, length), (0, start + count - length)]
+        } else {
+            vec![(start, start + count)]
+        }
     } else {
-        vec![(start.min(end), start.max(end) + 1)]
+        vec![(
+            left.max(0) as usize,
+            (left.max(0) as usize + count).min(length),
+        )]
     }
+}
+
+impl NucleotideCursor {
+    fn from_selection(selection: &Selection, length: usize) -> Option<Self> {
+        let first = selection.segments.first()?;
+        let last = selection.segments.last()?;
+        let (anchor, mut active) = if selection.strand < 0 {
+            ((first.1 - 1) as i64, last.0 as i64)
+        } else {
+            (first.0 as i64, (last.1 - 1) as i64)
+        };
+        if selection.strand < 0 && active > anchor {
+            active -= length as i64;
+        } else if selection.strand >= 0 && active < anchor {
+            active += length as i64;
+        }
+        Some(Self { anchor, active })
+    }
+
+    fn selection(self, length: usize, circular: bool) -> Selection {
+        Selection {
+            segments: selection_ranges(self.anchor, self.active, length, circular),
+            strand: 1,
+            label: "Selected range".into(),
+            ..Default::default()
+        }
+    }
+
+    fn step(&mut self, direction: i64, extend: bool, length: usize, circular: bool) {
+        let origin = if extend { self.active } else { self.anchor };
+        let active = origin + direction;
+        self.active = if circular {
+            active.clamp(
+                self.anchor - length as i64 + 1,
+                self.anchor + length as i64 - 1,
+            )
+        } else {
+            active.clamp(0, length as i64 - 1)
+        };
+        if !extend {
+            self.active = self.active.rem_euclid(length as i64);
+            self.anchor = self.active;
+        }
+    }
+}
+
+fn draw_nucleotide_cursor(painter: &egui::Painter, geometry: MapGeometry, active: i64) {
+    let index = active.rem_euclid(geometry.length as i64) as usize;
+    for (start, end) in geometry.spans(index, index + 1) {
+        let center = (start + end) / 2.;
+        painter.line_segment(
+            [
+                geometry.position(center, -8.),
+                geometry.position(center, 10.),
+            ],
+            Stroke::new(2., Color32::WHITE),
+        );
+        if geometry.scale >= 3.
+            && (geometry.curve < 0.0001
+                || geometry.scale / geometry.angular > geometry.rect.height() + 100.)
+        {
+            let block = Rect::from_center_size(
+                geometry.position(center, 214.) + Vec2::new(0., 12.),
+                Vec2::new(geometry.scale, 25.),
+            );
+            painter.rect_stroke(
+                block,
+                0.,
+                Stroke::new(1.5, Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+fn nucleotide_key_steps(input: &mut egui::InputState) -> Vec<(i64, bool)> {
+    let mut steps = Vec::new();
+    input.events.retain(|event| {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+            && !modifiers.alt
+            && (!modifiers.command || modifiers.ctrl)
+            && matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight)
+        {
+            steps.push((
+                (if *key == egui::Key::ArrowLeft { -1 } else { 1 })
+                    * if modifiers.ctrl { 3 } else { 1 },
+                modifiers.shift,
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    steps
+}
+
+struct MapCopyText {
+    nucleotides: Result<String, String>,
+    translation: Result<String, String>,
+}
+
+fn map_copy_menu(ui: &mut egui::Ui, copy: &MapCopyText) -> [egui::Response; 2] {
+    [
+        ("Copy nucleotides", &copy.nucleotides),
+        ("Copy translation", &copy.translation),
+    ]
+    .map(|(label, value)| {
+        let response = ui.add_enabled(value.is_ok(), egui::Button::new(label));
+        if response.clicked()
+            && let Ok(value) = value
+        {
+            ui.ctx().copy_text(value.clone());
+            ui.close();
+        }
+        if let Err(reason) = value {
+            response.on_disabled_hover_text(reason)
+        } else {
+            response
+        }
+    })
+}
+
+fn selected_nucleotides(
+    sequence: &str,
+    selection: &Selection,
+    circular: bool,
+    rna: bool,
+) -> Result<String, String> {
+    if !sequence.is_ascii()
+        || !matches!(selection.strand, -1 | 1)
+        || selection.segments.is_empty()
+        || selection.segments.len() > 256
+        || selection
+            .segments
+            .iter()
+            .any(|&(a, b)| a >= b || b > sequence.len())
+    {
+        return Err("Selected coordinates are unavailable or unsupported.".into());
+    }
+    let mut ordered = selection.segments.clone();
+    ordered.sort_unstable();
+    if ordered.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("Selected ranges overlap.".into());
+    }
+    if selection.strand < 0 {
+        ordered.reverse();
+    }
+    let rotation = circular
+        && (0..ordered.len()).any(|offset| {
+            ordered
+                .iter()
+                .cycle()
+                .skip(offset)
+                .take(ordered.len())
+                .eq(selection.segments.iter())
+        });
+    if selection.segments != ordered && !rotation {
+        return Err("Selected ranges are not in biological strand order.".into());
+    }
+    let mut bases = Vec::new();
+    for &(start, end) in &selection.segments {
+        let part = &sequence.as_bytes()[start..end];
+        if part.iter().any(|base| !b"ACGTURYSWKMBDHVN".contains(base)) {
+            return Err("The selected nucleotide alphabet is unsupported.".into());
+        }
+        if selection.strand < 0 {
+            bases.extend(part.iter().rev().map(|&base| {
+                let complement = complement(base);
+                if rna && complement == b'T' {
+                    b'U'
+                } else {
+                    complement
+                }
+            }));
+        } else {
+            bases.extend_from_slice(part);
+        }
+    }
+    String::from_utf8(bases).map_err(|_| "Selected sequence is not ASCII.".into())
+}
+
+fn map_copy_text(
+    view: &Value,
+    sequence: &str,
+    selection: Option<&Selection>,
+    frame: i64,
+    genetic_code: u64,
+) -> MapCopyText {
+    let Some(selection) = selection else {
+        return MapCopyText {
+            nucleotides: Err("Select nucleotides or an annotation first.".into()),
+            translation: Err("Select nucleotides or a CDS first.".into()),
+        };
+    };
+    let rna = text(view, "molecule_type") == "rna";
+    // A free selection may cross the displayed origin even in forced circular mode.
+    let nucleotides = selected_nucleotides(sequence, selection, true, rna);
+    let translation = (|| {
+        nucleotides.as_ref().map_err(Clone::clone)?;
+        if !selection.warning.is_empty() {
+            return Err(selection.warning.clone());
+        }
+        if rows(view, "issues")
+            .iter()
+            .any(|issue| text(issue, "code") == "orf_chemistry")
+        {
+            return Err(
+                "Explicit nucleotide chemistry needs interpretation before translation.".into(),
+            );
+        }
+        if let Some(definition) = &selection.translation {
+            let bases = selected_nucleotides(sequence, selection, view["circular"] == true, rna)?;
+            copy_defined_translation(&bases, selection, definition)
+        } else if selection.kind == "CDS" || selection.is_orf {
+            Err("This CDS has no supported translation definition.".into())
+        } else {
+            let frame = if selection.kind.is_empty() {
+                frame
+            } else {
+                frame.abs() * selection.strand
+            };
+            copy_displayed_translation(sequence, selection, frame, genetic_code)
+        }
+    })();
+    MapCopyText {
+        nucleotides,
+        translation,
+    }
+}
+
+fn copy_defined_translation(
+    bases: &str,
+    selection: &Selection,
+    definition: &Value,
+) -> Result<String, String> {
+    let invalid = || "The selected CDS translation definition is unsupported.".to_owned();
+    let schema = definition["schema"].as_u64().ok_or_else(invalid)?;
+    let code = definition["genetic_code"].as_u64().ok_or_else(invalid)?;
+    let skip = definition["codon_start"].as_u64().ok_or_else(invalid)?;
+    let first_stop = schema == 2 && text(definition, "stop_policy") == "first_stop";
+    let segments: Option<Vec<_>> = rows(definition, "segments")
+        .iter()
+        .map(|part| {
+            Some((
+                usize::try_from(part["start"].as_u64()?).ok()?,
+                usize::try_from(part["end"].as_u64()?).ok()?,
+            ))
+        })
+        .collect();
+    if !matches!(schema, 1 | 2)
+        || !matches!(code, 1 | 11)
+        || !(1..=3).contains(&skip)
+        || !matches!(text(definition, "initiation"), "cds" | "literal")
+        || (schema == 2 && !matches!(text(definition, "stop_policy"), "strict" | "first_stop"))
+        || definition["strand"].as_i64() != Some(selection.strand)
+        || segments.as_ref() != Some(&selection.segments)
+    {
+        return Err(invalid());
+    }
+    let bases = bases.replace('U', "T");
+    if !first_stop && bases.bytes().any(|base| !b"ACGT".contains(&base)) {
+        return Err("The coding span contains ambiguous nucleotides.".into());
+    }
+    let coding = bases.get(skip as usize - 1..).ok_or_else(invalid)?;
+    if coding.len() < 3 || (!first_stop && !coding.len().is_multiple_of(3)) {
+        return Err("The selected CDS does not contain complete codons.".into());
+    }
+    let mut protein = Vec::new();
+    for triplet in coding.as_bytes().chunks_exact(3) {
+        let amino = codon(triplet);
+        if amino == b'X' {
+            return Err("An encountered codon contains ambiguous nucleotides.".into());
+        }
+        protein.push(amino);
+        if first_stop && amino == b'*' {
+            break;
+        }
+    }
+    if text(definition, "initiation") == "cds" {
+        let initiator = matches!(&coding[..3], "TTG" | "CTG" | "ATG")
+            || (code == 11 && matches!(&coding[..3], "ATT" | "ATC" | "ATA" | "GTG"));
+        if !initiator || protein.last() != Some(&b'*') {
+            return Err(
+                "The CDS lacks a valid initiator or terminal stop under its genetic code.".into(),
+            );
+        }
+        protein[0] = b'M';
+    }
+    if protein.last() == Some(&b'*') {
+        protein.pop();
+    }
+    if protein.contains(&b'*') {
+        return Err("The selected CDS contains an internal stop codon.".into());
+    }
+    let start = definition["residue_start"]
+        .as_u64()
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(invalid)?;
+    let end = if definition["residue_end"].is_null() {
+        protein.len()
+    } else {
+        definition["residue_end"]
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(invalid)?
+    };
+    if start >= end || end > protein.len() {
+        return Err("The CDS residue crop is empty or outside its translation.".into());
+    }
+    Ok(String::from_utf8(protein[start..end].to_vec()).expect("codon table contains ASCII"))
+}
+
+fn copy_displayed_translation(
+    sequence: &str,
+    selection: &Selection,
+    frame: i64,
+    genetic_code: u64,
+) -> Result<String, String> {
+    if !matches!(genetic_code, 1 | 11) || !matches!(frame, -3..=-1 | 1..=3) {
+        return Err("The displayed translation frame or genetic code is unsupported.".into());
+    }
+    let offset = frame.unsigned_abs() as usize - 1;
+    let reverse = frame < 0;
+    // These are precisely the complete codons painted by draw_map. Do not
+    // translate clipped codons, splice unrelated ranges, or invent origin codons.
+    let mut segments = selection.segments.clone();
+    if selection.strand < 0 {
+        segments.reverse();
+    }
+    if reverse {
+        segments.reverse();
+    }
+    let mut protein = Vec::new();
+    for (start, end) in segments {
+        let starts: Vec<_> = (start..end.saturating_sub(2))
+            .filter(|&index| {
+                if reverse {
+                    (sequence.len() - index - 3) % 3 == offset
+                } else {
+                    index % 3 == offset
+                }
+            })
+            .collect();
+        for index in if reverse {
+            starts.into_iter().rev().collect::<Vec<_>>()
+        } else {
+            starts
+        } {
+            let bytes = sequence.as_bytes();
+            let amino = if reverse {
+                codon(&[
+                    complement(bytes[index + 2]),
+                    complement(bytes[index + 1]),
+                    complement(bytes[index]),
+                ])
+            } else {
+                codon(&bytes[index..index + 3])
+            };
+            if amino == b'X' {
+                return Err("A selected displayed codon contains ambiguous nucleotides.".into());
+            }
+            protein.push(amino);
+        }
+    }
+    if protein.is_empty() {
+        return Err("Select at least one complete codon in the displayed frame.".into());
+    }
+    Ok(String::from_utf8(protein).expect("codon table contains ASCII"))
 }
 fn track_items(view: &Value, features: bool, orfs: bool) -> Vec<Selection> {
     let length = view["length"].as_u64().unwrap_or(0) as usize;
@@ -1166,7 +1625,7 @@ impl MapGeometry {
         Vec2::angled((base - self.center) * self.angular)
     }
 
-    fn base_at(self, pos: Pos2) -> usize {
+    fn unwrapped_base_at(self, pos: Pos2) -> i64 {
         let delta = if self.curve < 0.0001 {
             (pos.x - self.anchor.x) / self.scale
         } else {
@@ -1174,12 +1633,15 @@ impl MapGeometry {
             (pos.x - self.anchor.x).atan2(radius - (pos.y - self.anchor.y)) / self.angular
         };
         let base = self.center + delta.clamp(-self.length / 2., self.length / 2.);
-        let base = if self.cyclic {
-            base.rem_euclid(self.length)
+        if self.cyclic {
+            base.floor() as i64
         } else {
-            base.clamp(0., self.length - 1.)
-        };
-        (base.floor() as usize).min(self.length as usize - 1)
+            base.clamp(0., self.length - 1.).floor() as i64
+        }
+    }
+
+    fn base_at(self, pos: Pos2) -> usize {
+        self.unwrapped_base_at(pos).rem_euclid(self.length as i64) as usize
     }
 
     fn window(self) -> (f32, f32) {
@@ -2728,8 +3190,521 @@ mod tests {
     }
     #[test]
     fn wrap_selection_retains_origin_order() {
-        assert_eq!(selection_ranges(95, 4, 100, true), vec![(95, 100), (0, 5)]);
+        assert_eq!(
+            selection_ranges(95, 104, 100, true),
+            vec![(95, 100), (0, 5)]
+        );
+        assert_eq!(
+            selection_ranges(104, 95, 100, true),
+            vec![(95, 100), (0, 5)]
+        );
+        assert_eq!(selection_ranges(4, -5, 100, true), vec![(95, 100), (0, 5)]);
+        assert_eq!(selection_ranges(95, 4, 100, true), vec![(4, 96)]);
         assert_eq!(selection_ranges(95, 4, 100, false), vec![(4, 96)]);
+    }
+
+    fn copy_selection(segments: &[(usize, usize)], strand: i64) -> Selection {
+        Selection {
+            segments: segments.to_vec(),
+            strand,
+            ..Default::default()
+        }
+    }
+
+    fn defined_selection(segments: &[(usize, usize)], strand: i64) -> Selection {
+        let mut selection = copy_selection(segments, strand);
+        selection.kind = "CDS".into();
+        selection.translation = Some(json!({"schema":1,
+            "segments":segments.iter().map(|&(start,end)|json!({"start":start,"end":end})).collect::<Vec<_>>(),
+            "strand":strand,"genetic_code":1,"codon_start":1,"initiation":"cds",
+            "residue_start":0,"residue_end":null}));
+        selection
+    }
+
+    #[test]
+    fn map_copy_preserves_biological_parts_reverse_rna_and_iupac() {
+        let view = json!({"molecule_type":"dna","circular":true});
+        let selection = copy_selection(&[(9, 12), (0, 6)], 1);
+        let copy = map_copy_text(&view, "AAACCCTTTGGG", Some(&selection), 1, 1);
+        assert_eq!(copy.nucleotides.unwrap(), "GGGAAACCC");
+        assert_eq!(copy.translation.unwrap(), "GKP");
+        assert_eq!(
+            map_copy_text(&view, "AAACCCTTTGGG", Some(&selection), -1, 1)
+                .translation
+                .unwrap(),
+            "GFP"
+        );
+        let selection = defined_selection(&[(9, 12), (6, 9), (0, 3)], -1);
+        let copy = map_copy_text(&view, "TTAGGGTTTCAT", Some(&selection), 2, 1);
+        assert_eq!(copy.nucleotides.unwrap(), "ATGAAATAA");
+        assert_eq!(copy.translation.unwrap(), "MK");
+        let rna = json!({"molecule_type":"rna"});
+        let selection = copy_selection(&[(0, 9)], -1);
+        assert_eq!(
+            map_copy_text(&rna, "UUAGGGCAU", Some(&selection), -1, 1)
+                .nucleotides
+                .unwrap(),
+            "AUGCCCUAA"
+        );
+        let selection = copy_selection(&[(0, 15)], -1);
+        let bases = "ACGTRYSWKMBDHVN";
+        let copied = selected_nucleotides(bases, &selection, false, false).unwrap();
+        assert_eq!(copied, "NBDHVKMWSRYACGT");
+        assert_eq!(
+            selected_nucleotides(&copied, &selection, false, false).unwrap(),
+            bases
+        );
+        assert!(selected_nucleotides("AC?", &copy_selection(&[(0, 3)], -1), false, false).is_err());
+    }
+
+    #[test]
+    fn map_copy_uses_displayed_frame_and_only_fully_selected_codons() {
+        let view = json!({"molecule_type":"dna"});
+        let whole = copy_selection(&[(0, 13)], 1);
+        assert_eq!(
+            map_copy_text(&view, "AATGAAACCCTAA", Some(&whole), 2, 1)
+                .translation
+                .unwrap(),
+            "MKP*"
+        );
+        assert_eq!(
+            map_copy_text(&view, "AATGAAACCCTAA", Some(&whole), 1, 1)
+                .translation
+                .unwrap(),
+            "NETL"
+        );
+        let middle = copy_selection(&[(2, 12)], 1);
+        assert_eq!(
+            map_copy_text(&view, "AATGAAACCCTAA", Some(&middle), 2, 1)
+                .translation
+                .unwrap(),
+            "KP"
+        );
+        let reverse = copy_selection(&[(1, 8)], 1);
+        assert_eq!(
+            map_copy_text(&view, "TTAGGGCAT", Some(&reverse), -1, 1)
+                .translation
+                .unwrap(),
+            "P"
+        );
+        assert!(
+            map_copy_text(&view, "ATG", Some(&copy_selection(&[(1, 3)], 1)), 1, 1)
+                .translation
+                .is_err()
+        );
+        // A feature's joined CDS may legitimately assemble a codon across parts.
+        let joined = defined_selection(&[(0, 2), (4, 11)], 1);
+        assert_eq!(
+            map_copy_text(&view, "ATCCGAAATAA", Some(&joined), 3, 1)
+                .translation
+                .unwrap(),
+            "MK"
+        );
+    }
+
+    #[test]
+    fn map_copy_honors_cds_code_frame_crop_and_stop_policy_without_guessing() {
+        let view = json!({"molecule_type":"dna"});
+        let mut selection = defined_selection(&[(0, 10)], 1);
+        selection.translation.as_mut().unwrap()["codon_start"] = json!(2);
+        assert_eq!(
+            map_copy_text(&view, "AATGAAATAA", Some(&selection), -3, 11)
+                .translation
+                .unwrap(),
+            "MK"
+        );
+        selection.translation.as_mut().unwrap()["residue_start"] = json!(1);
+        assert_eq!(
+            map_copy_text(&view, "AATGAAATAA", Some(&selection), 1, 1)
+                .translation
+                .unwrap(),
+            "K"
+        );
+        let mut bacterial = defined_selection(&[(0, 9)], 1);
+        assert!(
+            map_copy_text(&view, "GTGAAATAA", Some(&bacterial), 1, 11)
+                .translation
+                .is_err()
+        );
+        bacterial.translation.as_mut().unwrap()["genetic_code"] = json!(11);
+        assert_eq!(
+            map_copy_text(&view, "GTGAAATAA", Some(&bacterial), 1, 1)
+                .translation
+                .unwrap(),
+            "MK"
+        );
+        bacterial.translation.as_mut().unwrap()["initiation"] = json!("literal");
+        assert_eq!(
+            map_copy_text(&view, "GTGAAATAA", Some(&bacterial), 1, 1)
+                .translation
+                .unwrap(),
+            "VK"
+        );
+        let mut first_stop = defined_selection(&[(0, 10)], 1);
+        let definition = first_stop.translation.as_mut().unwrap();
+        definition["schema"] = json!(2);
+        definition["stop_policy"] = json!("first_stop");
+        assert_eq!(
+            map_copy_text(&view, "ATGTAANNNG", Some(&first_stop), 1, 1)
+                .translation
+                .unwrap(),
+            "M"
+        );
+        first_stop.translation.as_mut().unwrap()["stop_policy"] = json!("strict");
+        assert!(
+            map_copy_text(&view, "ATGTAANNNG", Some(&first_stop), 1, 1)
+                .translation
+                .is_err()
+        );
+        for warning in [
+            "Partial or fuzzy source coordinates",
+            "Historical annotation",
+            "Unsupported source coordinate expression",
+        ] {
+            bacterial.warning = warning.into();
+            let copy = map_copy_text(&view, "GTGAAATAA", Some(&bacterial), 1, 1);
+            assert!(copy.nucleotides.is_ok());
+            assert_eq!(copy.translation.unwrap_err(), warning);
+        }
+        let ambiguous = copy_selection(&[(0, 3)], 1);
+        assert!(
+            map_copy_text(&view, "ANN", Some(&ambiguous), 1, 1)
+                .translation
+                .is_err()
+        );
+        let chemistry = json!({"molecule_type":"dna","issues":[{"code":"orf_chemistry"}]});
+        assert!(
+            map_copy_text(&chemistry, "ATG", Some(&ambiguous), 1, 1)
+                .translation
+                .is_err()
+        );
+        assert!(
+            map_copy_text(&view, "ATG", Some(&copy_selection(&[(0, 4)], 1)), 1, 1)
+                .nucleotides
+                .is_err()
+        );
+        assert!(map_copy_text(&view, "ATG", None, 1, 1).nucleotides.is_err());
+        assert!(map_copy_text(&view, "ATG", None, 1, 1).translation.is_err());
+    }
+
+    struct MapHarness {
+        context: egui::Context,
+        viewer: Viewer,
+        time: f64,
+        detail: Value,
+    }
+
+    impl MapHarness {
+        fn new() -> Self {
+            let reference = "construct:map-clipboard-proof@1";
+            let mut viewer = Viewer::default();
+            viewer.accept(
+                reference,
+                json!({"ref":reference,"molecule_type":"dna","length":1000,"circular":true}),
+                &"ACGT".repeat(250),
+            );
+            viewer.mode = 2;
+            viewer.zoom = 4.;
+            viewer.center = 500.;
+            viewer.show_features = false;
+            viewer.show_orfs = false;
+            Self {
+                context: egui::Context::default(),
+                viewer,
+                time: 0.,
+                detail: json!({"ref":reference,"is_latest":true}),
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.time += 0.1;
+            let mut input = screen();
+            input.time = Some(self.time);
+            input.events = events;
+            self.context.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.viewer.show(ui, &self.detail, false, &[]);
+                });
+            })
+        }
+
+        fn geometry(&mut self) -> MapGeometry {
+            let output = self.frame(vec![]);
+            assert!(!painted_text(&output.shapes).contains(&"Copy sequence".into()));
+            let rect = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == Color32::from_rgb(25, 29, 32) => {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            MapGeometry::new(
+                rect,
+                1000,
+                self.viewer.center,
+                self.viewer.zoom,
+                self.viewer.mode,
+                true,
+            )
+        }
+
+        fn button(pos: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        }
+
+        fn click(&mut self, pos: Pos2, button: egui::PointerButton) -> egui::FullOutput {
+            self.frame(vec![
+                egui::Event::PointerMoved(pos),
+                Self::button(pos, button, true),
+            ]);
+            self.frame(vec![Self::button(pos, button, false)])
+        }
+
+        fn drag(
+            &mut self,
+            start: Pos2,
+            end: Pos2,
+            button: egui::PointerButton,
+        ) -> egui::FullOutput {
+            self.frame(vec![
+                egui::Event::PointerMoved(start),
+                Self::button(start, button, true),
+            ]);
+            self.frame(vec![egui::Event::PointerMoved(start.lerp(end, 0.5))]);
+            self.frame(vec![egui::Event::PointerMoved(end)]);
+            self.frame(vec![Self::button(end, button, false)])
+        }
+
+        fn key(key: egui::Key, shift: bool) -> egui::Event {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn map_reverse_drag_and_keys_retain_origin_extend_shrink_and_repeat() {
+        for (start, end) in [(480, 530), (530, 480)] {
+            let mut harness = MapHarness::new();
+            let geometry = harness.geometry();
+            harness.drag(
+                geometry.position(start as f32 + 0.25, 120.),
+                geometry.position(end as f32 + 0.25, 120.),
+                egui::PointerButton::Primary,
+            );
+            assert_eq!(
+                harness.viewer.selection.as_ref().unwrap().segments,
+                vec![(480, 531)]
+            );
+            let cursor = harness.viewer.nucleotide_cursor.unwrap();
+            assert_eq!((cursor.anchor, cursor.active), (start, end));
+            harness.frame(vec![MapHarness::key(egui::Key::ArrowRight, true)]);
+            assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, end + 1);
+            assert_eq!(harness.viewer.nucleotide_cursor.unwrap().anchor, start);
+            harness.frame(vec![MapHarness::key(egui::Key::ArrowLeft, true)]);
+            assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, end);
+            harness.frame(vec![MapHarness::key(egui::Key::ArrowLeft, false)]);
+            assert!(harness.viewer.selection.is_none());
+            let cursor = harness.viewer.nucleotide_cursor.unwrap();
+            assert_eq!((cursor.anchor, cursor.active), (start - 1, start - 1));
+            harness.frame(vec![
+                MapHarness::key(egui::Key::ArrowRight, false),
+                MapHarness::key(egui::Key::ArrowRight, false),
+            ]);
+            assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, start + 1);
+            harness.frame(vec![MapHarness::key(egui::Key::ArrowRight, true)]);
+            assert_eq!(
+                harness.viewer.selection.as_ref().unwrap().segments,
+                vec![(start as usize + 1, start as usize + 3)]
+            );
+            // Clicking elsewhere removes map focus, so arrow keys remain available elsewhere.
+            harness.click(Pos2::new(2., 2.), egui::PointerButton::Primary);
+            let before = harness.viewer.nucleotide_cursor.unwrap().active;
+            harness.frame(vec![MapHarness::key(egui::Key::ArrowRight, false)]);
+            assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, before);
+        }
+    }
+
+    #[test]
+    fn map_reverse_origin_drag_and_keyboard_boundaries_keep_cursor_visible() {
+        let mut harness = MapHarness::new();
+        harness.viewer.center = 0.;
+        let geometry = harness.geometry();
+        harness.drag(
+            geometry.position(10.25, 120.),
+            geometry.position(-20.25, 120.),
+            egui::PointerButton::Primary,
+        );
+        assert_eq!(
+            harness.viewer.selection.as_ref().unwrap().segments,
+            vec![(979, 1000), (0, 11)]
+        );
+        assert_eq!(harness.viewer.nucleotide_cursor.unwrap().anchor, 10);
+        harness.frame(vec![MapHarness::key(egui::Key::ArrowRight, false)]);
+        assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, 11);
+        assert!(harness.viewer.selection.is_none());
+        // Repeated movement past the visible linear window follows the cursor.
+        harness.frame(
+            (0..180)
+                .map(|_| MapHarness::key(egui::Key::ArrowRight, false))
+                .collect(),
+        );
+        let geometry = harness.geometry();
+        let (left, right) = geometry.window();
+        let active = harness.viewer.nucleotide_cursor.unwrap().active as f32;
+        assert!(left <= active && active <= right);
+        let mut cursor = NucleotideCursor {
+            anchor: 0,
+            active: 0,
+        };
+        cursor.step(-1, false, 1000, true);
+        assert_eq!(cursor.active, 999);
+        cursor.step(1, false, 1000, true);
+        assert_eq!(cursor.active, 0);
+        cursor.step(-1, true, 1000, false);
+        assert_eq!(cursor.active, 0);
+    }
+
+    #[test]
+    fn map_ctrl_arrows_step_one_residue_and_preserve_selection_origin() {
+        let mut harness = MapHarness::new();
+        let geometry = harness.geometry();
+        harness.drag(
+            geometry.position(530.25, 120.),
+            geometry.position(480.25, 120.),
+            egui::PointerButton::Primary,
+        );
+        let key = |key, shift| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                shift,
+                ..Default::default()
+            },
+        };
+        harness.frame(vec![key(egui::Key::ArrowLeft, true)]);
+        assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, 477);
+        assert_eq!(
+            harness.viewer.selection.as_ref().unwrap().segments,
+            vec![(477, 531)]
+        );
+        harness.frame(vec![key(egui::Key::ArrowRight, true)]);
+        assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, 480);
+        harness.frame(vec![key(egui::Key::ArrowRight, false)]);
+        assert!(harness.viewer.selection.is_none());
+        let cursor = harness.viewer.nucleotide_cursor.unwrap();
+        assert_eq!((cursor.anchor, cursor.active), (533, 533));
+        harness.frame(vec![key(egui::Key::ArrowLeft, false)]);
+        assert_eq!(harness.viewer.nucleotide_cursor.unwrap().active, 530);
+    }
+
+    #[test]
+    fn map_context_copy_uses_actual_clipboard_and_right_drag_still_pans() {
+        let mut harness = MapHarness::new();
+        let geometry = harness.geometry();
+        harness.viewer.selection = Some(copy_selection(&[(480, 492)], 1));
+        harness.viewer.nucleotide_cursor = Some(NucleotideCursor {
+            anchor: 480,
+            active: 491,
+        });
+        let original = harness.viewer.selection.as_ref().unwrap().segments.clone();
+        let before = (harness.viewer.center, harness.viewer.zoom);
+        let position = geometry.position(500., 120.);
+        harness.click(position, egui::PointerButton::Secondary);
+        let menu = harness.frame(vec![]);
+        assert!(painted_text(&menu.shapes).contains(&"Copy nucleotides".into()));
+        assert!(painted_text(&menu.shapes).contains(&"Copy translation".into()));
+        harness.frame(vec![MapHarness::key(egui::Key::ArrowRight, false)]);
+        assert_eq!(
+            harness.viewer.nucleotide_cursor.unwrap().active,
+            491,
+            "menu focus must not move the map cursor"
+        );
+        assert_eq!((harness.viewer.center, harness.viewer.zoom), before);
+        assert_eq!(
+            harness.viewer.selection.as_ref().unwrap().segments,
+            original
+        );
+        let button = menu
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Copy nucleotides" => {
+                    Some(text.pos + text.galley.size() / 2.)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let copied = harness.click(button, egui::PointerButton::Primary);
+        assert!(copied.platform_output.commands.iter().any(
+            |command| matches!(command,egui::OutputCommand::CopyText(text) if text=="ACGTACGTACGT")
+        ));
+        let geometry = harness.geometry();
+        let position = geometry.position(500., 120.);
+        harness.click(position, egui::PointerButton::Secondary);
+        let menu = harness.frame(vec![]);
+        let button = menu
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Copy translation" => {
+                    Some(text.pos + text.galley.size() / 2.)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let copied = harness.click(button, egui::PointerButton::Primary);
+        assert!(
+            copied.platform_output.commands.iter().any(
+                |command| matches!(command,egui::OutputCommand::CopyText(text) if text=="TYVR")
+            )
+        );
+        let geometry = harness.geometry();
+        let position = geometry.position(500., 120.);
+        let dragged = harness.drag(
+            position,
+            position + Vec2::new(45., 0.),
+            egui::PointerButton::Secondary,
+        );
+        assert_ne!(harness.viewer.center, before.0);
+        assert_eq!(harness.viewer.zoom, before.1);
+        assert!(!painted_text(&dragged.shapes).contains(&"Copy nucleotides".into()));
+        assert_eq!(
+            harness.viewer.selection.as_ref().unwrap().segments,
+            original
+        );
+    }
+
+    #[test]
+    fn map_copy_buttons_are_disabled_without_selection() {
+        let context = egui::Context::default();
+        let copy = map_copy_text(&json!({}), "ATG", None, 1, 1);
+        let output = context.run(screen(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let buttons = map_copy_menu(ui, &copy);
+                assert!(buttons.iter().all(|response| !response.enabled()));
+            });
+        });
+        assert!(output.platform_output.commands.is_empty());
     }
     #[test]
     fn biological_parts_and_residue_crop_roundtrip() {

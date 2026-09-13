@@ -392,11 +392,12 @@ def create_product(api, params):
 
 
 def create_protein(api, params):
-    keys(params, ('project_ref', 'expected_sha256', 'sequence', 'request_key'), ('alt_name',))
+    keys(params, ('project_ref', 'expected_sha256', 'sequence', 'request_key'), ('alt_name', 'structures'))
     string(params['project_ref'], 'project_ref', 256); sha(params['expected_sha256'])
     string(params['request_key'], 'request_key', 200)
     alt_name = _alt_name(params)
-    with _opened(api, write=True) as (module, registry, records):
+    from .library_structures import prepared_sources, add_to_document
+    with prepared_sources(api, params.get('structures', [])) as prepared, _opened(api, write=True) as (module, registry, records):
         events = _events(module, records)
         replay = _replay(events, api.actor, 'library.create', params['request_key'], params)
         if replay is not None:
@@ -414,7 +415,10 @@ def create_protein(api, params):
         if set(sequence) - set('ACDEFGHIKLMNPQRSTVWY'):
             document['status'] = 'draft'
         new_ref = f'construct:{ident}@1'
-        return _commit_operation(api, module, registry, records, events, [{'create': document}],
+        attachments = {}
+        if prepared:
+            attachments, _ = add_to_document(None, document, prepared, new_ref, hashlib.sha256(sequence.encode()).hexdigest())
+        return _commit_operation(api, module, registry, records, events, [{'create': document, 'attachments': attachments}],
             before_ref=None, after_ref=new_ref, method='library.create', params=params,
             action='create', label='Create standalone protein', additions={module.reference(project): [new_ref]})
 
@@ -537,6 +541,14 @@ def edit(api, params):
 def _comparable(module, record):
     """Metadata-only parent revisions do not change a derived molecular definition."""
     value = _effective(module, record)
+    # Structure curation is independent of names and molecular definitions.
+    # Undo keeps its append-only assets, including uploads subsequently hidden.
+    from .library_structures import FIELD, catalog
+    catalog(record)
+    curated = value.get('provenance', {}).get('workbench', {})
+    curated.pop(FIELD, None)
+    if not curated:
+        value.get('provenance', {}).pop('workbench', None)
     encoded = value.get('identity', {}).get('encoded_by', {})
     if encoded.get('translation'):
         encoded['construct_ref'] = encoded['construct_ref'].split('@')[0]
@@ -562,7 +574,8 @@ def _reverse_creation(api, module, registry, records, events, original, action, 
         curated.pop('archived', None)
     require(current == expected and presentation(old)['archived'] == (action == 'redo'),
             'This protein has another edit. Undo or redo would overwrite it.', 'conflict')
-    require(old['attachments'] == created['attachments'], 'This protein has different source attachments.', 'conflict')
+    from .library_structures import ordinary_attachments
+    require(ordinary_attachments(old) == ordinary_attachments(created), 'This protein has different source attachments.', 'conflict')
     document = {key: deepcopy(value) for key, value in old.items() if key in module.USER_FIELDS}
     document['provenance'].setdefault('workbench', {})['archived'] = action == 'undo'
     _current_parent_pin(module, registry, records, document)
@@ -580,9 +593,11 @@ def _dependent_reversal(module, registry, records, original, action, parent):
         family = f"{target['kind']}:{target['id']}"
         expected_families.add(family)
         old = records[registry._resolve(family, records)]
-        require(_comparable(module, old) == _comparable(module, target) and old['attachments'] == target['attachments'],
+        from .library_structures import ordinary_attachments, preserve_catalog
+        require(_comparable(module, old) == _comparable(module, target) and ordinary_attachments(old) == ordinary_attachments(target),
                 'A derived protein has another edit. Undo or redo would overwrite its definition.', 'conflict')
         document = {key: deepcopy(value) for key, value in restored.items() if key in module.USER_FIELDS}
+        preserve_catalog(old, document)
         document['parents'] = deepcopy(old['parents'])
         changes.append({'ref': module.reference(old), 'expected_sha256': old['sha256'], 'patch': document})
     if parent['kind'] == 'construct' and parent['identity'].get('molecule_type') in {'dna', 'rna'}:
@@ -671,6 +686,9 @@ def _reverse(api, params, action):
         original = next(event for event in events if event['operation_id'] == params['operation_id'])
         if original['action'] == 'create':
             return _reverse_creation(api, module, registry, records, events, original, action, params)
+        if original['method'] in {'library.structure_attach', 'library.structure_visibility'}:
+            from .library_structures import reverse_structure
+            return reverse_structure(api, module, registry, records, events, original, action, params)
         before, after = records[original['before_ref']], records[original['after_ref']]
         target = after if action == 'undo' else before
         restored = before if action == 'undo' else after
@@ -711,8 +729,10 @@ def _reverse(api, params, action):
             require(_comparable(module, old) == _comparable(module, target),
                     'This entry has another edit. Undo or redo would overwrite it; refresh the library.', 'conflict')
             document = {key: deepcopy(value) for key, value in restored.items() if key in module.USER_FIELDS}
-            require(old['attachments'] == target['attachments'],
+            from .library_structures import ordinary_attachments, preserve_catalog
+            require(ordinary_attachments(old) == ordinary_attachments(target),
                     'This entry has different source attachments; undo or redo cannot overwrite them.', 'conflict')
+            preserve_catalog(old, document)
         document['parents'] = deepcopy(old['parents'])
         _current_parent_pin(module, registry, records, document)
         # Reverse the actual last transaction, which may have included products

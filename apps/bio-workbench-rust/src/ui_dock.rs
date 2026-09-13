@@ -273,6 +273,34 @@ fn abbreviated_title(title: &str) -> String {
     result
 }
 
+fn center_sequence_pick(ui: &egui::Ui, target: Option<egui::Rect>, sequence_clicked: bool) {
+    if !sequence_clicked && let Some(rect) = target {
+        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+    }
+}
+
+fn sequence_scroll_area<R>(
+    ui: &mut egui::Ui,
+    area: egui::ScrollArea,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<egui::scroll_area::ScrollAreaOutput<R>> {
+    ui.scope(|ui| {
+        // egui applies this only to the hovered scroll area, consumes a wheel
+        // event only when it can move, and retains native horizontal scrolling.
+        ui.style_mut().always_scroll_the_only_direction = true;
+        // Reserve a separate gutter from the first frame. A floating bar covers
+        // short residue buttons, and a fixed height clips larger user fonts.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle {
+            bar_width: 8.,
+            bar_inner_margin: 3.,
+            ..egui::style::ScrollStyle::solid()
+        };
+        area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .auto_shrink([false, true])
+            .show(ui, add_contents)
+    })
+}
+
 struct StructureTabs<'a> {
     views: &'a mut BTreeMap<usize, ui_views::View>,
     loading: &'a BTreeMap<usize, String>,
@@ -439,6 +467,17 @@ impl TabViewer for StructureTabs<'_> {
             });
             return;
         };
+        // Resolve the previous frame's exact GPU hit before painting sequence
+        // blocks. A hit also focuses this tab even when its endpoint is unchanged.
+        if view.renderer.consume_pick(
+            &view.molecule,
+            &mut view.selected,
+            &mut view.hotspots,
+            &mut view.selection_range,
+        ) {
+            *self.selected = *slot;
+            self.focus = Some(*slot);
+        }
         let source = match text(&view.metadata, "source_kind") {
             "demo" => "EXPERIMENTAL DEMO · 4OO8 · 2.50 Å · not a prediction".into(),
             "local" => "LOCAL STRUCTURE · original coordinates".into(),
@@ -461,24 +500,30 @@ impl TabViewer for StructureTabs<'_> {
         );
         ui.horizontal(|ui| {
             ui.toggle_value(&mut view.hotspots.enabled, "Pick hotspots")
-                .on_hover_text("Click protein residues in the structure or sequence to toggle hotspots. Ctrl/Cmd-click also toggles; Shift-click the sequence selects a range. Drag still rotates.");
-            ui.small(format!("{} selected", view.hotspots.residues.len()));
+                .on_hover_text("Click protein residues in the structure or sequence to toggle hotspots. Ctrl/Cmd-click also toggles; Shift-click selects a range. Drag still rotates.");
+            ui.small(format!("{} hotspots", view.hotspots.residues.len()));
             if !view.hotspots.residues.is_empty() && ui.small_button("Clear hotspots").clicked() {
                 view.hotspots.residues.clear();
                 view.hotspots.anchor = None;
             }
+            ui.separator();
+            ui.small(format!("{} residues selected", view.selection_range.residues.len()))
+                .on_hover_text("Click a residue, then Shift-click another in the same chain. Both endpoints are included; this selection is separate from hotspots.");
         });
         let mut sequence_pick = None;
-        egui::ScrollArea::horizontal()
-            .id_salt(("sequence", *slot))
-            .max_height(22.)
-            .show(ui, |ui| {
+        let scroll_target = view.selection_range.take_scroll_target();
+        sequence_scroll_area(
+            ui,
+            egui::ScrollArea::horizontal().id_salt(("sequence", *slot)),
+            |ui| {
+                let mut scroll_rect = None;
                 ui.horizontal(|ui| {
                     for (residue_index, residue) in view.molecule.residues.iter().enumerate() {
                         if !view.chains[residue.chain] {
                             continue;
                         }
-                        let selected = view.selected.as_ref() == Some(&residue.key);
+                        let selected = view.selected.as_ref() == Some(&residue.key)
+                            || view.selection_range.residues.contains(&residue.key);
                         let hotspot = view.hotspots.residues.contains(&residue.key);
                         let domain = view.renderer.residue_color(residue_index);
                         let text_color = if hotspot || selected {
@@ -491,7 +536,7 @@ impl TabViewer for StructureTabs<'_> {
                         } else {
                             view.molecule.chains[residue.chain].color
                         };
-                        if ui
+                        let response = ui
                             .add(
                                 egui::Button::new(
                                     RichText::new(residue.letter.to_string())
@@ -508,9 +553,11 @@ impl TabViewer for StructureTabs<'_> {
                                 .min_size(Vec2::new(9., 17.))
                                 .selected(selected),
                             )
-                            .on_hover_text(residue.key.to_string())
-                            .clicked()
-                        {
+                            .on_hover_text(residue.key.to_string());
+                        if scroll_target.as_ref() == Some(&residue.key) {
+                            scroll_rect = Some(response.rect);
+                        }
+                        if response.clicked() {
                             view.selected = Some(residue.key.clone());
                             sequence_pick =
                                 Some((residue.key.clone(), ui.input(|input| input.modifiers)));
@@ -519,8 +566,12 @@ impl TabViewer for StructureTabs<'_> {
                         }
                     }
                 });
-            });
+                center_sequence_pick(ui, scroll_rect, sequence_pick.is_some());
+            },
+        );
         if let Some((key, modifiers)) = sequence_pick {
+            view.selection_range
+                .pick(&view.molecule, &key, modifiers.shift);
             view.hotspots.pick(
                 &view.molecule,
                 &key,
@@ -538,6 +589,7 @@ impl TabViewer for StructureTabs<'_> {
             *slot,
             &mut view.selected,
             &mut view.hotspots,
+            &mut view.selection_range,
             view.visible,
             view.labels,
             self.show_axes,
@@ -653,6 +705,239 @@ mod tests {
 
     fn refs(slots: &[usize]) -> Vec<Value> {
         slots.iter().map(|slot| json!({"slot":slot})).collect()
+    }
+
+    #[test]
+    fn long_sequence_centers_one_3d_pick_then_preserves_manual_scroll() {
+        let ctx = egui::Context::default();
+        let mut time = 0.;
+        let mut frame = |center: bool, sequence_click: bool, offset: Option<f32>| {
+            time += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(400., 100.),
+                )),
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut result = (0., 0.);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut area = egui::ScrollArea::horizontal().id_salt("long-sequence-proof");
+                    if let Some(offset) = offset {
+                        area = area.horizontal_scroll_offset(offset);
+                    }
+                    let output = sequence_scroll_area(ui, area, |ui| {
+                        let mut selected = None;
+                        ui.horizontal(|ui| {
+                            for index in 0..400 {
+                                let response = ui.add_sized([20., 18.], egui::Button::new("A"));
+                                if index == 300 {
+                                    selected = Some(response.rect);
+                                }
+                            }
+                        });
+                        center_sequence_pick(ui, selected.filter(|_| center), sequence_click);
+                        selected.unwrap().center().x
+                    })
+                    .inner;
+                    result = (
+                        output.state.offset.x,
+                        output.inner - output.inner_rect.center().x,
+                    );
+                });
+            });
+            result
+        };
+        assert!(frame(false, false, None).1 > 1000.);
+        frame(true, false, None);
+        for _ in 0..8 {
+            frame(false, false, None);
+        }
+        let centered = frame(false, false, None);
+        assert!(centered.0 > 1000.);
+        // egui keeps a small scroll margin around the centered button.
+        assert!(centered.1.abs() <= 4., "{centered:?}");
+        frame(false, false, Some(250.));
+        let manual = frame(false, false, None);
+        assert!((manual.0 - 250.).abs() < 1., "{manual:?}");
+        // A same-frame sequence click takes priority over a pending 3D marker.
+        frame(true, true, None);
+        for _ in 0..8 {
+            frame(false, false, None);
+        }
+        assert!((frame(false, false, None).0 - 250.).abs() < 1.);
+    }
+
+    #[derive(Debug)]
+    struct StripFrame {
+        offset: f32,
+        outer: egui::Rect,
+        row: egui::Rect,
+        remaining_wheel: Vec2,
+    }
+
+    struct StripHarness {
+        ctx: egui::Context,
+        time: f64,
+        count: usize,
+        width: f32,
+    }
+
+    impl StripHarness {
+        fn new(count: usize, width: f32, font: f32, scale: f32) -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            ctx.style_mut(|style| {
+                for text in [egui::TextStyle::Button, egui::TextStyle::Monospace] {
+                    style
+                        .text_styles
+                        .insert(text, egui::FontId::monospace(font));
+                }
+            });
+            Self {
+                ctx,
+                time: 0.,
+                count,
+                width,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>, recenter: bool) -> StripFrame {
+            self.time += 0.1;
+            let mut result = None;
+            let _ = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(self.width, 160.),
+                    )),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let previous_floating = ui.spacing().scroll.floating;
+                        let previous_wheel = ui.style().always_scroll_the_only_direction;
+                        let scoped = sequence_scroll_area(
+                            ui,
+                            egui::ScrollArea::horizontal().id_salt("strip-wheel-proof"),
+                            |ui| {
+                                let mut selected = None;
+                                let row = ui.horizontal(|ui| {
+                                    for index in 0..self.count {
+                                        let response = ui.add(
+                                            egui::Button::new(RichText::new("A").monospace())
+                                                .min_size(Vec2::new(9., 17.)),
+                                        );
+                                        if index == 300 {
+                                            selected = Some(response.rect);
+                                        }
+                                    }
+                                });
+                                center_sequence_pick(ui, selected.filter(|_| recenter), false);
+                                row.response.rect
+                            },
+                        );
+                        assert_eq!(ui.spacing().scroll.floating, previous_floating);
+                        assert_eq!(ui.style().always_scroll_the_only_direction, previous_wheel);
+                        result = Some(StripFrame {
+                            offset: scoped.inner.state.offset.x,
+                            outer: scoped.response.rect,
+                            row: scoped.inner.inner,
+                            remaining_wheel: ctx.input(|input| input.smooth_scroll_delta),
+                        });
+                    });
+                },
+            );
+            result.unwrap()
+        }
+
+        fn wheel(&mut self, position: egui::Pos2, delta: Vec2) -> StripFrame {
+            self.frame(
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn residue_strip_maps_hovered_vertical_wheel_and_preserves_native_horizontal() {
+        for delta in [Vec2::new(0., -24.), Vec2::new(-24., 0.)] {
+            let mut harness = StripHarness::new(400, 380., 14., 1.);
+            let first = harness.frame(vec![], false);
+            let hover = egui::pos2(first.outer.center().x, first.row.center().y);
+            let moved = harness.wheel(hover, delta);
+            assert!(
+                moved.offset > 0.,
+                "{delta:?} first={first:?} moved={moved:?}"
+            );
+            assert_eq!(moved.remaining_wheel, Vec2::ZERO);
+        }
+    }
+
+    #[test]
+    fn residue_strip_does_not_capture_wheel_outside_or_without_overflow() {
+        let mut harness = StripHarness::new(400, 380., 14., 1.);
+        let first = harness.frame(vec![], false);
+        let outside = egui::pos2(first.outer.center().x, first.outer.bottom() + 35.);
+        let moved = harness.wheel(outside, Vec2::new(0., -24.));
+        assert_eq!(moved.offset, 0.);
+        assert!(moved.remaining_wheel.y < 0.);
+        for count in [0, 2] {
+            let mut harness = StripHarness::new(count, 380., 14., 1.);
+            let first = harness.frame(vec![], false);
+            let moved = harness.wheel(first.outer.center(), Vec2::new(0., -24.));
+            assert_eq!(moved.offset, 0.);
+            assert!(moved.remaining_wheel.y < 0.);
+        }
+    }
+
+    #[test]
+    fn residue_strip_gutter_stays_below_complete_blocks_at_large_fonts_and_small_widths() {
+        for (font, width, scale) in [(12., 380., 1.), (28., 180., 1.), (40., 220., 2.)] {
+            let mut harness = StripHarness::new(400, width, font, scale);
+            for _ in 0..4 {
+                let frame = harness.frame(vec![], false);
+                assert!(
+                    frame.row.bottom() + 10. <= frame.outer.bottom(),
+                    "{frame:?}"
+                );
+                assert!(frame.outer.height() >= frame.row.height() + 10.);
+                assert!(frame.outer.bottom() <= 160.);
+            }
+        }
+    }
+
+    #[test]
+    fn residue_strip_wheel_moves_after_one_3d_recenter_without_snapping_back() {
+        let mut harness = StripHarness::new(400, 380., 14., 1.);
+        harness.frame(vec![], false);
+        harness.frame(vec![], true);
+        for _ in 0..8 {
+            harness.frame(vec![], false);
+        }
+        let centered = harness.frame(vec![], false);
+        assert!(centered.offset > 1000.);
+        let hover = egui::pos2(centered.outer.center().x, centered.row.center().y);
+        let moved = harness.wheel(hover, Vec2::new(0., -24.));
+        assert!(
+            moved.offset > centered.offset,
+            "centered={centered:?} moved={moved:?}"
+        );
+        for _ in 0..8 {
+            let later = harness.frame(vec![], false);
+            assert!(later.offset >= moved.offset);
+        }
     }
 
     fn ids(dock: &DockState<usize>) -> Vec<usize> {

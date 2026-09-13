@@ -20,6 +20,7 @@ rustPlatform.buildRustPackage {
     export GALLIUM_DRIVER=llvmpipe
     export LIBGL_DRIVERS_PATH=${mesa.drivers}/lib/dri
     export __EGL_VENDOR_LIBRARY_FILENAMES=${mesa.drivers}/share/glvnd/egl_vendor.d/50_mesa.json
+    export LD_LIBRARY_PATH=${mesa.drivers}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     unset WAYLAND_DISPLAY EFRAME_SCREENSHOT_TO
     export WINIT_UNIX_BACKEND=x11
     export WINIT_X11_SCALE_FACTOR=1

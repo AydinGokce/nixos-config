@@ -235,13 +235,78 @@ work. Molecular model compatibility remains part of the existing run preview.
   to 1,000 features and 256 KiB of metadata. Oversized peptides fail explicitly
   rather than returning a truncated sequence with its full digest. Clients must
   independently verify sequence-to-structure correspondence before coloring.
+* `library.structures {ref,include_revisions?,include_hidden?,limit?,cursor?}`
+  returns `schema:1,ref,sha256,sequence_sha256,entries,next_cursor,scope`.
+  Defaults include all revisions of the selected protein family, omit hidden
+  cards, and return 50 entries (maximum 100). Order is creation time descending,
+  then opaque stable `entry_id`. Manual cards are immutable library attachments;
+  automatic cards are retained `role:structure` PDB/mmCIF artifacts whose original
+  batch explicitly selected this pinned protein or an assembly containing it.
+  Names, equal sequences, floating references, templates and input files do not
+  create associations. Same-job identical-byte aliases share one card. Shared
+  prediction access requires artifact/job/batch ownership to agree and every
+  relevant molecular input to be a pinned shared library reference. Complexes
+  with private text/upload partners remain visible only to their original actor.
+  Generic job/artifact APIs retain their existing actor boundaries.
+  Previously saved BindCraft proteins also expose their existing
+  `predicted-complex.pdb` when its immutable structure/sequence/provenance receipts
+  agree. Their original saved protein revision is retained across later edits and
+  library-only backup/restore. The separately retained design target is excluded.
+  These cards add `association:saved_bindcraft_candidate,candidate_status`;
+  `job_state` is null because an archived library receipt does not establish the
+  current state or availability of its originating job.
+  Each card has `entry_id,origin:manual|prediction,label,format,size,sha256,
+  source_ref,source_sequence_sha256,sequence_relation,hidden,created_at,protein`.
+  Prediction cards additionally retain `source_refs,job_id,job_state,model,
+  confidence,qa`. `protein` binds the exact associated protein's `ref,sha256,
+  sequence_sha256,derivation_kind` and, when derived, `parent:{ref,sha256,
+  molecule_type,molecular_form}`; otherwise parent is null. This is the original
+  source revision, never a guessed current protein/plasmid. `sequence_relation`
+  is `same_library_sequence`, `historical_library_sequence`, or `unresolved`.
+  This compares library sequences, not coordinate-chain identity;
+  `coordinate_sequence_match:unverified` makes that distinction explicit.
+* `library.structure_read {ref,entry_id,offset?,length?}` reauthorizes the exact
+  association on every read and verifies the complete source digest. It returns
+  `ref,entry_id,source_ref,source_sequence_sha256,protein,sha256,size,format,name,
+  offset,next_offset,eof,data_base64`. Length defaults to 131072, maximum 262144.
+  Hidden entries remain readable by their exact ID; trash does not destroy or
+  revoke historical evidence. No filesystem paths are accepted or returned.
+  `library.structure_links {artifact_id}` supports structures opened from ordinary
+  run history: it requires the existing actor-owned `role:structure` artifact,
+  job and original batch, verifies the structure bytes, and returns
+  `schema:1,artifact_id,sha256,proteins:[...]` with the same exact source context
+  objects. Only explicitly referenced library proteins are returned; equal
+  sequences and names do not establish backlinks. This method grants no shared
+  artifact access beyond the separate verified gallery association.
+* `library.structure_attach {ref,expected_sha256,structures,request_key}` accepts
+  1–16 `{source:{kind:upload|artifact,id,sha256},label?}` entries from completed,
+  actor-owned uploads or artifacts. PDB/mmCIF files are bounded to 32 MiB each;
+  manual assets are bounded to 128 MiB / 256 associations per protein. Exact
+  original bytes are copied atomically into hash-named library attachments and
+  included in normal backups. Basic text/format checks preserve alternate
+  conformers, incomplete structures and multiple models; actual render/parser
+  issues remain visible in thumbnail/viewer diagnostics. No structure is made
+  a molecular input template via `identity.structure_file`.
+  `library.create` accepts the same optional `structures` list and creates the
+  protein, attachments and project membership in one recoverable transaction.
+* `library.structure_visibility {ref,expected_sha256,entry_id,hidden,request_key}`
+  hides/restores one shared card. Both structure mutations return the ordinary
+  library edit response and actor-owned Undo/Redo history. Upload undo hides the
+  association while retaining its append-only catalog and asset bytes. Ordinary
+  molecular/name undo preserves that independent structure catalog; only verified
+  managed structure attachments are exempted from strict source-attachment
+  equality. Other users' conflicting changes to the same visibility state are
+  rejected. No prediction completion writes to the library: automatic cards are
+  derived from retained exact associations, so existing runs appear immediately.
+  Thumbnail queue/read RPCs and their independent CPU service are documented in
+  `STRUCTURE_THUMBNAILS.md`; caches never bypass association authorization.
 * `library.product_preview {parent_ref,translation}` returns the canonical
   definition and `parent_ref,parent_sha256,available,sequence,length,issues`.
   `parent_sha256` binds the parent record, not just its DNA sequence. This is
   read-only and returns diagnostics for biologically unavailable definitions.
 * `library.product_create {parent_ref,expected_sha256,translation,alt_name?,request_key}`
   creates a derived protein and adds it to the current parent's projects.
-  `library.create {project_ref,expected_sha256,sequence,alt_name?,request_key}`
+  `library.create {project_ref,expected_sha256,sequence,alt_name?,structures?,request_key}`
   creates a standalone protein in that project. Both require an exact current
   parent/project record SHA and return the edit-response shape. New entities
   have `before_ref:null`; clients must not match that value against an existing

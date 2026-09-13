@@ -5,6 +5,7 @@
 let
   rfaaStorage = import ./rfaa-storage.nix;
   msaStorage = import ./msa-storage.nix;
+  structureRenderer = pkgs.callPackage ../../apps/bio-workbench-rust/renderer-package.nix { };
   workbenchConfig = pkgs.writeText "bio-workbench-config.json" (builtins.toJSON {
     max_jobs = 10;
   });
@@ -51,6 +52,7 @@ in
   environment.systemPackages = (with pkgs; [
     git curl wget jq tmux vim htop rsync openssh uv python3 tailscale util-linux
   ]) ++ [
+    structureRenderer
     (pkgs.writeShellScriptBin "dc" ''
       export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused python3 ])}''${PATH:+:$PATH}
       # Let provider cleanup settle across all submission controllers.
@@ -308,6 +310,7 @@ in
 
   systemd.tmpfiles.rules = [
     "d /var/lib/bio-workbench 0700 root root - -"
+    "d /var/lib/bio-workbench/structure-thumbnails 0700 root root - -"
     "d /var/lib/bio-inference 0700 root root - -"
     "d /var/lib/bio-library 0700 root root - -"
     "d /var/lib/bio-library-runtime 0700 root root - -"
@@ -372,6 +375,36 @@ in
       RestartSec = 5;
       TimeoutStopSec = 30;
       UMask = "0077";
+    };
+  };
+
+  systemd.services.bio-structure-thumbnails = {
+    description = "Cached protein gallery thumbnails with the native studio renderer";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-tmpfiles-setup.service" ];
+    restartTriggers = [ ./workbench structureRenderer ];
+    environment = {
+      BIO_WORKBENCH_RENDERER = "${structureRenderer}/bin/bio-render-headless";
+      LP_NUM_THREADS = "2";
+      OMP_NUM_THREADS = "2";
+    };
+    serviceConfig = {
+      Type = "simple";
+      ExecStart = "${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/library_structure_thumbnails.py --state /var/lib/bio-workbench --renderer ${structureRenderer}/bin/bio-render-headless";
+      Restart = "on-failure";
+      RestartSec = 5;
+      TimeoutStopSec = 10;
+      KillMode = "control-group";
+      UMask = "0077";
+      Nice = 5;
+      CPUQuota = "200%";
+      MemoryMax = "2G";
+      TasksMax = 64;
+      NoNewPrivileges = true;
+      PrivateTmp = true;
+      ProtectSystem = "strict";
+      ProtectHome = true;
+      ReadWritePaths = [ "/var/lib/bio-workbench/structure-thumbnails" ];
     };
   };
 

@@ -105,6 +105,7 @@ pub(super) struct Renderer {
     surface_failed: bool,
     highlights: glow::Texture,
     highlight_ids: Vec<usize>,
+    selection_ids: Vec<usize>,
     colors: glow::Texture,
     palette: ResiduePalette,
     residue_count: usize,
@@ -496,13 +497,13 @@ impl Renderer {
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
-                glow::R8 as i32,
+                glow::RG8 as i32,
                 256,
                 rows as i32,
                 0,
-                glow::RED,
+                glow::RG,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&vec![0; 256 * rows])),
+                glow::PixelUnpackData::Slice(Some(&vec![0; 2 * 256 * rows])),
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -551,6 +552,7 @@ impl Renderer {
             surface_failed: false,
             highlights,
             highlight_ids: Vec::new(),
+            selection_ids: Vec::new(),
             colors,
             palette,
             residue_count: molecule.residues.len(),
@@ -717,6 +719,7 @@ impl Renderer {
         selected: usize,
         chains: &[bool],
         hotspots: &[usize],
+        selection: &[usize],
     ) {
         if self.destroyed || self.error.is_some() {
             return;
@@ -777,12 +780,17 @@ impl Renderer {
         unsafe {
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.highlights));
-            if hotspots != self.highlight_ids {
+            if hotspots != self.highlight_ids || selection != self.selection_ids {
                 let rows = (self.residue_count + 1).div_ceil(256).max(1);
-                let mut data = vec![0u8; 256 * rows];
+                let mut data = vec![0u8; 2 * 256 * rows];
                 for &id in hotspots {
                     if id > 0 && id <= self.residue_count {
-                        data[id] = 255;
+                        data[2 * id] = 255;
+                    }
+                }
+                for &id in selection {
+                    if id > 0 && id <= self.residue_count {
+                        data[2 * id + 1] = 255;
                     }
                 }
                 gl.tex_sub_image_2d(
@@ -792,11 +800,12 @@ impl Renderer {
                     0,
                     256,
                     rows as i32,
-                    glow::RED,
+                    glow::RG,
                     glow::UNSIGNED_BYTE,
                     glow::PixelUnpackData::Slice(Some(&data)),
                 );
                 self.highlight_ids = hotspots.to_vec();
+                self.selection_ids = selection.to_vec();
             }
             gl.active_texture(glow::TEXTURE3);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.colors));
@@ -1043,7 +1052,9 @@ void surface(vec3 p,vec3 normal,vec3 color,float residue) {
     vec3 lit=color*diffuse+vec3(1.,0.97,0.92)*specular;
     lit+=vec3(0.13,0.26,0.32)*max(dot(n,rim),0.)*fresnel;
     float selected=step(0.5,u_selected)*(1.-smoothstep(0.25,0.75,abs(residue-u_selected)));
-    float hotspot=texelFetch(u_hotspots,ivec2(identity%256,identity/256),0).r;
+    vec2 highlights=texelFetch(u_hotspots,ivec2(identity%256,identity/256),0).rg;
+    float hotspot=highlights.r;
+    selected=max(selected,highlights.g);
     lit=mix(lit,lit*0.10+vec3(0.78,0.115,0.016)*diffuse,hotspot*0.90);
     lit=mix(lit,lit*0.45+vec3(0.68,0.47,0.13),selected*0.55*(1.-hotspot*0.8));
     // Mild atmospheric attenuation makes the interior less visually crowded.

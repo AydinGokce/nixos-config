@@ -28,6 +28,7 @@ pub(super) struct Import {
     chain: usize,
     filter: String,
     error: String,
+    proteins: Vec<Value>,
 }
 
 fn chain_name(molecule: &scene::Molecule, index: usize) -> String {
@@ -104,15 +105,8 @@ fn feature_mapping(
     Ok((domain_state::spans(indices), count, total))
 }
 
-pub(super) fn imported_layer(
-    response: &Value,
-    feature: &Value,
-    mapping: &[Option<usize>],
-    chain: usize,
-    color: [u8; 3],
-) -> Result<(Layer, usize, usize), String> {
-    let (spans, count, total) = feature_mapping(feature, mapping)?;
-    let id = domain_state::digest(
+fn import_id(response: &Value, feature: &Value, chain: usize) -> String {
+    domain_state::digest(
         &serde_json::to_vec(&json!([
             response["ref"],
             response["sequence_sha256"],
@@ -121,7 +115,34 @@ pub(super) fn imported_layer(
             chain
         ]))
         .unwrap(),
-    );
+    )
+}
+
+fn linked_plasmid_proteins(metadata: &Value, endpoint: &str) -> Vec<Value> {
+    if text(metadata, "library_endpoint") != endpoint {
+        return Vec::new();
+    }
+    rows(metadata, "library_proteins")
+        .iter()
+        .filter(|protein| {
+            text(protein, "derivation_kind") == "derived"
+                && text(&protein["parent"], "molecular_form") == "plasmid"
+                && text(protein, "ref").starts_with("construct:")
+                && !text(&protein["parent"], "ref").is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
+pub(super) fn imported_layer(
+    response: &Value,
+    feature: &Value,
+    mapping: &[Option<usize>],
+    chain: usize,
+    color: [u8; 3],
+) -> Result<(Layer, usize, usize), String> {
+    let (spans, count, total) = feature_mapping(feature, mapping)?;
+    let id = import_id(response, feature, chain);
     let color = text(feature, "color")
         .strip_prefix('#')
         .filter(|s| s.len() == 6)
@@ -147,6 +168,7 @@ pub(super) fn imported_layer(
 impl Workbench {
     pub(super) fn domains_panel(&mut self, ui: &mut egui::Ui) {
         let slot = self.state.selected_view;
+        let endpoint = self.run_endpoint();
         let Some(view) = self.views.get_mut(&slot).filter(|v| {
             v.molecule
                 .chains
@@ -155,6 +177,13 @@ impl Workbench {
         }) else {
             return;
         };
+        view.renderer.consume_pick(
+            &view.molecule,
+            &mut view.selected,
+            &mut view.hotspots,
+            &mut view.selection_range,
+        );
+        let can_import = !linked_plasmid_proteins(&view.metadata, &endpoint).is_empty();
         let mut import = false;
         let mut changed = false;
         egui::CollapsingHeader::new("Protein domains")
@@ -184,6 +213,50 @@ impl Workbench {
                         view.domains.color = domain_state::palette(view.domains.data.layers.len());
                     }
                 });
+                if !view.selection_range.residues.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak(format!(
+                            "{} selected residues",
+                            view.selection_range.residues.len()
+                        ));
+                        if ui.button("Create annotation…").clicked()
+                            && let Some((chain, indices)) = view
+                                .molecule
+                                .chains
+                                .iter()
+                                .enumerate()
+                                .find_map(|(chain, _)| {
+                                    let residues =
+                                        domain_state::protein_chain(&view.molecule, chain);
+                                    let indices: Vec<_> = residues
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(position, &index)| {
+                                            view.selection_range
+                                                .residues
+                                                .contains(&view.molecule.residues[index].key)
+                                                .then_some(position)
+                                        })
+                                        .collect();
+                                    (indices.len() == view.selection_range.residues.len())
+                                        .then_some((chain, indices))
+                                })
+                        {
+                            view.domains.chain = chain;
+                            view.domains.ranges =
+                                domain_state::ranges_label(&domain_state::spans(indices));
+                            view.domains.label.clear();
+                            view.domains.color =
+                                domain_state::palette(view.domains.data.layers.len());
+                            view.domains.editing = None;
+                            view.domains.open = true;
+                        }
+                        if ui.small_button("Clear selection").clicked() {
+                            view.selection_range = scene::SelectionRange::default();
+                            view.selected = None;
+                        }
+                    });
+                }
                 let mut next = view.domains.data.clone();
                 let mut remove = None;
                 for layer in &mut next.layers {
@@ -250,7 +323,7 @@ impl Workbench {
                 if view.domains.data.layers.is_empty() {
                     ui.weak("Color named protein regions.");
                 }
-                if ui.button("Import plasmid annotations…").clicked() {
+                if can_import && ui.button("Import plasmid annotations…").clicked() {
                     import = true;
                 }
                 if view.domains.open {
@@ -371,24 +444,21 @@ impl Workbench {
             self.log("Open a protein structure before importing its domains.");
             return;
         };
-        let reference = reference.unwrap_or_else(|| {
-            if self
-                .artifact_metadata
-                .contains_key(text(&view.metadata, "artifact_id"))
-            {
-                let refs = rows(&view.metadata["job_provenance"], "source_refs");
-                if refs.len() == 1 {
-                    return refs[0].as_str().unwrap_or("").to_owned();
-                }
-            }
-            String::new()
-        });
+        let proteins = linked_plasmid_proteins(&view.metadata, &self.run_endpoint());
+        let reference = reference
+            .filter(|r| proteins.iter().any(|p| text(p, "ref") == r))
+            .or_else(|| proteins.first().map(|p| text(p, "ref").to_owned()));
+        let Some(reference) = reference else {
+            self.log("This structure has no associated plasmid-derived protein.");
+            return;
+        };
         self.domain_import = Import {
             open: true,
             slot,
             sha256: text(&view.metadata, "sha256").into(),
             endpoint: self.run_endpoint(),
             reference,
+            proteins,
             chain: view.domains.chain,
             ..Default::default()
         };
@@ -449,6 +519,16 @@ impl Workbench {
                 .rsplit_once('@')
                 .is_none_or(|(_, n)| n.parse::<u64>().is_err())
             || (request.reference.contains('@') && request.reference != reference)
+            || self
+                .domain_import
+                .proteins
+                .iter()
+                .find(|p| text(p, "ref") == reference)
+                .is_none_or(|p| {
+                    p["sha256"] != response["sha256"]
+                        || p["sequence_sha256"] != response["sequence_sha256"]
+                        || p["parent"]["ref"] != response["source"]["ref"]
+                })
         {
             self.domain_import.error =
                 "The annotation response failed its protein identity checks.".into();
@@ -499,17 +579,16 @@ impl Workbench {
         let mut open = true;
         let mut fetch = false;
         let mut apply = false;
-        let mut browse = false;
         egui::Window::new("Import plasmid annotations").open(&mut open).default_width(650.).default_height(500.).resizable(true).show(ctx,|ui| {
             ui.label(format!("Structure: {}",ui_views::display_name(&view.metadata)));
             ui.horizontal(|ui| {
-                let changed=ui.add(egui::TextEdit::singleline(&mut panel.reference).hint_text("construct:protein-id@revision").desired_width((ui.available_width()-80.).max(120.))).changed();
-                if changed{panel.response=Value::Null;panel.selected.clear();panel.request=None;}
-                if ui.add_enabled(self.connected,egui::Button::new("Load")).clicked(){fetch=true;}
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Browse library").clicked(){browse=true;}
-                if text(&self.library.detail["record"]["identity"],"molecule_type")=="protein" && ui.button("Use selected library protein").clicked(){panel.reference=text(&self.library.detail,"ref").into();fetch=true;}
+                ui.label("Protein");
+                if panel.proteins.len()>1 {
+                    egui::ComboBox::from_id_salt("annotation-source-protein").selected_text(&panel.reference).show_ui(ui,|ui| {
+                        for protein in &panel.proteins {let reference=text(protein,"ref");if ui.selectable_value(&mut panel.reference,reference.into(),reference).changed(){fetch=true;}}
+                    });
+                }else{ui.label(&panel.reference);}
+                if ui.add_enabled(self.connected,egui::Button::new("Refresh")).clicked(){fetch=true;}
             });
             ui.weak("Curated plasmid annotations mapped through this protein's saved translation. No autodetected CDSs or ORFs.");
             ui.weak("Labels describe the original plasmid features; sequence or frame edits may change their biological meaning.");
@@ -529,9 +608,12 @@ impl Workbench {
                 if let Err(error)=&mapping{ui.colored_label(AMBER,error);}
                 ui.add(egui::TextEdit::singleline(&mut panel.filter).hint_text("Filter annotations (e.g. TadA)").desired_width(f32::INFINITY));
                 let filter=panel.filter.to_lowercase();
-                let features=rows(&panel.response,"features");
+                let features:Vec<_>=rows(&panel.response,"features").iter().filter(|feature|
+                    !view.domains.data.layers.iter().any(|layer|layer.id==import_id(&panel.response,feature,panel.chain))
+                ).collect();
+                panel.selected.retain(|id|features.iter().any(|f|text(f,"id")==id));
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(mapping.is_ok(),egui::Button::new("Select visible")).clicked(){for feature in features{if text(feature,"label").to_lowercase().contains(&filter) && mapping.as_ref().is_ok_and(|m|feature_mapping(feature,m).is_ok()){panel.selected.insert(text(feature,"id").into());}}}
+                    if ui.add_enabled(mapping.is_ok(),egui::Button::new("Select visible")).clicked(){for feature in &features{if text(feature,"label").to_lowercase().contains(&filter) && mapping.as_ref().is_ok_and(|m|feature_mapping(feature,m).is_ok()){panel.selected.insert(text(feature,"id").into());}}}
                     if ui.button("Clear").clicked(){panel.selected.clear();}
                 });
                 egui::ScrollArea::vertical().id_salt("domain-import-features").max_height((ui.available_height()-70.).max(160.)).show(ui,|ui| {
@@ -546,7 +628,7 @@ impl Workbench {
                         else{ui.weak("No reliably mapped residues in this chain.");}
                         for issue in rows(feature,"issues"){ui.colored_label(AMBER,text(issue,"message"));}
                     }
-                    if features.is_empty(){ui.weak("No current plasmid annotations map to this protein.");}
+                    if features.is_empty(){ui.weak(if rows(&panel.response,"features").is_empty(){"No current plasmid annotations map to this protein."}else{"All available annotations have been imported into this chain."});}
                     for issue in rows(&panel.response,"issues"){ui.colored_label(AMBER,text(issue,"message"));}
                     ui.collapsing(format!("Excluded annotations ({})",rows(&panel.response,"excluded").len()),|ui| {
                         for feature in rows(&panel.response,"excluded"){ui.weak(format!("{} · {}",text(feature,"label"),text(feature,"reason")));}
@@ -558,10 +640,6 @@ impl Workbench {
         });
         panel.open = open;
         self.domain_import = panel;
-        if browse {
-            self.domain_import.open = false;
-            self.sidebar_tab = 2;
-        }
         if fetch {
             self.domains_fetch();
         }

@@ -25,12 +25,12 @@ pub(super) struct Explorer {
     next_offset: Option<u64>,
     filtered_count: u64,
     total_count: u64,
-    tab: usize,
+    pub(super) tab: usize,
     source_document: bool,
     archive: bool,
     scoped_archive: bool,
     pub(super) undo_history: Value,
-    write_error: String,
+    pub(super) write_error: String,
     edit: Option<Edit>,
     added: String,
 }
@@ -437,13 +437,13 @@ impl Workbench {
         }
     }
 
-    fn library_writing(&self) -> bool {
+    pub(super) fn library_writing(&self) -> bool {
         self.pending
             .values()
             .any(|pending| matches!(pending.purpose, Purpose::LibraryWrite(_)))
     }
 
-    fn library_write(&mut self, method: &str, mut params: Value) {
+    pub(super) fn library_write(&mut self, method: &str, mut params: Value) {
         if self.library_writing() {
             return;
         }
@@ -505,6 +505,7 @@ impl Workbench {
             self.library.selected = text(&value, "ref").into();
             self.library.tab = 1;
         }
+        self.library_structures_saved(sent);
         self.library.write_error.clear();
         self.library.undo_history = value["history"].clone();
         self.library.detail = Value::Null;
@@ -851,6 +852,9 @@ impl Workbench {
                 }
             }
             ui_sequence::Action::Write(method, params) => self.library_write(method, params),
+            ui_sequence::Action::PickStructures(token) => {
+                self.library_structures.pick = Some(token)
+            }
             ui_sequence::Action::Parent(reference) => {
                 self.library.tab = 1;
                 self.library_select(&reference);
@@ -1293,11 +1297,6 @@ impl Workbench {
                     {
                         self.binder_library_target(text(&detail, "ref"));
                     }
-                    if text(&record["identity"], "molecule_type") == "protein"
-                        && ui.button("Color domains in viewer…").clicked()
-                    {
-                        self.domains_open(Some(text(&detail, "ref").into()));
-                    }
                     if let Err(reason) = input { ui.colored_label(AMBER, reason); }
                 });
                 if !self.library.added.is_empty() { ui.colored_label(GREEN, &self.library.added); }
@@ -1307,6 +1306,8 @@ impl Workbench {
                 for (index, label) in ["Purpose", "Sequence / identity", "Relationships", "Attachments", "Record JSON"].iter().enumerate() {
                     ui.selectable_value(&mut self.library.tab, index, *label);
                 }
+                if text(&record["identity"],"molecule_type")=="protein" {ui.selectable_value(&mut self.library.tab,5,"Structures");}
+                else if self.library.tab==5 {self.library.tab=0;}
             });
             ui.separator();
             egui::ScrollArea::both().id_salt(("library-detail", self.library.selected.clone(), self.library.tab))
@@ -1319,6 +1320,7 @@ impl Workbench {
                         1 => { self.library_identity(ui, &detail, ctx); self.library_run_controls(ui, &detail); },
                         2 => self.library_relations(ui, &detail),
                         3 => self.library_attachments(ui, &detail),
+                        5 => self.library_structures_panel(ui, &detail),
                         _ => {
                             if ui.button("Copy record JSON").clicked() { ctx.copy_text(serde_json::to_string_pretty(record).unwrap_or_default()); }
                             readonly(ui, &serde_json::to_string_pretty(record).unwrap_or_default());

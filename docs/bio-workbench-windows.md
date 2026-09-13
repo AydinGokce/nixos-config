@@ -49,7 +49,7 @@ Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing work
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/domain-annotations-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
+/home/aydin/bio-runs/protein-structure-gallery-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile
@@ -95,6 +95,17 @@ curated plasmid annotations through the selected protein's saved translation.
 Autodetected CDSs and ORFs are excluded. Domain colors persist independently in
 each structure tab and support Undo/Redo. Plasmid selections also highlight the
 full height of their map region.
+
+Each protein's **Structures** tab now shows cached studio thumbnails for uploaded
+PDB/mmCIF files and linked prediction outputs. Standalone creation supports optional
+structure uploads. Cards open the viewer and offer reversible removal. Structure
+views include protein/plasmid backlinks and automatic unimported-annotation lists
+for linked plasmid-derived proteins. Shift-click selects inclusive residue ranges
+for **Create annotation…**; a 3D click centers the residue in the sequence strip.
+Hover over that strip and use the mouse wheel to scroll it. The plasmid map
+supports selection in either direction, Left/Right cursor movement, Shift+arrows
+to select, Ctrl for three-nucleotide steps, and right-click copying of selected
+nucleotides or translation.
 
 The first build downloads dependencies and compiles the app. Keep the extracted
 source in Ubuntu's home directory for [better filesystem

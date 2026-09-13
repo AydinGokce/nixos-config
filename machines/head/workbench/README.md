@@ -39,6 +39,19 @@ attachment hashes, preserves frame, crop, strand and circular joins, and reports
 excluded or partially covered annotations. It neither discovers ORFs nor infers
 domain boundaries from names; the viewer separately verifies structure alignment.
 
+`library.structures` combines shared manually attached PDB/mmCIF files with
+predictions linked by exact original library inputs, including Harrisonbot runs.
+Previously saved BindCraft candidate complexes appear from their verified library
+receipts, including after restoring a library backup without its old job store.
+Manual uploads can accompany standalone protein creation or be attached later.
+Trash hides a card; Undo/Redo retains immutable original bytes and prior source
+revisions. Automatic discovery writes no library records and preserves generic
+job/artifact access controls; a private complex partner stays actor-scoped.
+Every card carries the exact source protein and encoded plasmid/nucleotide
+backlinks, while sequence edits explicitly mark older associations historical.
+The shared renderer's bounded CPU thumbnail queue is described in
+`STRUCTURE_THUMBNAILS.md`.
+
 `library.sequence` supplies bounded annotations, six-frame ORFs and exact-revision
 translations. `library.product_preview` resolves a proposed definition without
 writing; `library.product_create` adds a protein to its parent's projects.

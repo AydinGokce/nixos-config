@@ -16,7 +16,101 @@ pub use structure::{Atom, Molecule, MoleculeKind, ResidueKey, Secondary};
 /// Empty maps leave the normal chain/element palette unchanged.
 pub type ResidueColors = BTreeMap<ResidueKey, [u8; 3]>;
 
-/// A design selection is separate from the ordinary single-residue inspector.
+/// An ordinary inclusive sequence range, independent of binder hotspots.
+/// Source chain order, including insertion codes and missing coordinates, is
+/// authoritative; residue numbers alone are never treated as array offsets.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SelectionRange {
+    pub residues: BTreeSet<ResidueKey>,
+    pub anchor: Option<ResidueKey>,
+    #[serde(skip)]
+    scroll_to: Option<ResidueKey>,
+}
+impl Clone for SelectionRange {
+    fn clone(&self) -> Self {
+        Self {
+            residues: self.residues.clone(),
+            anchor: self.anchor.clone(),
+            scroll_to: None,
+        }
+    }
+}
+impl SelectionRange {
+    pub fn pick(&mut self, molecule: &Molecule, key: &ResidueKey, extend: bool) {
+        self.scroll_to = None;
+        let Some(residue) = molecule
+            .residue(key)
+            .filter(|residue| residue.kind == MoleculeKind::Protein)
+        else {
+            self.residues.clear();
+            self.anchor = None;
+            return;
+        };
+        if extend
+            && let Some(anchor) = self.anchor.as_ref().and_then(|key| molecule.residue(key))
+            && anchor.kind == MoleculeKind::Protein
+            && anchor.chain == residue.chain
+        {
+            let chain = &molecule.chains[residue.chain];
+            let start = chain
+                .residues
+                .iter()
+                .position(|&id| molecule.residues[id].key == anchor.key);
+            let end = chain
+                .residues
+                .iter()
+                .position(|&id| molecule.residues[id].key == *key);
+            if let (Some(start), Some(end)) = (start, end) {
+                self.residues = chain.residues[start.min(end)..=start.max(end)]
+                    .iter()
+                    .map(|&id| &molecule.residues[id])
+                    .filter(|residue| residue.kind == MoleculeKind::Protein)
+                    .map(|residue| residue.key.clone())
+                    .collect();
+                return;
+            }
+        }
+        self.residues.clear();
+        self.residues.insert(key.clone());
+        self.anchor = Some(key.clone());
+    }
+
+    /// Consume one pending 3D click. Ordinary sequence clicks and restored or
+    /// duplicated state never keep pulling the user's horizontal scroll position.
+    pub fn take_scroll_target(&mut self) -> Option<ResidueKey> {
+        self.scroll_to.take()
+    }
+
+    pub fn retain_existing(&mut self, molecule: &Molecule) {
+        let valid = self.anchor.as_ref().and_then(|key| {
+            let anchor = molecule.residue(key)?;
+            if anchor.kind != MoleculeKind::Protein || !self.residues.contains(key) {
+                return None;
+            }
+            let chain: Vec<_> = molecule.chains[anchor.chain]
+                .residues
+                .iter()
+                .map(|&id| &molecule.residues[id])
+                .filter(|residue| residue.kind == MoleculeKind::Protein)
+                .map(|residue| &residue.key)
+                .collect();
+            let start = chain.iter().position(|key| self.residues.contains(*key))?;
+            let end = chain.iter().rposition(|key| self.residues.contains(*key))?;
+            (end - start + 1 == self.residues.len()
+                && chain[start..=end]
+                    .iter()
+                    .all(|key| self.residues.contains(*key)))
+            .then_some(())
+        });
+        if valid.is_none() {
+            self.residues.clear();
+            self.anchor = None;
+        }
+    }
+}
+
+/// A design selection is separate from the ordinary residue/range inspector.
 /// Exact source residue identities survive view restoration; array offsets do not.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +125,7 @@ pub struct Hotspots {
 struct PickGesture {
     toggle: bool,
     range: bool,
+    selection_range: bool,
 }
 impl Hotspots {
     pub fn retain_existing(&mut self, molecule: &Molecule) {
@@ -129,6 +224,7 @@ impl Renderer {
         molecule: &Molecule,
         selected: &mut Option<ResidueKey>,
         hotspots: &mut Hotspots,
+        selection: &mut SelectionRange,
     ) -> bool {
         if let Some(picked) = self.0.lock().take_pick()
             && let Some(gesture) = hotspots.pending.take()
@@ -136,6 +232,8 @@ impl Renderer {
         {
             *selected = Some(residue.key.clone());
             hotspots.pick(molecule, &residue.key, gesture.toggle, gesture.range);
+            selection.pick(molecule, &residue.key, gesture.selection_range);
+            selection.scroll_to = Some(residue.key.clone());
             return true;
         }
         false
@@ -255,6 +353,7 @@ pub fn viewport(
     index: usize,
     selected: &mut Option<ResidueKey>,
     hotspots: &mut Hotspots,
+    selection: &mut SelectionRange,
     visible: bool,
     labels: bool,
     axes: bool,
@@ -274,7 +373,7 @@ pub fn viewport(
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
-    if renderer.consume_pick(molecule, selected, hotspots) {
+    if renderer.consume_pick(molecule, selected, hotspots, selection) {
         ui.ctx().request_repaint();
     }
     if response.dragged() {
@@ -296,7 +395,8 @@ pub fn viewport(
     }
     if response.double_clicked()
         && !hotspots.enabled
-        && !ui.input(|input| input.modifiers.ctrl || input.modifiers.command)
+        && !ui
+            .input(|input| input.modifiers.ctrl || input.modifiers.command || input.modifiers.shift)
     {
         *camera = Camera::fit(molecule);
         changed = true;
@@ -340,6 +440,12 @@ pub fn viewport(
             .enumerate()
             .filter_map(|(id, residue)| hotspots.residues.contains(&residue.key).then_some(id + 1))
             .collect();
+        let selection_ids: Vec<_> = molecule
+            .residues
+            .iter()
+            .enumerate()
+            .filter_map(|(id, residue)| selection.residues.contains(&residue.key).then_some(id + 1))
+            .collect();
         let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
             gpu.lock().paint(
                 painter.gl(),
@@ -351,6 +457,7 @@ pub fn viewport(
                 selected,
                 &chains,
                 &hotspot_ids,
+                &selection_ids,
             );
         });
         painter.add(egui::PaintCallback {
@@ -366,7 +473,8 @@ pub fn viewport(
             let modifiers = ui.input(|input| input.modifiers);
             hotspots.pending = Some(PickGesture {
                 toggle: modifiers.ctrl || modifiers.command || hotspots.enabled,
-                range: modifiers.shift && hotspots.enabled,
+                range: modifiers.shift && (hotspots.enabled || modifiers.ctrl || modifiers.command),
+                selection_range: modifiers.shift,
             });
             renderer.0.lock().request_pick([
                 (pointer.x - draw.left()) / draw.width(),
@@ -530,5 +638,115 @@ mod hotspot_tests {
         selection.residues.insert(nucleotide.key.clone());
         selection.retain_existing(&molecule);
         assert!(selection.residues.is_empty());
+    }
+
+    fn range_molecule() -> Molecule {
+        let mut pdb = String::new();
+        for (serial, (chain, number, insertion)) in [
+            ('A', 10, ' '),
+            ('A', 10, 'A'),
+            ('A', 10, 'B'),
+            ('A', 50, ' '),
+            ('B', 10, ' '),
+        ]
+        .iter()
+        .enumerate()
+        {
+            pdb.push_str(&format!(
+                "ATOM  {:>5}  CA  ALA {}{:>4}{}   {:>8.3}{:>8.3}{:>8.3}  1.00 80.00           C\n",
+                serial + 1,
+                chain,
+                number,
+                insertion,
+                serial as f32 * 3.,
+                2.,
+                0.
+            ));
+        }
+        Molecule::parse(pdb.as_bytes(), "pdb", "range fixture").unwrap()
+    }
+
+    #[test]
+    fn ordinary_range_includes_both_endpoints_in_chain_order_and_keeps_its_anchor() {
+        let molecule = range_molecule();
+        let keys: Vec<_> = molecule.residues.iter().map(|r| r.key.clone()).collect();
+        let mut range = SelectionRange::default();
+        range.pick(&molecule, &keys[0], false);
+        range.pick(&molecule, &keys[3], true);
+        assert_eq!(range.residues, keys[..4].iter().cloned().collect());
+        assert_eq!(range.anchor.as_ref(), Some(&keys[0]));
+        // Missing residue numbers are not invented; insertion variants are kept.
+        assert_eq!(range.residues.len(), 4);
+        range.pick(&molecule, &keys[1], true);
+        assert_eq!(range.residues, keys[..2].iter().cloned().collect());
+        assert_eq!(range.anchor.as_ref(), Some(&keys[0]));
+        range.pick(&molecule, &keys[3], false);
+        range.pick(&molecule, &keys[1], true);
+        assert_eq!(range.residues, keys[1..4].iter().cloned().collect());
+        assert_eq!(range.anchor.as_ref(), Some(&keys[3]));
+    }
+
+    #[test]
+    fn ordinary_ranges_do_not_cross_chains_or_modify_hotspots() {
+        let molecule = range_molecule();
+        let keys: Vec<_> = molecule.residues.iter().map(|r| r.key.clone()).collect();
+        let mut range = SelectionRange::default();
+        let mut hotspots = Hotspots::default();
+        hotspots.pick(&molecule, &keys[2], true, false);
+        let original = hotspots.residues.clone();
+        range.pick(&molecule, &keys[0], false);
+        range.pick(&molecule, &keys[3], true);
+        assert_eq!(hotspots.residues, original);
+        range.pick(&molecule, &keys[4], true);
+        assert_eq!(range.residues, BTreeSet::from([keys[4].clone()]));
+        assert_eq!(range.anchor.as_ref(), Some(&keys[4]));
+        range.pick(&molecule, &keys[4], true);
+        assert_eq!(range.residues.len(), 1);
+    }
+
+    #[test]
+    fn saved_range_roundtrips_and_copies_without_accepting_wrong_source_keys() {
+        let molecule = range_molecule();
+        let keys: Vec<_> = molecule.residues.iter().map(|r| r.key.clone()).collect();
+        let mut range = SelectionRange::default();
+        range.pick(&molecule, &keys[3], false);
+        range.pick(&molecule, &keys[0], true);
+        let mut restored: SelectionRange =
+            serde_json::from_value(serde_json::to_value(&range).unwrap()).unwrap();
+        restored.retain_existing(&molecule);
+        assert_eq!(restored.residues, range.residues);
+        assert_eq!(restored.anchor, range.anchor);
+        let mut duplicate = restored.clone();
+        duplicate.pick(&molecule, &keys[4], false);
+        assert_eq!(restored.residues, range.residues);
+        // Corrupt state with a hole or an unrelated chain is discarded.
+        restored.residues.remove(&keys[1]);
+        restored.retain_existing(&molecule);
+        assert!(restored.residues.is_empty());
+        assert!(restored.anchor.is_none());
+        range.residues.insert(keys[4].clone());
+        range.retain_existing(&molecule);
+        assert!(range.residues.is_empty());
+    }
+
+    #[test]
+    fn three_dimensional_scroll_marker_is_one_shot_and_not_saved_or_duplicated() {
+        let molecule = range_molecule();
+        let key = molecule.residues[2].key.clone();
+        let mut range = SelectionRange::default();
+        range.pick(&molecule, &key, false);
+        // GPU consumption records this marker after an exact occluded pick.
+        range.scroll_to = Some(key.clone());
+        let mut duplicate = range.clone();
+        assert!(duplicate.take_scroll_target().is_none());
+        let mut restored: SelectionRange =
+            serde_json::from_value(serde_json::to_value(&range).unwrap()).unwrap();
+        assert!(restored.take_scroll_target().is_none());
+        assert_eq!(range.take_scroll_target(), Some(key.clone()));
+        assert!(range.take_scroll_target().is_none());
+        range.scroll_to = Some(key.clone());
+        // A later sequence click overrides the earlier recenter request.
+        range.pick(&molecule, &key, true);
+        assert!(range.take_scroll_target().is_none());
     }
 }
