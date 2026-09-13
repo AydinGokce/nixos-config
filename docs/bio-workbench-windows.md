@@ -49,7 +49,7 @@ Copy `gc-protein-engineering-console-0.3.0-source.tar.gz` from the existing work
 your Windows **Downloads** folder. The prepared archive on that workstation is:
 
 ```text
-/home/aydin/bio-runs/msa-availability-ui-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
+/home/aydin/bio-runs/bindcraft-install-20260913/gc-protein-engineering-console-0.3.0-source.tar.gz
 ```
 
 In Ubuntu, replace `YOUR_WINDOWS_USERNAME` below with your Windows profile

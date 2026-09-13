@@ -325,9 +325,10 @@ use the same viewer code as the desktop.
 
 Beside **HEAD CONNECTED**, **MSA available** / **MSA unavailable** reports whether
 Verda currently advertises capacity to launch the configured private MSA worker.
-The console checks at startup and every five seconds. **MSA connected** separately
-identifies an existing ready or busy session; other session stages remain visible.
-Click either indicator to inspect measured startup stages and the shutdown countdown. Private runs
+The console checks at startup and every five seconds. One MSA tag is shown: a
+fresh ready or busy session takes priority as **MSA connected**; otherwise the
+tag reports availability. Lifecycle details remain in its tooltip and dialog.
+Click the tag to inspect measured startup stages and the shutdown countdown. Private runs
 also show this service status in **Run status**. An ETA is labeled for its stage,
 startup, or run scope; unavailable estimates remain unknown. A stage estimate
 does not imply an estimate for the whole prediction.

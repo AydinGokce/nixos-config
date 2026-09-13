@@ -277,6 +277,39 @@ impl Worker {
             _ => ("MSA UNKNOWN", AMBER),
         }
     }
+    fn connected_epoch(&self, connected: bool) -> Option<f64> {
+        if matches!(text(&self.status, "state"), "ready" | "idle" | "busy") {
+            self.epoch(connected)
+        } else {
+            None
+        }
+    }
+    fn indicator_label(&self, connected: bool, now: Instant) -> (&'static str, Color32) {
+        if self.connected_epoch(connected).is_some() {
+            ("MSA connected", GREEN)
+        } else {
+            self.capacity.label(connected, now)
+        }
+    }
+    fn draw_indicator(&self, ui: &mut egui::Ui, connected: bool) -> egui::Response {
+        let now = Instant::now();
+        let (label, color) = self.indicator_label(connected, now);
+        let suffix = if let (Some(epoch), Some(end)) = (
+            self.connected_epoch(connected),
+            seconds(&self.status["shutdown_epoch"]),
+        ) && end > epoch
+        {
+            format!(" · {}", duration(end - epoch))
+        } else {
+            String::new()
+        };
+        ui.small_button(RichText::new(format!("{label}{suffix}")).color(color).strong())
+            .on_hover_text(format!(
+                "{}\n{}\nUpdates every 5 seconds. Open shared MSA details for startup progress, available GPUs and keep-warm controls.",
+                self.state_label(connected).0,
+                self.capacity.label(connected, now).0,
+            ))
+    }
     fn age_label(&self) -> String {
         let age = seconds(&self.status["server_epoch"])
             .zip(seconds(&self.status["checked_epoch"]))
@@ -503,34 +536,10 @@ impl Workbench {
     }
 
     pub(super) fn worker_indicator(&mut self, ui: &mut egui::Ui) {
-        let (availability, availability_color) =
-            self.worker.capacity.label(self.connected, Instant::now());
-        if ui.small_button(RichText::new(availability).color(availability_color).strong())
-            .on_hover_text("Capacity to provision the configured private MSA worker. Checks Verda on startup and every 5 seconds; connection is shown separately.")
-            .clicked()
-        {
+        if self.worker.draw_indicator(ui, self.connected).clicked() {
             self.worker.open = !self.worker.open;
             self.worker_refresh();
             self.worker_refresh_capacity(false);
-        }
-        let epoch = self.worker.epoch(self.connected);
-        let (label, color) = self.worker.state_label(self.connected);
-        let suffix = if epoch.is_none() && self.worker.received.is_some() {
-            format!(" · {}", self.worker.age_label())
-        } else if let Some(end) = seconds(&self.worker.status["shutdown_epoch"])
-            && let Some(now) = epoch
-            && end > now
-        {
-            format!(" · {}", duration(end - now))
-        } else {
-            String::new()
-        };
-        if ui.small_button(RichText::new(format!("{label}{suffix}")).color(color).strong())
-            .on_hover_text("Shared private MSA worker. Inspect startup, shutdown countdown and keep-warm controls.")
-            .clicked()
-        {
-            self.worker.open = !self.worker.open;
-            self.worker_refresh();
         }
     }
 
@@ -710,12 +719,133 @@ mod tests {
             worker.status["state"] = json!(state);
             assert_eq!(worker.state_label(true), ("MSA connected", GREEN));
             assert_eq!(worker.capacity.label(true, now).0, "MSA unavailable");
+            assert_eq!(worker.indicator_label(true, now), ("MSA connected", GREEN));
         }
         assert_eq!(worker.state_label(false), ("MSA STALE", AMBER));
         assert_eq!(
             worker.capacity.label(false, now).0,
             "MSA availability unknown"
         );
+    }
+    #[test]
+    fn single_msa_indicator_prioritizes_a_fresh_connection_then_capacity() {
+        let now = Instant::now();
+        let mut worker = Worker {
+            status: status(),
+            received: Some(now),
+            ..Worker::default()
+        };
+        let request = worker.capacity.begin("head".into(), false, now).unwrap();
+        worker.capacity.receive(
+            &request,
+            "head",
+            json!({
+                "schema":1,"server_epoch":1000.,"checked_epoch":1000.,"state":"ready",
+                "msa_available":false,"gpus":[]
+            }),
+            now,
+        );
+        for state in ["absent", "failed", "starting", "warming", "closing"] {
+            worker.status["state"] = json!(state);
+            assert_eq!(worker.indicator_label(true, now).0, "MSA unavailable");
+            worker.capacity.snapshot["msa_available"] = json!(true);
+            assert_eq!(worker.indicator_label(true, now).0, "MSA available");
+            worker.capacity.snapshot["msa_available"] = json!(false);
+        }
+        worker.status["state"] = json!("ready");
+        assert_eq!(worker.indicator_label(true, now).0, "MSA connected");
+        worker.received = Some(now - Duration::from_secs(31));
+        assert_eq!(worker.indicator_label(true, now).0, "MSA unavailable");
+        assert_eq!(
+            worker
+                .indicator_label(true, now + Duration::from_secs(121))
+                .0,
+            "MSA availability stale"
+        );
+        assert_eq!(
+            worker.indicator_label(false, now).0,
+            "MSA availability unknown"
+        );
+        let request = worker.capacity.begin("head".into(), true, now).unwrap();
+        worker
+            .capacity
+            .fail(&request, "head", "Provider unavailable");
+        assert_eq!(
+            worker.indicator_label(true, now).0,
+            "MSA availability unknown"
+        );
+        worker.received = Some(now);
+        assert_eq!(worker.indicator_label(true, now).0, "MSA connected");
+    }
+
+    #[test]
+    fn top_indicator_renders_one_msa_tag_without_a_separate_failure_tag() {
+        fn collect(shape: &egui::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text.starts_with("MSA ") => {
+                    labels.push(text.galley.job.text.clone())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, labels)),
+                _ => {}
+            }
+        }
+        let now = Instant::now();
+        let mut worker = Worker {
+            status: status(),
+            received: Some(now),
+            ..Worker::default()
+        };
+        let request = worker.capacity.begin("head".into(), false, now).unwrap();
+        worker.capacity.receive(
+            &request,
+            "head",
+            json!({
+                "schema":1,"server_epoch":1000.,"checked_epoch":1000.,"state":"ready",
+                "msa_available":false,"gpus":[]
+            }),
+            now,
+        );
+        for (state, available, expected) in [
+            ("idle", false, "MSA connected"),
+            ("failed", false, "MSA unavailable"),
+            ("failed", true, "MSA available"),
+            ("warming", false, "MSA unavailable"),
+        ] {
+            worker.status["state"] = json!(state);
+            worker.capacity.snapshot["msa_available"] = json!(available);
+            let context = egui::Context::default();
+            ui_style::configure(&context);
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(600., 150.),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        worker.draw_indicator(ui, true);
+                    });
+                },
+            );
+            let mut labels = Vec::new();
+            for shape in output.shapes {
+                collect(&shape.shape, &mut labels);
+            }
+            assert_eq!(labels.len(), 1, "exactly one MSA tag for worker {state}");
+            assert!(
+                labels[0].starts_with(expected),
+                "{} should show {expected}",
+                labels[0]
+            );
+            if state != "idle" {
+                assert_eq!(
+                    labels[0], expected,
+                    "no worker countdown on a capacity-only tag"
+                );
+            }
+        }
     }
     #[test]
     fn countdown_uses_head_clock_and_expires_observation_without_local_wall_clock() {

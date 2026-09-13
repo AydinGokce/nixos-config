@@ -156,9 +156,25 @@ fn quantity(value: &Value, suffix: &str) -> String {
     seconds(value).map_or_else(|| "—".into(), |n| format!("{n:.0}{suffix}"))
 }
 
+fn gpu_rows_by_host_ram(snapshot: &Value) -> Vec<&Value> {
+    let mut gpus: Vec<_> = rows(snapshot, "gpus").iter().collect();
+    gpus.sort_by(|a, b| {
+        match (seconds(&a["ram_gib"]), seconds(&b["ram_gib"])) {
+            (Some(a), Some(b)) => b.total_cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| text(a, "instance_type").cmp(text(b, "instance_type")))
+        .then_with(|| text(a, "location").cmp(text(b, "location")))
+        .then_with(|| text(a, "contract").cmp(text(b, "contract")))
+    });
+    gpus
+}
+
 pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool) {
     let current = capacity.fresh(connected, Instant::now());
-    let gpus = rows(&capacity.snapshot, "gpus");
+    let gpus = gpu_rows_by_host_ram(&capacity.snapshot);
     ui.horizontal_wrapped(|ui| {
         ui.strong(if current {
             "Available Verda GPUs"
@@ -223,7 +239,7 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
                         "Region",
                         "Contract",
                         "Total VRAM",
-                        "Host RAM",
+                        "Host RAM ↓",
                         "$/hour",
                         "MSA",
                     ] {
@@ -266,6 +282,39 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_rows_sort_by_numeric_host_ram_descending_with_missing_last_and_stable_ties() {
+        let gpu = |id: &str, ram: Value, instance: &str, region: &str, contract: &str| json!({"id":id,"ram_gib":ram,"instance_type":instance,"location":region,"contract":contract});
+        let value = json!({"gpus":[
+            gpu("missing", Value::Null, "Z", "FIN-01", "regular"),
+            gpu("tie-spot", json!(512), "A", "FIN-01", "spot"),
+            gpu("small", json!(96), "Z", "FIN-01", "regular"),
+            gpu("largest", json!(1024), "Z", "FIN-01", "regular"),
+            gpu("tie-region", json!(512), "A", "FIN-02", "regular"),
+            gpu("fraction", json!(512.25), "A", "FIN-01", "regular"),
+            gpu("tie-instance", json!(512), "B", "FIN-01", "regular"),
+            gpu("tie-first", json!(512), "A", "FIN-01", "regular"),
+            {"id":"omitted","instance_type":"A","location":"FIN-01","contract":"regular"}
+        ]});
+        assert_eq!(
+            gpu_rows_by_host_ram(&value)
+                .iter()
+                .map(|gpu| text(gpu, "id"))
+                .collect::<Vec<_>>(),
+            [
+                "largest",
+                "fraction",
+                "tie-first",
+                "tie-spot",
+                "tie-region",
+                "tie-instance",
+                "small",
+                "omitted",
+                "missing"
+            ]
+        );
+    }
 
     fn snapshot(available: Value) -> Value {
         json!({"schema":1,"server_epoch":1000.,"checked_epoch":998.,"state":"ready",
