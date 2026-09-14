@@ -85,6 +85,16 @@ esac
             "dc": '''#!/usr/bin/env bash
 set -eu
 if [ "$1" = launch ]; then
+  if [ "${CACHE_ROUTE_FIXTURE:-0}" = 1 ]; then
+    python3 - <<'CACHEENV'
+import json,os
+from pathlib import Path
+root=Path(os.environ['AUDIT']);route=json.loads((root/'cache-fixture.json').read_text())
+assert os.environ['BIO_MSA_CACHE_LEASE_ID']==route['lease_id']
+assert os.environ['BIO_MSA_CACHE_GENERATION']==route['binding']['cache_generation']
+assert (root/'fixture-cache-launching.json').is_file()
+CACHEENV
+  fi
   if [ -n "${BIO_MSA_SESSION_STATE:-}" ]; then
     test -s "$BIO_MSA_SESSION_STATE/allocation-started.json"
     test ! -e "$BIO_MSA_SESSION_STATE/no-allocation.json"
@@ -290,6 +300,59 @@ except (OSError, ValueError, KeyError, AssertionError):
 
     def msa_settings(self, **settings):
         return dict(MSA_DB_VOLUME="msa-database-volume", MSA_DB_NFS="msa-server:/colabfold", **settings)
+
+    def mapped_cache_fixture(self):
+        """Fake the controller/device boundary; exercise the actual SSH relay."""
+        helper = self.root/'tools/msa/session_cache.py'
+        helper.with_name('cache_boundary_impl.py').write_bytes(helper.read_bytes())
+        route = json.loads(subprocess.check_output([sys.executable, '-c',
+            'import json,sys;sys.path.insert(0,sys.argv[1]);'
+            'from test_session_cache import route_fixture;print(json.dumps(route_fixture()))',
+            str(SCRIPT.parent/'msa')], text=True))
+        (self.root/'cache-fixture.json').write_text(json.dumps(route))
+        self.env['CACHE_ROUTE_FIXTURE']='1'
+        helper.write_text('''from cache_boundary_impl import *
+
+if __name__ == '__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('action'); p.add_argument('--route',type=Path); p.add_argument('--job',type=Path)
+    p.add_argument('--handoff',type=Path); p.add_argument('--script',type=Path)
+    p.add_argument('--session-state',type=Path); p.add_argument('--command',nargs=argparse.REMAINDER)
+    a=p.parse_args(); root=Path(os.environ['AUDIT'])
+    with (root/'events').open('a') as stream: stream.write('cache:'+a.action+'\\n')
+    route=validate(load(root/'cache-fixture.json'))
+    if a.action=='select':
+        require(os.environ.get('CACHE_UNAVAILABLE')!='1','Full SSD cache unavailable')
+        print(json.dumps(route)); raise SystemExit(0)
+    require(load(a.route)==route,'Route changed')
+    if a.action in ('acquire','launching'):
+        save(root/('fixture-cache-'+a.action+'.json'),identity(route))
+        print(json.dumps(dict(**route['binding'],lease=dict(lease_id=route['lease_id']))))
+    elif a.action=='job':
+        job=load(a.job);require(job['database_volume']==route['binding']['volume_id'],'Wrong attached disk')
+        job['database_cache']=identity(route);content.atomic_json(a.job,job)
+    elif a.action=='run':
+        require((root/'fixture-cache-launching.json').is_file(),'Lease was not marked launching')
+        def bind(route,job,boot):return dict(boot_id=boot,**identity(route))
+        raise SystemExit(run_worker(a.route,a.job,a.handoff,a.script,a.command,bind=bind))
+    elif a.action=='release':
+        require(os.environ.get('DELETE_FAIL')!='1','Exact managed worker/OS absence is unproven')
+        print(json.dumps(dict(status='released',**identity(route))))
+''')
+        ssh = self.root/'bin/ssh'
+        ssh.write_text(ssh.read_text().replace('if [ "${!#}" = true ]; then exit 0; fi', '''if [ "${!#}" = true ]; then
+  for option in "$@"; do
+    case "$option" in UserKnownHostsFile=*) printf '%s\\n' '127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4' > "${option#*=}";; esac
+  done
+  exit 0
+fi''').replace('exit "${MODEL_EXIT:-0}"', '''python3 - <<'CACHEMARKER'
+import json,os
+from pathlib import Path
+route=json.loads((Path(os.environ['AUDIT'])/'cache-fixture.json').read_text())
+print('BIO_MSA_CACHE_BIND_'+route['lease_id']+' 44444444-4444-4444-8444-444444444444',flush=True)
+CACHEMARKER
+exit "${MODEL_EXIT:-0}"'''))
+        return route
 
     def bindcraft_fixture(self, *, ready=True):
         """Only the orchestration boundary is mocked; no scientific code runs."""
@@ -1165,6 +1228,9 @@ sleep() { :; }
         self.assertFalse((self.root/'worker-selection-calls').exists())
 
     def test_nominal_128gb_search_binds_profile_and_caps_only_the_remote_worker(self):
+        route = self.mapped_cache_fixture()
+        # A sealed SSD generation is independent of the old head NFS mount.
+        (self.msa_root/'.msa-databases.json').unlink()
         result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
             MSA_SELECTED_TYPE='CPU.32V.128G', MSA_SELECTED_GB='128', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
@@ -1176,6 +1242,11 @@ sleep() { :; }
         self.assertEqual(choice['search_profile'], profile)
         self.assertAlmostEqual(choice['conservative_gib'], 119.20928955078125)
         job = json.loads((output/'job.json').read_text())
+        self.assertEqual(job['database_cache']['volume_id'], route['binding']['volume_id'])
+        launch_args = (self.root/'launch-args').read_text()
+        self.assertIn('--volume '+route['binding']['volume_id'], launch_args)
+        self.assertIn('--name bio-msa-cache-'+route['lease_id'], launch_args)
+        self.assertNotIn('msa-database-volume', launch_args)
         self.assertEqual(job['search_profile'], profile)
         self.assertEqual(job['search_profile_receipt'], dict(path='search-profile.json',
             sha256=hashlib.sha256((output/'search-profile.json').read_bytes()).hexdigest()))
@@ -1186,12 +1257,24 @@ sleep() { :; }
         self.assertTrue(command[4].startswith('--unit=bio-msa-memory-msa-'))
         self.assertEqual(command[5:], ['--property=MemoryMax=96G', '--property=MemorySwapMax=0', 'bash', '-s'])
         remote = (self.root/'transmitted.sh').read_text()
+        self.assertIn('session_cache.py" mount', remote)
+        self.assertIn('BIO_MSA_CACHE_RECEIPT', remote)
+        self.assertNotIn('msa-server:/colabfold', remote)
+        events = (self.root/'events').read_text().splitlines()
+        launch = next(event for event in events if event.startswith('launch:'))
+        cleanup = next(event for event in events if event.startswith('cleanup:'))
+        self.assertLess(events.index('cache:acquire'), events.index('cache:launching'))
+        self.assertLess(events.index('cache:launching'), events.index(launch))
+        self.assertLess(events.index('worker'), events.index('fetch'))
+        self.assertLess(events.index(cleanup), events.index('cache:release'))
+        self.assertIn('StrictHostKeyChecking=yes', argv)
         self.assertIn('export BIO_MSA_SEARCH_PROFILE=mapped-128gb-v1', remote)
         self.assertIn('BIO_MSA_SESSION_WARM=report', remote)
         with tarfile.open(output/'tools.tar.gz') as archive:
             self.assertEqual(archive.extractfile('msa/search_profile.py').read(),
                              (SCRIPT.parent/'msa/search_profile.py').read_bytes())
         # A folding worker remains independent of the CPU-MSA scope policy.
+        self.env.pop('CACHE_ROUTE_FIXTURE')
         result = self.run_job()
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         argv = [json.loads(line) for line in (self.root/'ssh-argv.jsonl').read_text().splitlines()][-1]
@@ -1211,7 +1294,52 @@ sleep() { :; }
         argv = [json.loads(line) for line in (self.root/'ssh-argv.jsonl').read_text().splitlines()][-1]
         self.assertEqual(argv[argv.index('root@127.0.0.1')+1:], ['bash', '-s'])
 
+    def test_prefetch_profile_transports_distinct_runtime_and_all_native_source_pins(self):
+        self.mapped_cache_fixture()
+        prefix = self.root/'shared/envs/msa-tools-prefetch-v1'
+        prefix.mkdir(parents=True)
+        shutil.copyfile(SCRIPT.parent/'msa/native-runtime.json', prefix/'native-runtime.json')
+        # This test stops at the cloud boundary; native bytes/versions and real
+        # archive extraction are verified separately by native_runtime tests.
+        (prefix/'transport-sentinel').write_bytes(b'distinct runtime fixture')
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            MSA_SELECTED_TYPE='CPU.32V.128G', MSA_SELECTED_GB='128',
+            BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['PREFETCH_PROFILE']))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        output = next((self.root/'results').iterdir())
+        runtime = json.loads((output/'runtime-plan.json').read_text())
+        self.assertEqual(runtime['search_profile'], MSA_PROFILES['PREFETCH_PROFILE'])
+        self.assertEqual(runtime['paths'], ['envs/msa-tools-prefetch-v1'])
+        self.assertEqual(runtime['package']['paths'], runtime['paths'])
+        profile = json.loads((output/'search-profile.json').read_text())
+        self.assertEqual(profile, MSA_PROFILES['resolve'](MSA_PROFILES['PREFETCH_PROFILE']))
+        self.assertIn('export BIO_MSA_SEARCH_PROFILE=mapped-prefetch-128gb-v1',
+                      (self.root/'transmitted.sh').read_text())
+        with tarfile.open(output/'tools.tar.gz') as archive:
+            for name in ('native_runtime.py', 'native-runtime.json', 'tools.sh', 'search_profile.py'):
+                self.assertEqual(archive.extractfile('msa/'+name).read(),
+                                 (SCRIPT.parent/'msa'/name).read_bytes())
+
+    def test_missing_prefetch_runtime_fails_before_cache_acquisition_or_rental(self):
+        self.mapped_cache_fixture()
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['PREFETCH_PROFILE']))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('installed before packaging', result.stdout+result.stderr)
+        self.assertFalse((self.root/'launches').exists())
+        self.assertFalse((self.root/'fixture-cache-acquire.json').exists())
+
+    def test_conversion_ignores_inherited_prefetch_runtime_selection(self):
+        result = self.submit('msa', '--sub', 'convert', **self.msa_settings(
+            BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['PREFETCH_PROFILE']))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        runtime = json.loads(next((self.root/'results').glob('*/runtime-plan.json')).read_text())
+        self.assertEqual(runtime['paths'], ['envs/msa-tools-v1'])
+        self.assertNotIn('search_profile', runtime)
+        self.assertEqual((self.root/'launches').read_text().splitlines(), ['CPU.16V.64G'])
+
     def test_bad_profile_or_warm_mode_and_sub_128gb_choice_never_allocate(self):
+        self.mapped_cache_fixture()
         for settings in ({'BIO_MSA_SEARCH_PROFILE':'unknown'}, {'BIO_MSA_SESSION_WARM':'prefetch'},
                          {'BIO_MSA_SESSION_WARM':'lock'}, {'MSA_SELECTED_GB':'127'}):
             with self.subTest(settings=settings):
@@ -1221,6 +1349,7 @@ sleep() { :; }
                 self.assertFalse((self.root/'transmitted.sh').exists())
 
     def test_worker_choice_requires_the_exact_nested_profile_and_summary_before_allocation(self):
+        self.mapped_cache_fixture()
         mapped = MSA_PROFILES['resolve'](MSA_PROFILES['MAPPED_PROFILE'])
         patches = [dict(search_profile=None), dict(search_profile=dict(mapped, mmseqs_threads=16)),
                    dict(search_profile=MSA_PROFILES['resolve'](MSA_PROFILES['LEGACY_PROFILE'])),
@@ -1236,6 +1365,7 @@ sleep() { :; }
                 self.assertFalse((self.root/'transmitted.sh').exists())
 
     def test_mapped_worker_oom_exit_is_retained_and_fetches_before_exact_cleanup(self):
+        self.mapped_cache_fixture()
         result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
             MODEL_EXIT='137', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
         self.assertEqual(result.returncode, 137, result.stdout+result.stderr)
@@ -1245,6 +1375,24 @@ sleep() { :; }
         self.assertEqual((self.root/'removals').read_text().count('rm '), 1)
         self.assertIn('--property=MemoryMax=96G', (self.root/'ssh-args').read_text())
         self.assertTrue(list((self.root/'results').glob('*/result.pdb')))
+
+    def test_unpublished_mapped_cache_fails_before_capacity_or_cloud_launch(self):
+        self.mapped_cache_fixture()
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            CACHE_UNAVAILABLE='1', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn('Full SSD cache unavailable', result.stderr)
+        for name in ('launches', 'worker-selection-calls', 'transmitted.sh'):
+            self.assertFalse((self.root/name).exists())
+
+    def test_mapped_cache_lease_stays_held_if_managed_cleanup_is_uncertain(self):
+        self.mapped_cache_fixture()
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            DELETE_FAIL='1', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        output = next((self.root/'results').iterdir())
+        self.assertIn('cache lease remains held', (output/'run.log').read_text())
+        self.assertEqual(json.loads((output/'job.json').read_text())['exit_status'], 1)
 
     def test_managed_capacity_timeout_records_proof_without_any_cloud_launch(self):
         state = self.managed_startup_fixture()
@@ -1286,6 +1434,17 @@ sleep() { :; }
         self.assertTrue((state / 'allocation-started.json').is_dir())
         self.assertFalse((self.root / 'launch-args').exists())
         self.assertFalse((state / 'no-allocation.json').exists())
+
+    def test_mapped_marker_failure_keeps_cache_preparing_and_releases_without_launch(self):
+        self.mapped_cache_fixture()
+        self.managed_startup_fixture()
+        result = self.submit('msa', '--sub', 'session', **self.msa_settings(
+            MSA_MARKER_UNWRITABLE='1', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        events=(self.root/'events').read_text().splitlines()
+        self.assertIn('cache:acquire',events);self.assertIn('cache:release',events)
+        self.assertNotIn('cache:launching',events)
+        self.assertFalse((self.root/'launch-args').exists())
 
     def test_expired_request_deadline_never_queries_or_allocates(self):
         state = self.managed_startup_fixture()
@@ -1946,7 +2105,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 root = Path(os.environ['AUDIT'])
 (root/'server.pid').write_text(str(os.getpid()))
 (root/'server-environment.json').write_text(json.dumps({key:os.environ.get(key) for key in
-    ('MMSEQS_NUM_THREADS','OMP_NUM_THREADS','OMP_THREAD_LIMIT','OMP_DYNAMIC','BIO_MSA_SEARCH_PROFILE')}))
+    ('MMSEQS_NUM_THREADS','OMP_NUM_THREADS','OMP_THREAD_LIMIT','OMP_DYNAMIC','BIO_MSA_SEARCH_PROFILE',
+     'GC_MMSEQS_POSTING_PREFETCH','GC_MMSEQS_POSTING_RANDOM','GC_MMSEQS_POSTING_READERS') if key in os.environ}))
 with (root/'events').open('a') as f: f.write('server-start\\n')
 HTTPServer(('127.0.0.1',8080),BaseHTTPRequestHandler).serve_forever()
 ''')
@@ -2035,6 +2195,29 @@ with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('database-'+sy
                 self.assertFalse((self.root/'calls.jsonl').exists())
                 self.assertFalse((Path(self.env['OUT'])/'memory-profile.json').exists())
 
+    def test_prefetch_recipe_exports_exact_reader_settings_to_actual_api_child(self):
+        self.panel_fixture()
+        result = self.recipe('panel', 100, TOTAL_GIB='110', SHARED=str(self.root/'shared'),
+            IN='manifest.json', BIO_MSA_PANEL_SHA256='expected', BIO_JOB_DEADLINE_EPOCH='1234567890',
+            EXPECTED_THREADS='4', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['PREFETCH_PROFILE'],
+            GC_MMSEQS_POSTING_PREFETCH='0', GC_MMSEQS_POSTING_RANDOM='0', GC_MMSEQS_POSTING_READERS='4')
+        self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
+        native = json.loads((self.root/'server-environment.json').read_text())
+        self.assertEqual({key: native[key] for key in MSA_PROFILES['PREFETCH_ENVIRONMENT']},
+                         MSA_PROFILES['PREFETCH_ENVIRONMENT'])
+        self.assertEqual(native['OMP_THREAD_LIMIT'], '4')
+        self.assertEqual(native['BIO_MSA_SEARCH_PROFILE'], MSA_PROFILES['PREFETCH_PROFILE'])
+        with self.assertRaises(ProcessLookupError): os.kill(int((self.root/'server.pid').read_text()), 0)
+
+    def test_conversion_selects_official_profile_before_tools_bootstrap(self):
+        with (Path(self.env['TOOLS'])/'msa/tools.sh').open('a') as output:
+            output.write('printf "%s\\n" "$BIO_MSA_SEARCH_PROFILE" > "$AUDIT/bootstrap-profile"\n')
+            output.write('[ -z "${GC_MMSEQS_POSTING_PREFETCH+x}${GC_MMSEQS_POSTING_RANDOM+x}${GC_MMSEQS_POSTING_READERS+x}" ]\n')
+        result = self.recipe('convert', 56, BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['PREFETCH_PROFILE'],
+                             **MSA_PROFILES['PREFETCH_ENVIRONMENT'])
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual((self.root/'bootstrap-profile').read_text().strip(), MSA_PROFILES['LEGACY_PROFILE'])
+
     def test_install_recipe_rejects_mapped_profile_before_bootstrap(self):
         result = self.recipe('install', 800, BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE'])
         self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
@@ -2048,11 +2231,13 @@ from pathlib import Path
 (Path(os.environ['AUDIT'])/'session-args.json').write_text(json.dumps(sys.argv[1:]))
 ''')
         result = self.recipe('session', 100, TOTAL_GIB='110', SHARED=str(self.root/'shared'),
-            BIO_MSA_SESSION_ID='a'*32, BIO_MSA_SESSION_IDLE_SECONDS='900', BIO_JOB_DEADLINE_EPOCH='1234567890')
+            BIO_MSA_SESSION_ID='a'*32, BIO_MSA_SESSION_IDLE_SECONDS='900', BIO_JOB_DEADLINE_EPOCH='1234567890',
+            BIO_MSA_CACHE_RECEIPT='/tmp/fixture-verified-cache.json')
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         args = json.loads((self.root/'session-args.json').read_text())
         for key, value in (('--search-profile', 'mapped-128gb-v1'), ('--warm', 'report'),
-                           ('--deadline', '1234567890'), ('--session-id', 'a'*32), ('--idle-seconds', '900')):
+                           ('--deadline', '1234567890'), ('--session-id', 'a'*32), ('--idle-seconds', '900'),
+                           ('--cache-receipt', '/tmp/fixture-verified-cache.json')):
             self.assertEqual(args[args.index(key)+1], value)
         self.assertEqual((self.root/'events').read_text().splitlines(), ['bootstrap'])
 

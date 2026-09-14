@@ -61,7 +61,8 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
       export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip zstd ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       ${builtins.readFile ./bio-submit.sh}
     '')
     (pkgs.writeShellScriptBin "bio-library" ''
@@ -71,7 +72,8 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-workbench" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/cli.py "$@"
     '')
@@ -127,7 +129,8 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-msa" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       ${builtins.readFile ./bio-msa.sh}
     '')
     (pkgs.writeShellScriptBin "bio-aws-msa" ''
@@ -148,7 +151,8 @@ in
       set -euo pipefail
       # Read provider capacity without opening a worker or changing its lease.
       # Credentials remain on the head and never enter the desktop RPC reply.
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       if [ -r "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}" ]; then
         source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
         export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
@@ -205,7 +209,8 @@ in
       export MSA_DB_VOLUME=${lib.escapeShellArg msaStorage.volumeId}
       export MSA_DB_NFS=${lib.escapeShellArg msaStorage.nfs}
       export MSA_DB_ROOT=/mnt/bio-msa-databases/colabfold
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       export BIO_MSA_DEFAULT_BACKEND=public
       export BIO_PUBLIC_MSA_LOCK=/mnt/bio-shared/coordination/public-msa.lock
     '';
@@ -404,7 +409,8 @@ in
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];
     environment.BIO_WORKBENCH_CONFIG = "/etc/bio-tools/workbench-config.json";
-    environment.BIO_MSA_PROVIDER = "aws";
+    environment.BIO_MSA_PROVIDER = "verda";
+    environment.BIO_MSA_SEARCH_PROFILE = "mapped-prefetch-128gb-v1";
     serviceConfig = {
       Type = "simple";
       ExecStart = "/run/current-system/sw/bin/bio-workbench daemon";

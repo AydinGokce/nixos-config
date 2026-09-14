@@ -1,0 +1,86 @@
+{
+  "status": "passed",
+  "purpose": "Exact portable wrapper recursive workflow and output parity",
+  "wrapper_sha256": "a54dc28d2c5e1667423c844e1a063e2492d611bb39cc3cf82826238b5bd822e2",
+  "binary_sha256": "ded6b985b8d853693637b4beab8550c5224873438fb50ae86e9341416e1dbdb1",
+  "inputs": {
+    "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/single.fasta": "9048bb8c905b82718b0b1afeff37b2c99d4d9905f33a66cae3fcf7cc17b27354",
+    "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/targets.fasta": "fc14cffd8582b37dc62aa3d1dc433b7867ed8ba6811d5f5b2d2bc5d1431a8cdc"
+  },
+  "results": {
+    "official": {
+      "argv": [
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/bin/mmseqs-official",
+        "easy-search",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/single.fasta",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/targets.fasta",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/official/hits.tsv",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/official/tmp",
+        "-k",
+        "5",
+        "--alph-size",
+        "aa:13,nucl:5",
+        "--threads",
+        "4",
+        "--max-seqs",
+        "100",
+        "--alignment-mode",
+        "3",
+        "--format-output",
+        "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+      ],
+      "seconds": 0.16396100498968735,
+      "output_bytes": 3761,
+      "output_sha256": "53172bcd96211ca9328bc598b874aced3bbf41036aae6f79eb00a98a7ff6ae41"
+    },
+    "portable-wrapper": {
+      "argv": [
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs",
+        "easy-search",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/single.fasta",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/targets.fasta",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/portable-wrapper/hits.tsv",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/portable-wrapper/tmp",
+        "-k",
+        "5",
+        "--alph-size",
+        "aa:13,nucl:5",
+        "--threads",
+        "4",
+        "--max-seqs",
+        "100",
+        "--alignment-mode",
+        "3",
+        "--format-output",
+        "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+      ],
+      "seconds": 0.2641459379956359,
+      "output_bytes": 3761,
+      "output_sha256": "53172bcd96211ca9328bc598b874aced3bbf41036aae6f79eb00a98a7ff6ae41"
+    }
+  },
+  "full_database_qualified": false,
+  "recursive_exec_evidence": {
+    "wrapper_exec_calls": 16,
+    "execve_log_sha256": "f663b1d2a65ca437eb0a62ad8c8d0f98a01bd4c49d4745e300f49f4d97f5e7ee",
+    "exact_output_sha256": "53172bcd96211ca9328bc598b874aced3bbf41036aae6f79eb00a98a7ff6ae41",
+    "all_wrapper_invocations": [
+      "426687 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"easy-search\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/single.fasta\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/targets.fasta\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/hits.tsv\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp\", \"-k\", \"5\", \"--alph-size\", \"aa:13,nucl:5\", \"--threads\", \"4\", \"--max-seqs\", \"100\", \"--alignment-mode\", \"3\", \"--format-output\", \"query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits\"], 0x7ffe5c6f5c00 /* 97 vars */) = 0",
+      "426690 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"createdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/single.fasta\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"--threads\", \"4\"], 0x588204929950 /* 111 vars */) = 0",
+      "426693 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"createdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/toy-parity/targets.fasta\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"--write-lookup\", \"0\", \"--threads\", \"4\", \"--gpu\", \"0\"], 0x588204929950 /* 111 vars */) = 0",
+      "426696 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"search\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/result\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp\", \"--alignment-mode\", \"3\", \"--threads\", \"4\", \"-s\", \"5.7\", \"-k\", \"5\", \"--alph-size\", \"aa:13,nucl:5\", \"--max-seqs\", \"100\", \"--remove-tmp-files\", \"1\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426699 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"prefilter\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/pref_0\", \"--sub-mat\", \"b64:YWE6Ymxvc3VtNjIub3V0LG51Y2w6bnVjbGVvdGlkZS5vdXQ=\", \"--seed-sub-mat\", \"b64:YWE6VlRNTDgwLm91dCxudWNsOm51Y2xlb3RpZGUub3V0\", \"-k\", \"5\", \"--target-search-mode\", \"0\", \"--k-score\", \"seq:2147483647,prof:2147483647\", \"--alph-size\", \"aa:13,nucl:5\", \"--max-seq-len\", \"65535\", \"--max-seqs\", \"100\", \"--split\", \"0\", \"--split-mode\", \"2\", \"--split-memory-limit\", \"0\", \"-c\", \"0\", \"--cov-mode\", \"0\", \"--comp-bias-corr\", \"1\", \"--comp-bias-corr-scale\", \"1\", \"--diag-score\", \"1\", \"--exact-kmer-matching\", \"0\", \"--mask\", \"1\", \"--mask-prob\", \"0.9\", \"--mask-lower-case\", \"0\", \"--mask-n-repeat\", \"0\", \"--min-ungapped-score\", \"15\", \"--add-self-matches\", \"0\", \"--spaced-kmer-mode\", \"1\", \"--db-load-mode\", \"0\", \"--pca\", \"substitution:1.100,context:1.400\", \"--pcb\", \"substitution:4.100,context:5.800\", \"--threads\", \"4\", \"--compressed\", \"0\", \"-v\", \"3\", \"-s\", \"5.7\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426709 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"align\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/pref_0\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/result\", \"--sub-mat\", \"b64:YWE6Ymxvc3VtNjIub3V0LG51Y2w6bnVjbGVvdGlkZS5vdXQ=\", \"-a\", \"0\", \"--alignment-mode\", \"3\", \"--alignment-output-mode\", \"0\", \"--wrapped-scoring\", \"0\", \"-e\", \"0.001\", \"--min-seq-id\", \"0\", \"--min-aln-len\", \"0\", \"--seq-id-mode\", \"0\", \"--alt-ali\", \"0\", \"-c\", \"0\", \"--cov-mode\", \"0\", \"--max-seq-len\", \"65535\", \"--comp-bias-corr\", \"1\", \"--comp-bias-corr-scale\", \"1\", \"--max-rejected\", \"2147483647\", \"--max-accept\", \"2147483647\", \"--add-self-matches\", \"0\", \"--db-load-mode\", \"0\", \"--pca\", \"substitution:1.100,context:1.400\", \"--pcb\", \"substitution:4.100,context:5.800\", \"--score-bias\", \"0\", \"--realign\", \"0\", \"--realign-score-bias\", \"-0.2\", \"--realign-max-seqs\", \"2147483647\", \"--corr-score-weight\", \"0\", \"--gap-open\", \"aa:11,nucl:5\", \"--gap-extend\", \"aa:1,nucl:2\", \"--zdrop\", \"40\", \"--threads\", \"4\", \"--compressed\", \"0\", \"-v\", \"3\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426715 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/pref_0\", \"-v\", \"3\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426718 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/aln_0\", \"-v\", \"3\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426721 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/input_0\", \"-v\", \"3\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426725 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/search_tmp/12251609226935110090/aln_merge\", \"-v\", \"3\"], 0x62080a725330 /* 119 vars */) = 0",
+      "426729 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"convertalis\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/result\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/hits.tsv\", \"--sub-mat\", \"b64:YWE6Ymxvc3VtNjIub3V0LG51Y2w6bnVjbGVvdGlkZS5vdXQ=\", \"--format-mode\", \"0\", \"--format-output\", \"query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits\", \"--translation-table\", \"1\", \"--gap-open\", \"aa:11,nucl:5\", \"--gap-extend\", \"aa:1,nucl:2\", \"--db-output\", \"0\", \"--db-load-mode\", \"0\", \"--search-type\", \"0\", \"--threads\", \"4\", \"--compressed\", \"0\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426735 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/result\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426738 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426741 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/target_h\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426744 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0",
+      "426747 execve(\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", [\"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-full-msa-launch/assets/bin/mmseqs\", \"rmdb\", \"/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-wrapper-check/traced-wrapper/tmp/960543705448460026/query_h\", \"-v\", \"3\"], 0x58820492cbc0 /* 111 vars */) = 0"
+    ]
+  }
+}

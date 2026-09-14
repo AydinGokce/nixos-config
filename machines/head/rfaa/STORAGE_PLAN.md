@@ -63,11 +63,13 @@ Every teardown must exclude these verified resources, regardless of names:
 | --- | --- |
 | Existing head instance | `340a396b-19a1-4969-833e-2ddc80d5729b` |
 | Head OS volume | `d48e5cae-cbbc-4d76-af0d-6faa275b5959` |
-| Original 100 GB `bio-shared` volume | `b8b3b446-e464-44dd-9e01-6402489f8c5a` |
+| 300 GiB `bio-shared` runtime volume | `b8b3b446-e464-44dd-9e01-6402489f8c5a` |
 
 The original share is `NVMe_Shared`, `PAY_AS_YOU_GO`, in `FIN-02`, with export
-`nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH`. Never resize or replace it to
-hold the full databases. Do not use bulk volume deletion or `dc rm all` for this
+`nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH`. It was expanded from 200 to
+300 GiB on September 14 to retain the MSA, BindCraft and RF3 runtime archives;
+its ID, export, mounted root and checked files were preserved. Never resize or
+replace it to hold the full databases. Do not use bulk volume deletion or `dc rm all` for this
 storage operation.
 
 ## Allocation and registration procedure

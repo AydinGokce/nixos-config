@@ -31,6 +31,7 @@ CHUNK = 8 * 1024**2
 EDGE = 65536
 MAX_FILES = 500_000
 MAX_JSON = 256 * 1024**2
+VERIFY_WORKERS = 8
 STATE = ".block-cache"
 PENDING = ".colabfold.pending"
 GENERATION_FILES = (".msa-databases.json",) + tuple(
@@ -649,6 +650,80 @@ def verify(cache, owner, device, *, full=False):
         return dict(result, mount=mounted)
 
 
+def _verify_entry(root, item, *, full):
+    name = item["path"]
+    path = root / name
+    require(path.parent.resolve() == path.parent and path.lstat().st_dev == root.stat().st_dev,
+            "Cache entry escaped its filesystem")
+    if item["kind"] == "file":
+        require(sha(item.get("sha256")) and sha(item.get("edge_sha256")), "Invalid cached content SHA")
+        check_file(path, item, full=full, device=root.stat().st_dev)
+        return "files", item["metadata"]["size"]
+    if item["kind"] == "directory":
+        require(stat.S_ISDIR(path.lstat().st_mode)
+                and portable_metadata(path, "directory") == item["metadata"], "Cached directory metadata changed")
+        return "directories", 0
+    require(item["kind"] == "symlink" and path.is_symlink()
+            and os.readlink(path) == item["target"] and metadata(path) == item["metadata"]
+            and path.resolve(strict=True).is_relative_to(root / PurePosixPath(name).parts[0]),
+            "Cached alias changed or escaped")
+    return "symlinks", 0
+
+
+def _verify_inventory(root, handle, *, full):
+    names = set()
+    counted = dict(files=0, symlinks=0, directories=0, payload_bytes=0)
+
+    def entries():
+        for line in handle:
+            require(len(line) <= 16384 and len(names) <= MAX_FILES + 10000, "Oversized cache content inventory")
+            item = json.loads(line)
+            name = safe_path(item["path"], root=True)
+            require(name not in names, "Duplicate content manifest path")
+            names.add(name)
+            yield item
+
+    def record(result):
+        kind, size = result
+        counted[kind] += 1
+        counted["payload_bytes"] += size
+
+    if full:
+        # Keep exhaustive whole-file hashing serial and directly interruptible.
+        for item in entries():
+            record(_verify_entry(root, item, full=True))
+    else:
+        cancelled = threading.Event()
+
+        def check(item):
+            require(not cancelled.is_set(), "Verification cancelled after another entry failed")
+            return _verify_entry(root, item, full=False)
+
+        iterator = iter(entries())
+        pending = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=VERIFY_WORKERS) as pool:
+            try:
+                while True:
+                    # Bound decoded entries, open files and queued work together.
+                    while len(pending) < VERIFY_WORKERS:
+                        item = next(iterator, None)
+                        if item is None:
+                            break
+                        pending.add(pool.submit(check, item))
+                    if not pending:
+                        break
+                    done, pending = concurrent.futures.wait(pending,
+                        return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        record(future.result())
+            except BaseException:
+                cancelled.set()
+                for future in pending:
+                    future.cancel()
+                raise
+    return names, counted
+
+
 def _verify_contents(cache, owner, *, full):
     state = cache / STATE
     raw = read_bytes(cache / "ready.json", 65536)
@@ -668,32 +743,7 @@ def _verify_contents(cache, owner, *, full):
     with manifest.open("rb") as handle:
         require(hash_handle(handle) == ready["content_manifest_sha256"], "Cached content manifest SHA changed")
         handle.seek(0)
-        names = set()
-        counted = dict(files=0, symlinks=0, directories=0, payload_bytes=0)
-        for line in handle:
-            require(len(line) <= 16384 and len(names) <= MAX_FILES + 10000, "Oversized cache content inventory")
-            item = json.loads(line)
-            name = safe_path(item["path"], root=True)
-            require(name not in names, "Duplicate content manifest path")
-            names.add(name)
-            path = root / name
-            require(path.parent.resolve() == path.parent and path.lstat().st_dev == root.stat().st_dev,
-                    "Cache entry escaped its filesystem")
-            if item["kind"] == "file":
-                require(sha(item.get("sha256")) and sha(item.get("edge_sha256")), "Invalid cached content SHA")
-                check_file(path, item, full=full, device=root.stat().st_dev)
-                counted["files"] += 1
-                counted["payload_bytes"] += item["metadata"]["size"]
-            elif item["kind"] == "directory":
-                require(stat.S_ISDIR(path.lstat().st_mode)
-                        and portable_metadata(path, "directory") == item["metadata"], "Cached directory metadata changed")
-                counted["directories"] += 1
-            else:
-                require(item["kind"] == "symlink" and path.is_symlink()
-                        and os.readlink(path) == item["target"] and metadata(path) == item["metadata"]
-                        and path.resolve(strict=True).is_relative_to(root / PurePosixPath(name).parts[0]),
-                        "Cached alias changed or escaped")
-                counted["symlinks"] += 1
+        names, counted = _verify_inventory(root, handle, full=full)
     actual = tree_paths(root)
     require(actual == names and all(ready["completion"].get(k) == v for k, v in counted.items()),
             "Cache contains missing, extra or uncompleted entries")

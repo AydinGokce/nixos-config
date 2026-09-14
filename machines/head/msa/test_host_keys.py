@@ -22,11 +22,16 @@ KEYS = {
 class HostKeyTests(unittest.TestCase):
     def setUp(self):
         self.fixture=fixtures.ClientTests();self.fixture.setUp();self.addCleanup(self.fixture.tearDown)
+        self.addCleanup(self.fixture.doCleanups)
         self.root=self.fixture.root
         self.job_path=self.root/'job'/'job.json';self.job_path.parent.mkdir()
         self.known=self.job_path.parent/'worker-known-hosts'
         self.job={'job':'msa-fixture','model':'msa','instance':'exact-worker','ip':'192.0.2.1',
-                  'search_profile':client.search_profile.resolve(client.search_profile.MAPPED_PROFILE)}
+                  'search_profile':client.search_profile.resolve(client.search_profile.MAPPED_PROFILE),
+                  'database_cache':client.session_cache.identity(self.fixture.route),
+                  'database_volume':self.fixture.route['binding']['volume_id']}
+        self.cache_proof=dict(cache_lease_id=self.fixture.route['lease_id'],
+                              cache_generation=self.fixture.route['binding']['cache_generation'])
 
     def key(self,algorithm='ed25519',ip='192.0.2.1'):
         raw=(ip+' '+KEYS[algorithm]+'\n').encode()
@@ -71,7 +76,7 @@ class HostKeyTests(unittest.TestCase):
              mock.patch.object(client.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'','')):
             started=client.start(self.fixture.args)
         state=Path(started['state']);intent=session.load(state/'intent.json')
-        proof={'hostname':'bio-fixture','instance':'exact-worker','os_id':'exact-os'}
+        proof=dict(hostname='bio-fixture',instance='exact-worker',os_id='exact-os',**self.cache_proof)
         observed=[]
         def check(command,**kwargs):
             observed.append(command)
@@ -100,7 +105,7 @@ class HostKeyTests(unittest.TestCase):
         state=Path(started['state']);intent=session.load(state/'intent.json')
         with mock.patch.dict(os.environ,{'INVOCATION_ID':'b'*32,'BIO_MSA_SESSION_ID':intent['session_id']}), \
              mock.patch.object(client,'unit_state',return_value={'InvocationID':'b'*32,'ActiveState':'active'}), \
-             mock.patch.object(client,'provider_check',return_value={}), \
+             mock.patch.object(client,'provider_check',return_value=self.cache_proof), \
              mock.patch.object(client.subprocess,'check_output') as ssh,self.assertRaisesRegex(ValueError,'bytes changed'):
             client.register_launch(state,self.job_path,'/mnt/bio-shared/runs/msa-fixture/out',self.known)
         ssh.assert_not_called();self.assertFalse((state/'launch.json').exists())
@@ -122,6 +127,25 @@ class HostKeyTests(unittest.TestCase):
                     client.register_launch(state,self.job_path,'/mnt/bio-shared/runs/msa-fixture/out',self.known)
                 provider.assert_not_called();ssh.assert_not_called()
                 self.assertFalse((state/'launch.json').exists())
+
+    def test_new_cache_registration_rejects_wrong_route_or_disk_before_provider_or_ssh(self):
+        self.key()
+        with mock.patch.object(client.shutil,'which',return_value=str(self.fixture.submit)), \
+             mock.patch.object(client.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'','')):
+            started=client.start(self.fixture.args)
+        state=Path(started['state']);intent=session.load(state/'intent.json')
+        original=dict(self.job)
+        for change in (dict(database_cache=None),dict(database_volume='another-disk'),
+                       dict(database_cache=dict(original['database_cache'],lease_id='e'*32))):
+            with self.subTest(change=change):
+                session.atomic(self.job_path,dict(original,**change))
+                with mock.patch.dict(os.environ,{'INVOCATION_ID':'b'*32,'BIO_MSA_SESSION_ID':intent['session_id']}), \
+                     mock.patch.object(client,'unit_state',return_value={'InvocationID':'b'*32,'ActiveState':'active'}), \
+                     mock.patch.object(client,'provider_check') as provider, \
+                     mock.patch.object(client.subprocess,'check_output') as ssh, \
+                     self.assertRaisesRegex(ValueError,'frozen full SSD cache'):
+                    client.register_launch(state,self.job_path,'/mnt/bio-shared/runs/msa-fixture/out',self.known)
+                provider.assert_not_called();ssh.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Versioned execution profiles for the unchanged complete CPU MSA search.
+"""Versioned execution profiles for the complete CPU MSA search.
 
 The limits below control admission, residency and aggregate concurrency. They
-do not change a database, native binary, index split or scientific parameter.
+do not change a database, index split or scientific parameter. The explicit
+mapped-prefetch profile selects a separately pinned scheduling-only native build.
 The mapped guest thresholds require qualification on the complete databases;
 they are not a source-derived worst-case native allocation guarantee.
 """
@@ -15,10 +16,18 @@ import re
 
 GIB = 1024**3
 MAPPED_PROFILE = "mapped-128gb-v1"
+PREFETCH_PROFILE = "mapped-prefetch-128gb-v1"
+MAPPED_PROFILES = frozenset((MAPPED_PROFILE, PREFETCH_PROFILE))
 LEGACY_PROFILE = "resident-768gib-v1"
 DEFAULT_PROFILE = LEGACY_PROFILE
 ENVIRONMENT_KEY = "BIO_MSA_SEARCH_PROFILE"
 _DEFINITIONS = {
+    PREFETCH_PROFILE: dict(minimum_advertised_bytes=128_000_000_000,
+        minimum_total_gib=110, minimum_available_gib=100, mmseqs_threads=4,
+        warm_mode="report", memory_max_gib=96, memory_swap_max_bytes=0,
+        native_variant="gc-mmseqs-posting-prefetch-v2",
+        runtime_manifest_sha256="65e7a0e6f7184bc8c0f4aa35c9f28af960b7b4ba59d9f21fad518e9fe4289bca",
+        posting_readers=32, posting_window_ids=128, posting_touch_bytes=64*1024**2),
     MAPPED_PROFILE: dict(minimum_advertised_bytes=128_000_000_000,
         minimum_total_gib=110, minimum_available_gib=100, mmseqs_threads=4,
         warm_mode="report", memory_max_gib=96, memory_swap_max_bytes=0),
@@ -27,6 +36,8 @@ _DEFINITIONS = {
         warm_mode="prefetch", memory_max_gib=None, memory_swap_max_bytes=None),
 }
 ENVIRONMENT_FIELDS = ("MMSEQS_NUM_THREADS", "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OMP_DYNAMIC")
+PREFETCH_ENVIRONMENT = dict(GC_MMSEQS_POSTING_PREFETCH="1", GC_MMSEQS_POSTING_RANDOM="1",
+                            GC_MMSEQS_POSTING_READERS="32")
 
 
 def canonical(value):
@@ -56,11 +67,23 @@ def resolve(value=None):
     return result
 
 
+def is_mapped(profile=None):
+    return resolve(profile)["profile_id"] in MAPPED_PROFILES
+
+
+def tools_directory(profile=None):
+    return "msa-tools-prefetch-v1" if resolve(profile)["profile_id"] == PREFETCH_PROFILE else "msa-tools-v1"
+
+
+def environment_fields(profile=None):
+    return ENVIRONMENT_FIELDS + (tuple(PREFETCH_ENVIRONMENT) if resolve(profile)["profile_id"] == PREFETCH_PROFILE else ())
+
+
 def warm_mode(profile=None, requested=None):
     profile = resolve(profile)
     mode = profile["warm_mode"] if requested is None else requested
     require(mode in ("report", "prefetch", "lock"), "Unknown index warm mode")
-    require(profile["profile_id"] != MAPPED_PROFILE or mode == "report",
+    require(not is_mapped(profile) or mode == "report",
             "The mapped 128 GB profile requires report-only residency; full prefetch/lock is forbidden")
     return mode
 
@@ -105,6 +128,10 @@ def configure_environment(profile=None, environ=None):
     threads = str(profile["mmseqs_threads"])
     values = dict(MMSEQS_NUM_THREADS=threads, OMP_NUM_THREADS=threads,
                   OMP_THREAD_LIMIT=threads, OMP_DYNAMIC="FALSE")
+    for name in PREFETCH_ENVIRONMENT:
+        environ.pop(name, None)
+    if profile["profile_id"] == PREFETCH_PROFILE:
+        values.update(PREFETCH_ENVIRONMENT)
     environ.update(values)
     environ[ENVIRONMENT_KEY] = profile["profile_id"]
     return values
@@ -137,6 +164,17 @@ def validate_configuration(config, provenance, profile=None, *, allow_legacy=Fal
                 and not config["paths"]["colabfold"].get("environmentalpair"),
                 "Private MSA configuration violates serialized search profile")
         runtime = provenance["runtime"]
+        if profile["profile_id"] == PREFETCH_PROFILE:
+            require(provenance["tools"]["runtime_manifest_sha256"] == profile["runtime_manifest_sha256"]
+                    and provenance["tools"]["native_variant"] == profile["native_variant"],
+                    "Native runtime differs from the selected search profile")
+            import native_runtime
+            native_runtime.validate_provenance(provenance["tools"])
+            require(config["paths"]["mmseqs"] == provenance["tools"]["mmseqs"],
+                    "Mapped-prefetch executable path differs from its provenance")
+        else:
+            require(not provenance.get("tools", {}).get("native_variant"),
+                    "Legacy search profile cannot adopt a modified native runtime")
         recorded = provenance.get("search_profile")
         if recorded is None and allow_legacy and profile["profile_id"] == LEGACY_PROFILE:
             require(type(runtime["mmseqs_threads"]) is int
@@ -156,7 +194,7 @@ def validate_configuration(config, provenance, profile=None, *, allow_legacy=Fal
 
 
 def check_process_environment(pid, profile=None):
-    """Read only the four nonsecret limit values of an existing native API."""
+    """Read only nonsecret execution limits, rejecting leaked prefetch flags."""
     profile = resolve(profile)
     require(type(pid) is int and pid > 0, "Invalid private MSA API PID")
     expected = configure_environment(profile, {})
@@ -164,7 +202,7 @@ def check_process_environment(pid, profile=None):
     # Never retain or report unrelated process environment entries.
     for entry in (Path("/proc")/str(pid)/"environ").read_bytes().split(b"\0"):
         key, separator, value = entry.partition(b"=")
-        if separator and key in {name.encode() for name in ENVIRONMENT_FIELDS}:
+        if separator and key in {name.encode() for name in (*ENVIRONMENT_FIELDS, *PREFETCH_ENVIRONMENT)}:
             name = key.decode("ascii")
             require(name not in values, "Duplicate private MSA native thread limit")
             values[name] = value.decode("ascii")

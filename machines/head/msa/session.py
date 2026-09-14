@@ -27,6 +27,7 @@ import uuid
 import databases
 import panel
 import prefetch
+import session_cache
 import server
 import search_profile
 import worker_controls
@@ -124,7 +125,7 @@ def adopted_api(path, database, deadline, profile=None):
     panel.manifest(Path(value["panel"]["manifest"]), value["panel"]["manifest_sha256"])
     if profile is not None:
         selected = search_profile.validate_configuration(config, provenance, profile, allow_legacy=True)
-        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+        if selected["profile_id"] in search_profile.MAPPED_PROFILES:
             search_profile.check_process_environment(value["api"]["pid"], selected)
             require(search_profile.check_cgroup(selected, value["api"]["pid"]) == search_profile.check_cgroup(selected),
                     "Mapped API adoption must share the session's aggregate memory scope")
@@ -160,12 +161,32 @@ def stop_request(process):
     panel.stop(process)
 
 
+PREFETCH_SOURCES = ('msa/native_runtime.py', 'msa/native-runtime.json', 'msa/tools.sh')
+
+
+def require_profile_sources(profile, recorded):
+    if profile['profile_id'] == search_profile.PREFETCH_PROFILE:
+        require(all(name in recorded for name in PREFETCH_SOURCES),
+                'Prefetch MSA requires its native installer, manifest and setup source pins')
+        require(recorded['msa/native-runtime.json'] == profile['runtime_manifest_sha256'],
+                'Prefetch native manifest differs from the search profile')
+
+
 def sources(tools):
     names = ["msa/session.py", "msa/session_client.py", "msa/panel.py", "msa/prepared.py", "msa/server.py",
              "msa/databases.py", "recipes/_common.sh", "rf3/msa.py"]
     # Existing frozen sessions predate the head lifecycle helper. New snapshots
     # include and bind it without invalidating those immutable old tool trees.
-    for extra in ('msa/lifecycle.py', 'msa/capacity.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'msa/search_profile.py', 'msa/provider.py', 'msa/aws_worker.py', 'msa/aws_transfer.py', 'py/worker_progress.py'):
+    extra_names = ['msa/lifecycle.py', 'msa/capacity.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'msa/search_profile.py', 'msa/provider.py', 'msa/aws_worker.py', 'msa/aws_transfer.py', 'py/worker_progress.py']
+    # The three standalone cache helpers already existed in old frozen trees.
+    # Their presence alone must not expand those sessions' historical receipts.
+    if (tools / 'msa/session_cache.py').exists():
+        extra_names += ['msa/session_cache.py', 'msa/block_cache.py', 'msa/block_cache_control.py', 'msa/block_cache_device.py']
+    if (tools / 'msa/native_runtime.py').exists():
+        require(all((tools / name).is_file() for name in PREFETCH_SOURCES),
+                'Incomplete prefetch-native tool snapshot')
+        extra_names += list(PREFETCH_SOURCES)
+    for extra in extra_names:
         if (tools / extra).exists(): names.append(extra)
     return {name: sha(tools/name) for name in names}
 
@@ -292,11 +313,16 @@ def check_ready(state, expected=None, now=None):
     require(now < ready["deadline_epoch"]-RESERVE, "Private MSA session time is exhausted")
     require(sha(ready["config"]) == ready["config_sha256"]
             and sha(ready["provenance"]) == ready["provenance_sha256"], "Session API provenance changed")
+    if 'database_cache' in ready:
+        cached = ready['database_cache']
+        require(session_cache.worker_receipt(cached['receipt'], cached['root']) == cached,
+                'Live session full SSD cache changed')
     # Old frozen generations have no profile and remain readable as before.
     # New generations bind the policy, guest admission and actual warm receipt.
     if "search_profile" in ready:
         require(isinstance(ready["search_profile"], dict), "Session requires an exact search profile receipt")
         selected = search_profile.resolve(ready["search_profile"])
+        require_profile_sources(selected, ready.get("sources", {}))
         search_profile.validate_configuration(load(ready["config"]), load(ready["provenance"]), selected,
                                               allow_legacy=ready.get("lifecycle") == "borrowed-api")
         search_profile.validate_guest_receipt(ready.get("guest_memory"), selected)
@@ -304,7 +330,7 @@ def check_ready(state, expected=None, now=None):
         require(sha(warm_path) == ready["warm_sha256"], "Session index residency receipt changed")
         warm = load(warm_path)
         search_profile.warm_mode(selected, warm["mode"])
-        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+        if selected["profile_id"] in search_profile.MAPPED_PROFILES:
             require(warm.get("loading") is None and warm.get("locked") is False,
                     "Mapped MSA session unexpectedly preloaded or locked indexes")
             require(search_profile.check_cgroup(selected, ready["api"]["pid"]) == ready.get("memory_limit")
@@ -478,6 +504,13 @@ def serve(args):
         guest_memory = search_profile.check_guest(selected)
         memory_limit = search_profile.check_cgroup(selected)
         search_profile.configure_environment(selected)
+        if selected['profile_id'] == search_profile.PREFETCH_PROFILE:
+            require_profile_sources(selected, sources(tools))
+        cache_receipt = None
+        if getattr(args, 'cache_receipt', None):
+            require(selected['profile_id'] in search_profile.MAPPED_PROFILES,
+                    'Full SSD cache route requires the mapped execution profile')
+            cache_receipt = session_cache.worker_receipt(args.cache_receipt, args.database)
         os.environ["BIO_TOOLS_DIR"] = str(tools)
         atomic(output/'session-starting.json', dict(schema=1, session_id=args.session_id, owner=identity(),
             deadline_epoch=args.deadline, idle_seconds=args.idle_seconds,
@@ -525,7 +558,7 @@ def serve(args):
             try:
                 with socket.create_connection(("127.0.0.1", 8080), timeout=.2): break
             except OSError: time.sleep(.2)
-        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+        if selected["profile_id"] in search_profile.MAPPED_PROFILES:
             search_profile.check_process_environment(api.pid, selected)
             require(search_profile.check_cgroup(selected, api.pid) == memory_limit,
                     "Private MSA API escaped the session's aggregate memory scope")
@@ -539,6 +572,8 @@ def serve(args):
                      provenance_sha256=sha(output/"msa-server.provenance.json"), namespace=provenance["namespace"],
                      warm_sha256=sha(output/"warm-index.json"), database=provenance["database"],
                      search_profile=selected, guest_memory=guest_memory, memory_limit=memory_limit)
+        if cache_receipt is not None:
+            ready['database_cache'] = cache_receipt
         ready.update(lifecycle="borrowed-api" if adoption else "owned-api", adoption=adoption,
                      adoption_sha256=sha(args.adopt) if adoption else None, controls_version=0 if adoption else 1)
         atomic(state/"ready.json", ready, exclusive=True)
@@ -640,6 +675,7 @@ def main(argv=None):
     p.add_argument("--state", type=Path, required=True)
     p.add_argument("--session-id"); p.add_argument("--request-id"); p.add_argument("--expected-ready-sha256")
     p.add_argument("--out", type=Path); p.add_argument("--database", type=Path)
+    p.add_argument('--cache-receipt', type=Path)
     p.add_argument("--tools", type=Path); p.add_argument("--tools-root", type=Path)
     p.add_argument("--results", type=Path); p.add_argument("--deadline", type=float)
     p.add_argument("--idle-seconds", type=float, default=900)

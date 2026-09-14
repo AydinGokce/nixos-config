@@ -34,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 PROFILES = runpy.run_path(str(HERE/'search_profile.py'))
 DEFAULT_PROFILE = PROFILES['DEFAULT_PROFILE']
 MAPPED_PROFILE = PROFILES['MAPPED_PROFILE']
+MAPPED_PROFILES = PROFILES['MAPPED_PROFILES']
 LEGACY_PROFILE = PROFILES['LEGACY_PROFILE']
 LOCATION = 'FIN-02'
 MAX_HOURLY = 13
@@ -143,7 +144,7 @@ def assess_offer(row, *, spot=False, location=LOCATION, profile=DEFAULT_PROFILE)
             r'[1248](?:L40S|A6000|RTX6000ADA|RTXPRO6000|V100)\.[0-9]+V', kind))
     cpu = kind.startswith('CPU.')
     image = 'ubuntu-24.04' if cpu else 'ubuntu-24.04-cuda-12.8-open-docker'
-    if not cpu and profile['profile_id'] == MAPPED_PROFILE and 'ubuntu-24.04' in row['supported_os']:
+    if not cpu and profile['profile_id'] in MAPPED_PROFILES and 'ubuntu-24.04' in row['supported_os']:
         # Both images are already allowed by the launcher. Native CPU MSA
         # needs no driver/toolkit initialization; older V100/A6000 instances
         # also omit the CUDA-12.8-open image from their supported catalog.
@@ -314,7 +315,7 @@ def main(argv=None):
     parser.add_argument('--tools-root', type=Path,
                         default=Path(os.environ.get('BIO_TOOLS_SRC', '/etc/bio-tools')))
     parser.add_argument('--spot-only', action='store_true', help='Honor an explicit spot-only request; never choose regular capacity')
-    parser.add_argument('--profile', default=DEFAULT_PROFILE, choices=(LEGACY_PROFILE, MAPPED_PROFILE),
+    parser.add_argument('--profile', default=DEFAULT_PROFILE, choices=(LEGACY_PROFILE, *sorted(MAPPED_PROFILES)),
                         help='Pinned search profile; build/install callers must use the resident profile')
     parser.add_argument('--wait-seconds', default=0,
                         help='Retry confirmed capacity shortages for up to this many seconds (0..7200; default: one check)')

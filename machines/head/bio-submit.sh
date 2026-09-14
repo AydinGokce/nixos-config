@@ -272,7 +272,8 @@ MSAPROFILE
 elif [ -n "$bundle_result" ]; then
   echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2
 fi
-db_nfs=""; db_volume=""; storage_tool=bio-rfaa-storage; volumes=(--volume "$SHARED_VOL")
+db_nfs=""; db_volume=""; msa_cache_route_json=""; cache_launch_args=()
+storage_tool=bio-rfaa-storage; volumes=(--volume "$SHARED_VOL")
 if [ "$recipe" = rfaa ]; then
   for setting in RFAA_CPU RFAA_MEM_GB; do
     [[ -z "${!setting:-}" || "${!setting}" =~ ^[1-9][0-9]*$ ]] \
@@ -299,11 +300,19 @@ if [ "$recipe" = rfaa ]; then
   esac
 fi
 if [ "$recipe" = msa ]; then
-  [ -n "${MSA_DB_VOLUME:-}" ] && [ -n "${MSA_DB_NFS:-}" ] \
-    || { echo 'bio-submit: private MSA needs storage configured in msa-storage.nix' >&2; exit 2; }
-  storage_tool=bio-msa-storage
-  "$storage_tool" check --volume "$MSA_DB_VOLUME"
-  db_nfs="$MSA_DB_NFS"; db_volume="$MSA_DB_VOLUME"; volumes+=(--volume "$db_volume")
+  if [ "$sub" != convert ] && [[ "${BIO_MSA_SEARCH_PROFILE:-}" = mapped-128gb-v1 || "${BIO_MSA_SEARCH_PROFILE:-}" = mapped-prefetch-128gb-v1 ]]; then
+    cache_select_args=()
+    if [ "$sub" = session ]; then cache_select_args=(--session-state "$BIO_MSA_SESSION_STATE"); fi
+    msa_cache_route_json=$(python3 "$TOOLS_SRC/msa/session_cache.py" select "${cache_select_args[@]}")
+    db_volume=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["binding"]["volume_id"])' "$msa_cache_route_json")
+    volumes+=(--volume "$db_volume")
+  else
+    [ -n "${MSA_DB_VOLUME:-}" ] && [ -n "${MSA_DB_NFS:-}" ] \
+      || { echo 'bio-submit: private MSA needs storage configured in msa-storage.nix' >&2; exit 2; }
+    storage_tool=bio-msa-storage
+    "$storage_tool" check --volume "$MSA_DB_VOLUME"
+    db_nfs="$MSA_DB_NFS"; db_volume="$MSA_DB_VOLUME"; volumes+=(--volume "$db_volume")
+  fi
 fi
 if [ "$recipe" = evolvepro ]; then
   for ((i=0; i<${#extra[@]}; i+=2)); do
@@ -465,7 +474,7 @@ if [ "$recipe" = rfaa ] && [ -n "$db_nfs" ]; then
     echo 'bio-submit: full RFAA databases are not ready on the head; finish installation and validation before launching' >&2
     exit 2
   }
-elif [ "$recipe" = msa ] && [ "$sub" != install ] && [ "$sub" != convert ]; then
+elif [ "$recipe" = msa ] && [ "$sub" != install ] && [ "$sub" != convert ] && [ -z "$msa_cache_route_json" ]; then
   msa_receipt="${MSA_DB_ROOT:-/mnt/bio-msa-databases/colabfold}/.msa-databases.json"
   [ -f "$msa_receipt" ] && [ -s "$msa_receipt" ] || {
     echo 'bio-submit: private MSA databases are not ready on the head; a nonempty final .msa-databases.json receipt is required' >&2
@@ -474,6 +483,7 @@ elif [ "$recipe" = msa ] && [ "$sub" != install ] && [ "$sub" != convert ]; then
 fi
 jobid="$recipe-$(date -u +%Y%m%d-%H%M%S)-$$"
 LOCALOUT="$RESULTS_DIR/$jobid"; mkdir -p "$LOCALOUT"
+if [ -n "$msa_cache_route_json" ]; then printf '%s\n' "$msa_cache_route_json" > "$LOCALOUT/cache-route.json"; fi
 if [ "$recipe" = msa ] && [ "$sub" != convert ]; then
   python3 "$TOOLS_SRC/msa/search_profile.py" show --profile "$BIO_MSA_SEARCH_PROFILE" > "$LOCALOUT/search-profile.json"
 fi
@@ -518,6 +528,7 @@ if [ -n "$library_bundle" ]; then
   fi
 fi
 ROUT="$run/out"
+if [ -n "$msa_cache_route_json" ]; then mkdir -m 700 "$run/cache-control"; fi
 public_msa_proxy=0
 public_msa_head_port=${BIO_PUBLIC_MSA_HEAD_PORT:-18763}
 if [[ "$recipe" = boltz2 || "$recipe" = protenix || "$recipe" = openfold3 ]] && \
@@ -552,8 +563,12 @@ fi
 # Build/reuse one immutable archive before rental. The quoted OS disk includes
 # both the downloaded archive and extracted private files; dc accounts for it.
 [ "$recipe" = msa ] || head_preparation_acquire
+runtime_profile_args=()
+if [ "$recipe" = msa ] && [ "$sub" != convert ]; then
+  runtime_profile_args=(--search-profile "$BIO_MSA_SEARCH_PROFILE")
+fi
 python3 "$TOOLS_SRC/py/worker_runtime.py" plan --package --shared "$SHARED_MNT" \
-  --recipe "$recipe" --model "$model" --sub "$sub" > "$LOCALOUT/runtime-plan.json"
+  --recipe "$recipe" --model "$model" --sub "$sub" "${runtime_profile_args[@]}" > "$LOCALOUT/runtime-plan.json"
 worker_os_size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["os_size_gb"])' "$LOCALOUT/runtime-plan.json")
 [ "$recipe" = msa ] || head_preparation_release
 # NFS clients have returned stale recipe contents after deployment. Snapshot
@@ -592,6 +607,7 @@ remote_msa_bundle="$RPREP"
   printf 'export BIO_MSA_SESSION_ID=%q BIO_MSA_SESSION_IDLE_SECONDS=%q BIO_MSA_SESSION_WARM=%q\n' \
     "${BIO_MSA_SESSION_ID:-}" "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" "${BIO_MSA_SESSION_WARM:-report}"
   printf 'export BIO_MSA_SEARCH_PROFILE=%q\n' "${BIO_MSA_SEARCH_PROFILE:-}"
+  if [ -n "$msa_cache_route_json" ]; then printf 'export BIO_MSA_CACHE_HANDOFF=%q\n' "$run/cache-control/handoff.json"; fi
   printf 'export BIO_WORKER_SCOPE=%q\n' "$worker_scope"
   printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
@@ -637,6 +653,11 @@ BUNDLE
   printf 'base64 --decode > "$BIO_TOOLS_DIR/runtime-plan.json" <<\x27BIO_RUNTIME_PLAN\x27\n'
   base64 "$LOCALOUT/runtime-plan.json"
   printf 'BIO_RUNTIME_PLAN\n'
+  if [ -n "$msa_cache_route_json" ]; then
+    printf 'base64 --decode > "$BIO_TOOLS_DIR/cache-route.json" <<\x27BIO_CACHE_ROUTE\x27\n'
+    base64 "$LOCALOUT/cache-route.json"
+    printf 'BIO_CACHE_ROUTE\n'
+  fi
   cat <<'REMOTE'
 export HOME=/root PATH=/root/.local/bin:$PATH
 export SHARED_NFS RFAA_DB_NFS MSA_DB_NFS
@@ -702,6 +723,13 @@ python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage base_setup --scope "$
   --message "Preparing the worker and mounting shared storage" --eta-lower 30 --eta-upper 180 \
   -- bash "$BIO_TOOLS_DIR/base-setup.sh"
 export BIO_WORKER_PROGRESS_JSON="$OUT/startup-progress.json"
+if [ -n "${BIO_MSA_CACHE_HANDOFF:-}" ]; then
+  python3 "$BIO_TOOLS_DIR/py/worker_progress.py" run --stage database_check --scope msa \
+    --message "Mounting and verifying the full private SSD cache" -- \
+    python3 "$BIO_TOOLS_DIR/msa/session_cache.py" mount --route "$BIO_TOOLS_DIR/cache-route.json" \
+      --handoff "$BIO_MSA_CACHE_HANDOFF" --output "$OUT/cache"
+  export BIO_MSA_CACHE_RECEIPT="$OUT/cache/verified.json"
+fi
 source "$BIO_TOOLS_DIR/recipes/_isolate-runtime.sh"
 bio_worker_isolate_runtime /mnt/bio-shared "$BIO_TOOLS_DIR/runtime-plan.json"
 REMOTE
@@ -755,6 +783,12 @@ cleanup() {
     # the ordinary SSH/rsync path. Unsealed crash checkpoints remain unusable.
     rsync -a "$ROUT/" "$LOCALOUT/" || {
       echo 'bio-submit: MD partial-result retention failed; inspect shared job outputs' >&2
+      [ "$status" -ne 0 ] || status=1
+    }
+  fi
+  if [ -n "${msa_cache_route_json:-}" ]; then
+    python3 "$TOOLS_SRC/msa/session_cache.py" release --route "$LOCALOUT/cache-route.json" || {
+      echo 'bio-submit: cache lease remains held; inspect exact worker cleanup' >&2
       [ "$status" -ne 0 ] || status=1
     }
   fi
@@ -861,6 +895,18 @@ else
     msa_convert) candidates=(CPU.16V.64G) ;;
   esac
 fi
+if [ -n "$msa_cache_route_json" ]; then
+  python3 "$TOOLS_SRC/msa/session_cache.py" acquire --route "$LOCALOUT/cache-route.json"
+  cache_fields=$(python3 - "$LOCALOUT/cache-route.json" <<'CACHEFIELDS'
+import json,sys
+value=json.load(open(sys.argv[1]))
+print(value['lease_id']+'\t'+value['binding']['cache_generation'])
+CACHEFIELDS
+  )
+  IFS=$'\t' read -r BIO_MSA_CACHE_LEASE_ID BIO_MSA_CACHE_GENERATION <<< "$cache_fields"
+  export BIO_MSA_CACHE_LEASE_ID BIO_MSA_CACHE_GENERATION
+  cache_launch_args=(--name "bio-msa-cache-$BIO_MSA_CACHE_LEASE_ID")
+fi
 for g in "${candidates[@]}"; do
   echo "bio-submit: launching $g ..."
   max_hours=$(python3 -c 'import sys; print((int(sys.argv[1])+900)/3600)' "$seconds")
@@ -873,10 +919,13 @@ for g in "${candidates[@]}"; do
   if [ "$msa_startup_attempt" = 1 ]; then
     python3 "$TOOLS_SRC/msa/startup.py" mark-allocation --state "$BIO_MSA_SESSION_STATE"
   fi
+  if [ -n "$msa_cache_route_json" ]; then
+    python3 "$TOOLS_SRC/msa/session_cache.py" launching --route "$LOCALOUT/cache-route.json"
+  fi
   if out=$(python3 "$TOOLS_SRC/py/worker_progress.py" run --stage allocating --scope "$worker_scope" \
       --message "Allocating $g and starting the operating system" --eta-lower 60 --eta-upper 180 \
       -- bash -c 'exec "$@" 2>&1' worker-launch "${launch_environment[@]}" dc launch "$g" \
-      --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" \
+      --loc "$LOC" ${spot:+"$spot"} "${volumes[@]}" "${image_args[@]}" "${cache_launch_args[@]}" \
       --os-size "$worker_os_size" --max-hours "$max_hours"); then
     id=$(printf '%s\n' "$out" | sed -n 's/.*READY id=\([^ ]*\).*/\1/p' | tail -1)
     ip=$(printf '%s\n' "$out" | sed -n 's/.*READY.*ip=\([^ ]*\).*/\1/p' | tail -1)
@@ -893,7 +942,7 @@ if [ -n "$db_nfs" ]; then
 fi
 SSHO=(-i /root/.ssh/datacrunch_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
 worker_known_hosts=""
-if [ "$recipe" = msa ] && [ "$sub" = session ]; then
+if [ "$recipe" = msa ] && { [ "$sub" = session ] || [ -n "$msa_cache_route_json" ]; }; then
   # Capture the key negotiated by the actual authenticated readiness connection.
   # Subsequent attempts reject changes; session registration reuses these bytes.
   worker_known_hosts="$LOCALOUT/worker-known-hosts"
@@ -949,6 +998,9 @@ value['worker_memory_scope']='bio-msa-memory-'+value['job']+'.scope' if profile[
 job.write_text(json.dumps(value,indent=2)+'\n')
 MSAPROFILEJOB
 fi
+if [ -n "$msa_cache_route_json" ]; then
+  python3 "$TOOLS_SRC/msa/session_cache.py" job --route "$LOCALOUT/cache-route.json" --job "$LOCALOUT/job.json"
+fi
 if [ -n "$rf3_preparation_receipt" ]; then
   python3 - "$LOCALOUT/job.json" "$LOCALOUT/rf3-preparation-cache.json" <<'RF3CACHEJOB'
 import hashlib,json,pathlib,sys
@@ -982,7 +1034,13 @@ MSALIMIT
       --property="MemoryMax=$memory_max" --property="MemorySwapMax=$memory_swap" bash -s)
   fi
 fi
-timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" "${worker_command[@]}" < "$remote_file" || status=$?
+if [ -n "$msa_cache_route_json" ]; then
+  python3 "$TOOLS_SRC/msa/session_cache.py" run --route "$LOCALOUT/cache-route.json" --job "$LOCALOUT/job.json" \
+    --handoff "$run/cache-control/handoff.json" --script "$remote_file" --command \
+    timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" "${worker_command[@]}" || status=$?
+else
+  timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" "${worker_command[@]}" < "$remote_file" || status=$?
+fi
 # Fetch partial outputs even on failure; model status must remain nonzero.
 echo "bio-submit: fetching results -> $LOCALOUT"
 ssh_transport="ssh ${SSHO[*]}"

@@ -55,15 +55,35 @@ session and never starts compute. `bio-msa session start --timeout 7200` starts
 an explicit managed session. `session status` checks the original unit invocation,
 provider ownership, pinned SSH host key, boot and session generation.
 
-`BIO_MSA_PROVIDER=verda` or explicit `session start --provider verda` retains the
-older temporary-worker provider; its ordinary profile now also defaults to
-resident/full prefetch. `mapped-128gb-v1` requires explicit selection and remains
-unqualified: the full-database 1,726-aa editor exceeded the native one-hour limit
-under its 96 GiB cap over NFS. Its four-thread/report-only mechanics remain
-available for a separately authorized experiment, not an automatic fallback.
-The AWS route rejects this profile, spot mode, non-900-second idle and partial
-prefetch. Existing saved sessions lacking a provider field remain Verda sessions;
-new configuration never changes their frozen provider or policy.
+`BIO_MSA_PROVIDER=verda` or explicit `session start --provider verda` selects
+the temporary-worker provider. `--search-profile mapped-prefetch-128gb-v1`
+selects the separately pinned native runtime, four native/OpenMP threads,
+32 helper readers per query matcher, report-only residency and a 96 GiB cap
+with no swap. It admits hosts with at least 128 decimal GB advertised RAM,
+then checks at least 110 GiB total and 100 GiB available in the actual guest.
+Profile flags, runtime hashes and native-helper source pins must all match
+before readiness or adoption. See [README.md](README.md) for qualification
+requirements and the current performance projection.
+
+The older `mapped-128gb-v1` retains the original binary; its 1,726-aa NFS trial
+exceeded the native one-hour limit. The low-level policy default remains
+resident/full prefetch; deployment wrappers explicitly select their policy.
+The AWS route accepts only the resident profile and rejects spot mode,
+non-900-second idle and partial prefetch. Existing saved sessions lacking a
+provider field remain Verda sessions; new configuration never changes their
+frozen provider or policy.
+
+New explicitly selected mapped Verda sessions require the full, published SSD
+cache before registering a startup. One serve lease binds its volume, filesystem,
+source generation and ready receipt to the session. A fresh worker boot handshake
+checks the actual attachment before mounting it read-only and verifying the
+complete database inventory. The same identity accompanies readiness and status.
+Cleanup releases the cache only after the managed worker and disposable OS disk
+are absent and the retained cache is detached. A missing cache fails before
+allocation; normal prediction startup never populates one or falls back to NFS.
+The published SSD snapshot is reused across worker lifetimes. Native scientific
+qualification and a check of the normal managed-session transport are required
+before promoting a new runtime/profile into production defaults.
 
 Managed sessions retain the host key negotiated by the first successful SSH
 readiness connection in a fresh, private per-job `worker-known-hosts` file.

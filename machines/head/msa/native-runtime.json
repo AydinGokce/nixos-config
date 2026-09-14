@@ -1,0 +1,73 @@
+{
+  "backend_version": "01365aa4735539ba95b417f73fb5326c77410394",
+  "build_provenance_sha256": "b1014f46a110e1ed785cbd7aa6a301980671cf3ecb82b9d73fba4e2dce32424a",
+  "files": {
+    "bin/mmseqs": {
+      "bytes": 213,
+      "mode": 493,
+      "sha256": "a54dc28d2c5e1667423c844e1a063e2492d611bb39cc3cf82826238b5bd822e2"
+    },
+    "bin/mmseqs-server": {
+      "bytes": 13782437,
+      "mode": 493,
+      "sha256": "a0ae89d4a38ef1d0aec3842f692a38835fa21fc048cda3ed46f96be28c928b67"
+    },
+    "portable/lib/ld-linux-x86-64.so.2": {
+      "bytes": 263056,
+      "mode": 493,
+      "sha256": "c469e248cff434cdbd3070df445f77af455a6d8562430912f0196fd6046c2a63"
+    },
+    "portable/lib/libatomic.so.1": {
+      "bytes": 51048,
+      "mode": 493,
+      "sha256": "8e9ad1ab36798f702b3eb8ac4fe4b13e496c8adb3f8151f1a180e0782987ec2f"
+    },
+    "portable/lib/libc.so.6": {
+      "bytes": 2413096,
+      "mode": 493,
+      "sha256": "5f52a6729ff1a9f4276b0e1ceafdc09ceb318ca2166428ca6dd1176bb0caa8d0"
+    },
+    "portable/lib/libdl.so.2": {
+      "bytes": 15688,
+      "mode": 493,
+      "sha256": "ce680484e222556a494c13045085401025f2f977bf05e8e8222844bfe2aca79b"
+    },
+    "portable/lib/libgcc_s.so.1": {
+      "bytes": 196968,
+      "mode": 493,
+      "sha256": "ae044ece9877d38a4a4bcee7b9c15eed9b50d0dad24d41617eec8fff8bbd262d"
+    },
+    "portable/lib/libgomp.so.1": {
+      "bytes": 383144,
+      "mode": 493,
+      "sha256": "b56126d12c0ea5016e6bf72784ce8d009aeed7d08747e157dbd9e0220ccc9f63"
+    },
+    "portable/lib/libm.so.6": {
+      "bytes": 1102240,
+      "mode": 493,
+      "sha256": "4b964c1131f93ae5354a61eb94d30d3ecca34d7174d89c29f68d95c2f2690de8"
+    },
+    "portable/lib/libpthread.so.0": {
+      "bytes": 16536,
+      "mode": 493,
+      "sha256": "d57b63649efa1b07ebff5703c9ca9e2204b98def060a91eebce56f7a20963d1d"
+    },
+    "portable/lib/libstdc++.so.6": {
+      "bytes": 3230944,
+      "mode": 493,
+      "sha256": "0eec868953ce4c9cbc4437917643576057fde052b9c284358c648d9e8857e336"
+    },
+    "portable/mmseqs": {
+      "bytes": 12672096,
+      "mode": 493,
+      "sha256": "d33f1b17a8dff3060025c9aa78ed93a184719d7c63188506b3254d438c3df8a5"
+    }
+  },
+  "mmseqs_version": "8cc5ce367b5638c4306c2d7cfc652dd099a4643f-gc-reader-sweep-v2",
+  "patch_sha256": "2e991aa986d970337a749c12b7f2ff5e0f51ef2add5133a893307b7d31431ca3",
+  "platform": "linux-x86_64-avx2",
+  "schema": 1,
+  "tools_directory": "msa-tools-prefetch-v1",
+  "upstream_commit": "8cc5ce367b5638c4306c2d7cfc652dd099a4643f",
+  "variant": "gc-mmseqs-posting-prefetch-v2"
+}

@@ -88,9 +88,13 @@ def snapshot(responses, selector, *, current=None, profile=None):
     try:
         require(isinstance(catalog, list) and len(catalog) <= LIMIT)
         selector['evidence'](catalog, empty, empty)
-        profile = selector['search_profile'](selector['DEFAULT_PROFILE'] if profile is None else profile)
     except Exception:
         result['error'] = 'Verda instance catalog is unavailable or invalid'
+        return result
+    try:
+        profile = selector['search_profile'](selector['DEFAULT_PROFILE'] if profile is None else profile)
+    except Exception:
+        result['error'] = 'Configured private MSA search profile is invalid'
         return result
     names = {row['instance_type']: row for row in catalog}
     try:
@@ -192,7 +196,7 @@ def verda_snapshot(tools):
     require(bool(os.environ.get('DATACRUNCH_CLIENT_ID')) and bool(os.environ.get('DATACRUNCH_CLIENT_SECRET')))
     selector = runpy.run_path(str(tools / 'msa/worker.py'))
     client = runpy.run_path(str(tools / 'dc-budget.py'))['API']()
-    return collect(client, selector)
+    return collect(client, selector, profile=os.environ.get('BIO_MSA_SEARCH_PROFILE'))
 
 
 def combined(aws, verda):

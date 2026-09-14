@@ -328,6 +328,135 @@ class Controller:
         return [dict(token=token, **job) for token, job in state["jobs"].items()
                 if intent["volume_id"] in job.get("volumes", [])]
 
+    def reset_retired(self, volume_id, cache_id):
+        """Archive a proven permanent retirement, then clear only current pointers.
+
+        No provider mutation occurs here. The original budget deletion receipt
+        is mandatory: an empty inventory alone cannot retire an uncertain POST.
+        The immutable archive precedes both unlinks so interrupted resets retry.
+        """
+        identifier(volume_id)
+        hex_id(cache_id, 32)
+        archive = self.storage["Store"](self.root / ("msa-block-cache-retired-" + cache_id + ".json"), owner=self.owner)
+        done = self.storage["Store"](self.root / ("msa-block-cache-reset-" + cache_id + ".json"), owner=self.owner)
+        with self.operation.locked(), self.accounting.store.admission(), self.accounting.store.locked(self.clock()) as state:
+            saved, completed = archive.read(), done.read()
+            if completed is not None:
+                require(saved is not None and completed.get("archive_sha256") == hashlib.sha256(archive.path.read_bytes()).hexdigest()
+                        and completed.get("cache_id") == cache_id and completed.get("volume_id") == volume_id
+                        and completed.get("status") == "reset", "Completed cache reset receipt changed")
+                return completed
+            current, pointer = self.read(required=False), self.active.read()
+            intent = current if current is not None else (saved or {}).get("intent")
+            require(intent is not None, "No retired allocation or interrupted reset archive exists")
+            self.validate(intent)
+            require(intent["cache_id"] == cache_id and intent["volume_id"] == volume_id
+                    and intent["status"] == "rejected", "Only the exact rejected retired cache can be reset")
+            retired = intent.get("retired_at")
+            confirmed = intent.get("permanent_removal_confirmed_epoch")
+            require(type(retired) in {int, float} and type(confirmed) in {int, float}
+                    and math.isfinite(retired) and math.isfinite(confirmed)
+                    and retired <= confirmed <= self.clock(), "Permanent cache retirement is not recorded")
+            verified = self.verified(intent, intent.get("verified", {}))
+            require(self.storage["utc"](verified["created_at"]) <= retired, "Retirement precedes cache creation")
+
+            histories = {}
+            for path in sorted(self.root.glob("msa-block-cache-lease-*.json")):
+                lease_id = hex_id(path.name.removeprefix("msa-block-cache-lease-").removesuffix(".json"), 32)
+                lease = self.lease_store(lease_id).read()
+                if not any(lease.get(k) == v for k, v in dict(cache_id=cache_id, volume_id=volume_id,
+                                                          cache_generation=intent["cache_generation"]).items()):
+                    continue
+                require(type(lease.get("schema")) is int and lease["schema"] == 1
+                        and lease.get("lease_id") == lease_id and lease.get("status") == "released"
+                        and lease.get("mode") in {"populate", "serve"}
+                        and lease.get("worker_name") == "bio-msa-cache-" + lease_id
+                        and all(lease.get(k) == v for k, v in self.identity(intent).items()),
+                        "Historical cache lease is active, uncertain, or changed")
+                require(lease.get("release_checks") == dict(exact_workers_absent=True,
+                        exact_os_disks_absent=True, volume_detached=True, managed_jobs_closed=True),
+                        "Historical cache lease has no complete release proof")
+                histories[lease_id] = lease
+            if pointer is not None:
+                require(type(pointer.get("schema")) is int and pointer == dict(schema=1, lease_id=pointer.get("lease_id"))
+                        and pointer.get("lease_id") in histories, "Active cache pointer does not match released history")
+            else:
+                require(not histories or saved is not None, "Released cache history lost its current pointer")
+            if saved is not None:
+                require(saved.get("intent") == intent and saved.get("leases") == histories
+                        and (pointer is None or saved.get("active_pointer") == pointer),
+                        "Interrupted reset archive no longer matches retained records")
+
+            allocation = state.get("expected_database_volumes", {}).get(volume_id, {})
+            resource = state["resources"].get("volume:" + volume_id, {})
+            expected = dict(profile=PROFILE, name=intent["name"],
+                            created=self.storage["utc"](verified["created_at"]),
+                            rate=verified["base_hourly_cost"], retired_at=retired)
+            require(all(allocation.get(k) == v for k, v in expected.items())
+                    and resource.get("active") is False and resource.get("deleted") == retired
+                    and resource.get("kind") == "volume"
+                    and all(resource.get(k) == expected[k] for k in ("name", "created", "rate")),
+                    "Exact cache budget ownership and deletion are not proven")
+            jobs = self.cache_jobs(state, intent)
+            require(all(j.get("status") == "closed" and j.get("cache_lease_id") in histories
+                        and j.get("cache_generation") == intent["cache_generation"] for j in jobs),
+                    "A cache budget job is unresolved or differs from released history")
+            require(not any((j.get("cache_lease_id") in histories or j.get("cache_generation") == intent["cache_generation"])
+                            and volume_id not in j.get("volumes", []) for j in state["jobs"].values()),
+                    "A cache budget job has changed its volume binding")
+            for lease_id, lease in histories.items():
+                matching = [j for j in jobs if j["cache_lease_id"] == lease_id]
+                require(set(lease.get("closed_job_tokens", [])) == {j["token"] for j in matching},
+                        "Released lease no longer matches its closed budget jobs")
+                managed = lease.get("managed")
+                require(managed is None or any(j["token"] == managed.get("token")
+                        and j.get("id") == managed.get("instance_id")
+                        and j.get("os_id") == managed.get("os_volume_id") for j in matching),
+                        "Released worker identity no longer matches its budget receipt")
+
+            inventory = self.api.inventory()
+            require(len(inventory) == 3 and all(isinstance(rows, list) for rows in inventory), "Incomplete provider inventory")
+            for row in inventory[1] + inventory[2]:
+                observed_tags = tags(row)
+                require(row.get("id") != volume_id and row.get("name") != intent["name"]
+                        and observed_tags.get("allocation-token") != cache_id
+                        and not any(row.get("id") == j.get("os_id") for j in jobs),
+                        "Retired cache identity or managed OS disk remains in active storage or trash")
+            for row in inventory[0]:
+                refs = row.get("volume_ids")
+                require(isinstance(refs, list) and volume_id not in refs and row.get("os_volume_id") != volume_id
+                        and not any(row.get("id") == j.get("id") for j in jobs)
+                        and not any(row.get("hostname") == lease["worker_name"] for lease in histories.values())
+                        and not any(row.get("description", "").startswith("bio-dc:" + j["token"] + " ") for j in jobs),
+                        "A cache attachment or leased worker remains in provider inventory")
+            # Refresh normal accounting only after its earlier deletion proof is
+            # checked; never turn one empty inventory into that proof ourselves.
+            self.budget["reconcile"](state, inventory, self.clock())
+            if saved is None:
+                saved = dict(schema=1, kind="msa-block-cache-retirement", intent=intent,
+                             active_pointer=pointer, leases=histories,
+                             budget=dict(allocation=allocation, resource=resource, jobs=jobs),
+                             provider=dict(observed_epoch=self.clock(), instances=inventory[0],
+                                           volumes=inventory[1], trash=inventory[2]))
+                archive.save(saved)
+            self.accounting.store.save(state)
+            # The per-lease files remain in place, and all former current bytes
+            # are retained in the fsynced archive before either pointer clears.
+            for store in (self.active, self.intent):
+                if store.read() is not None:
+                    store.path.unlink()
+                    fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+            result = dict(schema=1, status="reset", cache_id=cache_id, volume_id=volume_id,
+                          archive_path=str(archive.path), archive_sha256=hashlib.sha256(archive.path.read_bytes()).hexdigest(),
+                          reset_epoch=self.clock(), provider_mutations=False,
+                          budget_history_preserved=True, lease_history_preserved=True)
+            done.save(result)
+            return result
+
     def acquire(self, lease_id, mode="serve"):
         hex_id(lease_id, 32)
         require(mode in {"serve", "populate"}, "Unknown cache lease mode")
@@ -470,7 +599,7 @@ class Controller:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "create", "reconcile", "status", "preflight", "acquire",
-                                             "launching", "bind", "release", "publish-ready"))
+                                             "launching", "bind", "release", "publish-ready", "reset-retired"))
     parser.add_argument("--state-root", default=os.environ.get("DC_STATE_DIR", "/var/lib/dc"))
     parser.add_argument("--source-manifest-sha256")
     parser.add_argument("--source-receipt-sha256")
@@ -481,6 +610,7 @@ def main(argv=None):
     parser.add_argument("--ready-receipt", type=Path)
     parser.add_argument("--ready-receipt-sha256")
     parser.add_argument("--expected-volume-id")
+    parser.add_argument("--expected-cache-id")
     parser.add_argument("--expected-filesystem-uuid")
     parser.add_argument("--expected-cache-generation")
     args = parser.parse_args(argv)
@@ -492,10 +622,12 @@ def main(argv=None):
     expected = {key: value for key, value in dict(volume_id=args.expected_volume_id,
         filesystem_uuid=args.expected_filesystem_uuid, cache_generation=args.expected_cache_generation).items()
         if value is not None}
-    if expected:
+    if expected and args.command != "reset-retired":
         retained = controller.read()
         require(all(retained.get(k) == v for k, v in expected.items()), "Configured cache identity differs from its allocation")
-    if args.command in {"plan", "create", "reconcile", "status", "preflight"}:
+    if args.command == "reset-retired":
+        result = controller.reset_retired(args.expected_volume_id, args.expected_cache_id)
+    elif args.command in {"plan", "create", "reconcile", "status", "preflight"}:
         result = controller.execute("status" if args.command == "preflight" else args.command,
                                     args.source_manifest_sha256, args.source_receipt_sha256)
         if args.command == "preflight":
@@ -514,7 +646,7 @@ def main(argv=None):
         require(args.ready_receipt is not None, "A ready receipt file is required")
         result = controller.publish_ready(args.lease_id, args.ready_receipt.read_bytes(), args.ready_receipt_sha256)
     print(json.dumps(result, indent=2, allow_nan=False))
-    return 0 if result["status"] == "allocated" or args.command == "plan" else 4
+    return 0 if result["status"] in {"allocated", "reset"} or args.command == "plan" else 4
 
 
 if __name__ == "__main__":

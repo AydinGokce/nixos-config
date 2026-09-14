@@ -1,0 +1,272 @@
+--- a/src/prefiltering/QueryMatcher.cpp
++++ b/src/prefiltering/QueryMatcher.cpp
+@@ -2,6 +2,7 @@
+ #include "QueryMatcher.h"
+ #include "FastSort.h"
+ #include "Util.h"
++#include "PostingPrefetch.h"
+ 
+ #define FE_1(WHAT, X) WHAT(X)
+ #define FE_2(WHAT, X, ...) WHAT(X)FE_1(WHAT, __VA_ARGS__)
+@@ -65,9 +66,24 @@
+         ungappedAlignment = new UngappedAlignment(maxSeqLen, ungappedAlignmentSubMat, sequenceLookup);
+     }
+     compositionBias = new float[maxSeqLen];
++    postingPrefetch = NULL;
++    const char *prefetch = std::getenv("GC_MMSEQS_POSTING_PREFETCH");
++    if (prefetch != NULL && std::strcmp(prefetch, "1") == 0) {
++        postingPrefetch = new PostingPrefetch(indexTable->getEntries(),
++            indexTable->getTableEntriesNum(), indexTable->getOffsets(),
++            indexTable->getTableSize(), sizeof(IndexEntryLocal));
++        Debug(Debug::INFO) << "Experimental posting prefetch: " << postingPrefetch->readers()
++            << " readers, 128 lists/window, 64 MiB touched-page cap\n";
++    }
+ }
+ 
+ QueryMatcher::~QueryMatcher(){
++    if (postingPrefetch != NULL) {
++        Debug(Debug::INFO) << "Experimental posting prefetch completed windows: " << postingPrefetch->batchCount()
++            << " touched-page references: " << postingPrefetch->pageCount()
++            << " rejected out-of-bounds lists: " << postingPrefetch->invalidCount() << "\n";
++        delete postingPrefetch;
++    }
+     deleteDiagonalMatcher(activeCounter);
+     free(resList);
+     delete[] scoreSizes;
+@@ -264,6 +280,10 @@
+         kmerListLen += kmerElementSize;
+ 
+         for (unsigned int kmerPos = 0; kmerPos < kmerElementSize; kmerPos++) {
++            if (postingPrefetch != NULL && kmerPos % PostingPrefetch::WINDOW == 0) {
++                postingPrefetch->progress(current_i, seq->L, kmerPos, kmerElementSize);
++                postingPrefetch->warm(index + kmerPos, kmerElementSize - kmerPos);
++            }
+             const IndexEntryLocal *entries = indexTable->getDBSeqList(index[kmerPos], &seqListSize);
+             // DEBUG
+             //std::cout << seq->getDbKey() << std::endl;
+--- a/src/prefiltering/QueryMatcher.h
++++ b/src/prefiltering/QueryMatcher.h
+@@ -49,6 +49,7 @@
+ };
+ 
+ class QueryMatcherHook;
++class PostingPrefetch;
+ 
+ class QueryMatcher {
+ public:
+@@ -143,6 +144,7 @@
+     KmerGenerator *kmerGenerator;
+     /* contains the sequences for a kmer */
+     IndexTable *indexTable;
++    PostingPrefetch *postingPrefetch;
+     // k of the k-mer
+     int kmerSize;
+     // local amino acid bias correction
+--- /dev/null
++++ b/src/prefiltering/PostingPrefetch.h
+@@ -0,0 +1,205 @@
++#ifndef GC_EXPERIMENTAL_POSTING_PREFETCH_H
++#define GC_EXPERIMENTAL_POSTING_PREFETCH_H
++
++// Experimental scheduling only. The caller still reads every posting list in
++// its original order. Never enabled without GC_MMSEQS_POSTING_PREFETCH=1.
++#include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++#include <pthread.h>
++#include <limits>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <unistd.h>
++
++class PostingPrefetch {
++public:
++    static const size_t DEFAULT_WORKERS = 4;
++    static const size_t WINDOW = 128;
++    static const size_t WINDOW_BYTES = 64 * 1024 * 1024;
++
++    PostingPrefetch(const void *entries, uint64_t entryCount,
++                   const size_t *offsets, size_t tableSize, size_t entrySize)
++        : entries(static_cast<const volatile unsigned char *>(entries)),
++          entryCount(entryCount), offsets(offsets), tableSize(tableSize),
++          entrySize(entrySize), workerCount(configuredReaders()), pageSize(static_cast<size_t>(sysconf(_SC_PAGESIZE))),
++          count(0), generation(0), remaining(0), stopping(false),
++          batches(0), touchedPages(0), invalidLists(0), randomBytes(0),
++          began(std::chrono::steady_clock::now()), lastReport(began-std::chrono::seconds(10)) {
++        if (!entries || !offsets || !entrySize || !tableSize || !pageSize ||
++            pageSize > WINDOW_BYTES / workerCount ||
++            entryCount > std::numeric_limits<size_t>::max() / entrySize) {
++            std::fputs("Invalid experimental posting-prefetch bounds\n", stderr);
++            std::abort();
++        }
++        const char *randomAdvice = std::getenv("GC_MMSEQS_POSTING_RANDOM");
++        if (randomAdvice && std::strcmp(randomAdvice, "1") == 0) {
++            const uint64_t requested = static_cast<size_t>(entryCount) * entrySize;
++            randomBytes += adviseRandom(entries, requested);
++            uint64_t offsetBytes = 0;
++            if (tableSize < std::numeric_limits<size_t>::max() / sizeof(size_t)) {
++                offsetBytes = (tableSize + 1) * sizeof(size_t);
++                randomBytes += adviseRandom(offsets, offsetBytes);
++            }
++            std::fprintf(stderr, "GC_PREFETCH_RANDOM flag=1 advised_file_bytes=%llu skipped_bytes=%llu\n",
++                static_cast<unsigned long long>(randomBytes),
++                static_cast<unsigned long long>(requested + offsetBytes - randomBytes));
++        }
++        // MMseqs builds with exceptions disabled. Thread-creation failure is
++        // therefore a process failure, never a silently partial worker pool.
++        for (size_t i = 0; i < workerCount; ++i)
++            workers.emplace_back(&PostingPrefetch::worker, this, i);
++    }
++
++    ~PostingPrefetch() { stop(); }
++    PostingPrefetch(const PostingPrefetch &) = delete;
++    PostingPrefetch &operator=(const PostingPrefetch &) = delete;
++
++    void warm(const size_t *ids, size_t length) {
++        if (!length) return;
++        std::unique_lock<std::mutex> lock(mutex);
++        count = std::min(length, size_t(WINDOW));
++        std::copy(ids, ids + count, kmers);
++        remaining = workerCount;
++        ++generation;
++        ++batches;
++        work.notify_all();
++        finished.wait(lock, [this] { return remaining == 0; });
++    }
++
++    size_t readers() const { return workerCount; }
++
++    uint64_t batchCount() const { return batches; }
++    uint64_t pageCount() const { return touchedPages; }
++    uint64_t invalidCount() const { return invalidLists; }
++    uint64_t randomAdviceBytes() const { return randomBytes; }
++
++    void progress(size_t position, size_t queryLength, size_t kmerPosition, size_t kmerCount) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now-lastReport < std::chrono::seconds(10)) return;
++        std::fprintf(stderr, "GC_PREFETCH_PROGRESS elapsed=%.3f readers=%zu query_position_zero_based=%zu query_length=%zu "
++            "kmer_position=%zu kmer_count=%zu windows=%llu touched_page_references=%llu\n",
++            std::chrono::duration<double>(now-began).count(), workerCount, position, queryLength,
++            kmerPosition, kmerCount, static_cast<unsigned long long>(batches),
++            static_cast<unsigned long long>(touchedPages));
++        std::fflush(stderr);
++        lastReport = now;
++    }
++
++private:
++    static size_t configuredReaders() {
++        const char *value = std::getenv("GC_MMSEQS_POSTING_READERS");
++        if (!value) return DEFAULT_WORKERS;
++        if (std::strcmp(value, "4") == 0) return 4;
++        if (std::strcmp(value, "16") == 0) return 16;
++        if (std::strcmp(value, "32") == 0) return 32;
++        std::fputs("GC_MMSEQS_POSTING_READERS must be exactly4,16 or32\n", stderr);
++        std::abort();
++    }
++
++    uint64_t adviseRandom(const void *pointer, size_t bytes) {
++        // Advice changes access scheduling only. Restrict it to complete pages
++        // inside the requested data range AND one verified read-only file VMA.
++        // This deliberately skips heap/anonymous buffers and partial edge pages.
++        const uintptr_t start = reinterpret_cast<uintptr_t>(pointer);
++        if (!bytes || bytes > std::numeric_limits<uintptr_t>::max() - start) return 0;
++        const uintptr_t end = start + bytes;
++        FILE *maps = std::fopen("/proc/self/maps", "r");
++        if (!maps) return 0;
++        char line[4096];
++        uint64_t advised = 0;
++        while (std::fgets(line, sizeof(line), maps)) {
++            unsigned long lo, hi, inode;
++            char permissions[5] = {};
++            if (std::sscanf(line, "%lx-%lx %4s %*s %*s %lu", &lo, &hi, permissions, &inode) != 4)
++                continue;
++            if (start < lo || end > hi || permissions[0] != 'r' || permissions[1] != '-' || !inode)
++                continue;
++            const size_t skip = (pageSize - start % pageSize) % pageSize;
++            if (skip >= bytes) break;
++            const uintptr_t aligned = start + skip;
++            const uintptr_t alignedEnd = end - end % pageSize;
++            if (alignedEnd > aligned && madvise(reinterpret_cast<void *>(aligned),
++                                               alignedEnd - aligned, MADV_RANDOM) == 0)
++                advised = alignedEnd - aligned;
++            break;
++        }
++        std::fclose(maps);
++        return advised;
++    }
++
++    void stop() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++            work.notify_all();
++        }
++        for (std::thread &thread : workers)
++            if (thread.joinable()) thread.join();
++    }
++
++    void worker(size_t workerId) {
++        char name[16];
++        std::snprintf(name, sizeof(name), "gc-posting-%02zu", workerId);
++        pthread_setname_np(pthread_self(), name);
++        uint64_t seen = 0;
++        std::unique_lock<std::mutex> lock(mutex);
++        while (true) {
++            work.wait(lock, [this, seen] { return stopping || generation != seen; });
++            if (stopping) return;
++            seen = generation;
++            lock.unlock();
++            size_t pages = 0, invalid = 0;
++            const size_t quota = WINDOW_BYTES / workerCount / pageSize;
++            for (size_t i = workerId; i < count && pages < quota; i += workerCount) {
++                const size_t id = kmers[i];
++                if (id >= tableSize) { ++invalid; continue; }
++                // Resolve offsets in parallel too: the offset table is mapped
++                // and can itself fault. No scoring or query state is touched.
++                const size_t begin = offsets[id], end = offsets[id + 1];
++                if (begin > end || end > entryCount) { ++invalid; continue; }
++                size_t position = begin * entrySize;
++                const size_t limit = end * entrySize;
++                while (position < limit && pages < quota) {
++                    // Start inside the actual list; never round down into a
++                    // preceding record, allocation, mapping gap or file hole.
++                    const unsigned char value = entries[position];
++                    (void)value;
++                    ++pages;
++                    const uintptr_t address = reinterpret_cast<uintptr_t>(entries + position);
++                    const size_t advance = pageSize - address % pageSize;
++                    if (advance >= limit - position) break;
++                    position += advance;
++                }
++            }
++            lock.lock();
++            touchedPages += pages;
++            invalidLists += invalid;
++            if (--remaining == 0) finished.notify_one();
++        }
++    }
++
++    const volatile unsigned char *entries;
++    uint64_t entryCount;
++    const size_t *offsets;
++    size_t tableSize, entrySize, workerCount, pageSize;
++    size_t kmers[WINDOW];
++    size_t count;
++    uint64_t generation;
++    size_t remaining;
++    bool stopping;
++    std::mutex mutex;
++    std::condition_variable work, finished;
++    std::vector<std::thread> workers;
++    uint64_t batches, touchedPages, invalidLists, randomBytes;
++    std::chrono::steady_clock::time_point began, lastReport;
++};
++
++#endif

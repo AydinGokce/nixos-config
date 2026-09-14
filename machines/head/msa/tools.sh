@@ -1,11 +1,21 @@
 # Source on the preparation worker. Application code arrives in the verified job
 # bundle; these immutable, version-checked executables are reusable on the share.
 set -euo pipefail
+[ "$(uname -sm)" = 'Linux x86_64' ] || { echo 'msa-tools: Linux x86_64 required' >&2; return 1; }
+grep -qw avx2 /proc/cpuinfo || { echo 'msa-tools: this pinned build requires AVX2' >&2; return 1; }
+if [ "${BIO_MSA_SEARCH_PROFILE:-}" = mapped-prefetch-128gb-v1 ]; then
+  MSA_TOOLS_ROOT="${MSA_TOOLS_ROOT:-/mnt/bio-shared/envs/msa-tools-prefetch-v1}"
+  # The head installs the frozen build once. Existing runtime packaging copies
+  # this complete environment to workers; never build/download a replacement.
+  python3 "$(dirname "${BASH_SOURCE[0]}")/native_runtime.py" verify --root "$MSA_TOOLS_ROOT" >/dev/null
+  export MSA_TOOLS_ROOT
+  export MMSEQS="$MSA_TOOLS_ROOT/bin/mmseqs" MMSEQS_SERVER="$MSA_TOOLS_ROOT/bin/mmseqs-server"
+  export PATH="$MSA_TOOLS_ROOT/bin:$PATH"
+  return 0 2>/dev/null || exit 0
+fi
 : "${MSA_TOOLS_ROOT:=/mnt/bio-shared/envs/msa-tools-v1}"
 msa_mmseqs_commit=8cc5ce367b5638c4306c2d7cfc652dd099a4643f
 msa_backend_commit=01365aa4735539ba95b417f73fb5326c77410394
-[ "$(uname -sm)" = 'Linux x86_64' ] || { echo 'msa-tools: Linux x86_64 required' >&2; return 1; }
-grep -qw avx2 /proc/cpuinfo || { echo 'msa-tools: this pinned build requires AVX2' >&2; return 1; }
 mkdir -p "$(dirname "$MSA_TOOLS_ROOT")"
 exec {msa_lock}>"$MSA_TOOLS_ROOT.lock"
 flock "$msa_lock"

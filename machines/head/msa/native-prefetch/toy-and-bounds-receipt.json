@@ -1,0 +1,61 @@
+{
+  "build_receipt_sha256": "7dda4afd1f80062ea74b6650350667aa189fe3161484fc020d9c83b685ac1edf",
+  "bundle_manifest_sha256": "8c6c45e77868dc7478050202cae000d72f10039cc6bf1076016dc701dbf86672",
+  "cache_reset": "Index-only DONTNEED after prior process reaped; eviction requested, residency not independently measured",
+  "caveats": [
+    "64MiB is touched-page references, not a cap on physical I/O or RSS",
+    "Readers are per QueryMatcher; four concurrent queries can create128 helpers plus native threads; sampler retains actual named helper active/wait counts",
+    "Short first-query prefix sweep compares progress only; final scientific output parity requires complete results",
+    "Exact single-query raw files and multiquery raw per-ID payloads match official/local baseline/patch OFF/4/16/32 in toy fixture",
+    "Thread lifetime test allows up to100ms for /proc task directory retirement after pthread_join; initial timing-sensitive failure is retained",
+    "Incremental build reuses unchanged v1 object archive and recompiles QueryMatcher/version only; input archive and all commands pinned"
+  ],
+  "created_epoch": 1789421786.955474,
+  "driver_sha256": "8cc7b3844dc9c5e4d9bbee805e1a1e6ab24c820b06fa6e5ec9c0c8ba7c1e030d",
+  "full_database_or_full_msa_qualified": false,
+  "guest_assets_bytes": 37794157,
+  "guest_assets_sha256": "59879dabe65b96fbcd394fcbba7b0ff028ead3f6a02dc9d8fe27f31a2af53312",
+  "limits": {
+    "cgroup_memory_bytes": 103079215104,
+    "default_readers": 4,
+    "kmer_ids_per_window": 128,
+    "max_observed_tasks": 160,
+    "maximum_native_seconds_total": 180,
+    "reader_counts": [
+      4,
+      16,
+      32
+    ],
+    "seconds_each": 60,
+    "swap_bytes": 0,
+    "total_touched_page_bytes_per_window": 67108864
+  },
+  "patch_sha256": "10c5bf4653bd83700f8d30a564adf8f7c68db8978aafa7d854aa1f6032c39c6a",
+  "patched_binary_sha256": "d33f1b17a8dff3060025c9aa78ed93a184719d7c63188506b3254d438c3df8a5",
+  "preserved_v1_receipt_sha256": "f4c5c4fc9c0371643de829fcb7da239058d341182db42fc0ac94dd1e396d194c",
+  "scientific_arguments_and_query_unchanged": true,
+  "source": {
+    "PostingPrefetch.h": {
+      "after": "0d231a999a9c79c1b262f42747fbc65a8d1738da816c40d2877ec9e73cc50228",
+      "before": "ab112eea27ebf9a121fd51550e07c6bb1bb22e56c0d7191636ed7380da152335"
+    },
+    "QueryMatcher.cpp": {
+      "after": "4c43cf61e05a629a0b08c0deaf9615d994b33715f7fa75eeae055122036a41ff",
+      "before": "30b7e3d1b1ae29eff50084fb2987631b841783adcb165a07bd7537c785860ab1"
+    },
+    "QueryMatcher.h": {
+      "after": "85ca32c29f43ca9114dd9f5f8fb6b60dce54887b40bad4e079c119b598640b70",
+      "before": "85ca32c29f43ca9114dd9f5f8fb6b60dce54887b40bad4e079c119b598640b70"
+    }
+  },
+  "status": "local-tests-passed-awaiting-bounded-reader-sweep",
+  "tests": {
+    "driver-tests.log": "3da3e689633c1113c838a4cd460194f0fd8cde001f0ebf7159ded1b429eae494",
+    "helper-tests.log": "4c3566e3aa2782227ad28492b9705df7adf5f72d0091198ee7ccb2dd3fa1274e",
+    "portable-loader-resolution.log": "d73e1a9c88f9d4a457332a6ae7adbf702ddca0daeab66f2f6825e8e175d5454e",
+    "test_native_probe.py": "8b69addad93501f503d521cfdeafccbc17aca7fd32c16e289dd050b46c316422",
+    "test_posting_prefetch.cpp": "b4e17cf9330a62aec11de66bcee463c9ea45114f224ba6a5cee76ff02399d512",
+    "toy-parity/RESULTS.json": "3639ea88cc4d61f8a052b80124c771b5ae00ce969d63680f94056b4bb9921474",
+    "toy_parity.py": "08f5e110afcae267fdcbf936689db0be8d7839c9da978a8441f5db304ff22f4f"
+  }
+}

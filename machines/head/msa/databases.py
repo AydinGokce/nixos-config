@@ -273,7 +273,14 @@ def validate_component(directory, name):
     return inventory(directory)
 
 
-def tools(root):
+def tools(root, profile=None):
+    # Database construction and historical callers keep the official runtime.
+    # Only an explicit search profile can select the separately pinned wrapper.
+    if profile is not None:
+        import search_profile
+        if search_profile.resolve(profile)["profile_id"] == search_profile.PREFETCH_PROFILE:
+            import native_runtime
+            return native_runtime.validate(root)
     mmseqs, server = root / "bin/mmseqs", root / "bin/mmseqs-server"
     for binary, flag, expected, sha in ((mmseqs, "version", MMSEQS_COMMIT, MMSEQS_SHA256),
                                        (server, "-version", BACKEND_COMMIT, BACKEND_SHA256)):

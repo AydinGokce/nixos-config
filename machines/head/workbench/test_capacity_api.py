@@ -113,6 +113,76 @@ class AwsCapacityTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def entrypoint(self, profile=None, *, selected='verda', aws=None):
+        candidate = machine('1H100.80S.32V', ram=128, count=1, regular=3.25)
+        data = evidence(catalog=[candidate])
+        requests, loaded = [], []
+        real_run_path = runpy.run_path
+        class FakeAPI:
+            def request(self, method, endpoint):
+                requests.append((method, endpoint))
+                return deepcopy(data[next(key for key, path in provider.ENDPOINTS.items() if path == endpoint)])
+        def source(path):
+            loaded.append(Path(path))
+            if Path(path) == HEAD / 'dc-budget.py':
+                return {'API': FakeAPI}
+            return real_run_path(path)
+        environment = dict(BIO_MSA_PROVIDER=selected, DATACRUNCH_CLIENT_ID='offline-id',
+                           DATACRUNCH_CLIENT_SECRET='offline-secret')
+        if profile is not None:
+            environment['BIO_MSA_SEARCH_PROFILE'] = profile
+        with patch.dict(os.environ, environment, clear=True), \
+             patch.object(provider.runpy, 'run_path', side_effect=source), \
+             patch.object(provider, 'aws_snapshot', return_value=aws), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            self.assertEqual(provider.main(['--tools-root', str(HEAD)]), 0)
+        self.assertIn(HEAD / 'msa/worker.py', loaded)
+        self.assertIn(HEAD / 'msa/search_profile.py', loaded)
+        self.assertEqual(sorted(requests), sorted(('GET', path) for path in provider.ENDPOINTS.values()))
+        return json.loads(output.getvalue()), data
+
+    def test_entrypoint_propagates_mapped_profile_to_selection_and_128gb_gpu_rows(self):
+        for profile, eligible in ((SELECTOR['MAPPED_PROFILE'], True),
+                                  (SELECTOR['PROFILES']['PREFETCH_PROFILE'], True),
+                                  (SELECTOR['LEGACY_PROFILE'], False), (None, False)):
+            with self.subTest(profile=profile):
+                result, data = self.entrypoint(profile)
+                self.assertEqual(result['state'], 'ready')
+                self.assertEqual(result['msa_available'], eligible)
+                self.assertEqual(result['gpus'][0]['msa_eligible'], eligible)
+                assessment = SELECTOR['assess_offer'](data['catalog'][0], profile=profile,
+                                                       spot=False, location='FIN-02')
+                self.assertEqual(result['gpus'][0]['reason'], assessment['reason'])
+                if eligible:
+                    choice = SELECTOR['choose'](data['catalog'], data['regular'], data['spot'], profile=profile)
+                    self.assertEqual(result['gpus'][0]['instance_type'], choice['instance_type'])
+
+    def test_entrypoint_invalid_explicit_profile_is_unknown_without_fallback(self):
+        for profile in ('', 'invalid-private-profile'):
+            with self.subTest(profile=profile):
+                result, _ = self.entrypoint(profile)
+                self.assertEqual(result['state'], 'error')
+                self.assertIsNone(result['msa_available'])
+                self.assertEqual(result['gpus'], [])
+                self.assertEqual(result['error'], 'Configured private MSA search profile is invalid')
+                self.assertNotIn('invalid-private-profile', json.dumps(result))
+
+    def test_entrypoint_aws_status_stays_independent_of_verda_profile(self):
+        aws = aws_observed(); aws['msa_available'] = False
+        for profile, gpu in ((SELECTOR['MAPPED_PROFILE'], True),
+                             (SELECTOR['PROFILES']['PREFETCH_PROFILE'], True),
+                             (SELECTOR['LEGACY_PROFILE'], False), ('invalid', None)):
+            with self.subTest(profile=profile):
+                result, _ = self.entrypoint(profile, selected='aws', aws=aws)
+                self.assertEqual(result['msa_provider'], 'aws')
+                self.assertFalse(result['msa_available'])
+                self.assertEqual(result['cpus'], aws['cpus'])
+                if gpu is None:
+                    self.assertEqual(result['gpus'], [])
+                    self.assertIn('gpu_error', result)
+                else:
+                    self.assertEqual(result['gpus'][0]['msa_eligible'], gpu)
+
     def test_other_gpu_families_share_mapped_admission_and_base_image_support(self):
         for kind, ram in [('4A6000.40V', 240), ('4L40S.80V', 240),
                           ('4RTX6000ADA.40V', 240), ('2RTXPRO6000.60V', 180),

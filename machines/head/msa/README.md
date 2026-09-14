@@ -52,15 +52,72 @@ identify candidates for that readback. Verified reused bytes are reported
 separately from newly transferred bytes and transfer rates. Interrupted large
 files are recopied; partial bytes never qualify the database for search.
 
-The production profile default is resident even on the older Verda routes.
-`mapped-128gb-v1` is retained only as an explicit, **unqualified experiment**.
-Its full-database trial on a larger host under a 96 GiB cap preserved
-short-query output, but the 1,726-residue editor hit the native one-hour timeout
-over NFS. It is not the production path for large editors. Opting in explicitly
-uses at least 128 decimal GB advertised RAM, guest floors of 110 GiB total and
-100 GiB available, four threads, a 96 GiB cgroup with no swap and report-only
-index residency. Full indexes stay mapped with native `--db-load-mode 2`;
-no database or scientific setting is reduced. Prefetch/lock is rejected there.
+Verda's `mapped-prefetch-128gb-v1` profile uses at least 128 decimal GB
+advertised RAM, guest floors of 110 GiB total and 100 GiB available, four
+native/OpenMP threads, a 96 GiB cgroup with no swap and report-only index
+residency. Full indexes stay mapped with native `--db-load-mode 2`; no database
+or scientific setting is reduced. Full-index prefetch/lock is rejected.
+The separate `resident-768gib-v1` profile remains the low-level policy default
+and the only AWS profile. Deployment wrappers select their profile explicitly;
+an existing session always retains its frozen policy.
+
+The new mapped profile selects an explicitly pinned native runtime at
+`envs/msa-tools-prefetch-v1`. It adds bounded concurrent reads ahead of the
+unchanged MMseqs posting/scoring loop. Each query matcher has 32 helper readers,
+a 128-ID window and a 64 MiB page-touch budget per window. With four simultaneous
+query matchers there can be 128 helpers in addition to the four native threads;
+the 96 GiB cgroup still bounds the whole service. The touch budget is not a
+limit on kernel I/O or cache residency. Offset/posting mappings use random-read
+advice; later sequence scoring and expansion remain their original algorithms.
+See [native build and qualification](native-prefetch/README.md). All runtime
+members, the patch, build provenance and execution flags participate in saved
+provenance. A missing or changed runtime fails before search; it never silently
+uses another binary. Database conversion/indexing uses the original runtime.
+
+The older `mapped-128gb-v1` profile retains the original MMseqs binary. Its
+full-database NFS trial preserved short-query output but the 1,726-residue editor
+hit the native one-hour timeout. That failure does not qualify the replacement
+native variant. Before production promotion, the replacement requires a
+complete editor search with ordered A3M/template comparison and memory evidence,
+followed by a check through the normal managed-session transport. Small timing
+probes and local parity fixtures alone do not establish those results.
+
+The replacement Verda mapped route requires a published, persistent 1,300 GiB
+NVMe cache containing the **entire** database, including expansion sequences,
+pairing data and templates. Its one-time population hashes every source file
+and reads each destination file back before publication. Ordinary mapped runs
+lease the existing cache, attach it to their temporary worker and mount its exact
+filesystem read-only; they do not copy the database at startup or fall back to
+NFS. The cache survives worker deletion. Session intent and readiness bind the
+cache generation and verification receipt. Normal startup verifies the complete
+inventory and per-file edge fingerprints with eight bounded readers. Initial
+publication and explicit full verification still check every byte. In measured
+fresh-worker trials, parallel startup verification took 108 seconds versus
+431 seconds serially; host/cache conditions were not identical. The full SSD
+snapshot is published; normal startup does not repeat its population.
+
+The September 14 complete-database test of the 1,726-residue editor finished
+native MSA preparation in **30 minutes 57 seconds**. Its entire UniRef and
+environmental A3M files matched the completed September 10 resident reference
+byte-for-byte, preserving all rows and their order. All 300 template-hit rows
+also matched the separately completed run06 original-binary PDB stage; the
+September 10 reference had templates disabled. This establishes equivalence for
+those retained references, not for the present public server deployment.
+
+A fresh worker then passed a short88 request through the ordinary managed-session
+route, including runtime restoration, API submission, exact output comparison
+and automatic worker/OS removal and cache release. Startup took **13 minutes
+51 seconds** and that short request took **6 minutes 3 seconds**. Both workloads
+stayed within the 96 GiB cap with zero OOM or swap events. They ran on a host
+advertising 170 GB RAM; the capped measurements do not independently qualify
+every nominal 128 GB SKU or arbitrary protein complexes.
+
+Combining the separately measured normal startup and complete editor search gives
+**44 minutes 48 seconds**. Use approximately **45 minutes** as the central cold
+estimate and **40–60 minutes** as a planning range, excluding provider-capacity
+waiting and GPU folding. This is a combination of separate runs, not a single
+editor run through the normal launcher or a guaranteed upper bound. The earlier
+11 minute 28 second startup remains a separate, faster observation.
 
 `bio-msa install`, `convert`, `panel` and `serve` remain standalone **Verda**
 operator routes; setting the AWS session provider does not redirect them.
@@ -73,8 +130,8 @@ quote or combined project budget checks. The actual guest must support AVX2.
 Profile receipts, thread environment and configuration bind the search namespace
 and readiness. Existing saved sessions retain their frozen provider, sources and
 execution limits. Selecting AWS or changing the default does not reconfigure an
-already-running worker. The mapped memory cap applies only when that experimental
-profile is explicitly selected; resident AWS sessions have no 96 GiB cap.
+already-running worker. The mapped memory cap applies to both mapped profiles;
+resident AWS sessions have no 96 GiB cap.
 
 Source archives total about 242 GB before extraction. Serial working allowances are conservative planning estimates, not measured final footprints; actual free-space checks stop before exhaustion and require additional storage rather than reduced datasets. [Official MSA server](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/README.md).
 
@@ -152,7 +209,7 @@ Downloads resume and verify exact source length and the upstream-published MD5 w
 
 `server.py config` validates the installation and writes a localhost-only configuration (`127.0.0.1:8080`, no URL prefix, one local worker, serial stages), a sibling `.provenance.json`, and JSON containing `config`, `namespace`, and the exact server `command`. Database receipts, executable hashes and configuration determine the persistent results namespace, because upstream ticket IDs alone do not encode that provenance. Both `/ticket/msa` and `/ticket/pair` work; environmental pairing stays disabled as in the published server configuration. Template retrieval includes selected A3M profiles and current/obsolete mmCIF coordinates. Keep raw result tarballs, generated `msa.sh`/`pair.sh`, template bundles and model-native prepared files: row ordering, insertions, chain mapping and templates are part of any parity comparison. [Official configuration](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/config.json).
 
-Export `MMSEQS_NUM_THREADS` before generating configuration and starting the backend; the effective count and relevant OpenMP environment also participate in the namespace and provenance. Release 18 reads this variable and then calls `omp_set_num_threads`, so `OMP_NUM_THREADS` alone does not replace it. The mapped profile fixes API searches at four threads; the resident profile uses 16. Both also set `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT` and `OMP_DYNAMIC=FALSE`. Index creation keeps its separate thread count. [Pinned parameter handling](https://github.com/soedinglab/MMseqs2/blob/8cc5ce367b5638c4306c2d7cfc652dd099a4643f/src/commons/Parameters.cpp).
+Export `MMSEQS_NUM_THREADS` before generating configuration and starting the backend; the effective count and relevant OpenMP environment also participate in the namespace and provenance. Release 18 reads this variable and then calls `omp_set_num_threads`, so `OMP_NUM_THREADS` alone does not replace it. Both mapped profiles fix API searches at four native/OpenMP threads; the resident profile uses 16. All set `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT` and `OMP_DYNAMIC=FALSE`. The mapped-prefetch profile also pins its three `GC_MMSEQS_POSTING_*` flags and accounts for its helper readers separately, as described above. Index creation keeps its separate thread count. [Pinned parameter handling](https://github.com/soedinglab/MMseqs2/blob/8cc5ce367b5638c4306c2d7cfc652dd099a4643f/src/commons/Parameters.cpp).
 
 Offline checks: `python3 -m unittest discover -s machines/head/msa -p test_databases.py -v`. Local miniature UniRef/environmental fixtures also exercised conversion-only, repeated conversion and subsequent full CPU indexing with the exact pinned binary: both reported two representatives and two members totaling 152 residues each, and full hashes confirmed that indexing left every converted file unchanged. The unmodified official API separately completed environmental/unpaired and paired searches and template retrieval on a miniature full index. These fixtures validate runtime compatibility only; they do not create a production receipt, qualify the full corpus, or establish public/private scientific parity. Production installation and target-specific comparison remain required.
 

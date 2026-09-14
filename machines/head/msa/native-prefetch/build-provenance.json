@@ -1,0 +1,199 @@
+{
+  "build": [
+    "cmake",
+    "--build",
+    "build",
+    "--parallel",
+    "6"
+  ],
+  "configure": [
+    "cmake",
+    "-S",
+    "mmseqs",
+    "-B",
+    "build",
+    "-DHAVE_AVX2=1",
+    "-DNATIVE_ARCH=0",
+    "-DENABLE_CUDA=0",
+    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+    "-DVERSION_OVERRIDE=8cc5ce367b5638c4306c2d7cfc652dd099a4643f-gc-reader-sweep-v2"
+  ],
+  "patch_sha256": "2e991aa986d970337a749c12b7f2ff5e0f51ef2add5133a893307b7d31431ca3",
+  "portable_dependencies": {
+    "ld-linux-x86-64.so.2": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib64/ld-linux-x86-64.so.2",
+    "libatomic.so.1": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib/lib/libatomic.so.1",
+    "libc.so.6": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib/libc.so.6",
+    "libdl.so.2": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib/libdl.so.2",
+    "libgcc_s.so.1": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib/lib/libgcc_s.so.1",
+    "libgomp.so.1": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib/lib/libgomp.so.1",
+    "libm.so.6": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib/libm.so.6",
+    "libpthread.so.0": "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib/libpthread.so.0",
+    "libstdc++.so.6": "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib/lib/libstdc++.so.6"
+  },
+  "qualification_receipts": {
+    "recursive_wrapper_sha256": "98f4b93095ab33b5c24f60d2ce8dfcea8a574ddfea676d42dd6f6c6018a620c9",
+    "toy_bounds_parity_sha256": "b96b10d2ef024c39f709dabbef11ac9ba13280c3187dc6a42a19fd788610f5f0"
+  },
+  "reproduction_limit": "Exact inputs and resulting ELF/libs are pinned; no independent clean reproducible-build/bit-identity claim yet",
+  "schema": 1,
+  "source": {
+    "archive_path": "/home/aydin/bio-runs/msa-128gb-loader-20260913/source/host-memory-audit/MMseqs2-8cc5ce367b5638c4306c2d7cfc652dd099a4643f.tar.gz",
+    "archive_sha256": "e7d2a893a502a3f79bbde5c1ec4ec9a640728df83cd77d13697add6933a2164a",
+    "commit": "8cc5ce367b5638c4306c2d7cfc652dd099a4643f",
+    "created_epoch": 1789419488.1410158
+  },
+  "source_changes": {
+    "src/prefiltering/PostingPrefetch.h": {
+      "after": "0d231a999a9c79c1b262f42747fbc65a8d1738da816c40d2877ec9e73cc50228",
+      "before": null
+    },
+    "src/prefiltering/QueryMatcher.cpp": {
+      "after": "4c43cf61e05a629a0b08c0deaf9615d994b33715f7fa75eeae055122036a41ff",
+      "before": "0964bb6c72dac05923ba2c48839c0b92a8722e2de785f578212e49324a8a002d"
+    },
+    "src/prefiltering/QueryMatcher.h": {
+      "after": "85ca32c29f43ca9114dd9f5f8fb6b60dce54887b40bad4e079c119b598640b70",
+      "before": "01ba92003b5d838e2f2832a70fb03dae3778e7ffe429a24cb2e2ccd03b46a8bc"
+    }
+  },
+  "tested_build": {
+    "binary_sha256": "d33f1b17a8dff3060025c9aa78ed93a184719d7c63188506b3254d438c3df8a5",
+    "commands": [
+      [
+        "/run/current-system/sw/bin/c++",
+        "-DENABLE_IPS4O=1",
+        "-DHAVE_POSIX_FADVISE=1",
+        "-DHAVE_POSIX_MADVISE=1",
+        "-DOPENMP=1",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/zstd/lib",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/tinyexpr",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/microtar",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/tantan",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/simde",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/simd",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/alp",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/ksw2",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/xxhash",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/ips4o",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/generated",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/alignment",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/clustering",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/commons",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/multihit",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/prefiltering",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/linclust",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/taxonomy",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/util",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/.",
+        "-O2",
+        "-g",
+        "-DNDEBUG",
+        "-fsigned-char",
+        "-mavx2",
+        "-mfma",
+        "-mcx16",
+        "-Wa,-q",
+        "-std=c++1y",
+        "-pedantic",
+        "-Wall",
+        "-Wextra",
+        "-Wdisabled-optimization",
+        "-fno-exceptions",
+        "-fopenmp",
+        "-c",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/prefiltering/QueryMatcher.cpp",
+        "-o",
+        "QueryMatcher.cpp.o"
+      ],
+      [
+        "ar",
+        "r",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/build-incremental/libmmseqs-framework.a",
+        "QueryMatcher.cpp.o"
+      ],
+      [
+        "/run/current-system/sw/bin/c++",
+        "-DGIT_SHA1=8cc5ce367b5638c4306c2d7cfc652dd099a4643f-gc-reader-sweep-v2",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/zstd/lib",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/tinyexpr",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/microtar",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/tantan",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/simde",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/simd",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/alp",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/ksw2",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/xxhash",
+        "-I/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/lib/ips4o",
+        "-O2",
+        "-g",
+        "-DNDEBUG",
+        "-fsigned-char",
+        "-mavx2",
+        "-mfma",
+        "-mcx16",
+        "-Wa,-q",
+        "-std=c++1y",
+        "-c",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/mmseqs/src/version/Version.cpp",
+        "-o",
+        "Version.cpp.o"
+      ],
+      [
+        "ar",
+        "rcs",
+        "libversion.a",
+        "Version.cpp.o"
+      ],
+      [
+        "/run/current-system/sw/bin/c++",
+        "-O2",
+        "-g",
+        "-DNDEBUG",
+        "-fsigned-char",
+        "-mavx2",
+        "-mfma",
+        "-mcx16",
+        "-Wa,-q",
+        "-std=c++1y",
+        "-pedantic",
+        "-Wall",
+        "-Wextra",
+        "-Wdisabled-optimization",
+        "-fno-exceptions",
+        "-fopenmp",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/src/CMakeFiles/mmseqs.dir/mmseqs.cpp.o",
+        "-o",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/build-incremental/mmseqs",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/build-incremental/libmmseqs-framework.a",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/build-incremental/libversion.a",
+        "-latomic",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/lib/tinyexpr/libtinyexpr.a",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/lib/zstd/build/cmake/lib/libzstd.a",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/lib/microtar/libmicrotar.a",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/build/lib/tantan/libtantan.a",
+        "/nix/store/hngmi01i8wgi25a0byrxcn4ysz5j79mw-gcc-15.2.0-lib/lib/libgomp.so",
+        "/nix/store/8kvxvr3pmsypxiypq4g8zy13glnfr7nx-glibc-2.42-67/lib/libpthread.so"
+      ],
+      [
+        "strip",
+        "--strip-debug",
+        "/home/aydin/bio-runs/msa-128gb-loader-20260913/block-cache/resume-20260914/native-prefetch-prototype/reader-sweep-v2/portable/mmseqs"
+      ]
+    ],
+    "note": "All v1 source/build/assets remain unchanged; normal CMake clean rebuild uses v2 source and VERSION_OVERRIDE suffixed-gc-reader-sweep-v2",
+    "recompiled_translation_units": [
+      "QueryMatcher.cpp",
+      "Version.cpp"
+    ],
+    "reused_framework_archive_sha256": "a0cb6827f38439f28b80c2b8e52dbd10cbe58b46c4deb19a9b2cfca75b76b831"
+  },
+  "toolchain": {
+    "c++": "/nix/store/xcnqqnhw9hb4j5rjgds2yjryi8qki5f3-gcc-wrapper-15.2.0/bin/g++",
+    "cc": "/nix/store/xcnqqnhw9hb4j5rjgds2yjryi8qki5f3-gcc-wrapper-15.2.0/bin/gcc",
+    "cmake": "/nix/store/k1b82rs72af124wmq6nb00nhw5i7ikp7-cmake-4.1.2/bin/cmake",
+    "ld": "/nix/store/z4zcd87nx2hrsdayd0vl2mx5ncj3ikd8-binutils-wrapper-2.46/bin/ld",
+    "strip": "/nix/store/z4zcd87nx2hrsdayd0vl2mx5ncj3ikd8-binutils-wrapper-2.46/bin/strip"
+  }
+}

@@ -165,7 +165,7 @@ def configuration(root, results, tools_root, profile=None):
     if selected is not None:
         search_profile.configure_environment(selected)
     ready = databases.validate(root)
-    provenance = databases.tools(tools_root)
+    provenance = databases.tools(tools_root, profile=selected) if selected is not None else databases.tools(tools_root)
     # Release18 Parameters.cpp reads MMSEQS_NUM_THREADS before calling
     # omp_set_num_threads; otherwise it uses _SC_NPROCESSORS_ONLN.
     thread_limit = int(os.environ.get("MMSEQS_NUM_THREADS", os.sysconf("SC_NPROCESSORS_ONLN")))
@@ -173,7 +173,7 @@ def configuration(root, results, tools_root, profile=None):
         databases.fail("MMSEQS_NUM_THREADS must be positive")
     runtime = dict(mmseqs_threads=thread_limit,
                    environment={name: os.environ.get(name) for name in
-                                ("MMSEQS_NUM_THREADS", "OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "OMP_DYNAMIC")})
+                                search_profile.environment_fields(selected)})
     config = dict(app="colabfold", verbose=True,
                   server=dict(address="127.0.0.1:8080", pathprefix="", dbmanagment=False, cors=False, checkold=True),
                   worker=dict(gracefulexit=True, paralleldatabases=1),
@@ -202,7 +202,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("action", choices=["config", "proxy", "export"])
     p.add_argument("--root", type=Path, default=Path(os.environ.get("MSA_DB_ROOT", databases.DEFAULT_ROOT)))
-    p.add_argument("--tools-root", type=Path, default=Path(os.environ.get("MSA_TOOLS_ROOT", databases.DEFAULT_TOOLS)))
+    p.add_argument("--tools-root", type=Path, default=os.environ.get("MSA_TOOLS_ROOT"))
     p.add_argument("--results", type=Path)
     p.add_argument("--output", type=Path)
     p.add_argument("--audit", type=Path)
@@ -222,6 +222,8 @@ def main():
         return
     if args.results is None or args.output is None:
         p.error("config requires --results and --output")
+    if args.tools_root is None:
+        args.tools_root = Path(databases.DEFAULT_TOOLS).with_name(search_profile.tools_directory(args.search_profile))
     config, receipt = configuration(args.root.resolve(), args.results.resolve(), args.tools_root.resolve(),
                                     profile=args.search_profile)
     databases.write_json(args.output, config)

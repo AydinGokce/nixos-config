@@ -1,6 +1,7 @@
 """Offline cache integrity/resume tests; tiny fixtures do not qualify real MSA."""
 import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import stat
 import struct
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -386,6 +388,108 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(event["work_completed_bytes"], 550)
         self.assertTrue(0 < event["eta_seconds"][0] < event["eta_seconds"][1])
         self.assertTrue(all(math.isfinite(x) for x in event["eta_seconds"]))
+
+
+class ParallelVerificationTests(unittest.TestCase):
+    def test_normal_verification_has_eight_in_flight_and_bounded_manifest_read_ahead(self):
+        rows = [dict(path="file-" + str(i), kind="file") for i in range(80)]
+        raw = b"".join(cache.canonical(row) + b"\n" for row in rows)
+        handle = io.BytesIO(raw)
+        release, filled = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        active = maximum = started = 0
+        results, errors = [], []
+
+        def check(root, item, *, full):
+            nonlocal active, maximum, started
+            self.assertFalse(full)
+            with lock:
+                active += 1
+                started += 1
+                maximum = max(maximum, active)
+                if active == 8:
+                    filled.set()
+            try:
+                self.assertTrue(release.wait(5), "Verifier failed to release its bounded batch")
+                return "files", 1
+            finally:
+                with lock:
+                    active -= 1
+
+        def run():
+            try:
+                results.append(cache._verify_inventory(Path("/fixture"), handle, full=False))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(cache, "_verify_entry", side_effect=check):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(filled.wait(5), "Eight independent checks did not start")
+                self.assertEqual(started, 8)
+                self.assertEqual(handle.tell(), sum(len(cache.canonical(row)) + 1 for row in rows[:8]))
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(maximum, 8)
+        self.assertEqual(started, 80)
+        self.assertEqual(results, [(set(row["path"] for row in rows),
+            dict(files=80, symlinks=0, directories=0, payload_bytes=80))])
+
+    def test_failed_entry_stops_submission_and_propagates_after_bounded_checks_finish(self):
+        rows = [dict(path="file-" + str(i), kind="file") for i in range(80)]
+        handle = io.BytesIO(b"".join(cache.canonical(row) + b"\n" for row in rows))
+        barrier = threading.Barrier(8, timeout=5)
+        release = threading.Event()
+        executor = cache.concurrent.futures.ThreadPoolExecutor
+        original_shutdown = executor.shutdown
+        started = []
+        lock = threading.Lock()
+
+        def check(root, item, *, full):
+            with lock:
+                started.append(item["path"])
+            barrier.wait()
+            if item["path"] == "file-0":
+                raise RuntimeError("injected verifier failure")
+            self.assertTrue(release.wait(5), "Failure did not initiate executor shutdown")
+            return "files", 1
+
+        def shutdown(pool, *args, **kwargs):
+            # The failure handler must run while the other seven checks remain
+            # blocked, instead of continuing to read or queue the inventory.
+            self.assertEqual(handle.tell(), sum(len(cache.canonical(row)) + 1 for row in rows[:8]))
+            release.set()
+            return original_shutdown(pool, *args, **kwargs)
+
+        with patch.object(cache, "_verify_entry", side_effect=check), \
+                patch.object(executor, "shutdown", shutdown):
+            with self.assertRaisesRegex(RuntimeError, "injected verifier failure"):
+                cache._verify_inventory(Path("/fixture"), handle, full=False)
+        self.assertCountEqual(started, [row["path"] for row in rows[:8]])
+
+    def test_full_sha_verification_stays_serial_and_directly_interruptible(self):
+        rows = [dict(path="file-" + str(i), kind="file") for i in range(3)]
+        handle = io.BytesIO(b"".join(cache.canonical(row) + b"\n" for row in rows))
+        caller = threading.get_ident()
+        visited = []
+
+        def check(root, item, *, full):
+            self.assertTrue(full)
+            self.assertEqual(threading.get_ident(), caller)
+            visited.append(item["path"])
+            if item["path"] == "file-1":
+                raise KeyboardInterrupt("injected full-SHA interruption")
+            return "files", 1
+
+        with patch.object(cache, "_verify_entry", side_effect=check), \
+                patch.object(cache.concurrent.futures, "ThreadPoolExecutor", side_effect=AssertionError("parallel full SHA")):
+            with self.assertRaisesRegex(KeyboardInterrupt, "full-SHA interruption"):
+                cache._verify_inventory(Path("/fixture"), handle, full=True)
+        self.assertEqual(visited, ["file-0", "file-1"])
 
 
 class MountTests(unittest.TestCase):

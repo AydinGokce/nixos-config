@@ -45,6 +45,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((self.root / "two/cache/boltz/weights").read_bytes(), original)
         self.assertEqual((self.shared / "cache/boltz/weights").read_bytes(), original)
 
+    def test_mapped_prefetch_runtime_requires_explicit_profile_and_installation(self):
+        self.assertEqual(runtime.paths_for("msa", sub="convert"), ["envs/msa-tools-v1"])
+        profile = runtime.PREFETCH_PROFILE
+        with self.assertRaisesRegex(ValueError, "installed before packaging"):
+            runtime.plan(self.shared, "msa", sub="convert", profile=profile)
+        prefix = self.shared / "envs/msa-tools-prefetch-v1"; prefix.mkdir()
+        (prefix/"native-runtime.json").write_text("pinned fixture, fully checked by tools.sh")
+        (prefix/"native").write_bytes(b"new runtime bytes")
+        value = runtime.plan(self.shared, "msa", sub="convert", profile=profile)
+        self.assertEqual(value["paths"], ["envs/msa-tools-prefetch-v1"])
+        self.assertEqual(value["search_profile"], profile)
+        self.assertNotIn("search_profile", runtime.plan(self.shared, "msa", sub="convert"))
+        self.assertEqual(runtime.plan(self.shared, "msa", sub="convert"),
+                         runtime.plan(self.shared, "msa", sub="convert", profile="mapped-128gb-v1"))
+        runtime.stage(self.shared, self.root/"new-worker", value)
+        self.assertEqual((self.root/"new-worker/envs/msa-tools-prefetch-v1/native").read_bytes(), b"new runtime bytes")
+        changed = dict(value); changed.pop("search_profile")
+        with self.assertRaisesRegex(ValueError, "invalid worker"):
+            runtime.stage(self.shared, self.root/"wrong-worker", changed)
+        self.assertFalse((self.root/"wrong-worker").exists())
+        for recipe, invalid in (("msa", "unknown"), ("boltz2", profile)):
+            with self.subTest(recipe=recipe), self.assertRaises(ValueError):
+                runtime.paths_for(recipe, profile=invalid)
+
     def test_embedding_selects_only_requested_cache_and_preserves_large_model_room(self):
         value = runtime.plan(self.shared, "esm", "esm2_t48_15B_UR50D")
         self.assertIn("cache/hf/hub/models--facebook--esm2_t48_15B_UR50D", value["paths"])

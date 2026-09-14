@@ -14,9 +14,13 @@ ROOTS = ("envs", "src", "python", "weights", "protenix", "openfold3", "rf3", "bi
          "cache/hf", "cache/torch", "cache/uv", "cache/boltz", "cache/rfaa")
 FOUNDRY = "b02eed6a6bdf8f44d14a80cc36e3da13c9f2291c"
 GIB = 1024 ** 3
+PREFETCH_PROFILE = "mapped-prefetch-128gb-v1"
+MSA_PROFILES = ("resident-768gib-v1", "mapped-128gb-v1", PREFETCH_PROFILE)
 
 
-def paths_for(recipe, model="", sub=""):
+def paths_for(recipe, model="", sub="", *, profile=None):
+    if profile is not None and (recipe != "msa" or profile not in MSA_PROFILES):
+        raise ValueError("invalid worker runtime MSA search profile")
     paths = {
         "boltz2": ["envs/boltz", "cache/boltz"],
         "openfold3": ["envs/openfold3", "openfold3/home"],
@@ -33,6 +37,8 @@ def paths_for(recipe, model="", sub=""):
         "msa": ["envs/msa-tools-v1"],
         "md": [],  # Pinned packed MD runtime is selected by its separate lock.
     }[recipe].copy()
+    if recipe == "msa" and profile == PREFETCH_PROFILE:
+        paths = ["envs/msa-tools-prefetch-v1"]
     if recipe in {"esm", "evolvepro"}:
         embedding = model or "esm2_t33_650M_UR50D"
         repository = "facebook/" + embedding if embedding.startswith("esm") and "/" not in embedding else embedding
@@ -85,8 +91,8 @@ def source_size(source, *, shared=None, selected=(), digest=None):
     return total, files
 
 
-def plan(shared, recipe, model="", sub="", *, fingerprint=False):
-    paths = paths_for(recipe, model, sub)
+def plan(shared, recipe, model="", sub="", *, fingerprint=False, profile=None):
+    paths = paths_for(recipe, model, sub, profile=profile)
     total = files = 0
     digest = hashlib.sha256() if fingerprint else None
     for relative in paths:
@@ -96,6 +102,8 @@ def plan(shared, recipe, model="", sub="", *, fingerprint=False):
             raise ValueError(f"runtime source contains a symlink: {source}")
         if recipe == "bindcraft" and not source.is_dir():
             raise ValueError("BindCraft runtime must be installed and preflighted before packaging; no worker launched")
+        if relative == "envs/msa-tools-prefetch-v1" and not (source/"native-runtime.json").is_file():
+            raise ValueError("Mapped-prefetch runtime must be installed before packaging; no worker launched")
         size, count = source_size(source, shared=shared, selected=paths, digest=digest)
         if recipe == "bindcraft" and (not size or not count):
             raise ValueError("BindCraft runtime is empty; no worker launched")
@@ -111,21 +119,23 @@ def plan(shared, recipe, model="", sub="", *, fingerprint=False):
     result = dict(schema=1, isolation="private-local-copies", recipe=recipe, model=model, sub=sub,
                 paths=paths, source_bytes=total, source_files=files, os_size_gb=os_size,
                 setup_reserve_bytes=reserve)
+    if profile == PREFETCH_PROFILE:
+        result["search_profile"] = profile
     if digest is not None:
         result["source_fingerprint"] = digest.hexdigest()
     return result
 
 
-def packaged_plan(shared, recipe, model="", sub=""):
+def packaged_plan(shared, recipe, model="", sub="", *, profile=None):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import runtime_package
-    inspect_source = lambda: plan(shared, recipe, model, sub, fingerprint=True)
+    inspect_source = lambda: plan(shared, recipe, model, sub, fingerprint=True, profile=profile)
     return runtime_package.publish(shared, inspect_source(), inspect_source)
 
 
 def stage(shared, destination, value):
     if (value.get("schema") != 1 or value.get("isolation") != "private-local-copies"
-            or value.get("paths") != paths_for(value["recipe"], value["model"], value["sub"])
+            or value.get("paths") != paths_for(value["recipe"], value["model"], value["sub"], profile=value.get("search_profile"))
             or not 50 <= value["os_size_gb"] <= 200):
         raise ValueError("invalid worker runtime plan")
     if "package" in value:
@@ -158,6 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--recipe")
     parser.add_argument("--model", default="")
     parser.add_argument("--sub", default="")
+    parser.add_argument("--search-profile", choices=MSA_PROFILES)
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--package", action="store_true", help="Build or reuse a verified compressed runtime snapshot")
@@ -166,6 +177,6 @@ if __name__ == "__main__":
         print("\n".join(ROOTS))
     elif args.command == "plan":
         function = packaged_plan if args.package else plan
-        print(json.dumps(function(args.shared, args.recipe, args.model, args.sub), indent=2))
+        print(json.dumps(function(args.shared, args.recipe, args.model, args.sub, profile=args.search_profile), indent=2))
     else:
         stage(args.shared, args.destination, json.loads(args.plan.read_text()))

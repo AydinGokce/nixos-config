@@ -420,6 +420,161 @@ class ControllerTests(unittest.TestCase):
         self.c.release(LEASE)
         self.assertEqual([(m, p) for m, p, _ in self.api.calls if m != "GET"], [("POST", "/volumes")])
 
+    def retired_cache(self):
+        self.managed_worker()
+        self.close_worker()
+        self.c.release(LEASE)
+        self.now += 60
+        removed = copy.deepcopy(self.volume())
+        removed.update(status="deleted", deleted_at=storage["stamp"](self.now))
+        self.api.volumes = [v for v in self.api.volumes if v["id"] != VOLUME]
+        self.api.trash.append(removed)
+        state = self.state()
+        budget["reconcile"](state, self.api.inventory(), self.now)
+        self.assertEqual(state["resources"]["volume:" + VOLUME]["deleted"], self.now)
+        state["expected_database_volumes"][VOLUME]["retired_at"] = self.now
+        self.c.accounting.store.save(state)
+        self.api.trash.clear()
+        self.c.save(self.c.read(), status="rejected", retired_at=self.now,
+                    permanent_removal_confirmed_epoch=self.now)
+        return self.c.read()
+
+    def test_reset_retired_preserves_evidence_and_budget_then_plans_new_identity_once(self):
+        intent = self.retired_cache()
+        old_budget = self.state()
+        lease_path = self.c.lease_store(LEASE).path
+        old_lease = lease_path.read_bytes()
+        result = self.c.reset_retired(VOLUME, intent["token"])
+        archive_path = Path(result["archive_path"])
+        archived = json.loads(archive_path.read_text())
+        self.assertEqual(result["archive_sha256"], hashlib.sha256(archive_path.read_bytes()).hexdigest())
+        self.assertEqual(archived["intent"], intent)
+        self.assertEqual(archived["leases"][LEASE], json.loads(old_lease))
+        self.assertEqual(archived["active_pointer"], dict(schema=1, lease_id=LEASE))
+        self.assertEqual(lease_path.read_bytes(), old_lease)
+        self.assertIsNone(self.c.read(required=False))
+        self.assertIsNone(self.c.active.read())
+        for key in ("jobs", "expected_database_volumes"):
+            self.assertEqual(self.state()[key], old_budget[key])
+        self.assertEqual(self.state()["resources"]["volume:" + VOLUME], old_budget["resources"]["volume:" + VOLUME])
+        planned = self.c.execute("plan", SOURCE, RECEIPTS)
+        self.assertNotEqual(planned["cache_id"], intent["cache_id"])
+        self.assertNotEqual(planned["filesystem_uuid"], intent["filesystem_uuid"])
+        self.assertNotEqual(planned["cache_generation"], intent["cache_generation"])
+        self.assertEqual(planned["status"], "planned")
+        self.assertEqual(self.c.reset_retired(VOLUME, intent["token"]), result)
+        self.assertEqual(self.c.read()["cache_id"], planned["cache_id"])
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual([(m, p) for m, p, _ in self.api.calls if m != "GET"], [("POST", "/volumes")])
+
+    def test_reset_retired_recovers_after_either_pointer_unlink_without_losing_history(self):
+        intent = self.retired_cache()
+        original_unlink = Path.unlink
+        fail_on = [self.c.intent.path]
+        def interrupted(path, *args, **kwargs):
+            if fail_on and path == fail_on[0]:
+                fail_on.clear()
+                raise OSError("simulated interrupted reset")
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", interrupted), self.assertRaisesRegex(OSError, "interrupted"):
+            self.c.reset_retired(VOLUME, intent["token"])
+        self.assertIsNone(self.c.active.read())
+        self.assertEqual(self.c.read(), intent)
+        archive = self.root / ("msa-block-cache-retired-" + intent["token"] + ".json")
+        retained = archive.read_bytes()
+        original_save = storage["Store"].save
+        def interrupt_completion(store, value):
+            if store.path.name.startswith("msa-block-cache-reset-"):
+                raise OSError("completion interrupted")
+            return original_save(store, value)
+        with patch.object(storage["Store"], "save", interrupt_completion), self.assertRaisesRegex(OSError, "completion"):
+            self.c.reset_retired(VOLUME, intent["token"])
+        self.assertIsNone(self.c.read(required=False))
+        result = self.controller().reset_retired(VOLUME, intent["token"])
+        self.assertEqual(result["status"], "reset")
+        self.assertEqual(archive.read_bytes(), retained)
+        self.assertIsNotNone(self.c.lease_store(LEASE).read())
+
+    def test_reset_retired_requires_exact_identity_rejected_state_and_budget_deletion(self):
+        intent = self.retired_cache()
+        state = self.state()
+        for changed in (dict(status="uncertain"), dict(status="allocated"),
+                        dict(status="creating"), dict(retired_at=None),
+                        dict(permanent_removal_confirmed_epoch=self.now + 1)):
+            with self.subTest(changed=changed):
+                self.c.intent.save(dict(intent, **changed))
+                with self.assertRaises(cache.Error):
+                    self.c.reset_retired(VOLUME, intent["token"])
+        self.c.intent.save(intent)
+        for volume, token in ((WORKER_OS, intent["token"]), (VOLUME, "f" * 32)):
+            with self.assertRaisesRegex(cache.Error, "exact rejected"):
+                self.c.reset_retired(volume, token)
+        for resource_changes, allocation_changes in ((dict(active=True), {}), (dict(deleted=None), {}),
+                (dict(name="wrong"), {}), ({}, dict(retired_at=None)), ({}, dict(profile="colabfold"))):
+            with self.subTest(resource=resource_changes, allocation=allocation_changes):
+                altered = copy.deepcopy(state)
+                altered["resources"]["volume:" + VOLUME].update(resource_changes)
+                altered["expected_database_volumes"][VOLUME].update(allocation_changes)
+                self.c.accounting.store.save(altered)
+                with self.assertRaisesRegex(cache.Error, "budget ownership"):
+                    self.c.reset_retired(VOLUME, intent["token"])
+        self.assertEqual(self.c.read(), intent)
+        self.assertFalse(list(self.root.glob("msa-block-cache-retired-*.json")))
+
+    def test_reset_retired_blocks_live_or_ambiguous_provider_identity_and_old_workers(self):
+        intent = self.retired_cache()
+        clear = self.api.inventory()
+        for where, row in [(1, intent["verified"]), (2, intent["verified"]),
+                (1, dict(intent["verified"], id=WORKER_OS)),
+                (1, dict(intent["verified"], id=WORKER_OS, name="different-name")),
+                (1, dict(intent["verified"], id=WORKER_OS, name="old-os", tags=[])),
+                (0, dict(id=WORKER, hostname="unrelated-name", volume_ids=[], os_volume_id=WORKER_OS)),
+                (0, dict(id=HEAD, hostname="head", volume_ids=[VOLUME], os_volume_id=HEAD_OS)),
+                (0, dict(id=HEAD, hostname="bio-msa-cache-" + LEASE, volume_ids=[], os_volume_id=HEAD_OS))]:
+            with self.subTest(where=where, row=row):
+                self.api.instances, self.api.volumes, self.api.trash = copy.deepcopy(clear)
+                (self.api.instances, self.api.volumes, self.api.trash)[where].append(copy.deepcopy(row))
+                with self.assertRaises(cache.Error):
+                    self.c.reset_retired(VOLUME, intent["token"])
+        self.assertEqual(self.c.read(), intent)
+        self.assertFalse(list(self.root.glob("msa-block-cache-retired-*.json")))
+
+    def test_reset_retired_requires_all_released_leases_and_exact_closed_budget_jobs(self):
+        intent = self.retired_cache()
+        original_lease = self.c.lease_store(LEASE).read()
+        state = self.state()
+        for changes in (dict(status="bound"), dict(status="launching"), dict(release_checks={}),
+                        dict(closed_job_tokens=[]), dict(managed=dict(instance_id=HEAD, os_volume_id=HEAD_OS, token=TOKEN))):
+            with self.subTest(changes=changes):
+                self.c.lease_store(LEASE).save(dict(original_lease, **changes))
+                with self.assertRaises(cache.Error):
+                    self.c.reset_retired(VOLUME, intent["token"])
+        self.c.lease_store(LEASE).save(original_lease)
+        for changes in (dict(status="uncertain"), dict(cache_generation="f" * 64),
+                        dict(volumes=[]), dict(os_id=HEAD_OS), dict(cache_lease_id="f" * 32)):
+            with self.subTest(changes=changes):
+                changed = copy.deepcopy(state)
+                changed["jobs"][TOKEN].update(changes)
+                self.c.accounting.store.save(changed)
+                with self.assertRaises(cache.Error):
+                    self.c.reset_retired(VOLUME, intent["token"])
+        self.c.accounting.store.save(state)
+        old = dict(original_lease, lease_id="e" * 32, worker_name="bio-msa-cache-" + "e" * 32, status="bound")
+        self.c.lease_store(old["lease_id"]).save(old)
+        with self.assertRaisesRegex(cache.Error, "Historical"):
+            self.c.reset_retired(VOLUME, intent["token"])
+        self.assertEqual(self.c.read(), intent)
+
+    def test_reset_retired_archive_or_completion_changes_fail_closed(self):
+        intent = self.retired_cache()
+        result = self.c.reset_retired(VOLUME, intent["token"])
+        archive = self.root / Path(result["archive_path"]).name
+        value = json.loads(archive.read_text())
+        value["intent"]["volume_id"] = HEAD_OS
+        storage["Store"](archive, owner=os.geteuid()).save(value)
+        with self.assertRaisesRegex(cache.Error, "receipt changed"):
+            self.c.reset_retired(VOLUME, intent["token"])
+
 
 if __name__ == "__main__":
     unittest.main()

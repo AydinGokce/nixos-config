@@ -21,7 +21,21 @@ else:
         dict(search_profile=profile, guest_memory=observed, memory_limit=limit), sort_keys=True)+'\n')
     print(f"MSA {profile['profile_id']}: {observed['available_bytes']/1024**3:.1f} GiB available RAM", flush=True)
 PY
+  if [ "$SUB" = convert ]; then
+    export BIO_MSA_SEARCH_PROFILE=resident-768gib-v1
+  fi
+  case "$SUB" in
+    install|convert) unset GC_MMSEQS_POSTING_PREFETCH GC_MMSEQS_POSTING_RANDOM GC_MMSEQS_POSTING_READERS ;;
+  esac
   source "$TOOLS/msa/tools.sh"
+  cache_args=()
+  if [ -n "${BIO_MSA_CACHE_RECEIPT:-}" ]; then
+    case "$BIO_MSA_SEARCH_PROFILE" in
+      mapped-128gb-v1|mapped-prefetch-128gb-v1) ;;
+      *) echo 'msa: cache requires a mapped profile' >&2; exit 2 ;;
+    esac
+    cache_args=(--cache-receipt "$BIO_MSA_CACHE_RECEIPT")
+  fi
   if [ "$SUB" = session ]; then
     [ -n "${BIO_MSA_SESSION_ID:-}" ] || { echo 'msa: session ID is missing' >&2; exit 2; }
     exec python3 "$TOOLS/msa/session.py" serve \
@@ -29,7 +43,7 @@ PY
       --out "$OUT" --database "$MSA_DB_ROOT" --tools "$TOOLS" --tools-root "$MSA_TOOLS_ROOT" \
       --results "$SHARED/cache/msa-api" --deadline "$BIO_JOB_DEADLINE_EPOCH" \
       --idle-seconds "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" \
-      --search-profile "$BIO_MSA_SEARCH_PROFILE" --warm "$BIO_MSA_SESSION_WARM"
+      --search-profile "$BIO_MSA_SEARCH_PROFILE" --warm "$BIO_MSA_SESSION_WARM" "${cache_args[@]}"
   fi
   threads=$(nproc)
   if [ "$SUB" = convert ]; then
@@ -47,13 +61,17 @@ PY
     [ -n "${BIO_MSA_PANEL_SHA256:-}" ] || exit 0
   fi
   # Keep every native/OpenMP execution limit in the same versioned profile.
-  search_threads=$(python3 - "$TOOLS/msa/search_profile.py" "$BIO_MSA_SEARCH_PROFILE" <<'PY'
+  search_environment=$(python3 - "$TOOLS/msa/search_profile.py" "$BIO_MSA_SEARCH_PROFILE" <<'PYENV'
 import runpy, sys
-print(runpy.run_path(sys.argv[1])['resolve'](sys.argv[2])['mmseqs_threads'])
-PY
+policy = runpy.run_path(sys.argv[1])
+for name, value in policy['configure_environment'](sys.argv[2], {}).items():
+    print(name+'='+value)
+PYENV
   )
-  export MMSEQS_NUM_THREADS="$search_threads"
-  export OMP_NUM_THREADS="$search_threads" OMP_THREAD_LIMIT="$search_threads" OMP_DYNAMIC=FALSE
+  unset GC_MMSEQS_POSTING_PREFETCH GC_MMSEQS_POSTING_RANDOM GC_MMSEQS_POSTING_READERS
+  while IFS='=' read -r native_name native_value; do
+    export "$native_name=$native_value"
+  done <<< "$search_environment"
   python3 "$TOOLS/msa/server.py" config --root "$MSA_DB_ROOT" \
     --tools-root "$MSA_TOOLS_ROOT" --results "$SHARED/cache/msa-api" \
     --search-profile "$BIO_MSA_SEARCH_PROFILE" \

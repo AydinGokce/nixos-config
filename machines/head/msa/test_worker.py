@@ -154,6 +154,17 @@ class SelectionTests(unittest.TestCase):
         kwargs.setdefault("profile", worker.MAPPED_PROFILE)
         return worker.choose(*args, **kwargs)
 
+    def test_prefetch_profile_preserves_128gb_admission_and_ubuntu_selection(self):
+        profile='mapped-prefetch-128gb-v1'
+        item=row('1H100.80S.32V',128,3.25,1.625)
+        selected=worker.choose([item],avail(item['instance_type']),avail(),profile=profile)
+        self.assertEqual(selected['profile_id'],profile)
+        self.assertEqual(selected['image'],'ubuntu-24.04')
+        self.assertEqual(selected['search_profile']['memory_max_gib'],96)
+        item['memory']['size_in_gigabytes']=127.999
+        with self.assertRaises(worker.Unavailable):
+            worker.choose([item],avail(item['instance_type']),avail(),profile=profile)
+
     def test_mapped_accepts_reviewed_cpu_hosts_of_other_gpu_families(self):
         for kind, gb in [('4L40S.80V', 240), ('4A6000.40V', 240),
                          ('4RTX6000ADA.40V', 240), ('2RTXPRO6000.60V', 180),
