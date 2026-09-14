@@ -180,6 +180,23 @@ impl Default for Draft {
     }
 }
 impl Draft {
+    /// Remove only the editable target, keeping exact submitted requests and
+    /// saved, structure-bound patches available for recovery and later reuse.
+    pub fn clear_target(&mut self) {
+        self.name = Self::default().name;
+        self.endpoint.clear();
+        self.target = Value::Null;
+        self.target_name.clear();
+        self.target_slot = None;
+        self.inspection = Value::Null;
+        self.chains.clear();
+        self.hotspots.clear();
+        self.crop.clear();
+        self.crop_enabled = false;
+        self.source_ref.clear();
+        self.project_ref.clear();
+    }
+
     pub fn request(&self, endpoint: &str) -> Result<Value, String> {
         if self.endpoint != endpoint || endpoint.is_empty() {
             return Err("Select and inspect a target on this head connection.".into());
@@ -388,5 +405,71 @@ mod tests {
         assert!(!intent.matches_batch("head-one", "first-run"));
         assert!(intent.matches_batch("head-one", "second-run"));
         assert!(!intent.matches_batch("head-two", "second-run"));
+    }
+
+    #[test]
+    fn clearing_target_persists_without_changing_submitted_or_recoverable_work() {
+        let mut draft = Draft {
+            enabled: true,
+            name: "target binders".into(),
+            endpoint: "head".into(),
+            target: json!({"kind":"upload","id":"upload","sha256":"original"}),
+            target_name: "target".into(),
+            target_slot: Some(4),
+            inspection: json!({"target":{"sha256":"original"}}),
+            chains: BTreeSet::from(["A".into()]),
+            hotspots: BTreeSet::from([available()[3].clone()]),
+            crop: "A:1-4".into(),
+            crop_enabled: true,
+            source_ref: "construct:source@1".into(),
+            project_ref: "project:project@2".into(),
+            lengths: [40, 80],
+            designs: 5,
+            seed: "42".into(),
+            results_job: "existing-results".into(),
+            patches: vec![Patch {
+                name: "saved patch".into(),
+                sha256: "original".into(),
+                hotspots: BTreeSet::from([available()[3].clone()]),
+                ..Default::default()
+            }],
+            intent: Some(Intent {
+                endpoint: "head".into(),
+                request: json!({"target":{"id":"original"},"request_key":"never-resubmit"}),
+                uncertain: true,
+                ..Default::default()
+            }),
+            save_intent: Some(Intent {
+                endpoint: "head".into(),
+                request: json!({"candidate":"existing","request_key":"never-save-twice"}),
+                uncertain: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let before = json!(draft);
+        draft.clear_target();
+        let restored: Draft = serde_json::from_value(json!(draft)).unwrap();
+        assert!(restored.enabled);
+        assert!(restored.target.is_null() && restored.inspection.is_null());
+        assert!(restored.target_slot.is_none());
+        assert!(restored.endpoint.is_empty() && restored.target_name.is_empty());
+        assert!(restored.chains.is_empty() && restored.hotspots.is_empty());
+        assert!(restored.crop.is_empty() && !restored.crop_enabled);
+        assert!(restored.source_ref.is_empty() && restored.project_ref.is_empty());
+        assert!(restored.request("head").is_err());
+        for field in [
+            "intent",
+            "save_intent",
+            "patches",
+            "results_job",
+            "lengths",
+            "designs",
+            "seed",
+            "timeout_minutes",
+            "max_cost_usd",
+        ] {
+            assert_eq!(json!(restored)[field], before[field], "changed {field}");
+        }
     }
 }

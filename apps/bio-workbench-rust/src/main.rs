@@ -100,7 +100,7 @@ struct Failure {
 #[derive(Clone)]
 enum Pick {
     LibraryStructures(String),
-    BinderTarget,
+    BinderTarget(String),
     Inputs,
     Structure,
     Key,

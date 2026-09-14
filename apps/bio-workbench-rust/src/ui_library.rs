@@ -1834,7 +1834,7 @@ fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
 }
 
 #[derive(Clone, Copy)]
-enum Icon {
+pub(super) enum Icon {
     Trash,
     Pencil,
 }
@@ -1914,7 +1914,12 @@ fn document_editor(ui: &mut egui::Ui, edit: &mut Edit, writing: bool) -> (bool, 
     (save, cancel)
 }
 
-fn icon_button(ui: &mut egui::Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
+pub(super) fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
     let response = ui
         .add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(23.)))
         .on_hover_text(tooltip);

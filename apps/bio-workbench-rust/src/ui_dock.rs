@@ -526,13 +526,15 @@ impl TabViewer for StructureTabs<'_> {
                             || view.selection_range.residues.contains(&residue.key);
                         let hotspot = view.hotspots.residues.contains(&residue.key);
                         let domain = view.renderer.residue_color(residue_index);
-                        let text_color = if hotspot || selected {
+                        let text_color = if hotspot {
                             Color32::from_gray(245)
                         } else if let Some(color) = domain {
                             let brightness = u32::from(color.r()) * 299
                                 + u32::from(color.g()) * 587
                                 + u32::from(color.b()) * 114;
                             Color32::from_gray(if brightness >= 128_000 { 15 } else { 245 })
+                        } else if selected {
+                            Color32::from_gray(245)
                         } else {
                             view.molecule.chains[residue.chain].color
                         };
@@ -545,10 +547,14 @@ impl TabViewer for StructureTabs<'_> {
                                 )
                                 .fill(if hotspot {
                                     Color32::from_rgb(145, 66, 31)
+                                } else if let Some(color) = domain {
+                                    // Selection keeps its outline without hiding the
+                                    // annotation underneath a cleared hotspot.
+                                    color
                                 } else if selected {
                                     ui.visuals().selection.bg_fill
                                 } else {
-                                    domain.unwrap_or(ui.visuals().widgets.inactive.bg_fill)
+                                    ui.visuals().widgets.inactive.bg_fill
                                 })
                                 .min_size(Vec2::new(9., 17.))
                                 .selected(selected),

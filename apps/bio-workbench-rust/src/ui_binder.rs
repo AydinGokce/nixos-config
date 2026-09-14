@@ -28,6 +28,8 @@ pub(super) struct Panel {
     pub target_library_ref: String,
     pub target_picker_open: bool,
     pub upload_token: String,
+    pub inspection_token: String,
+    pub file_picker_token: String,
     pub progress_open: bool,
     pub batch: Value,
     pub results_open: bool,
@@ -53,6 +55,50 @@ pub(super) struct Panel {
     last_hotspots: BTreeSet<Residue>,
 }
 impl Panel {
+    fn clear_target(&mut self) {
+        self.draft.clear_target();
+        self.pending_view = None;
+        self.pending_source_ref = None;
+        self.target_runs.clear();
+        self.target_library_ref.clear();
+        self.target_picker_open = false;
+        self.upload_token.clear();
+        self.inspection_token.clear();
+        self.file_picker_token.clear();
+        self.status.clear();
+        self.error.clear();
+        self.manual.clear();
+        self.patch_name.clear();
+        self.last_hotspots.clear();
+        self.undo.clear();
+        self.redo.clear();
+    }
+
+    fn accepts_inspection(&self, token: &str) -> bool {
+        !token.is_empty()
+            && self.inspection_token == token
+            && !self.draft.target.is_null()
+            && !text(&self.draft.target, "sha256").is_empty()
+    }
+
+    fn accepts_upload(&self, token: &str) -> bool {
+        !token.is_empty() && self.upload_token == token && !self.draft.target.is_null()
+    }
+
+    pub(super) fn consume_file_picker(&mut self, token: &str) -> bool {
+        if token.is_empty() || self.file_picker_token != token {
+            return false;
+        }
+        self.file_picker_token.clear();
+        true
+    }
+
+    fn has_target_input(&self) -> bool {
+        !self.draft.target.is_null()
+            || self.pending_view.is_some()
+            || !self.file_picker_token.is_empty()
+    }
+
     pub fn restore(state: &UiState) -> Self {
         let mut draft: Draft = state
             .extra
@@ -101,10 +147,85 @@ fn residue_from_key(key: &scene::ResidueKey) -> Option<Residue> {
     })
 }
 
+fn restorable_on_head(saved: &Value, endpoint: &str) -> bool {
+    text(saved, "endpoint") == endpoint
+        && (!saved["draft"]["target"].is_null()
+            || saved["draft"]["intent"].is_object()
+            || saved["draft"]["save_intent"].is_object())
+}
+
+fn inspection_notes(ui: &mut egui::Ui, inspection: &Value) -> egui::CollapsingResponse<()> {
+    egui::CollapsingHeader::new("Structure inspection notes")
+        .id_salt("binder-structure-inspection-notes")
+        .show(ui, |ui| {
+            let warnings: Vec<_> = rows(inspection, "warnings")
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|warning| !warning.trim().is_empty())
+                .collect();
+            if warnings.is_empty() {
+                ui.weak("No structure inspection issues detected.");
+            } else {
+                for warning in warnings {
+                    ui.weak(warning);
+                }
+            }
+            let chains = rows(inspection, "chains");
+            let residues: usize = chains
+                .iter()
+                .map(|chain| rows(chain, "residues").len())
+                .sum();
+            let chain_label = if chains.len() == 1 { "chain" } else { "chains" };
+            ui.small(format!(
+                "{} {chain_label} · {residues} residues inspected",
+                chains.len()
+            ));
+        })
+}
+
+fn target_header(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    ui.horizontal(|ui| {
+        let remove =
+            ui_library::icon_button(ui, ui_library::Icon::Trash, true, "Remove binder input");
+        ui.add(
+            egui::Label::new(
+                RichText::new(if name.is_empty() {
+                    "Loading target…"
+                } else {
+                    name
+                })
+                .strong(),
+            )
+            .wrap(),
+        );
+        remove
+    })
+    .inner
+}
+
 impl Workbench {
+    fn binder_remove_target(&mut self) {
+        // Hotspot picking belongs to this editable target. Ordinary selections,
+        // annotations, the structure itself, and submitted requests remain intact.
+        if let Some(view) = self
+            .binder
+            .draft
+            .target_slot
+            .and_then(|slot| self.views.get_mut(&slot))
+            .filter(|view| view.metadata["sha256"] == self.binder.draft.target["sha256"])
+        {
+            // Also discard its queued pick gesture/anchor so a late GPU hit
+            // cannot restore a hotspot after the input was removed.
+            view.hotspots = scene::Hotspots::default();
+        }
+        self.binder.clear_target();
+        self.persist();
+    }
+
     pub(super) fn binder_use_active(&mut self) {
         self.binder.pending_view = None;
         self.binder.pending_source_ref = None;
+        self.binder.file_picker_token.clear();
         self.binder_activate_target(None);
     }
 
@@ -113,6 +234,7 @@ impl Workbench {
         // including a library result that is already open in a viewer tab.
         self.binder.pending_view = None;
         self.binder.pending_source_ref = None;
+        self.binder.file_picker_token.clear();
         let slot = self.state.selected_view;
         let Some(view) = self
             .views
@@ -158,6 +280,7 @@ impl Workbench {
         self.binder.redo.clear();
         self.binder.error.clear();
         self.binder.upload_token.clear();
+        self.binder.inspection_token.clear();
         self.binder.draft.chains = view
             .molecule
             .chains
@@ -216,7 +339,7 @@ impl Workbench {
     }
 
     pub(super) fn binder_uploaded(&mut self, token: &str, receipt: Value) {
-        if self.binder.upload_token != token {
+        if !self.binder.accepts_upload(token) {
             return;
         }
         if text(&receipt, "upload_id").is_empty()
@@ -232,13 +355,16 @@ impl Workbench {
     }
 
     pub(super) fn binder_inspect(&mut self) {
-        let sha = text(&self.binder.draft.target, "sha256").to_owned();
+        if self.binder.draft.target.is_null() || text(&self.binder.draft.target, "id").is_empty() {
+            return;
+        }
+        self.binder.inspection_token = uid();
         self.binder.status = "Inspecting target chains and residue identities…".into();
         if self
             .request(
                 "binder.inspect",
                 json!({"target":self.binder.draft.target}),
-                Purpose::Binder(Request::Inspect(sha)),
+                Purpose::Binder(Request::Inspect(self.binder.inspection_token.clone())),
             )
             .is_none()
         {
@@ -310,9 +436,9 @@ impl Workbench {
                 .get("detached_binder_drafts")
                 .and_then(Value::as_array)
                 .and_then(|drafts| {
-                    drafts.iter().rposition(|item| {
-                        text(item, "endpoint") == endpoint && !item["draft"]["target"].is_null()
-                    })
+                    drafts
+                        .iter()
+                        .rposition(|item| restorable_on_head(item, &endpoint))
                 });
             if let Some(index) = saved
                 && ui.button("Restore previous draft for this head").clicked()
@@ -339,17 +465,27 @@ impl Workbench {
                 self.binder_use_active();
             }
             if ui.button("Load target…").clicked() {
-                self.choose_files(Pick::BinderTarget, ctx);
+                self.binder.pending_view = None;
+                self.binder.pending_source_ref = None;
+                self.binder.file_picker_token = uid();
+                self.choose_files(
+                    Pick::BinderTarget(self.binder.file_picker_token.clone()),
+                    ctx,
+                );
             }
             if ui.button("Library…").clicked() {
                 self.open_library();
             }
         });
+        if self.binder.has_target_input()
+            && target_header(ui, &self.binder.draft.target_name).clicked()
+        {
+            self.binder_remove_target();
+        }
         if self.binder.draft.target.is_null() {
             ui.label("Choose a target structure from a viewer tab or file.");
             ui.weak("For a sequence-only construct, open a folding result from its library run history first.");
         } else {
-            ui.strong(&self.binder.draft.target_name);
             if let Some(slot) = self.binder.draft.target_slot
                 && self.has_view(slot)
                 && ui.small_button("Show target tab").clicked()
@@ -410,14 +546,7 @@ impl Workbench {
                         });
                     }
                 }
-                egui::CollapsingHeader::new("Structure inspection notes").show(ui, |ui| {
-                    for warning in rows(&self.binder.draft.inspection, "warnings")
-                        .iter()
-                        .filter_map(Value::as_str)
-                    {
-                        ui.weak(warning);
-                    }
-                });
+                inspection_notes(ui, &self.binder.draft.inspection);
                 ui.weak("Only the selected protein chains/crop enter design. Other displayed molecules remain visual context.");
                 ui.checkbox(&mut self.binder.draft.crop_enabled, "Crop target residues");
                 if self.binder.draft.crop_enabled {
@@ -520,7 +649,7 @@ impl Workbench {
             .as_ref()
             .is_some_and(Intent::unresolved);
         let run = ui.add_enabled(
-            !pending && self.connected,
+            !pending && self.connected && !self.binder.draft.target.is_null(),
             egui::Button::new(
                 RichText::new("▶ Design binders")
                     .strong()
@@ -798,14 +927,15 @@ impl Workbench {
     pub(super) fn binder_received(&mut self, request: Request, value: Value, ctx: &egui::Context) {
         match request {
             Request::Catalog => self.binder.catalog = value,
-            Request::Inspect(sha) => {
-                if text(&self.binder.draft.target, "sha256") != sha {
+            Request::Inspect(token) => {
+                if !self.binder.accepts_inspection(&token) {
                     return;
                 }
-                if text(&value["target"], "sha256") != sha {
+                if value["target"]["sha256"] != self.binder.draft.target["sha256"] {
                     self.binder.error = "Head inspection returned a different target hash.".into();
                     return;
                 }
+                self.binder.inspection_token.clear();
                 self.binder.draft.inspection = value;
                 self.binder.status = "Target ready".into();
                 self.binder.error.clear();
@@ -933,8 +1063,17 @@ impl Workbench {
                 self.binder.save_error = message.into();
             }
             Purpose::Binder(Request::Projects) => self.binder.save_error = message.into(),
+            Purpose::Binder(Request::Inspect(token)) if self.binder.accepts_inspection(token) => {
+                self.binder.error = message.into();
+            }
+            Purpose::Binder(Request::LibraryTargets(reference))
+                if !reference.is_empty() && self.binder.target_library_ref == *reference =>
+            {
+                self.binder.error = message.into();
+            }
+            Purpose::Binder(Request::Inspect(_) | Request::LibraryTargets(_)) => {}
             Purpose::Binder(_) => self.binder.error = message.into(),
-            Purpose::Upload(UploadTarget::Binder(token)) if self.binder.upload_token == *token => {
+            Purpose::Upload(UploadTarget::Binder(token)) if self.binder.accepts_upload(token) => {
                 self.binder.error = message.into()
             }
             _ => {}
@@ -1004,6 +1143,9 @@ impl Workbench {
     }
 
     pub(super) fn binder_library_target(&mut self, reference: &str) {
+        self.binder.file_picker_token.clear();
+        self.binder.pending_view = None;
+        self.binder.pending_source_ref = None;
         self.binder.target_library_ref = reference.into();
         self.binder.target_runs.clear();
         self.binder.target_picker_open = true;
@@ -1047,5 +1189,270 @@ impl Workbench {
             open = false;
         }
         self.binder.target_picker_open = open;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_target() -> Panel {
+        Panel {
+            draft: Draft {
+                enabled: true,
+                target: json!({"kind":"upload","id":"target","sha256":"same-bytes"}),
+                target_slot: Some(4),
+                inspection: json!({"target":{"sha256":"same-bytes"}}),
+                intent: Some(Intent {
+                    id: "running".into(),
+                    endpoint: "head".into(),
+                    batch_id: "batch".into(),
+                    request: json!({"request_key":"exact"}),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            pending_view: Some(7),
+            pending_source_ref: Some("construct:original@1".into()),
+            target_library_ref: "construct:original@1".into(),
+            target_picker_open: true,
+            target_runs: vec![json!({"job_id":"old"})],
+            upload_token: "old-upload".into(),
+            inspection_token: "old-inspection".into(),
+            file_picker_token: "old-picker".into(),
+            manual: "A:1".into(),
+            patch_name: "draft patch".into(),
+            progress_open: true,
+            batch: json!({"batch_id":"batch"}),
+            results_open: true,
+            candidates: json!({"job_id":"results"}),
+            save_receipt: json!({"ref":"construct:saved@1"}),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn removing_input_invalidates_all_target_callbacks_and_keeps_running_work() {
+        let mut panel = pending_target();
+        let intent = json!(panel.draft.intent);
+        let batch = panel.batch.clone();
+        let candidates = panel.candidates.clone();
+        let save = panel.save_receipt.clone();
+        assert!(panel.has_target_input());
+        assert!(panel.accepts_upload("old-upload"));
+        assert!(panel.accepts_inspection("old-inspection"));
+        panel.clear_target();
+        assert!(!panel.has_target_input());
+        assert!(!panel.accepts_upload("old-upload"));
+        assert!(!panel.accepts_upload(""));
+        assert!(!panel.accepts_inspection("old-inspection"));
+        assert!(!panel.accepts_inspection(""));
+        assert!(!panel.consume_file_picker("old-picker"));
+        assert!(panel.pending_view.is_none() && panel.pending_source_ref.is_none());
+        assert!(panel.target_library_ref.is_empty() && panel.target_runs.is_empty());
+        assert!(!panel.target_picker_open);
+        assert!(panel.manual.is_empty() && panel.patch_name.is_empty());
+        assert!(panel.undo.is_empty() && panel.redo.is_empty() && panel.last_hotspots.is_empty());
+        assert_eq!(json!(panel.draft.intent), intent);
+        assert_eq!(panel.batch, batch);
+        assert_eq!(panel.candidates, candidates);
+        assert_eq!(panel.save_receipt, save);
+        assert!(panel.progress_open && panel.results_open);
+        let mut state = UiState::default();
+        state
+            .extra
+            .insert("binder_design".into(), json!(panel.draft));
+        let restored = Panel::restore(&state);
+        assert!(restored.draft.target.is_null() && restored.draft.target_slot.is_none());
+        assert_eq!(json!(restored.draft.intent), intent);
+    }
+
+    #[test]
+    fn selecting_same_structure_again_never_accepts_previous_inspection_or_upload() {
+        let mut panel = pending_target();
+        let target = panel.draft.target.clone();
+        panel.clear_target();
+        panel.draft.target = target;
+        panel.inspection_token = "new-inspection".into();
+        panel.upload_token = "new-upload".into();
+        assert!(!panel.accepts_inspection("old-inspection"));
+        assert!(panel.accepts_inspection("new-inspection"));
+        assert!(!panel.accepts_upload("old-upload"));
+        assert!(panel.accepts_upload("new-upload"));
+    }
+
+    #[test]
+    fn obsolete_or_cancelled_file_picker_cannot_consume_new_choice() {
+        let mut panel = pending_target();
+        panel.file_picker_token = "new-picker".into();
+        assert!(!panel.consume_file_picker("old-picker"));
+        assert_eq!(panel.file_picker_token, "new-picker");
+        assert!(panel.consume_file_picker("new-picker"));
+        assert!(!panel.consume_file_picker("new-picker"));
+        assert!(!panel.consume_file_picker(""));
+    }
+
+    #[test]
+    fn cleared_target_keeps_archived_run_and_save_recovery_accessible_on_original_head() {
+        let mut panel = pending_target();
+        panel.clear_target();
+        let saved = json!({"endpoint":"original-head","draft":panel.draft});
+        assert!(restorable_on_head(&saved, "original-head"));
+        assert!(!restorable_on_head(&saved, "another-head"));
+        panel.draft.intent = None;
+        panel.draft.save_intent = Some(Intent {
+            id: "pending-save".into(),
+            ..Default::default()
+        });
+        assert!(restorable_on_head(
+            &json!({"endpoint":"original-head","draft":panel.draft}),
+            "original-head"
+        ));
+        panel.draft.save_intent = None;
+        assert!(!restorable_on_head(
+            &json!({"endpoint":"original-head","draft":panel.draft}),
+            "original-head"
+        ));
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn collect(shape: &egui::Shape, result: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => result.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for shape in shapes {
+            collect(&shape.shape, &mut result);
+        }
+        result
+    }
+
+    fn click(position: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn inspection_dropdown_opens_visible_body_with_or_without_warnings() {
+        for warnings in [json!([]), json!(["A:42 has an unsupported residue"])] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| style.animation_time = 0.);
+            let inspection = json!({"warnings":warnings,"chains":[{"residues":[{},{}]}]});
+            let mut time = 0.;
+            let mut draw = |events| {
+                time += 0.1;
+                let mut response = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(350., 500.),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            response = Some(inspection_notes(ui, &inspection));
+                        });
+                    },
+                );
+                (response.unwrap(), output)
+            };
+            let (closed, _) = draw(vec![]);
+            assert!(closed.body_response.is_none());
+            let header_id = closed.header_response.id;
+            let position = closed.header_response.rect.center();
+            draw(click(position, true));
+            draw(click(position, false));
+            let (opened, output) = draw(vec![]);
+            assert_eq!(opened.header_response.id, header_id);
+            assert!(opened.body_response.unwrap().rect.height() > 20.);
+            let visible = painted_text(&output.shapes);
+            let message = warnings
+                .as_array()
+                .unwrap()
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or("No structure inspection issues detected.");
+            assert!(visible.iter().any(|text| text == message), "{visible:?}");
+            assert!(
+                visible
+                    .iter()
+                    .any(|text| text == "1 chain · 2 residues inspected")
+            );
+            draw(click(position, true));
+            draw(click(position, false));
+            assert!(draw(vec![]).0.body_response.is_none());
+        }
+    }
+
+    #[test]
+    fn trash_is_one_click_and_visible_for_long_names_at_narrow_widths() {
+        for (width, font_size) in [(230., 14.), (310., 24.)] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| {
+                style
+                    .text_styles
+                    .insert(egui::TextStyle::Body, egui::FontId::proportional(font_size));
+            });
+            let mut panel = pending_target();
+            let mut time = 0.;
+            let mut draw = |events| {
+                time += 0.1;
+                let mut response = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width, 500.),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if panel.has_target_input() {
+                                let remove = target_header(
+                                    ui,
+                                    "Large engineered editor with a long descriptive target name",
+                                );
+                                assert!(
+                                    remove.rect.left() >= ui.clip_rect().left()
+                                        && remove.rect.right() <= ui.clip_rect().right()
+                                );
+                                if remove.clicked() {
+                                    panel.clear_target();
+                                }
+                                response = Some(remove);
+                            }
+                        });
+                    },
+                );
+                response
+            };
+            let position = draw(vec![]).unwrap().rect.center();
+            draw(click(position, true));
+            assert!(draw(click(position, false)).unwrap().clicked());
+            assert!(draw(vec![]).is_none());
+            assert!(panel.draft.target.is_null());
+            assert_eq!(panel.draft.intent.unwrap().batch_id, "batch");
+        }
     }
 }

@@ -34,6 +34,13 @@ fn select(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut String, choic
 }
 impl Workbench {
     pub(super) fn picked(&mut self, kind: Pick, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        // Consume even cancellation so an old picker cannot repopulate a
+        // removed target or interfere with a newer choice on another head.
+        if let Pick::BinderTarget(token) = &kind
+            && !self.binder.consume_file_picker(token)
+        {
+            return;
+        }
         for path in paths {
             let path = std::fs::canonicalize(&path).unwrap_or(path);
             match &kind {
@@ -42,7 +49,7 @@ impl Workbench {
                         files.add(vec![path]);
                     }
                 }
-                Pick::BinderTarget => {
+                Pick::BinderTarget(_) => {
                     self.binder.pending_source_ref = None;
                     let (format, _) = infer_file(&path);
                     let metadata = json!({"name":path.file_name().unwrap_or_default().to_string_lossy(),"format":format,"source_kind":"local","local_path":path});
