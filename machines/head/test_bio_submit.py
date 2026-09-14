@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("bio-submit.sh")
 RFAA_DATABASES = runpy.run_path(str(SCRIPT.parent / "rfaa" / "databases.py"))
+MSA_PROFILES = runpy.run_path(str(SCRIPT.parent / "msa" / "search_profile.py"))
 
 
 class SubmissionTests(unittest.TestCase):
@@ -106,6 +107,12 @@ fi
             "ssh": '''#!/usr/bin/env bash
 set -eu
 echo "$*" >> "$AUDIT/ssh-args"
+python3 - "$@" <<'PY'
+import json, os, sys
+from pathlib import Path
+with (Path(os.environ['AUDIT'])/'ssh-argv.jsonl').open('a') as stream:
+    stream.write(json.dumps(sys.argv[1:])+'\\n')
+PY
 if [ "${!#}" = true ]; then exit 0; fi
 echo 'worker' >> "$AUDIT/events"
 cat > "$AUDIT/transmitted.sh"
@@ -184,14 +191,24 @@ if [ -n "${BIO_MSA_SESSION_STATE:-}" ]; then
   if [ "${MSA_MARKER_UNWRITABLE:-0}" = 1 ]; then mkdir "$BIO_MSA_SESSION_STATE/allocation-started.json"; fi
 fi
 [ "${MSA_SELECTOR_EXIT:-0}" = 0 ] || exit "$MSA_SELECTOR_EXIT"
-python3 - <<'PY'
-import json, os
+python3 - "$@" <<'PY'
+import json, os, runpy, sys
+from pathlib import Path
+policy=runpy.run_path(str(Path(os.environ['BIO_TOOLS_SRC'])/'msa/search_profile.py'))
+profile=policy['resolve'](sys.argv[sys.argv.index('--profile')+1])
 kind=os.environ.get('MSA_SELECTED_TYPE','CPU.360V.1440G')
-print(json.dumps(dict(schema=1,kind='msa-worker-choice',reserved=False,location='FIN-02',
+advertised=float(os.environ.get('MSA_SELECTED_GB','1440'))
+value=dict(schema=1,kind='msa-worker-choice',reserved=False,location='FIN-02',
     instance_type=kind,spot=os.environ.get('MSA_SELECTED_SPOT')=='1',
     image='ubuntu-24.04' if kind.startswith('CPU.') else 'ubuntu-24.04-cuda-12.8-open-docker',
-    price_per_hour=float(os.environ.get('MSA_SELECTED_PRICE','8')),conservative_gib=1000,
-    maximum_instance_hourly=13)))
+    price_per_hour=float(os.environ.get('MSA_SELECTED_PRICE','8')),
+    advertised_gb=advertised,conservative_gib=advertised*10**9/1024**3,
+    maximum_instance_hourly=13,search_profile=profile,
+    **{key:profile[key] for key in ('profile_id','profile_sha256','minimum_advertised_bytes',
+                                  'minimum_total_gib','minimum_available_gib')})
+value.update(json.loads(os.environ.get('MSA_CHOICE_PATCH','{}')))
+if os.environ.get('MSA_CHOICE_DROP_PROFILE')=='1': value.pop('search_profile')
+print(json.dumps(value))
 PY
 '''
         stubs["bio-msa-storage"] = stubs["bio-rfaa-storage"].replace("storage-checks", "msa-storage-checks").replace("RFAA", "MSA")
@@ -1137,7 +1154,7 @@ sleep() { :; }
     def test_msa_no_capacity_or_overpriced_selection_never_launches(self):
         for settings in ({'MSA_SELECTOR_EXIT':'4'},{'MSA_SELECTED_PRICE':'14'}):
             with self.subTest(settings=settings):
-                result=self.submit('msa','--sub','install',**self.msa_settings(**settings))
+                result=self.submit('msa','--sub','install',**self.msa_settings(**{'BIO_MSA_SEARCH_PROFILE':MSA_PROFILES['MAPPED_PROFILE'], **settings}))
                 self.assertNotEqual(result.returncode,0)
                 self.assertFalse((self.root/'launches').exists())
 
@@ -1146,6 +1163,88 @@ sleep() { :; }
                            **self.msa_settings(MSA_SELECTOR_EXIT='4'))
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         self.assertFalse((self.root/'worker-selection-calls').exists())
+
+    def test_nominal_128gb_search_binds_profile_and_caps_only_the_remote_worker(self):
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            MSA_SELECTED_TYPE='CPU.32V.128G', MSA_SELECTED_GB='128', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertEqual((self.root/'launches').read_text().splitlines(), ['CPU.32V.128G'])
+        profile = MSA_PROFILES['resolve'](MSA_PROFILES['MAPPED_PROFILE'])
+        output = next((self.root/'results').iterdir())
+        self.assertEqual(json.loads((output/'search-profile.json').read_text()), profile)
+        choice = json.loads((output/'worker-choice.json').read_text())
+        self.assertEqual(choice['search_profile'], profile)
+        self.assertAlmostEqual(choice['conservative_gib'], 119.20928955078125)
+        job = json.loads((output/'job.json').read_text())
+        self.assertEqual(job['search_profile'], profile)
+        self.assertEqual(job['search_profile_receipt'], dict(path='search-profile.json',
+            sha256=hashlib.sha256((output/'search-profile.json').read_bytes()).hexdigest()))
+        self.assertEqual(job['worker_memory_scope'], 'bio-msa-memory-'+job['job']+'.scope')
+        argv = [json.loads(line) for line in (self.root/'ssh-argv.jsonl').read_text().splitlines()][-1]
+        command = argv[argv.index('root@127.0.0.1')+1:]
+        self.assertEqual(command[:4], ['systemd-run', '--scope', '--quiet', '--collect'])
+        self.assertTrue(command[4].startswith('--unit=bio-msa-memory-msa-'))
+        self.assertEqual(command[5:], ['--property=MemoryMax=96G', '--property=MemorySwapMax=0', 'bash', '-s'])
+        remote = (self.root/'transmitted.sh').read_text()
+        self.assertIn('export BIO_MSA_SEARCH_PROFILE=mapped-128gb-v1', remote)
+        self.assertIn('BIO_MSA_SESSION_WARM=report', remote)
+        with tarfile.open(output/'tools.tar.gz') as archive:
+            self.assertEqual(archive.extractfile('msa/search_profile.py').read(),
+                             (SCRIPT.parent/'msa/search_profile.py').read_bytes())
+        # A folding worker remains independent of the CPU-MSA scope policy.
+        result = self.run_job()
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        argv = [json.loads(line) for line in (self.root/'ssh-argv.jsonl').read_text().splitlines()][-1]
+        self.assertEqual(argv[argv.index('root@127.0.0.1')+1:], ['bash', '-s'])
+        self.assertNotIn('systemd-run', (self.root/'launch-args').read_text())
+
+    def test_install_forces_legacy_profile_without_mapped_worker_scope(self):
+        result = self.submit('msa', '--sub', 'install', **self.msa_settings(
+            BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        choice = json.loads(next((self.root/'results').glob('*/worker-choice.json')).read_text())
+        self.assertEqual(choice['search_profile'], MSA_PROFILES['resolve'](MSA_PROFILES['LEGACY_PROFILE']))
+        job = json.loads(next((self.root/'results').glob('*/job.json')).read_text())
+        self.assertEqual(job['search_profile'], choice['search_profile'])
+        self.assertIsNone(job['worker_memory_scope'])
+        self.assertIn('--profile '+MSA_PROFILES['LEGACY_PROFILE'], (self.root/'worker-selection-calls').read_text())
+        argv = [json.loads(line) for line in (self.root/'ssh-argv.jsonl').read_text().splitlines()][-1]
+        self.assertEqual(argv[argv.index('root@127.0.0.1')+1:], ['bash', '-s'])
+
+    def test_bad_profile_or_warm_mode_and_sub_128gb_choice_never_allocate(self):
+        for settings in ({'BIO_MSA_SEARCH_PROFILE':'unknown'}, {'BIO_MSA_SESSION_WARM':'prefetch'},
+                         {'BIO_MSA_SESSION_WARM':'lock'}, {'MSA_SELECTED_GB':'127'}):
+            with self.subTest(settings=settings):
+                result = self.submit('msa', '--sub', 'serve', **self.msa_settings(**{'BIO_MSA_SEARCH_PROFILE':MSA_PROFILES['MAPPED_PROFILE'], **settings}))
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertFalse((self.root/'launches').exists())
+                self.assertFalse((self.root/'transmitted.sh').exists())
+
+    def test_worker_choice_requires_the_exact_nested_profile_and_summary_before_allocation(self):
+        mapped = MSA_PROFILES['resolve'](MSA_PROFILES['MAPPED_PROFILE'])
+        patches = [dict(search_profile=None), dict(search_profile=dict(mapped, mmseqs_threads=16)),
+                   dict(search_profile=MSA_PROFILES['resolve'](MSA_PROFILES['LEGACY_PROFILE'])),
+                   dict(profile_sha256='0'*64), dict(conservative_gib=128)]
+        settings = [{'MSA_CHOICE_PATCH':json.dumps(value)} for value in patches]
+        settings.append({'MSA_CHOICE_DROP_PROFILE':'1'})
+        for changes in settings:
+            with self.subTest(changes=changes):
+                result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+                    BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE'], **changes))
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertFalse((self.root/'launches').exists())
+                self.assertFalse((self.root/'transmitted.sh').exists())
+
+    def test_mapped_worker_oom_exit_is_retained_and_fetches_before_exact_cleanup(self):
+        result = self.submit('msa', '--sub', 'serve', **self.msa_settings(
+            MODEL_EXIT='137', BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertEqual(result.returncode, 137, result.stdout+result.stderr)
+        self.assertNotIn('DONE', result.stdout)
+        events = (self.root/'events').read_text().splitlines()
+        self.assertLess(events.index('fetch'), next(i for i, value in enumerate(events) if value.startswith('cleanup:rm ')))
+        self.assertEqual((self.root/'removals').read_text().count('rm '), 1)
+        self.assertIn('--property=MemoryMax=96G', (self.root/'ssh-args').read_text())
+        self.assertTrue(list((self.root/'results').glob('*/result.pdb')))
 
     def test_managed_capacity_timeout_records_proof_without_any_cloud_launch(self):
         state = self.managed_startup_fixture()
@@ -1413,7 +1512,7 @@ runpy.run_path(''' + repr(str(original_gate)) + ", run_name='__main__')\n")
         for settings in ({"EXPIRE_ON_CHECK": "1"}, {"EXPIRE_ON_CHECK": "2"}, {"EXPIRE_BEFORE_LAUNCH": "1"}):
             with self.subTest(settings=settings):
                 (self.root / "msa-storage-checks").unlink(missing_ok=True)
-                result = self.submit("msa", "--sub", "install", **self.msa_settings(**settings))
+                result = self.submit("msa", "--sub", "install", **self.msa_settings(**{'BIO_MSA_SEARCH_PROFILE':MSA_PROFILES['MAPPED_PROFILE'], **settings}))
                 self.assertEqual(result.returncode, 2, result.stdout+result.stderr)
                 self.assertFalse((self.root / "launches").exists())
                 self.assertFalse((self.root / "transmitted.sh").exists())
@@ -1729,8 +1828,8 @@ class MsaRecipeTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         commands = self.root / "bin"
         commands.mkdir()
-        # Only /proc/meminfo is replaced. The actual recipe's Python preflight
-        # and shell control flow execute, including errexit and early return.
+        # Replace kernel observations with fixture RAM and a virtual cgroup.
+        # Execute the real profile checks and shell control flow unchanged.
         python = commands / "python3"
         python.write_text(f'#!{sys.executable}\n' + '''import os, sys
 from pathlib import Path
@@ -1739,11 +1838,19 @@ if sys.argv[1] == '-':
     code = sys.stdin.read()
     sys.argv = sys.argv[1:]
     read_text = Path.read_text
+    resolve = Path.resolve
     def synthetic_memory(path, *args, **kwargs):
         if str(path) == '/proc/meminfo':
-            return 'MemAvailable: ' + str(int(os.environ['AVAILABLE_GIB']) * 1024**2) + ' kB\\n'
+            return ('MemTotal: '+str(int(os.environ['TOTAL_GIB'])*1024**2)+' kB\\n'
+                +'MemAvailable: '+str(int(os.environ['AVAILABLE_GIB'])*1024**2)+' kB\\n')
+        if str(path) == '/proc/'+str(os.getpid())+'/cgroup':
+            return '0::/system.slice/fixture.scope\\n'
         return read_text(path, *args, **kwargs)
-    with patch.object(Path, 'read_text', synthetic_memory):
+    def synthetic_cgroup_root(path, *args, **kwargs):
+        if str(path) == '/sys/fs/cgroup':
+            return resolve(Path(os.environ['AUDIT'])/'virtual-cgroup', *args, **kwargs)
+        return resolve(path, *args, **kwargs)
+    with patch.object(Path, 'read_text', synthetic_memory), patch.object(Path, 'resolve', synthetic_cgroup_root):
         exec(compile(code, '<recipe stdin>', 'exec'), {'__name__': '__main__'})
 else:
     os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
@@ -1754,6 +1861,7 @@ else:
         nproc.chmod(0o700)
         tools = self.root / "tools with spaces"
         (tools / "msa").mkdir(parents=True)
+        shutil.copy2(SCRIPT.parent / "msa/search_profile.py", tools / "msa/search_profile.py")
         (tools / "msa" / "tools.sh").write_text(
             'echo bootstrap >> "$AUDIT/events"\nexport MSA_TOOLS_ROOT="$AUDIT/pinned tools"\n')
         stub = '''import json, os, sys
@@ -1773,11 +1881,23 @@ print(json.dumps({'stage': 'databases-converted', 'production_ready': False}))
         self.env = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ["PATH"],
                         AUDIT=str(self.root), TOOLS=str(tools), OUT=str(out),
                         MSA_DB_ROOT=str(self.root / "database with spaces"))
+        self.cgroup = self.root / "virtual-cgroup/system.slice/fixture.scope"
+        self.cgroup.mkdir(parents=True)
+        for path in (self.cgroup, self.cgroup.parent):
+            (path / "memory.max").write_text("max")
+            (path / "memory.swap.max").write_text("max")
 
     def recipe(self, sub, available_gib, **settings):
+        maximum = settings.pop("CGROUP_MEMORY_GIB", "96")
+        (self.cgroup / "memory.max").write_text(str(int(maximum)*1024**3) if maximum.isdigit() else maximum)
+        (self.cgroup / "memory.swap.max").write_text(settings.pop("CGROUP_SWAP_BYTES", "0"))
+        profile = MSA_PROFILES["LEGACY_PROFILE"] if sub == "install" else MSA_PROFILES["MAPPED_PROFILE"]
+        env = {**self.env, "SUB":sub, "AVAILABLE_GIB":str(available_gib),
+               "TOTAL_GIB":str(max(118, available_gib+8)), "BIO_MSA_SEARCH_PROFILE":profile,
+               "BIO_MSA_SESSION_WARM":"prefetch" if sub == "install" else "report", **settings}
         return subprocess.run(["bash", "-c", 'EXTRA_ARGS=(); source "$1"', "recipe-test",
                                str(SCRIPT.parent / "recipes" / "msa.sh")],
-                              env=dict(self.env, SUB=sub, AVAILABLE_GIB=str(available_gib), **settings),
+                              env=env,
                               text=True, capture_output=True, timeout=5)
 
     def test_conversion_accepts_56_gib_caps_threads_and_exits_before_indexing_or_serving(self):
@@ -1806,25 +1926,27 @@ print(json.dumps({'stage': 'databases-converted', 'production_ready': False}))
         self.assertFalse((self.root / "events").exists())
         self.assertFalse((self.root / "calls.jsonl").exists())
 
-    def test_full_install_prepare_and_serve_still_require_768_gib(self):
+    def test_explicit_legacy_install_prepare_and_serve_still_require_768_gib(self):
         for sub in ("install", "panel", "prepare", "serve"):
             with self.subTest(sub=sub):
-                result = self.recipe(sub, 767)
+                result = self.recipe(sub, 767, BIO_MSA_SEARCH_PROFILE=MSA_PROFILES["LEGACY_PROFILE"])
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("full indexed CPU reference requires at least 768 GiB", result.stderr)
+                self.assertIn("requires at least 768 GiB guest available RAM", result.stderr)
                 self.assertFalse((self.root / "events").exists())
                 self.assertFalse((self.root / "calls.jsonl").exists())
 
-    def test_panel_starts_one_server_routes_manifest_and_preserves_failure_during_cleanup(self):
+    def panel_fixture(self):
         tools = Path(self.env["TOOLS"])
         with (tools / "msa/tools.sh").open("a") as output:
             output.write('export MMSEQS_SERVER="$AUDIT/server"\n')
         server = self.root / "server"
-        server.write_text(f'#!{sys.executable}\n' + '''import os
+        server.write_text(f'#!{sys.executable}\n' + '''import json,os
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 root = Path(os.environ['AUDIT'])
 (root/'server.pid').write_text(str(os.getpid()))
+(root/'server-environment.json').write_text(json.dumps({key:os.environ.get(key) for key in
+    ('MMSEQS_NUM_THREADS','OMP_NUM_THREADS','OMP_THREAD_LIMIT','OMP_DYNAMIC','BIO_MSA_SEARCH_PROFILE')}))
 with (root/'events').open('a') as f: f.write('server-start\\n')
 HTTPServer(('127.0.0.1',8080),BaseHTTPRequestHandler).serve_forever()
 ''')
@@ -1835,13 +1957,17 @@ assert sys.argv[1] == 'config', 'recipe must leave per-target auditing to panel.
 path = Path(sys.argv[sys.argv.index('--output')+1])
 path.write_text('{}')
 path.with_suffix('.provenance.json').write_text('{}')
+(Path(os.environ['AUDIT'])/'config-args.json').write_text(json.dumps(sys.argv[1:]))
 with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('config\\n')
 ''')
         (tools / "msa/panel.py").write_text('''import json,os,sys
 from pathlib import Path
 root = Path(os.environ['AUDIT'])
 (root/'panel-args.json').write_text(json.dumps(sys.argv[1:]))
-assert os.environ['MMSEQS_NUM_THREADS'] == '16'
+assert os.environ['MMSEQS_NUM_THREADS'] == os.environ['EXPECTED_THREADS']
+assert os.environ['OMP_NUM_THREADS'] == os.environ['EXPECTED_THREADS']
+assert os.environ['OMP_THREAD_LIMIT'] == os.environ['EXPECTED_THREADS']
+assert os.environ['OMP_DYNAMIC'] == 'FALSE'
 with (root/'events').open('a') as f: f.write('panel\\n')
 raise SystemExit(17)
 ''')
@@ -1850,11 +1976,15 @@ from pathlib import Path
 assert sys.argv[1] in ('install','validate')
 with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('database-'+sys.argv[1]+'\\n')
 ''')
+
+    def test_panel_starts_one_server_routes_manifest_and_preserves_failure_during_cleanup(self):
+        self.panel_fixture()
         for sub in ("panel", "install"):
             with self.subTest(sub=sub):
                 (self.root / "events").unlink(missing_ok=True)
                 result = self.recipe(sub, 800, SHARED=str(self.root / "shared"), IN="manifest.json",
-                                     BIO_MSA_PANEL_SHA256="expected-manifest-sha", BIO_JOB_DEADLINE_EPOCH="1234567890")
+                                     BIO_MSA_PANEL_SHA256="expected-manifest-sha", BIO_JOB_DEADLINE_EPOCH="1234567890",
+                                     EXPECTED_THREADS="16" if sub == "install" else "4")
                 self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
                 expected = ["bootstrap"] + (["database-install", "database-validate"] if sub == "install" else [])
                 self.assertEqual((self.root / "events").read_text().splitlines(), expected+["config", "server-start", "panel"])
@@ -1870,6 +2000,61 @@ with (Path(os.environ['AUDIT'])/'events').open('a') as f: f.write('database-'+sy
         result = self.recipe("install", 800, BIO_MSA_PANEL_SHA256="")
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertEqual((self.root / "events").read_text().splitlines(), ["bootstrap", "database-install", "database-validate"])
+
+    def test_mapped_search_accepts_100gib_available_and_exports_caps_to_actual_api_child(self):
+        self.panel_fixture()
+        result = self.recipe('panel', 100, TOTAL_GIB='110', SHARED=str(self.root/'shared'),
+            IN='manifest.json', BIO_MSA_PANEL_SHA256='expected', BIO_JOB_DEADLINE_EPOCH='1234567890',
+            EXPECTED_THREADS='4', MMSEQS_NUM_THREADS='128', OMP_THREAD_LIMIT='128', OMP_DYNAMIC='TRUE')
+        self.assertEqual(result.returncode, 17, result.stdout+result.stderr)
+        self.assertEqual((self.root/'events').read_text().splitlines(), ['bootstrap', 'config', 'server-start', 'panel'])
+        native = json.loads((self.root/'server-environment.json').read_text())
+        self.assertEqual(native, dict(MMSEQS_NUM_THREADS='4', OMP_NUM_THREADS='4', OMP_THREAD_LIMIT='4',
+                                     OMP_DYNAMIC='FALSE', BIO_MSA_SEARCH_PROFILE='mapped-128gb-v1'))
+        memory = json.loads((Path(self.env['OUT'])/'memory-profile.json').read_text())
+        self.assertEqual(memory['search_profile'], MSA_PROFILES['resolve'](MSA_PROFILES['MAPPED_PROFILE']))
+        self.assertEqual(memory['guest_memory']['available_bytes'], 100*1024**3)
+        self.assertEqual(memory['memory_limit']['memory_max_bytes'], 96*1024**3)
+        self.assertEqual(memory['memory_limit']['memory_swap_max_bytes'], 0)
+        args = json.loads((self.root/'config-args.json').read_text())
+        self.assertEqual(args[args.index('--search-profile')+1], 'mapped-128gb-v1')
+        with self.assertRaises(ProcessLookupError): os.kill(int((self.root/'server.pid').read_text()), 0)
+
+    def test_mapped_low_guest_ram_or_wrong_cgroup_fails_before_tools_or_search(self):
+        cases = [(99, {}, 'available RAM'), (100, {'TOTAL_GIB':'109'}, 'total RAM'),
+                 (100, {'CGROUP_MEMORY_GIB':'max'}, 'cgroup memory cap'),
+                 (100, {'CGROUP_MEMORY_GIB':'128'}, 'cgroup memory cap'),
+                 (100, {'CGROUP_MEMORY_GIB':'80'}, 'cgroup memory cap'),
+                 (100, {'CGROUP_SWAP_BYTES':'1048576'}, 'zero swap')]
+        for available, settings, error in cases:
+            with self.subTest(available=available, settings=settings):
+                result = self.recipe('panel', available, **settings)
+                self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn(error, result.stderr)
+                self.assertFalse((self.root/'events').exists())
+                self.assertFalse((self.root/'calls.jsonl').exists())
+                self.assertFalse((Path(self.env['OUT'])/'memory-profile.json').exists())
+
+    def test_install_recipe_rejects_mapped_profile_before_bootstrap(self):
+        result = self.recipe('install', 800, BIO_MSA_SEARCH_PROFILE=MSA_PROFILES['MAPPED_PROFILE'])
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertIn('installation requires the resident build profile', result.stderr)
+        self.assertFalse((self.root/'events').exists())
+
+    def test_session_forwards_exact_profile_warm_mode_and_original_deadline(self):
+        path = Path(self.env['TOOLS'])/'msa/session.py'
+        path.write_text('''import json,os,sys
+from pathlib import Path
+(Path(os.environ['AUDIT'])/'session-args.json').write_text(json.dumps(sys.argv[1:]))
+''')
+        result = self.recipe('session', 100, TOTAL_GIB='110', SHARED=str(self.root/'shared'),
+            BIO_MSA_SESSION_ID='a'*32, BIO_MSA_SESSION_IDLE_SECONDS='900', BIO_JOB_DEADLINE_EPOCH='1234567890')
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        args = json.loads((self.root/'session-args.json').read_text())
+        for key, value in (('--search-profile', 'mapped-128gb-v1'), ('--warm', 'report'),
+                           ('--deadline', '1234567890'), ('--session-id', 'a'*32), ('--idle-seconds', '900')):
+            self.assertEqual(args[args.index(key)+1], value)
+        self.assertEqual((self.root/'events').read_text().splitlines(), ['bootstrap'])
 
 
 if __name__ == "__main__":

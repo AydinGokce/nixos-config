@@ -23,55 +23,61 @@ are rejected. IDs are opaque strings. Times are UTC ISO 8601. Error codes includ
 
 ## Shared MSA worker and startup progress
 
-`worker.capacity {refresh?:bool}` reads Verda capacity separately from the running
-worker. It never allocates a worker, reserves spend, or changes an existing
-session. The Console checks on startup and on its existing five-second polling
-cadence. A shared disk cache survives SSH/RPC process restarts and deduplicates
-all operators: successful checks cache for five seconds; partial/failed checks
-back off for 30 seconds. `refresh:true` bypasses those ages. A concurrent check
-returns the existing observation with `refreshing:true`; the next ordinary poll
-reads its result. Refresh does not create a durable write request.
+`worker.capacity {refresh?:bool}` reads configured MSA capacity independently of
+the current session and retains a separate Verda prediction-GPU inventory. It
+never allocates, reserves spend or changes a session. The Console checks on
+startup and every five seconds. The shared process-independent cache coalesces
+operators: successful checks cache five seconds; partial/error checks back off
+30 seconds. `refresh:true` bypasses age; concurrent checks return the existing
+snapshot with `refreshing:true`. Configured provider changes invalidate the cache.
 
-Its response is `{schema:1,server_epoch,checked_epoch,observed_epoch,state,
-stale,stale_after_seconds:120,refresh_after_seconds,refreshing,msa_available,
-msa_message,gpus,error?}`. `state` is `ready|partial|error`; `checked_epoch` is
-the last **complete successful** snapshot, or null. It is never advanced by a
-cache read or failed refresh. `observed_epoch` timestamps the current attempted
-snapshot, including partial evidence. All times are epoch seconds. An old full
-snapshot cannot claim current availability after 120 seconds. Partial evidence
-may contain a current known MSA result if both FIN-02 contract lookups and the
-catalog succeeded; failures of those essential lookups set `msa_available:null`,
-never false. Missing regions, malformed or incomplete responses are explicit
-partial/error states, not empty capacity.
+The response is `{schema:1,server_epoch,checked_epoch,observed_epoch,state,stale,
+stale_after_seconds:120,refresh_after_seconds,refreshing,msa_available,msa_message,
+msa_provider,compute_kind,cpus,gpus,region?,error?,gpu_error?}`. `state` is
+`ready|partial|error`. `checked_epoch` is the last complete successful observation
+or null; cache reads and failed refreshes never advance it. `observed_epoch` is
+the current attempted observation. Stale evidence cannot claim availability.
+Errors set `msa_available:null`, never a fabricated false result.
 
-`msa_available` means capacity to **launch** the currently configured private
-MSA worker, independent of whether one is already connected. CPU-only offers
-also participate in this decision. The endpoint reuses `msa/worker.py` and its
-reviewed build-queue policy: FIN-02, supported x86 worker family/image, at least
-768 GiB conservatively converted host RAM, and regular/spot price at most
-$13/hour. It does not claim that account budget or a later fresh launch quote
-has been approved. A connected worker remains represented by `worker.status`.
+With `BIO_MSA_PROVIDER=aws`, `msa_provider:"aws"` and `compute_kind:"cpu"` select
+AWS in `us-east-1`. `msa_available:true` requires the helper's verified running
+worker and prepared private assets; incomplete assets/quota produce false,
+while an eligible stopped worker produces null because offerings and quota do
+not prove live EC2 capacity. That complete, successful AWS observation may have
+`state:"ready"` with null availability. Actual search readiness/connection remains
+separately represented by `worker.status`; an EC2 running state is not API readiness.
 
-`gpus` lists currently advertised available GPU offers across Verda locations,
-including offers unsuitable for private MSA. Rows are
-`{instance_type,name,location,contract,gpu_count,gpu_memory_gib,ram_gib,
-price_hourly,msa_eligible,reason}`. `contract` is `regular|spot`; price is USD per
-hour for the entire instance. `gpu_memory_gib` is total aggregate VRAM, or null
-if provider metadata is absent. RAM and VRAM are decimal provider GB converted
-to GiB (`GB * 10^9 / 2^30`); GPU count does not multiply the provider's already
-aggregate VRAM. Eligibility reasons explain the region, RAM, price, or supported
-worker/image restriction. The list is not a count of physical GPUs in stock and
-is not a reservation. Partial lists carry an explicit `error` summary.
+AWS `cpus` rows are `{instance_type,name,location,contract:"on-demand",vcpus,
+ram_gib,price_hourly,msa_eligible,availability,reason}`. `availability` is
+`eligible|unavailable|unknown`; price may be null if unverified. Host memory uses
+AWS's GiB units directly. Eligibility is not a reserved instance or launch promise.
+The AWS helper owns account/region, quota, asset and retained-pool observations;
+private account identifiers and configuration are omitted from the public row.
 
-The trusted `capacity_helper` default is
-`/run/current-system/sw/bin/bio-msa-capacity`; clients cannot choose its path,
-credentials, provider URL or endpoints. The private wrapper supplies existing
-dc credentials. Its isolated process is killed after 20 seconds and responses
-are bounded to 1 MiB. Resource access is four GETs (catalog, locations, regular
-capacity, spot capacity), with the existing client's OAuth authentication.
-Provider response bodies, private configuration and transport exceptions are
-never exposed. This cache has no dependency on the five-second worker lifecycle
-observation and does not open the budget ledger or modify launch controls.
+For Verda-only MSA, the endpoint reuses `msa/worker.py` with the production
+resident profile: FIN-02, supported x86 image/family, 768 GiB advertised host RAM,
+regular/spot price no greater than $13/hour. CPU-only offers also count.
+`mapped-128gb-v1` is an explicitly selected, unqualified experiment, never the
+production default. A capacity result does not grant a budget reservation or
+replace the launcher's fresh quote and guest checks. Missing essential regional
+lookups keep availability unknown; partial inventory is not treated as empty.
+
+`gpus` remains the available Verda GPU inventory across regions, independently of
+which provider handles MSA. Rows are `{instance_type,name,location,contract,
+gpu_count,gpu_memory_gib,ram_gib,price_hourly,msa_eligible,reason}`. `contract` is
+`regular|spot`. Price is USD/hour per entire instance; VRAM is total aggregate
+VRAM or null. Verda decimal GB convert to GiB (`GB * 10^9 / 2^30`); GPU count
+never multiplies the already aggregate number. Under AWS, the Console labels this
+as prediction inventory and omits the irrelevant Verda MSA-eligibility column.
+`gpu_error` reports incomplete Verda inventory without overwriting a valid AWS
+MSA observation. GPU offers are not counts of physical stock or reservations.
+
+The trusted helper is `/run/current-system/sw/bin/bio-msa-capacity`; clients
+cannot choose paths, credentials or provider endpoints. Its subprocess has a
+20-second/1-MiB bound. The Verda inventory uses its four fixed GETs plus OAuth.
+AWS capacity delegates only to `bio-aws-msa capacity`; allocation and control
+commands are unavailable through this endpoint. Errors are fixed/redacted;
+raw provider responses and credentials never enter the desktop reply.
 
 `worker.status {}` reads the existing shared worker; it does not allocate, ensure,
 extend, or retire one. Its bounded response includes `schema:1`, `shared:true`,
@@ -79,7 +85,9 @@ extend, or retire one. Its bounded response includes `schema:1`, `shared:true`,
 `message`, `server_epoch`, `checked_epoch`, `stale`, `stale_after_seconds:30`,
 `target`, `shutdown_epoch`, `shutdown_reason`, `hard_deadline_epoch`,
 `idle_deadline_epoch`, `active_request_id`, `queued_requests`, and optional
-`idle_credit_seconds` and `progress`. These countdown timestamps use epoch
+`idle_credit_seconds` and `progress`, plus validated `provider_name:"aws"|"verda"`
+and `compute_kind:"cpu"`. Existing sessions report their frozen provider even
+after configuration changes. These countdown timestamps use epoch
 seconds, unlike the ordinary job ISO timestamps. Unknown deadlines are null.
 The target is null or the exact four-pin object
 `{session_id,invocation_id,intent_sha256,launch_sha256}`. Never substitute the
@@ -92,7 +100,9 @@ The returned deadline is authoritative; the desktop must not infer a hard
 deadline from a worker's creation time. Idle keep-warm credit stays within the
 existing budgeted hard lifetime and does not renew that reservation. Shutdown
 stops admitting searches and drains accepted work; it does not cancel other
-Workbench runs or signal unrelated workers.
+Workbench runs or signal unrelated workers. AWS completion stops the exact EC2
+instance and releases its compute reservation while retaining the original OS
+and database volumes. Verda keeps its original temporary-worker removal policy.
 
 `worker.extend {request_key,target}` and `worker.shutdown {request_key,target}`
 immediately retain an actor-owned intent. They return

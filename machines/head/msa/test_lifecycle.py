@@ -17,6 +17,7 @@ import lifecycle
 import session
 import session_client as client
 import startup
+import search_profile
 
 
 def silent(*args):
@@ -73,10 +74,11 @@ class LifecycleTests(unittest.TestCase):
             path = self.tools / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(name)
+        self.tools.joinpath('msa/search_profile.py').write_bytes(Path(search_profile.__file__).read_bytes())
         self.submit = self.root / 'bio-submit'
         self.submit.write_text('fixture only')
         self.args = argparse.Namespace(root=self.sessions, tools=self.tools, timeout=300,
-            session_timeout=7200, idle_seconds=900, warm='prefetch', worker=None, spot=False,
+            session_timeout=7200, idle_seconds=900, warm=None, worker=None, spot=False,
             model='rf3', name=None, fasta=None, json=self.root/'queries.json', bundle_result=None,
             require_session=False)
         self.args.json.write_text(json.dumps({'A': 'MAG'}))

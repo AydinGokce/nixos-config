@@ -15,6 +15,7 @@ import time
 import uuid
 
 import databases
+import search_profile
 
 
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -156,7 +157,13 @@ def export_jobs(audit, config_path, output):
     return retained
 
 
-def configuration(root, results, tools_root):
+def configuration(root, results, tools_root, profile=None):
+    # Unprofiled historical/direct callers retain their existing environment.
+    # New managed searches explicitly select and freeze a reviewed profile.
+    selected = profile if profile is not None else os.environ.get(search_profile.ENVIRONMENT_KEY)
+    selected = search_profile.resolve(selected) if selected is not None else None
+    if selected is not None:
+        search_profile.configure_environment(selected)
     ready = databases.validate(root)
     provenance = databases.tools(tools_root)
     # Release18 Parameters.cpp reads MMSEQS_NUM_THREADS before calling
@@ -176,13 +183,19 @@ def configuration(root, results, tools_root):
                                             pdb=ready["prefixes"]["pdb100"], environmental=ready["prefixes"]["environmental"],
                                             pdb70=ready["pdb70"], pdbdivided=ready["pdbdivided"],
                                             pdbobsolete=ready["pdbobsolete"])))
-    namespace = hashlib.sha256(databases.canonical(dict(database=ready, tools=provenance,
-                                                       configuration=config, runtime=runtime))).hexdigest()
+    binding = dict(database=ready, tools=provenance, configuration=config, runtime=runtime)
+    if selected is not None:
+        binding["search_profile"] = selected
+    namespace = hashlib.sha256(databases.canonical(binding)).hexdigest()
     jobs = results / namespace
     jobs.mkdir(parents=True, exist_ok=True)
     config["paths"]["results"] = str(jobs)
-    return config, dict(namespace=namespace, database=ready, tools=provenance, runtime=runtime,
-                        search_settings="unmodified backend CPU MsaJob/PairJob pipelines; environmental pairing disabled")
+    receipt = dict(namespace=namespace, database=ready, tools=provenance, runtime=runtime,
+                   search_settings="unmodified backend CPU MsaJob/PairJob pipelines; environmental pairing disabled")
+    if selected is not None:
+        receipt["search_profile"] = selected
+        search_profile.validate_configuration(config, receipt, selected)
+    return config, receipt
 
 
 def main():
@@ -194,6 +207,7 @@ def main():
     p.add_argument("--output", type=Path)
     p.add_argument("--audit", type=Path)
     p.add_argument("--config", type=Path)
+    p.add_argument("--search-profile", default=os.environ.get(search_profile.ENVIRONMENT_KEY))
     args = p.parse_args()
     if args.action == "proxy":
         if args.audit is None:
@@ -208,7 +222,8 @@ def main():
         return
     if args.results is None or args.output is None:
         p.error("config requires --results and --output")
-    config, receipt = configuration(args.root.resolve(), args.results.resolve(), args.tools_root.resolve())
+    config, receipt = configuration(args.root.resolve(), args.results.resolve(), args.tools_root.resolve(),
+                                    profile=args.search_profile)
     databases.write_json(args.output, config)
     databases.write_json(args.output.with_suffix(".provenance.json"), receipt)
     print(json.dumps(dict(config=str(args.output), namespace=receipt["namespace"],

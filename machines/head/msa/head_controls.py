@@ -94,6 +94,7 @@ def worker_status(root, deadline=None):
     deadline = deadline or time.monotonic()+15
     root = lifecycle.registry_root(root)
     value = dict(schema=1, state='absent', checked_epoch=time.time(), server_epoch=time.time(),
+                 provider_name=client.session_provider.selected(), compute_kind='cpu',
                  session_id=None, invocation_id=None, intent_sha256=None, launch_sha256=None,
                  shutdown_epoch=None, shutdown_reason=None, hard_deadline_epoch=None, idle_deadline_epoch=None,
                  active_request_id=None, queued_requests=0, controls_version=0, can_extend=False,
@@ -101,6 +102,7 @@ def worker_status(root, deadline=None):
     try:
         if lifecycle.document(root/'active.json', optional=True) is None: return value
         state, intent = client.active(root)
+        value['provider_name'] = client.session_provider.name(intent)
         value.update(state='starting', session_id=intent['session_id'], intent_sha256=session.sha(state/'intent.json'),
                      control_reason='Controls become available after this worker is ready')
         launch = lifecycle.document(state/'launch.json', optional=True)
@@ -157,6 +159,7 @@ def worker_status(root, deadline=None):
         if live.get('ActiveState') == 'deactivating' or (Path(launch['remote_out'])/'session-closed.json').exists():
             value.update(state='closing', control_reason='Shared worker cleanup is in progress'); return value
         session.require(live.get('ActiveState') == 'active', 'Shared worker is not active')
+        client.sync_output(state, intent, deadline=deadline)
         output = Path(launch['remote_out'])
         starting = lifecycle.document(output/'session-starting.json', optional=True)
         if starting:

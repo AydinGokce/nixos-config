@@ -172,21 +172,68 @@ fn gpu_rows_by_host_ram(snapshot: &Value) -> Vec<&Value> {
     gpus
 }
 
+fn aws_cpu_table(ui: &mut egui::Ui, capacity: &Capacity, current: bool) {
+    ui.strong("AWS CPU workers · private MSA");
+    ui.small("Full database resident in RAM. A stopped worker retains its disks and reloads the indexes when started.");
+    ui.small("Eligible means the configuration, offering and quota checks passed. It does not guarantee immediate EC2 capacity.");
+    let cpus = rows(&capacity.snapshot, "cpus");
+    if cpus.is_empty() {
+        ui.weak("No current AWS CPU eligibility list available.");
+        return;
+    }
+    egui::ScrollArea::both()
+        .id_salt("msa-capacity-aws-cpus")
+        .max_height(180.)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            egui::Grid::new("msa-capacity-aws-grid")
+                .num_columns(6)
+                .min_col_width(64.)
+                .striped(true)
+                .spacing([14., 6.])
+                .show(ui, |ui| {
+                    for title in [
+                        "CPU instance",
+                        "Region / zone",
+                        "vCPUs",
+                        "Host RAM",
+                        "$/hour",
+                        "Eligibility",
+                    ] {
+                        ui.strong(title);
+                    }
+                    ui.end_row();
+                    for cpu in cpus {
+                        ui.label(text(cpu, "instance_type"))
+                            .on_hover_text(text(cpu, "name"));
+                        ui.label(text(cpu, "location"));
+                        ui.monospace(quantity(&cpu["vcpus"], ""));
+                        ui.monospace(quantity(&cpu["ram_gib"], " GiB"));
+                        ui.monospace(
+                            seconds(&cpu["price_hourly"])
+                                .map_or_else(|| "—".into(), |n| format!("{n:.3}")),
+                        );
+                        let (label, color) = match text(cpu, "availability") {
+                            "eligible" if current => ("Eligible", GREEN),
+                            "unavailable" if current => ("Unavailable", Color32::GRAY),
+                            _ => ("Unverified", AMBER),
+                        };
+                        ui.colored_label(color, label)
+                            .on_hover_text(text(cpu, "reason"));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
 pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool) {
     let current = capacity.fresh(connected, Instant::now());
     let gpus = gpu_rows_by_host_ram(&capacity.snapshot);
-    ui.horizontal_wrapped(|ui| {
-        ui.strong(if current {
-            "Available Verda GPUs"
-        } else {
-            "Last observed Verda GPUs"
-        });
-        ui.weak(format!("{} offers", gpus.len()));
-        if text(&capacity.snapshot, "state") == "partial" {
-            ui.colored_label(AMBER, "Partial update");
-        }
-    });
-    ui.small("MSA eligibility uses the configured full-database worker's RAM, region and price limits. CPU capacity is also included in the availability indicator.");
+    let aws = text(&capacity.snapshot, "msa_provider") == "aws";
+    if aws {
+        aws_cpu_table(ui, capacity, current);
+    }
     let message = text(&capacity.snapshot, "msa_message");
     if !message.is_empty() {
         ui.label(message);
@@ -205,18 +252,43 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
                 .unwrap_or("Provider capacity check was incomplete."),
         );
     }
-    if !current && !gpus.is_empty() {
+    if aws {
+        ui.separator();
+    }
+    let gpu_current = current && text(&capacity.snapshot, "gpu_error").is_empty();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(if gpu_current {
+            "Available Verda GPUs"
+        } else {
+            "Last observed Verda GPUs"
+        });
+        ui.weak(format!("{} offers", gpus.len()));
+        if text(&capacity.snapshot, "state") == "partial" {
+            ui.colored_label(AMBER, "Partial update");
+        }
+    });
+    ui.small(if aws {
+        "Prediction compute inventory. Private MSA runs separately on AWS CPUs."
+    } else {
+        "MSA eligibility uses the configured full-database worker's RAM, region and price limits. CPU capacity is also included in the availability indicator."
+    });
+    if !text(&capacity.snapshot, "gpu_error").is_empty() {
+        ui.colored_label(AMBER, text(&capacity.snapshot, "gpu_error"));
+    }
+    if !gpu_current && !gpus.is_empty() {
         ui.colored_label(
             AMBER,
             "This previous GPU list may have changed. Refresh to check again.",
         );
     }
     if gpus.is_empty() {
-        ui.weak(if current && text(&capacity.snapshot, "state") == "ready" {
-            "No GPUs were reported available."
-        } else {
-            "No current GPU list available."
-        });
+        ui.weak(
+            if gpu_current && text(&capacity.snapshot, "state") == "ready" {
+                "No GPUs were reported available."
+            } else {
+                "No current GPU list available."
+            },
+        );
         return;
     }
     egui::ScrollArea::both()
@@ -229,7 +301,7 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
             // scrolls long GPU names instead of wrapping them character by character.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             egui::Grid::new("msa-capacity-grid")
-                .num_columns(7)
+                .num_columns(if aws { 6 } else { 7 })
                 .min_col_width(64.)
                 .striped(true)
                 .spacing([14., 6.])
@@ -241,9 +313,11 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
                         "Total VRAM",
                         "Host RAM ↓",
                         "$/hour",
-                        "MSA",
                     ] {
                         ui.strong(title);
+                    }
+                    if !aws {
+                        ui.strong("MSA");
                     }
                     ui.end_row();
                     for gpu in gpus {
@@ -263,16 +337,18 @@ pub(super) fn gpu_table(ui: &mut egui::Ui, capacity: &Capacity, connected: bool)
                             seconds(&gpu["price_hourly"])
                                 .map_or_else(|| "—".into(), |n| format!("{n:.3}")),
                         );
-                        let eligible = gpu["msa_eligible"] == true;
-                        ui.colored_label(
-                            if eligible && current {
-                                GREEN
-                            } else {
-                                Color32::GRAY
-                            },
-                            if eligible { "Eligible" } else { "Not eligible" },
-                        )
-                        .on_hover_text(text(gpu, "reason"));
+                        if !aws {
+                            let eligible = gpu["msa_eligible"] == true;
+                            ui.colored_label(
+                                if eligible && current {
+                                    GREEN
+                                } else {
+                                    Color32::GRAY
+                                },
+                                if eligible { "Eligible" } else { "Not eligible" },
+                            )
+                            .on_hover_text(text(gpu, "reason"));
+                        }
                         ui.end_row();
                     }
                 });
@@ -319,6 +395,70 @@ mod tests {
     fn snapshot(available: Value) -> Value {
         json!({"schema":1,"server_epoch":1000.,"checked_epoch":998.,"state":"ready",
             "stale_after_seconds":120,"msa_available":available,"gpus":[]})
+    }
+
+    #[test]
+    fn eligible_aws_cpu_is_visible_without_claiming_live_capacity_or_gpu_msa() {
+        let now = Instant::now();
+        let mut capacity = Capacity::default();
+        let mut value = snapshot(Value::Null);
+        value["msa_provider"] = json!("aws");
+        value["cpus"] = json!([{"instance_type":"r6a.32xlarge", "name":"AMD EPYC CPU",
+            "location":"us-east-1a", "vcpus":128, "ram_gib":1024, "price_hourly":7.2576,
+            "availability":"eligible", "reason":"Live capacity unproven", "msa_eligible":true}]);
+        receive(&mut capacity, value, now);
+        assert_eq!(capacity.label(true, now).0, "MSA availability unknown");
+        assert_eq!(capacity.age_label(now), "Last update 2 sec ago");
+        fn labels(shape: &egui::Shape, result: &mut Vec<(String, usize)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    result.push((text.galley.job.text.clone(), text.galley.rows.len()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| labels(shape, result)),
+                _ => {}
+            }
+        }
+        for width in [500., 900.] {
+            let context = egui::Context::default();
+            ui_style::configure(&context);
+            for _ in 0..2 {
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(width, 900.),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default()
+                            .show(context, |ui| gpu_table(ui, &capacity, true));
+                    },
+                );
+                let mut painted = Vec::new();
+                output
+                    .shapes
+                    .iter()
+                    .for_each(|shape| labels(&shape.shape, &mut painted));
+                for label in [
+                    "CPU instance",
+                    "Region / zone",
+                    "r6a.32xlarge",
+                    "1024 GiB",
+                    "Eligible",
+                ] {
+                    assert!(
+                        painted
+                            .iter()
+                            .any(|(text, rows)| text == label && *rows == 1),
+                        "{label} must fit on one line or horizontal scroll at {width}"
+                    );
+                }
+                assert!(painted.iter().any(|(text, _)| text
+                    == "Prediction compute inventory. Private MSA runs separately on AWS CPUs."));
+                assert!(!painted.iter().any(|(text, _)| text == "MSA"));
+            }
+        }
     }
 
     fn receive(capacity: &mut Capacity, snapshot: Value, now: Instant) {

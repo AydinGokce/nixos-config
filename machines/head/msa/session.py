@@ -28,6 +28,7 @@ import databases
 import panel
 import prefetch
 import server
+import search_profile
 import worker_controls
 
 SCHEMA = 1
@@ -106,7 +107,7 @@ class BorrowedAPI:
         except (OSError, ValueError): return 1
 
 
-def adopted_api(path, database, deadline):
+def adopted_api(path, database, deadline, profile=None):
     value = load(path)
     require(value.get("schema") == SCHEMA and value.get("kind") == "borrowed-private-msa-api"
             and time.time() < deadline <= value["original_work_deadline_epoch"], "Invalid borrowed API deadline contract")
@@ -121,6 +122,12 @@ def adopted_api(path, database, deadline):
             "Borrowed API native command differs")
     require(value["panel"]["identity"]["boot_id"] == value["api"]["boot_id"], "Panel/API boot mismatch")
     panel.manifest(Path(value["panel"]["manifest"]), value["panel"]["manifest_sha256"])
+    if profile is not None:
+        selected = search_profile.validate_configuration(config, provenance, profile, allow_legacy=True)
+        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+            search_profile.check_process_environment(value["api"]["pid"], selected)
+            require(search_profile.check_cgroup(selected, value["api"]["pid"]) == search_profile.check_cgroup(selected),
+                    "Mapped API adoption must share the session's aggregate memory scope")
     return value, config, provenance, BorrowedAPI(value["api"], value["api_argv"])
 
 
@@ -158,7 +165,7 @@ def sources(tools):
              "msa/databases.py", "recipes/_common.sh", "rf3/msa.py"]
     # Existing frozen sessions predate the head lifecycle helper. New snapshots
     # include and bind it without invalidating those immutable old tool trees.
-    for extra in ('msa/lifecycle.py', 'msa/capacity.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'py/worker_progress.py'):
+    for extra in ('msa/lifecycle.py', 'msa/capacity.py', 'msa/startup.py', 'msa/prefetch.py', 'msa/worker_controls.py', 'msa/head_controls.py', 'msa/search_profile.py', 'msa/provider.py', 'msa/aws_worker.py', 'msa/aws_transfer.py', 'py/worker_progress.py'):
         if (tools / extra).exists(): names.append(extra)
     return {name: sha(tools/name) for name in names}
 
@@ -176,36 +183,57 @@ def index_paths(database, provenance):
 class IndexCache:
     """Measure Linux page residency; optional read-only prefetch or mlock.
 
-    ACCESS_COPY permits ctypes to obtain an address without writing the file.
-    Only reads, mincore, mlock and munlock operate on these private mappings.
+    Native PROT_READ mappings expose their addresses without requesting a
+    writable private copy of every index. ACCESS_COPY/from_buffer would reserve
+    private commit for the entire database even when no page is written.
     """
     def __init__(self, paths):
+        require(sys.platform == "linux" and ctypes.sizeof(ctypes.c_void_p) == 8
+                and ctypes.sizeof(ctypes.c_long) == 8, "Index residency requires 64-bit Linux")
         self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        self.libc.mmap.restype = ctypes.c_void_p
+        self.libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
+        self.libc.mincore.restype = ctypes.c_int
+        for name in ("munmap", "mlock", "munlock"):
+            function = getattr(self.libc, name)
+            function.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            function.restype = ctypes.c_int
         self.page = mmap.PAGESIZE
         self.entries = []
         self.locked = []
         try:
             for path in paths:
                 with path.open("rb") as stream:
-                    mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_COPY)
-                address = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
-                self.entries.append((path, mapping, address))
+                    length = os.fstat(stream.fileno()).st_size
+                    require(0 < length <= sys.maxsize, "Invalid full index mapping length")
+                    address = self.libc.mmap(None, length, mmap.PROT_READ, mmap.MAP_PRIVATE,
+                                             stream.fileno(), 0)
+                    if address == ctypes.c_void_p(-1).value:
+                        raise OSError(ctypes.get_errno(), "Cannot map full index read-only", str(path))
+                    address = 0 if address is None else address
+                    try:
+                        self.entries.append((path, length, address))
+                    except BaseException:
+                        self.libc.munmap(address, length)
+                        raise
         except BaseException:
             self.close(); raise
 
     def residency(self, deadline):
         rows = []
-        for path, mapping, address in self.entries:
-            count = 0; total = (len(mapping)+self.page-1)//self.page
-            for start in range(0, len(mapping), 256*1024**2):
+        for path, size, address in self.entries:
+            count = 0; total = (size+self.page-1)//self.page
+            for start in range(0, size, 256*1024**2):
                 require(STOP is None and time.time() < deadline, "Index residency inspection interrupted or timed out")
-                length = min(256*1024**2, len(mapping)-start)
+                length = min(256*1024**2, size-start)
                 pages = (length+self.page-1)//self.page
                 vector = (ctypes.c_ubyte*pages)()
                 status = self.libc.mincore(ctypes.c_void_p(address+start), ctypes.c_size_t(length), vector)
                 if status: raise OSError(ctypes.get_errno(), "Index residency inspection failed")
                 count += sum(byte & 1 for byte in vector)
-            rows.append(dict(path=str(path), bytes=len(mapping), pages=total, resident_pages=count))
+            rows.append(dict(path=str(path), bytes=size, pages=total, resident_pages=count))
         return dict(indexes=rows, total_bytes=sum(r["bytes"] for r in rows),
                     fully_resident=all(r["pages"] == r["resident_pages"] for r in rows))
 
@@ -222,11 +250,11 @@ class IndexCache:
             loading = prefetch.load([path for path, _, _ in self.entries], deadline,
                 lambda: STOP is not None, state=prefetch_state, progress=progress)
             if mode == "lock":
-                for _, mapping, address in self.entries:
+                for _, length, address in self.entries:
                     require(STOP is None and time.time() < deadline, "Index warm-up interrupted or timed out")
-                    if self.libc.mlock(ctypes.c_void_p(address), ctypes.c_size_t(len(mapping))):
+                    if self.libc.mlock(ctypes.c_void_p(address), ctypes.c_size_t(length)):
                         raise OSError(ctypes.get_errno(), "Cannot lock full indexes; configure sufficient LimitMEMLOCK")
-                    self.locked.append((address, len(mapping)))
+                    self.locked.append((address, length))
         after = self.residency(deadline)
         require(mode == "report" or after["fully_resident"], "Index pages were evicted during warm-up")
         return dict(mode=mode, checked_epoch=time.time(), before=before, after=after,
@@ -238,8 +266,14 @@ class IndexCache:
         for address, length in self.locked:
             self.libc.munlock(ctypes.c_void_p(address), ctypes.c_size_t(length))
         self.locked.clear()
-        for _, mapping, _ in self.entries: mapping.close()
-        self.entries.clear()
+        failed = []; error = None
+        for entry in self.entries:
+            _, length, address = entry
+            if self.libc.munmap(address, length):
+                if error is None: error = OSError(ctypes.get_errno(), "Cannot unmap full index")
+                failed.append(entry)
+        self.entries = failed
+        if error is not None: raise error
 
 
 def check_ready(state, expected=None, now=None):
@@ -258,6 +292,24 @@ def check_ready(state, expected=None, now=None):
     require(now < ready["deadline_epoch"]-RESERVE, "Private MSA session time is exhausted")
     require(sha(ready["config"]) == ready["config_sha256"]
             and sha(ready["provenance"]) == ready["provenance_sha256"], "Session API provenance changed")
+    # Old frozen generations have no profile and remain readable as before.
+    # New generations bind the policy, guest admission and actual warm receipt.
+    if "search_profile" in ready:
+        require(isinstance(ready["search_profile"], dict), "Session requires an exact search profile receipt")
+        selected = search_profile.resolve(ready["search_profile"])
+        search_profile.validate_configuration(load(ready["config"]), load(ready["provenance"]), selected,
+                                              allow_legacy=ready.get("lifecycle") == "borrowed-api")
+        search_profile.validate_guest_receipt(ready.get("guest_memory"), selected)
+        warm_path = Path(ready["output"])/"warm-index.json"
+        require(sha(warm_path) == ready["warm_sha256"], "Session index residency receipt changed")
+        warm = load(warm_path)
+        search_profile.warm_mode(selected, warm["mode"])
+        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+            require(warm.get("loading") is None and warm.get("locked") is False,
+                    "Mapped MSA session unexpectedly preloaded or locked indexes")
+            require(search_profile.check_cgroup(selected, ready["api"]["pid"]) == ready.get("memory_limit")
+                    and search_profile.check_cgroup(selected, ready["owner"]["pid"]) == ready.get("memory_limit"),
+                    "Private MSA aggregate memory scope changed")
     return ready
 
 
@@ -401,6 +453,8 @@ def startup_activity(tools, output, session_id, stage, message):
 
 def serve(args):
     global STOP
+    selected = search_profile.resolve(getattr(args, "search_profile", None))
+    mode = search_profile.warm_mode(selected, args.warm)
     require(re.fullmatch(r"[a-f0-9]{32}", args.session_id), "Invalid session ID")
     finite(args.deadline, "session deadline", time.time()+RESERVE, time.time()+85500)
     finite(args.idle_seconds, "idle timeout", 60, 86400)
@@ -421,15 +475,20 @@ def serve(args):
         STOP = sig
     previous = {s:signal.signal(s, interrupted) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
     try:
-        os.environ["MMSEQS_NUM_THREADS"] = "16"
+        guest_memory = search_profile.check_guest(selected)
+        memory_limit = search_profile.check_cgroup(selected)
+        search_profile.configure_environment(selected)
         os.environ["BIO_TOOLS_DIR"] = str(tools)
         atomic(output/'session-starting.json', dict(schema=1, session_id=args.session_id, owner=identity(),
-            deadline_epoch=args.deadline, idle_seconds=args.idle_seconds), exclusive=True)
+            deadline_epoch=args.deadline, idle_seconds=args.idle_seconds,
+            search_profile=selected, guest_memory=guest_memory, memory_limit=memory_limit), exclusive=True)
         with startup_activity(tools, output, args.session_id, 'database_check', 'Verifying full private MSA database indexes'):
             if getattr(args, "adopt", None):
-                adoption, config, provenance, api = adopted_api(args.adopt, args.database, args.deadline)
+                adoption, config, provenance, api = adopted_api(args.adopt, args.database, args.deadline, profile=selected)
             else:
-                config, provenance = server.configuration(args.database.resolve(), args.results.resolve(), args.tools_root.resolve())
+                config, provenance = server.configuration(args.database.resolve(), args.results.resolve(),
+                                                          args.tools_root.resolve(), profile=selected)
+        search_profile.validate_configuration(config, provenance, selected, allow_legacy=bool(adoption))
         atomic(output/"msa-server.json", config, exclusive=True)
         atomic(output/"msa-server.provenance.json", provenance, exclusive=True)
         cache = IndexCache(index_paths(args.database, provenance))
@@ -442,13 +501,19 @@ def serve(args):
             if fields is not None:
                 startup_progress(output, args.session_id, 'index_warm', 'running', **fields)
         stage = 'index_warm'
-        startup_progress(output, args.session_id, stage, 'running', 'Loading and checking full private MSA index residency')
-        warm = cache.warm(args.warm, warm_deadline, int(args.headroom_gib*1024**3),
+        startup_progress(output, args.session_id, stage, 'running',
+                         'Observing full indexes for on-demand mapped reads; no full preload' if mode == 'report'
+                         else 'Loading and checking full private MSA index residency')
+        warm = cache.warm(mode, warm_deadline, int(args.headroom_gib*1024**3),
                          prefetch_state=Path('/tmp')/('bio-msa-prefetch-'+args.session_id), progress=loading_progress)
         atomic(output/"warm-index.json", warm, exclusive=True)
-        startup_progress(output, args.session_id, 'index_warm', 'complete',
-                         'Full private MSA index residency verified' if warm['after']['fully_resident'] else 'Private MSA index residency observation complete',
-                         completed=warm['after']['total_bytes'], total=warm['after']['total_bytes'], unit='bytes')
+        if mode == 'report':
+            startup_progress(output, args.session_id, 'index_warm', 'complete',
+                             'Full indexes mapped; search loads required pages on demand')
+        else:
+            startup_progress(output, args.session_id, 'index_warm', 'complete',
+                             'Full private MSA index residency verified',
+                             completed=warm['after']['total_bytes'], total=warm['after']['total_bytes'], unit='bytes')
         if not adoption:
             log = (output/"msa-server.log").open("ab")
             api = subprocess.Popen([provenance["tools"]["server"], "-local", "-config", str(output/"msa-server.json")],
@@ -460,6 +525,10 @@ def serve(args):
             try:
                 with socket.create_connection(("127.0.0.1", 8080), timeout=.2): break
             except OSError: time.sleep(.2)
+        if selected["profile_id"] == search_profile.MAPPED_PROFILE:
+            search_profile.check_process_environment(api.pid, selected)
+            require(search_profile.check_cgroup(selected, api.pid) == memory_limit,
+                    "Private MSA API escaped the session's aggregate memory scope")
         ready = dict(schema=SCHEMA, kind="private-msa-session", session_id=args.session_id,
                      owner=identity(), api=identity(api.pid), created_epoch=time.time(),
                      deadline_epoch=args.deadline, idle_seconds=args.idle_seconds,
@@ -468,7 +537,8 @@ def serve(args):
                      config=str(output/"msa-server.json"), config_sha256=sha(output/"msa-server.json"),
                      provenance=str(output/"msa-server.provenance.json"),
                      provenance_sha256=sha(output/"msa-server.provenance.json"), namespace=provenance["namespace"],
-                     warm_sha256=sha(output/"warm-index.json"), database=provenance["database"])
+                     warm_sha256=sha(output/"warm-index.json"), database=provenance["database"],
+                     search_profile=selected, guest_memory=guest_memory, memory_limit=memory_limit)
         ready.update(lifecycle="borrowed-api" if adoption else "owned-api", adoption=adoption,
                      adoption_sha256=sha(args.adopt) if adoption else None, controls_version=0 if adoption else 1)
         atomic(state/"ready.json", ready, exclusive=True)
@@ -573,7 +643,9 @@ def main(argv=None):
     p.add_argument("--tools", type=Path); p.add_argument("--tools-root", type=Path)
     p.add_argument("--results", type=Path); p.add_argument("--deadline", type=float)
     p.add_argument("--idle-seconds", type=float, default=900)
-    p.add_argument("--warm", choices=["report", "prefetch", "lock"], default="prefetch")
+    p.add_argument("--search-profile", default=os.environ.get(search_profile.ENVIRONMENT_KEY, search_profile.DEFAULT_PROFILE))
+    p.add_argument("--warm", choices=["report", "prefetch", "lock"], default=None,
+                   help="Defaults to the selected profile; mapped searches permit report only")
     p.add_argument("--warm-seconds", type=float, default=None,
                    help="Optional shorter warm-up timeout; default uses remaining session lifetime minus cleanup reserve")
     p.add_argument("--headroom-gib", type=float, default=64)

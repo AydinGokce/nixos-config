@@ -50,7 +50,7 @@ in
   # Orchestration toolbox + the `dc` ephemeral-GPU CLI (reads creds from
   # /root/.config/datacrunch/credentials.env, ledgers spend under /var/lib/dc).
   environment.systemPackages = (with pkgs; [
-    git curl wget jq tmux vim htop rsync openssh uv python3 tailscale util-linux
+    git curl wget jq tmux vim htop rsync openssh uv python3 tailscale util-linux awscli2
   ]) ++ [
     structureRenderer
     (pkgs.writeShellScriptBin "dc" ''
@@ -61,6 +61,7 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
       export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip zstd ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       ${builtins.readFile ./bio-submit.sh}
     '')
     (pkgs.writeShellScriptBin "bio-library" ''
@@ -70,6 +71,7 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-workbench" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/cli.py "$@"
     '')
@@ -125,20 +127,32 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-msa" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       ${builtins.readFile ./bio-msa.sh}
+    '')
+    (pkgs.writeShellScriptBin "bio-aws-msa" ''
+      set -euo pipefail
+      export PATH=${lib.makeBinPath (with pkgs; [ awscli2 python3 openssh rsync coreutils util-linux systemd ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      umask 077
+      # Freeze the complete controller import tree in the helper path retained
+      # by each session. AWS credentials stay in the head's private profile.
+      exec ${pkgs.python3}/bin/python3 -B ${./.}/msa/aws_provider.py "$@"
     '')
     (pkgs.writeShellScriptBin "bio-msa-worker" ''
       set -euo pipefail
       source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
       export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
-      exec ${pkgs.python3}/bin/python3 /etc/bio-tools/msa/worker.py "$@"
+      exec ${pkgs.python3}/bin/python3 "''${BIO_TOOLS_SRC:-/etc/bio-tools}/msa/worker.py" "$@"
     '')
     (pkgs.writeShellScriptBin "bio-msa-capacity" ''
       set -euo pipefail
       # Read provider capacity without opening a worker or changing its lease.
       # Credentials remain on the head and never enter the desktop RPC reply.
-      source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
-      export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
+      if [ -r "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}" ]; then
+        source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
+        export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
+      fi
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/capacity_provider.py "$@"
     '')
     (pkgs.writeShellScriptBin "bio-msa-build-queue" ''
@@ -159,6 +173,7 @@ in
   # Ship the bio tool code (pinned requirements + helper CLIs from modules/bio)
   # to the head; bio-submit sends a verified snapshot to each GPU over SSH.
   environment.etc = {
+    "bio-aws-msa.json".source = ./msa/aws-config.json;
     "bio-tools/dc-budget.py".source = ./dc-budget.py;
     "bio-tools/database-volume.py".source = ./database-volume.py;
     "bio-tools/py".source = ../../modules/bio/py;                # esm_cli, rfaa patch, etc.
@@ -190,6 +205,7 @@ in
       export MSA_DB_VOLUME=${lib.escapeShellArg msaStorage.volumeId}
       export MSA_DB_NFS=${lib.escapeShellArg msaStorage.nfs}
       export MSA_DB_ROOT=/mnt/bio-msa-databases/colabfold
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_DEFAULT_BACKEND=public
       export BIO_PUBLIC_MSA_LOCK=/mnt/bio-shared/coordination/public-msa.lock
     '';
@@ -210,6 +226,26 @@ in
     };
   };
   systemd.timers.dc-budget-watchdog = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "30s";
+      OnUnitActiveSec = "60s";
+      AccuracySec = "5s";
+    };
+  };
+
+  systemd.services.bio-aws-msa-watchdog = {
+    description = "Reconcile AWS MSA spending and stop expired CPU workers";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "/run/current-system/sw/bin/bio-aws-msa watchdog";
+      TimeoutStartSec = 300;
+      UMask = "0077";
+    };
+  };
+  systemd.timers.bio-aws-msa-watchdog = {
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnBootSec = "30s";
@@ -368,6 +404,7 @@ in
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];
     environment.BIO_WORKBENCH_CONFIG = "/etc/bio-tools/workbench-config.json";
+    environment.BIO_MSA_PROVIDER = "aws";
     serviceConfig = {
       Type = "simple";
       ExecStart = "/run/current-system/sw/bin/bio-workbench daemon";

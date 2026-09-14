@@ -291,6 +291,19 @@ impl Worker {
             self.capacity.label(connected, now)
         }
     }
+    fn provider_label(&self) -> &'static str {
+        let active = !matches!(text(&self.status, "state"), "absent" | "failed" | "");
+        let name = if active && !text(&self.status, "provider_name").is_empty() {
+            text(&self.status, "provider_name")
+        } else {
+            text(&self.capacity.snapshot, "msa_provider")
+        };
+        match name {
+            "aws" => "AWS CPU · private MSA",
+            "verda" => "Verda · private MSA",
+            _ => "Private MSA provider unverified",
+        }
+    }
     fn draw_indicator(&self, ui: &mut egui::Ui, connected: bool) -> egui::Response {
         let now = Instant::now();
         let (label, color) = self.indicator_label(connected, now);
@@ -305,9 +318,10 @@ impl Worker {
         };
         ui.small_button(RichText::new(format!("{label}{suffix}")).color(color).strong())
             .on_hover_text(format!(
-                "{}\n{}\nUpdates every 5 seconds. Open shared MSA details for startup progress, available GPUs and keep-warm controls.",
+                "{}\n{}\n{}\nUpdates every 5 seconds. Open shared MSA details for CPU eligibility, separate GPU inventory and keep-warm controls.",
                 self.state_label(connected).0,
                 self.capacity.label(connected, now).0,
+                self.provider_label(),
             ))
     }
     fn age_label(&self) -> String {
@@ -628,17 +642,18 @@ impl Workbench {
             .open(&mut open).default_width(900.).max_height((ctx.content_rect().height()-60.).max(260.)).vscroll(true).resizable(true).show(ctx, |ui| {
             let epoch = self.worker.epoch(self.connected);
             let (label,color) = self.worker.state_label(self.connected);
+            ui.strong(self.worker.provider_label());
             ui.horizontal_wrapped(|ui| {
                 let (availability, availability_color) = self.worker.capacity.label(self.connected, Instant::now());
                 ui.colored_label(availability_color, RichText::new(availability).strong());
                 ui.separator();
                 ui.colored_label(color, RichText::new(label).strong());
                 if ui.add_enabled(self.connected && !self.worker.capacity.pending(),egui::Button::new("Refresh"))
-                    .on_hover_text("Check Verda capacity and the shared worker now.").clicked() {
+                    .on_hover_text("Check MSA provider capacity, Verda GPU inventory and the shared worker now.").clicked() {
                     self.worker_refresh();
                     self.worker_refresh_capacity(true);
                 }
-                if self.worker.capacity.refreshing() { ui.spinner(); ui.weak("Checking Verda…"); }
+                if self.worker.capacity.refreshing() { ui.spinner(); ui.weak("Checking providers…"); }
             });
             ui.horizontal_wrapped(|ui| {
                 ui.small(self.worker.capacity.age_label(Instant::now()));
@@ -670,6 +685,9 @@ impl Workbench {
             for reason in [extend_reason.as_deref(),shutdown_reason.as_deref()].into_iter().flatten().collect::<BTreeSet<_>>() { ui.small(reason); }
             ui.small("+15 minutes keeps this shared MSA service warm within its original paid runtime. GPU prediction workers have separate lifetimes.");
             ui.small("Shutdown finishes accepted searches and refuses new ones. It does not cancel unrelated predictions.");
+            if text(&self.worker.status,"provider_name") == "aws" {
+                ui.small("AWS shutdown stops compute and retains the instance and its OS/database disks for the next session.");
+            }
             if !self.worker.read_error.is_empty() { ui.colored_label(RED,&self.worker.read_error); }
             if !self.worker.command_message.is_empty() { ui.colored_label(if self.worker.command_failed { RED } else { AMBER },&self.worker.command_message); }
             if let Some(op) = self.worker_operation() {
@@ -692,6 +710,18 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn existing_worker_provider_takes_precedence_over_new_capacity_configuration() {
+        let mut worker = Worker::default();
+        worker.capacity.snapshot = json!({"msa_provider":"aws"});
+        assert_eq!(worker.provider_label(), "AWS CPU · private MSA");
+        worker.status = json!({"state":"idle", "provider_name":"verda"});
+        assert_eq!(worker.provider_label(), "Verda · private MSA");
+        worker.status = json!({"state":"warming", "provider_name":"aws"});
+        assert_eq!(worker.provider_label(), "AWS CPU · private MSA");
+        worker.status = json!({"state":"absent", "provider_name":"verda"});
+        assert_eq!(worker.provider_label(), "AWS CPU · private MSA");
+    }
     fn status() -> Value {
         json!({"schema":1,"state":"idle","server_epoch":1000.,"checked_epoch":998.,"stale_after_seconds":30,
             "shutdown_epoch":1100.,"shutdown_reason":"idle","hard_deadline_epoch":2000.,"target":{"session_id":"exact","invocation_id":"one","intent_sha256":"a","launch_sha256":"b"},

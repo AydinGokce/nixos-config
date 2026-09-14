@@ -255,6 +255,19 @@ if [ "$recipe" = msa ]; then
     panel_manifest_sha=$(python3 "$TOOLS_SRC/msa/panel.py" validate --manifest "$infile" --hash-only)
   fi
   [ "$sub" != convert ] || tier=msa_convert
+  if [ "$sub" != convert ]; then
+    profile_settings=$(python3 - "$TOOLS_SRC/msa/search_profile.py" "$sub" <<'MSAPROFILE'
+import os, runpy, sys
+policy = runpy.run_path(sys.argv[1])
+name = policy['LEGACY_PROFILE'] if sys.argv[2] == 'install' else os.environ.get('BIO_MSA_SEARCH_PROFILE')
+profile = policy['resolve'](name)
+warm = policy['warm_mode'](profile, os.environ.get('BIO_MSA_SESSION_WARM') or None)
+print(profile['profile_id']+'\t'+warm)
+MSAPROFILE
+    )
+    IFS=$'\t' read -r BIO_MSA_SEARCH_PROFILE BIO_MSA_SESSION_WARM <<< "$profile_settings"
+    export BIO_MSA_SEARCH_PROFILE BIO_MSA_SESSION_WARM
+  fi
   [ -z "$msa_bundle" ] || { echo 'bio-submit: a database job cannot consume an inference bundle' >&2; exit 2; }
 elif [ -n "$bundle_result" ]; then
   echo 'bio-submit: --bundle-result is only valid for MSA preparation' >&2; exit 2
@@ -461,6 +474,9 @@ elif [ "$recipe" = msa ] && [ "$sub" != install ] && [ "$sub" != convert ]; then
 fi
 jobid="$recipe-$(date -u +%Y%m%d-%H%M%S)-$$"
 LOCALOUT="$RESULTS_DIR/$jobid"; mkdir -p "$LOCALOUT"
+if [ "$recipe" = msa ] && [ "$sub" != convert ]; then
+  python3 "$TOOLS_SRC/msa/search_profile.py" show --profile "$BIO_MSA_SEARCH_PROFILE" > "$LOCALOUT/search-profile.json"
+fi
 exec > >(tee -a "$LOCALOUT/run.log") 2>&1
 worker_scope=gpu
 [ "$recipe" != msa ] || worker_scope=msa
@@ -575,6 +591,7 @@ remote_msa_bundle="$RPREP"
   printf 'export BIO_MSA_PANEL_SHA256=%q\n' "$panel_manifest_sha"
   printf 'export BIO_MSA_SESSION_ID=%q BIO_MSA_SESSION_IDLE_SECONDS=%q BIO_MSA_SESSION_WARM=%q\n' \
     "${BIO_MSA_SESSION_ID:-}" "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" "${BIO_MSA_SESSION_WARM:-report}"
+  printf 'export BIO_MSA_SEARCH_PROFILE=%q\n' "${BIO_MSA_SEARCH_PROFILE:-}"
   printf 'export BIO_WORKER_SCOPE=%q\n' "$worker_scope"
   printf 'export BIO_NATIVE_BUNDLE=%q BIO_NATIVE_SHA256=%q BIO_NATIVE_HAS_PROTEIN=%q\n' "$RNATIVE" "$library_sha" "$native_has_protein"
   printf 'export RFAA_DB_DIR=%q\n' "${RFAA_DB_DIR:-/mnt/bio-databases/rfaa}"
@@ -796,12 +813,15 @@ except ValueError:
 MSACAPACITY
   )
   selection_args=(select --tools-root "$TOOLS_SRC" --wait-seconds "$msa_capacity_wait"
-    --poll-seconds "${BIO_MSA_CAPACITY_POLL_SECONDS:-30}")
+    --poll-seconds "${BIO_MSA_CAPACITY_POLL_SECONDS:-30}" --profile "$BIO_MSA_SEARCH_PROFILE")
   [ -z "$spot" ] || selection_args+=(--spot-only)
   bio-msa-worker "${selection_args[@]}" > "$LOCALOUT/worker-choice.json"
-  selection=$(python3 - "$LOCALOUT/worker-choice.json" <<'MSAWORKER'
-import json, math, os, re, sys
+  selection=$(python3 - "$LOCALOUT/worker-choice.json" "$TOOLS_SRC/msa/search_profile.py" "$BIO_MSA_SEARCH_PROFILE" <<'MSAWORKER'
+import json, math, os, re, runpy, sys
 value=json.load(open(sys.argv[1]))
+policy=runpy.run_path(sys.argv[2]); profile=policy['resolve'](sys.argv[3])
+if not isinstance(value.get('search_profile'), dict) or policy['resolve'](value['search_profile']) != profile:
+    raise SystemExit('bio-submit: MSA choice belongs to a different search profile')
 kind=value['instance_type']; image=value['image']; spot=value['spot']
 cap=float(os.environ.get('DC_MAX_INSTANCE_HOURLY') or 13)
 valid=(value['schema']==1 and value['kind']=='msa-worker-choice' and value['reserved'] is False
@@ -809,7 +829,13 @@ valid=(value['schema']==1 and value['kind']=='msa-worker-choice' and value['rese
        and isinstance(kind,str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*',kind)
        and image in ('ubuntu-24.04','ubuntu-24.04-cuda-12.8-open-docker')
        and math.isfinite(cap) and cap>0 and 0<float(value['price_per_hour'])<=13
-       and float(value['conservative_gib'])>=768 and value['maximum_instance_hourly']==13)
+       and math.isfinite(float(value['advertised_gb']))
+       and float(value['advertised_gb'])*10**9>=profile['minimum_advertised_bytes']
+       and float(value['conservative_gib'])==float(value['advertised_gb'])*10**9/1024**3
+       and value['maximum_instance_hourly']==13
+       and value['profile_id']==profile['profile_id'] and value['profile_sha256']==profile['profile_sha256']
+       and all(value[name]==profile[name] for name in
+               ('minimum_advertised_bytes','minimum_total_gib','minimum_available_gib')))
 if not valid:
     raise SystemExit('bio-submit: invalid MSA worker choice; no instance was launched')
 print('\t'.join((kind,'yes' if spot else 'no',image,str(min(cap,13)))))
@@ -912,6 +938,17 @@ value['runtime_isolation']={'kind':runtime['isolation'],'plan':plan.name,
     'plan_sha256':hashlib.sha256(plan.read_bytes()).hexdigest(),'os_size_gb':runtime['os_size_gb']}
 job.write_text(json.dumps(value,indent=2)+'\n')
 RUNTIMEPLAN
+if [ "$recipe" = msa ] && [ "$sub" != convert ]; then
+  python3 - "$LOCALOUT/job.json" "$LOCALOUT/search-profile.json" "$TOOLS_SRC/msa/search_profile.py" <<'MSAPROFILEJOB'
+import hashlib,json,pathlib,runpy,sys
+job,receipt=map(pathlib.Path,sys.argv[1:3]); value=json.loads(job.read_text())
+profile=runpy.run_path(sys.argv[3])['resolve'](json.loads(receipt.read_text()))
+value['search_profile']=profile
+value['search_profile_receipt']={'path':receipt.name,'sha256':hashlib.sha256(receipt.read_bytes()).hexdigest()}
+value['worker_memory_scope']='bio-msa-memory-'+value['job']+'.scope' if profile['memory_max_gib'] is not None else None
+job.write_text(json.dumps(value,indent=2)+'\n')
+MSAPROFILEJOB
+fi
 if [ -n "$rf3_preparation_receipt" ]; then
   python3 - "$LOCALOUT/job.json" "$LOCALOUT/rf3-preparation-cache.json" <<'RF3CACHEJOB'
 import hashlib,json,pathlib,sys
@@ -930,7 +967,22 @@ msa_forward=()
 if [ "$public_msa_proxy" = 1 ]; then
   msa_forward=(-o ExitOnForwardFailure=yes -R "127.0.0.1:18763:127.0.0.1:$public_msa_head_port")
 fi
-timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" bash -s < "$remote_file" || status=$?
+worker_command=(bash -s)
+if [ "$recipe" = msa ] && [ "$sub" != convert ]; then
+  memory_limit=$(python3 - "$LOCALOUT/search-profile.json" "$TOOLS_SRC/msa/search_profile.py" <<'MSALIMIT'
+import json, runpy, sys
+profile=runpy.run_path(sys.argv[2])['resolve'](json.load(open(sys.argv[1])))
+if profile['memory_max_gib'] is not None:
+    print(str(profile['memory_max_gib'])+'G\t'+str(profile['memory_swap_max_bytes']))
+MSALIMIT
+  )
+  if [ -n "$memory_limit" ]; then
+    IFS=$'\t' read -r memory_max memory_swap <<< "$memory_limit"
+    worker_command=(systemd-run --scope --quiet --collect --unit="bio-msa-memory-$jobid"
+      --property="MemoryMax=$memory_max" --property="MemorySwapMax=$memory_swap" bash -s)
+  fi
+fi
+timeout --signal=TERM --kill-after=60 "$seconds" ssh "${SSHO[@]}" "${msa_forward[@]}" "root@$ip" "${worker_command[@]}" < "$remote_file" || status=$?
 # Fetch partial outputs even on failure; model status must remain nonzero.
 echo "bio-submit: fetching results -> $LOCALOUT"
 ssh_transport="ssh ${SSHO[*]}"

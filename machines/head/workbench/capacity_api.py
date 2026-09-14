@@ -40,6 +40,26 @@ def normalize(value):
     rows = value.get('gpus')
     require(isinstance(rows, list) and len(rows) <= 2048, 'Invalid GPU capacity list', 'integrity')
     result = {key: value[key] for key in ('schema', 'state', 'observed_epoch', 'msa_available', 'msa_message')}
+    msa_provider = value.get('msa_provider', 'verda')
+    require(msa_provider in ('aws', 'verda'), 'Invalid MSA capacity provider', 'integrity')
+    result['msa_provider'] = msa_provider
+    result['compute_kind'] = 'cpu'
+    result['cpus'] = []
+    if msa_provider == 'aws':
+        require(value.get('region') == 'us-east-1' and isinstance(value.get('cpus'), list)
+                and len(value['cpus']) <= 32, 'Invalid AWS CPU capacity scope', 'integrity')
+        result['region'] = value['region']
+        for row in value['cpus']:
+            require(isinstance(row, dict) and all(text(row.get(key), 200)
+                    for key in ('instance_type', 'name', 'location', 'reason'))
+                    and row.get('contract') == 'on-demand' and type(row.get('msa_eligible')) is bool
+                    and type(row.get('vcpus')) is int and 1 <= row['vcpus'] <= 2048
+                    and finite(row.get('ram_gib')) and row['ram_gib'] > 0
+                    and (row.get('price_hourly') is None or finite(row['price_hourly']) and row['price_hourly'] > 0)
+                    and row.get('availability') in ('eligible', 'unavailable', 'unknown'),
+                    'Invalid AWS CPU capacity metadata', 'integrity')
+            result['cpus'].append({key: row[key] for key in ('instance_type', 'name', 'location', 'reason',
+                'contract', 'msa_eligible', 'vcpus', 'ram_gib', 'price_hourly', 'availability')})
     result['gpus'] = []
     for row in rows:
         require(isinstance(row, dict) and all(text(row.get(key), 200)
@@ -55,7 +75,12 @@ def normalize(value):
     if 'error' in value:
         require(text(value['error']), 'Invalid capacity error', 'integrity')
         result['error'] = value['error']
-    require(result['state'] != 'ready' or result['msa_available'] is not None,
+    if 'gpu_error' in value:
+        require(text(value['gpu_error']), 'Invalid GPU capacity error', 'integrity')
+        result['gpu_error'] = value['gpu_error']
+    # A complete AWS quota/offering check cannot promise live capacity for a
+    # stopped instance. Its eligible CPU rows remain useful without that claim.
+    require(result['state'] != 'ready' or result['msa_available'] is not None or msa_provider == 'aws',
             'Complete capacity evidence has unknown MSA availability', 'integrity')
     require(result['state'] != 'error' or result['msa_available'] is None,
             'Failed capacity evidence claims known MSA availability', 'integrity')
@@ -74,11 +99,14 @@ def invoke(config):
 
 
 def failed(current, *, refreshing=False):
-    return {'schema': 1, 'state': 'error', 'observed_epoch': current, 'msa_available': None, 'gpus': [],
-            'msa_message': ('Checking Verda MSA availability' if refreshing else
+    value = {'schema': 1, 'state': 'error', 'observed_epoch': current, 'msa_available': None, 'gpus': [],
+            'msa_message': ('Checking private MSA availability' if refreshing else
                             'MSA availability is unknown; provider check failed'),
             'error': ('Another capacity check is running' if refreshing else
-                      'Verda capacity check is unavailable; refresh to retry')}
+                      'Private MSA capacity check is unavailable; refresh to retry')}
+    if os.environ.get('BIO_MSA_PROVIDER', 'verda') == 'aws':
+        value.update(msa_provider='aws', compute_kind='cpu', region='us-east-1', cpus=[])
+    return value
 
 
 def read_cache(path, identity):
@@ -119,7 +147,8 @@ def capacity(api, params, *, bridge=None, clock=None):
     clock = time.time if clock is None else clock
     config = configuration(api)
     identity = digest({'schema': 1, 'tools_dir': str(config['tools_dir']),
-        'capacity_helper': config.get('capacity_helper', '/run/current-system/sw/bin/bio-msa-capacity')})
+        'capacity_helper': config.get('capacity_helper', '/run/current-system/sw/bin/bio-msa-capacity'),
+        'msa_provider': os.environ.get('BIO_MSA_PROVIDER', 'verda')})
     path = no_links(api.store.root / 'worker-capacity.json')
     lock_path = no_links(api.store.root / 'worker-capacity.lock')
     current = clock()

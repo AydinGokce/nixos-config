@@ -76,9 +76,14 @@ def _attempt(state, intent):
     return attempt, run
 
 
+def _allocation_exists(state, run):
+    return any(os.path.lexists(path) for path in
+               (state / 'allocation-started.json', state / 'launch.json', run / 'job.json',
+                state / 'aws-lease.json', state / 'aws-job.json', state / 'cleanup-pending.json'))
+
+
 def _require_no_allocation(state, run):
-    session.require(not any(os.path.lexists(path) for path in
-                            (state / 'allocation-started.json', state / 'launch.json', run / 'job.json')),
+    session.require(not _allocation_exists(state, run),
                     'Allocation may have started; absence cannot be certified')
 
 
@@ -121,8 +126,7 @@ def finish(state, exit_status):
         attempt, run = _attempt(state, intent)
         # Even an unsuccessful dc launch may have submitted a cloud request.
         # Retain the uncertainty fence until exact resource cleanup is proven.
-        if any(os.path.lexists(path) for path in
-               (state / 'allocation-started.json', state / 'launch.json', run / 'job.json')):
+        if _allocation_exists(state, run):
             return None
         session.require(exit_status != 0, 'Successful startup cannot certify a pre-allocation failure')
         reason = ('capacity_timeout' if exit_status == 4 else

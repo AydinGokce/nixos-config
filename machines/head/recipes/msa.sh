@@ -3,16 +3,23 @@
 msa_run() (
   set -euo pipefail
   [ "${#EXTRA_ARGS[@]}" -eq 0 ] || { echo 'msa: unexpected extra arguments' >&2; exit 2; }
-  python3 - "$SUB" <<'PY'
-import sys
+  python3 - "$SUB" "$TOOLS/msa/search_profile.py" "$OUT" <<'PY'
+import json, os, runpy, sys
 from pathlib import Path
-memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
-available_kib = int(memory['MemAvailable'].split()[0])
-required_gib = 56 if sys.argv[1] == 'convert' else 768
-if available_kib < required_gib * 1024 * 1024:
-    stage = 'database conversion' if sys.argv[1] == 'convert' else 'full indexed CPU reference'
-    raise SystemExit(f'msa: {stage} requires at least {required_gib} GiB available RAM')
-print(f'MSA reference worker: {available_kib / 1024**2:.1f} GiB available host RAM', flush=True)
+if sys.argv[1] == 'convert':
+    memory = dict(line.split(':', 1) for line in Path('/proc/meminfo').read_text().splitlines())
+    if int(memory['MemAvailable'].split()[0]) < 56*1024**2:
+        raise SystemExit('msa: database conversion requires at least 56 GiB available RAM')
+else:
+    policy = runpy.run_path(sys.argv[2])
+    profile = policy['resolve'](os.environ.get('BIO_MSA_SEARCH_PROFILE'))
+    if sys.argv[1] == 'install' and profile['profile_id'] != policy['LEGACY_PROFILE']:
+        raise SystemExit('msa: database installation requires the resident build profile')
+    observed = policy['check_guest'](profile)
+    limit = policy['check_cgroup'](profile)
+    Path(sys.argv[3], 'memory-profile.json').write_text(json.dumps(
+        dict(search_profile=profile, guest_memory=observed, memory_limit=limit), sort_keys=True)+'\n')
+    print(f"MSA {profile['profile_id']}: {observed['available_bytes']/1024**3:.1f} GiB available RAM", flush=True)
 PY
   source "$TOOLS/msa/tools.sh"
   if [ "$SUB" = session ]; then
@@ -21,7 +28,8 @@ PY
       --session-id "$BIO_MSA_SESSION_ID" --state "/tmp/bio-msa-session-$BIO_MSA_SESSION_ID" \
       --out "$OUT" --database "$MSA_DB_ROOT" --tools "$TOOLS" --tools-root "$MSA_TOOLS_ROOT" \
       --results "$SHARED/cache/msa-api" --deadline "$BIO_JOB_DEADLINE_EPOCH" \
-      --idle-seconds "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" --warm "${BIO_MSA_SESSION_WARM:-prefetch}"
+      --idle-seconds "${BIO_MSA_SESSION_IDLE_SECONDS:-900}" \
+      --search-profile "$BIO_MSA_SEARCH_PROFILE" --warm "$BIO_MSA_SESSION_WARM"
   fi
   threads=$(nproc)
   if [ "$SUB" = convert ]; then
@@ -38,13 +46,17 @@ PY
       --tools-root "$MSA_TOOLS_ROOT" > "$OUT/database-validation.json"
     [ -n "${BIO_MSA_PANEL_SHA256:-}" ] || exit 0
   fi
-  # MMseqs otherwise inherits every core on large hosts, multiplying its
-  # per-thread prefilter memory. This bounds concurrency, not search depth.
-  search_threads="$threads"
-  [ "$search_threads" -le 16 ] || search_threads=16
+  # Keep every native/OpenMP execution limit in the same versioned profile.
+  search_threads=$(python3 - "$TOOLS/msa/search_profile.py" "$BIO_MSA_SEARCH_PROFILE" <<'PY'
+import runpy, sys
+print(runpy.run_path(sys.argv[1])['resolve'](sys.argv[2])['mmseqs_threads'])
+PY
+  )
   export MMSEQS_NUM_THREADS="$search_threads"
+  export OMP_NUM_THREADS="$search_threads" OMP_THREAD_LIMIT="$search_threads" OMP_DYNAMIC=FALSE
   python3 "$TOOLS/msa/server.py" config --root "$MSA_DB_ROOT" \
     --tools-root "$MSA_TOOLS_ROOT" --results "$SHARED/cache/msa-api" \
+    --search-profile "$BIO_MSA_SEARCH_PROFILE" \
     --output "$OUT/msa-server.json" > "$OUT/server-command.json"
   "$MMSEQS_SERVER" -local -config "$OUT/msa-server.json" > "$OUT/msa-server.log" 2>&1 &
   server_pid=$!

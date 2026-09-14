@@ -4,6 +4,7 @@ import copy
 import io
 import json
 import os
+import runpy
 from pathlib import Path
 import signal
 import subprocess
@@ -149,6 +150,121 @@ class WaitingTests(unittest.TestCase):
 
 
 class SelectionTests(unittest.TestCase):
+    def choose_mapped(self, *args, **kwargs):
+        kwargs.setdefault("profile", worker.MAPPED_PROFILE)
+        return worker.choose(*args, **kwargs)
+
+    def test_mapped_accepts_reviewed_cpu_hosts_of_other_gpu_families(self):
+        for kind, gb in [('4L40S.80V', 240), ('4A6000.40V', 240),
+                         ('4RTX6000ADA.40V', 240), ('2RTXPRO6000.60V', 180),
+                         ('4RTXPRO6000.120V', 360), ('8V100.48V', 180)]:
+            item = row(kind, gb, 4, 2)
+            item['supported_os'] = ['ubuntu-24.04']
+            with self.subTest(kind=kind):
+                result = self.choose_mapped([item], avail(kind), avail())
+                self.assertEqual(result['instance_type'], kind)
+                self.assertFalse(result['cpu'])
+                self.assertEqual(result['image'], 'ubuntu-24.04')
+                # More RAM and the old image do not expand resident/build's
+                # independently reviewed family policy.
+                resident = row(kind, 1440)
+                with self.assertRaises(worker.Unavailable):
+                    self.choose_mapped([resident], avail(kind), avail(), profile=worker.LEGACY_PROFILE)
+
+    def test_mapped_prefers_base_ubuntu_and_only_uses_reviewed_cuda_fallback(self):
+        item = row('1H100.80S.32V', 170)
+        result = self.choose_mapped([item], avail(item['instance_type']), avail())
+        self.assertEqual(result['image'], 'ubuntu-24.04')
+        item['supported_os'] = ['ubuntu-24.04-cuda-12.8-open-docker']
+        result = self.choose_mapped([item], avail(item['instance_type']), avail())
+        self.assertEqual(result['image'], 'ubuntu-24.04-cuda-12.8-open-docker')
+        for images in (['ubuntu-24.04-cuda-13.0-open-docker'], ['ubuntu-22.04'], []):
+            item['supported_os'] = images
+            with self.subTest(images=images), self.assertRaises(worker.Unavailable):
+                self.choose_mapped([item], avail(item['instance_type']), avail())
+        resident = row('8H100.80S.176V', 1360)
+        self.assertEqual(self.choose_mapped([resident], avail(resident['instance_type']), avail(),
+                         profile=worker.LEGACY_PROFILE)['image'], 'ubuntu-24.04-cuda-12.8-open-docker')
+        resident['supported_os'] = ['ubuntu-24.04']
+        with self.assertRaises(worker.Unavailable):
+            self.choose_mapped([resident], avail(resident['instance_type']), avail(), profile=worker.LEGACY_PROFILE)
+
+    def test_mapped_does_not_infer_support_from_unknown_suffix_or_grace_name(self):
+        for kind in ('2GB200.186V', '1GB300.32V', '1GH200.72V', '2GRACE.60V',
+                     '2RTXPRO6000.60V.CC', '2RTXPRO6000.60V.UNKNOWN', '2L40S.ARM.80V',
+                     '1H100.80S.32V.CC.UNKNOWN', '1H100.80S.32V.ARM', '1H100.UNKNOWN',
+                     '4UNKNOWN.80V', '16RTXPRO6000.480V'):
+            item = row(kind, 1800)
+            with self.subTest(kind=kind), self.assertRaises(worker.Unavailable):
+                self.choose_mapped([item], avail(kind), avail())
+
+    def test_mapped_profile_uses_exact_decimal_128gb_and_distinct_guest_floors(self):
+        for gb in (128, '128', 128.0, 128.01, 170):
+            with self.subTest(gb=gb):
+                item = row('1H100.80S.32V', gb, 3.25, 1.625)
+                result = self.choose_mapped([item], avail(item['instance_type']), avail())
+                self.assertEqual(result['profile_id'], 'mapped-128gb-v1')
+                self.assertEqual(result['minimum_advertised_bytes'], 128_000_000_000)
+                self.assertEqual(result['minimum_total_gib'], 110)
+                self.assertEqual(result['minimum_available_gib'], 100)
+                self.assertEqual(result['search_profile'], worker.search_profile(worker.MAPPED_PROFILE))
+                self.assertEqual(result['profile_sha256'], result['search_profile']['profile_sha256'])
+                self.assertAlmostEqual(result['conservative_gib'], float(gb) * 10**9 / 1024**3)
+                self.assertFalse(result['reserved'])
+        for gb in (0, 127, 127.99999, '127.99999'):
+            item = row('CPU.32V.128G', gb)
+            with self.subTest(gb=gb), self.assertRaisesRegex(worker.Unavailable, '128 GB advertised'):
+                self.choose_mapped([item], avail(item['instance_type']), avail())
+
+    def test_legacy_profile_keeps_exact_build_admission_and_tie_breaks(self):
+        policy = runpy.run_path(str(Path(worker.__file__).with_name('build-queue.py')))
+        catalog = [row('CPU.32V.128G', 128, 1, .5), row('CPU.192V.768G', 768, 1, .5),
+                   row('CPU.256V.1024G', 1024, 6, 3), row('1H100.80S.32V', 170, 3.25, 1.625),
+                   row('8H100.80S.176V', 1360, 13, 6), row('2GB200.186V', 1800, 1, .5),
+                   row('8H100.80S.176V.CC', 1440, 1, .5)]
+        for regular in ([], [item['instance_type'] for item in catalog]):
+            for spot in ([], [item['instance_type'] for item in catalog]):
+                for spot_only in (False, True):
+                    with self.subTest(regular=bool(regular), spot=bool(spot), spot_only=spot_only):
+                        expected = policy['choose'](catalog, avail(*([] if spot_only else regular)), avail(*spot))
+                        if expected is None:
+                            with self.assertRaises(worker.Unavailable):
+                                worker.choose(catalog, avail(*regular), avail(*spot),
+                                              profile=worker.LEGACY_PROFILE, spot_only=spot_only)
+                        else:
+                            result = worker.choose(catalog, avail(*regular), avail(*spot),
+                                                   profile=worker.LEGACY_PROFILE, spot_only=spot_only)
+                            self.assertEqual({key: result[key] for key in expected}, expected)
+                            self.assertEqual(result['minimum_advertised_bytes'], 768 * 1024**3)
+                            self.assertEqual(result['search_profile']['warm_mode'], 'prefetch')
+        edge = row('CPU.192V.768G', 768 * 1024**3 / 10**9)
+        self.assertEqual(worker.choose([edge], avail(edge['instance_type']), avail(),
+                         profile=worker.LEGACY_PROFILE)['conservative_gib'], 768)
+        # The actual database build/install selector stays high-memory.
+        low = row('CPU.32V.128G', 128)
+        self.assertIsNone(policy['choose']([low], avail(low['instance_type']), avail()))
+
+    def test_invalid_or_tampered_profile_is_rejected_before_provider_access(self):
+        modified = worker.search_profile(); modified['minimum_advertised_bytes'] = 1
+        boolean = worker.search_profile(); boolean['api_workers'] = True
+        for profile in ('unknown', modified, boolean, True):
+            api = RoundsAPI([([row()], avail(), avail())])
+            with self.subTest(profile=profile), self.assertRaises(worker.Error):
+                worker.wait_for_capacity(api, profile=profile, wait_seconds=7200)
+            self.assertEqual(api.calls, [])
+
+    def test_profile_is_preserved_across_capacity_retries(self):
+        large = row()
+        small = row('CPU.32V.128G', 128)
+        api = RoundsAPI([([small, large], avail(small['instance_type']), avail()),
+                         ([small, large], avail(large['instance_type']), avail())])
+        clock = Clock()
+        result = worker.wait_for_capacity(api, profile=worker.LEGACY_PROFILE, wait_seconds=7200,
+                                          clock=clock, sleep=clock.sleep)
+        self.assertEqual(result['instance_type'], large['instance_type'])
+        self.assertEqual(result['profile_id'], worker.LEGACY_PROFILE)
+        self.assertEqual(clock.sleeps, [30])
+
     def test_unavailable_cpu_selects_cheapest_eligible_regular_or_spot(self):
         cpu, h100, b200 = row(), row('8H100.80S.176V', 1360, 26, 13), row('8B200.240V', 1440, 24, 12)
         result = worker.choose([cpu, h100, b200], avail(), avail(h100['instance_type'], b200['instance_type']))
@@ -162,12 +278,12 @@ class SelectionTests(unittest.TestCase):
         catalog = [row('CPU.192V.768G', 768, 1, .5), row('2GB200.186V', 1800, 1, .5),
                    row('8H100.80S.176V.CC', 1440, 1, .5), row('8H100.80S.176V', 1360, 13, 13.01)]
         names = [item['instance_type'] for item in catalog]
-        result = worker.choose(catalog, avail(*names), avail(*names))
+        result = worker.choose(catalog, avail(*names), avail(*names), profile=worker.LEGACY_PROFILE)
         self.assertEqual(result['instance_type'], '8H100.80S.176V')
         self.assertFalse(result['spot'])
         catalog[-1]['price_per_hour'] = 13.00001
         with self.assertRaises(worker.Unavailable):
-            worker.choose(catalog, avail(*names), avail(*names))
+            worker.choose(catalog, avail(*names), avail(*names), profile=worker.LEGACY_PROFILE)
 
     def test_tie_prefers_cpu_then_regular_without_changing_queue_policy(self):
         cpu, gpu = row(price=13, spot=13), row('8H100.80S.176V', 1360, 13, 13)
@@ -257,6 +373,20 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status, 4)
         self.assertEqual(out, '')
         self.assertIn('No available FIN-02', err)
+
+    def test_cli_default_rejects_128gb_until_experimental_profile_is_explicit(self):
+        item = row('CPU.32V.128G', 128)
+        body = ('class API:\n def request(self,method,path):\n  assert method=="GET"\n'
+                +'  return '+repr([item])+' if path.startswith("/instance-types") else '
+                +repr(avail(item['instance_type']))+'\n')
+        status, out, err = self.invoke(body, extra=['--profile', worker.MAPPED_PROFILE])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(out)['profile_id'], worker.MAPPED_PROFILE)
+        self.assertEqual(err, '')
+        status, out, err = self.invoke(body)
+        self.assertEqual(status, 4)
+        self.assertEqual(out, '')
+        self.assertIn('768 GiB advertised', err)
 
     def test_cli_success_is_exact_json_selection_without_catalog_extra_fields(self):
         item = row('8H100.80S.176V', 1360, 26, 13)

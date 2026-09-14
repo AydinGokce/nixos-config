@@ -2,25 +2,68 @@
 
 `bio-msa prepare --model protenix --fasta query.fasta --bundle-result
 prepared.json` validates its input locally, then ensures one shared private search
-session. A missing session is started through the existing worker selector, fresh
-quote, budget reservation and cleanup wrapper. Concurrent callers join that same
-startup and wait for full database readiness. An already-ready session is reused.
-RF3's verified preparation-cache lookup still runs first: a cache hit does not
-start a search worker. Explicit prepared bundles likewise need no startup.
+session. A missing session starts through the configured provider's fresh quote,
+combined-budget reservation and managed cleanup. Concurrent callers join that
+same startup and wait for its validated readiness. An already-ready session is
+reused. RF3's verified preparation-cache lookup still runs first; a cache hit or
+explicit prepared bundle needs no search-worker startup.
 
-The default maximum session lifetime is 7,200 seconds, the idle timeout is 900
-seconds, and index prefetch remains enabled. Existing instance selection, the
-$13/hour instance-price ceiling and the current total project budget gate remain
-in force. Full database storage and completed prepared bundles persist when the
-worker is removed. The native GUI defaults to private MSA; the low-level legacy
-`bio-submit` default remains public unless private is selected. No request falls
-back to a public endpoint when private infrastructure is unavailable.
+With `BIO_MSA_PROVIDER=aws`, the managed provider is `bio-aws-msa` in `us-east-1`,
+using the configured 1 TiB CPU worker, normally `r6a.32xlarge`. The required policy
+is `resident-768gib-v1`, full `prefetch`, 16 native/OpenMP threads, one API job,
+serial stages, 900 seconds idle and on-demand compute. Normal maximum lifetime
+is 7,200 seconds. The head freezes the provider helper's path/SHA and exact
+profile in the session intent before launch. AWS resource management belongs to
+the separate pool/lease controller; no AWS credentials are sent to the worker.
 
-`bio-msa prepare --require-session ...` preserves the operator mode that requires
-an already-ready session and never starts compute. `bio-msa session start
---timeout 7200` still starts an explicit managed session. `session status` checks
-the original unit invocation, current managed provider identity, pinned SSH host
-key, boot and session generation. `session stop` retains its explicit semantics.
+Operational status on 2026-09-14: AWS native qualification is pending restoration
+of the `us-east-1` Standard On-Demand quota from the observed 0 to at least 128
+vCPUs. The retained 1 TiB `r6a.32xlarge` is stopped with both EBS volumes preserved;
+the database copy is incomplete and no AWS native search has qualified it.
+Preparation05 stopped at its quota preflight without a compute reservation or
+start. Restore account eligibility, finish verified database/runtime preparation,
+then run the retained native qualification before enabling the new session route.
+The complete source/database generation and pinned native search parameters have
+not been reduced. Existing installed sessions keep their frozen provider and code.
+
+One-time `bio-aws-msa prepare --state ... --tools ... --timeout 21600
+--owner-unit UNIT` runs inside its exact supervised head unit and owns a
+separate preparation lease for the complete database/runtime copy. It stops
+compute after verified preparation; it does not publish session readiness.
+Normal sessions reuse those exact persistent assets. Idle or graceful shutdown
+**stops** the EC2 instance and retains its OS and database volumes; a later
+session starts that owned instance again. RAM is lost on stop, so full prefetch
+is repeated before API readiness. Retained storage remains billable.
+
+The initial database copy uses 32 independent SSH ranges per large file and
+four disjoint rsync shards for smaller files and aliases. Range connections are
+bounded globally, with staggered authentication and a shared cancellation signal.
+The preparation coordinator checks its paid lease while transfer and full source
+hashing run; destination verification and publication remain mandatory afterward.
+Completed files can be reused after a fresh full readback against the sealed
+source, with exact cache ownership and filesystem checks. Their verified reused
+bytes remain separate from network throughput. Interrupted files without that
+proof are recopied.
+Use observed byte/rate progress to assess a slow transfer early. A preparation's
+six-hour limit is a cleanup boundary, not an estimate of how long to wait before
+investigating a stalled or unsuitable transfer rate.
+
+The Console defaults to private MSA. The low-level `bio-submit` default remains
+public unless private is selected. No private request falls back to a public
+endpoint. `bio-msa prepare --require-session ...` requires an already-ready
+session and never starts compute. `bio-msa session start --timeout 7200` starts
+an explicit managed session. `session status` checks the original unit invocation,
+provider ownership, pinned SSH host key, boot and session generation.
+
+`BIO_MSA_PROVIDER=verda` or explicit `session start --provider verda` retains the
+older temporary-worker provider; its ordinary profile now also defaults to
+resident/full prefetch. `mapped-128gb-v1` requires explicit selection and remains
+unqualified: the full-database 1,726-aa editor exceeded the native one-hour limit
+under its 96 GiB cap over NFS. Its four-thread/report-only mechanics remain
+available for a separately authorized experiment, not an automatic fallback.
+The AWS route rejects this profile, spot mode, non-900-second idle and partial
+prefetch. Existing saved sessions lacking a provider field remain Verda sessions;
+new configuration never changes their frozen provider or policy.
 
 Managed sessions retain the host key negotiated by the first successful SSH
 readiness connection in a fresh, private per-job `worker-known-hosts` file.
@@ -37,12 +80,15 @@ can join its exact saved unit command/invocation, but never issues another launc
 A caller that starts or joins a starting generation does not replace it if startup
 fails. Later requests may retire an already-ended generation after a verified
 pre-allocation failure receipt, or after fresh provider evidence proves the
-exact allocated worker and temporary OS disk are absent.
+exact allocated Verda worker and temporary OS disk are absent. For AWS, fresh
+evidence must instead prove the exact instance is stopped, its compute reservation
+is released and its original OS/database IDs remain under the registered ownership.
+An AWS stopped instance is never reported as absent or deleted.
 Replaced units, missing worker identity, unknown startup outcomes and uncertain
 cleanup keep registration intact for inspection. An old closure receipt alone
 never authorizes replacement. No search request is silently replayed.
 
-Automatic capacity selection waits up to 1,800 seconds, pausing 30 seconds after
+The Verda capacity selector waits up to 7,200 seconds, pausing 30 seconds after
 each confirmed shortage before checking regular and spot offers again. Set
 `--capacity-wait-seconds 0..7200` on `session start` or `prepare` (or
 `BIO_MSA_CAPACITY_WAIT_SECONDS`) to change the window; zero checks once.
@@ -52,7 +98,7 @@ fail closed without retrying. The GUI shows `waiting_capacity` with a retry
 window and unknown availability ETA. The request deadline still bounds waiting;
 the paid worker lifetime starts with its normal allocation reservation.
 
-Before selecting a managed session worker, `startup.py` records `attempt.json`
+Before selecting a Verda managed session worker, `startup.py` records `attempt.json`
 bound to the exact session intent, systemd invocation, frozen tools and launcher.
 It fsyncs `allocation-started.json` before any `dc launch`. A failure before that
 marker can publish `no-allocation.json`; after the exact unit stops, the next
@@ -62,9 +108,18 @@ allocation or unknown old startup cannot use this path. Existing waiting callers
 receive `capacity_timeout`, `preallocation_failed`, or `cancelled` without starting
 a replacement in the same request.
 
+AWS shared-session launches invoke the pinned startup helper before configuration,
+asset and quota checks. They mark allocation before the first lease/reservation
+write. A verified synchronous failure before that boundary follows the same
+terminal retirement path. Any AWS lease, job, allocation marker or pending cleanup
+keeps the registration fenced, including a lost cloud response. Historical failures
+without the exact attempt and outcome receipts still require inspection.
+
 Startup, readiness checks, queued search and execution consume the same request
 `--timeout`. Each provider/systemd/SSH readiness wait is bounded by the remaining
 deadline. Search deadlines are also capped by the managed session's deadline.
+The pinned native API separately limits each MsaJob/PairJob to one hour; a longer
+head request or capacity-wait allowance does not extend that native limit.
 There is the existing maximum 45-second result-receipt transport grace after
 search, followed by bounded local output validation; this does not extend native
 search or worker lifetime. `--session-timeout` controls only a newly started
@@ -91,10 +146,27 @@ response bytes, downloaded result archives, selected template payloads,
 backend job scripts and full database/source provenance. The standard model
 preparers and RF3's per-chain TaxID search adapter are reused unchanged.
 
+AWS workers do not mount the Verda NFS share across clouds. Worker and head use
+the same logical output path, `/mnt/bio-shared/runs/msa-aws-SESSIONID/out`, on
+separate filesystems. The provider mirrors only the bounded status/control
+metadata allowlist. After an exact completed request response, the head calls
+`sync-output --request-id ID` before checking the original immutable manifest
+and native prepared bundle. Transfer uncertainty retains the request; it never
+repeats the search. Control writes continue over the existing pinned SSH protocol;
+mirrored receipts support exact recovery after the instance stops.
+
 ## Index residency
 
-The three full CPU indexes occupy about 700 GB. `--warm prefetch` is the default
-and reads all existing index pages, with a memory-headroom preflight and a
+The three full CPU indexes occupy about 700 decimal GB (652 GiB). The experimental mapped profile defaults to
+`--warm report`, which measures residency without reading missing pages and
+permits partial residency at readiness. Native search still uses the complete
+indexes and unchanged scientific settings. Cold NFS page faults can increase
+latency; the 96 GiB resource limit and report-only startup do not guarantee a
+particular search duration. Explicit prefetch or lock is rejected for this
+profile.
+
+The production resident profile defaults to `--warm prefetch`; AWS requires it. It
+reads all existing index pages, with a memory-headroom preflight and a
 deadline bounded by the existing session lifetime minus its cleanup reserve.
 Runtime setup and index warm-up consume that lifetime; they never extend it.
 An explicit worker `--warm-seconds` can impose a shorter warm-up cap. The
@@ -103,7 +175,8 @@ Loading uses four independent buffered readers over disjoint, page-aligned
 ranges, with 16 MiB read buffers. Each reader opens its own read-only descriptor
 so the kernel can maintain a separate sequential read-ahead stream. Index
 identity and byte counts are checked, and the existing final `mincore` check
-still requires every page of every full index to be resident before readiness.
+requires every page of every full index to be resident before resident-profile
+readiness. This requirement does not apply to the mapped report-only profile.
 
 Where writable BDI controls are available, loading temporarily raises the
 worker device's read-ahead to at least 15,360 KiB. A private claim records its
@@ -166,7 +239,7 @@ for borrowed APIs and older frozen sessions. The existing explicit manual
 
 ## Existing-worker operational adoption
 
-The separately labeled `adopt` path supports an explicit transition on an
+The separately labeled Verda-only `adopt` path supports an explicit transition on an
 already managed worker. A new spool observes the exact original API PID,
 start ticks, boot, native command and configuration/provenance hashes. It
 validates the full database receipts. It owns neither the borrowed API nor

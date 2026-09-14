@@ -26,6 +26,8 @@ import uuid
 import session
 import lifecycle
 import capacity
+import search_profile
+import provider as session_provider
 
 DEFAULT_ROOT = Path(os.environ.get("BIO_MSA_SESSIONS_ROOT", "/var/lib/dc/msa-sessions"))
 TOOLS = Path(os.environ.get("BIO_TOOLS_SRC", "/etc/bio-tools"))
@@ -63,6 +65,35 @@ def provider_check(tools, instance, ip, closing_os=None, deadline=None):
     bound = lifecycle.timeout(deadline, 60)
     try: return json.loads(subprocess.check_output(command, text=True, timeout=bound, stderr=subprocess.PIPE))
     except Exception: raise ValueError("Session provider/budget check failed; no request was submitted") from None
+
+
+def check_session_provider(state, intent, launch, *, closing=False, deadline=None):
+    if session_provider.name(intent) == 'aws':
+        proof = session_provider.invoke(intent, state, 'provider-close' if closing else 'provider-check',
+            timeout=lifecycle.timeout(deadline, 60), job=dict(instance=launch['instance'], ip=launch['ip'],
+                os_id=launch.get('provider', {}).get('os_id')))
+        return session_provider.closed(proof, launch) if closing else session_provider.check_proof(proof, launch)
+    return provider_check(Path(intent['tools']), launch['instance'], launch['ip'],
+        launch['provider']['os_id'] if closing else None, deadline=deadline)
+
+
+def sync_output(state, intent, *, request_id=None, deadline=None):
+    if session_provider.name(intent) != 'aws':
+        return
+    value = session_provider.invoke(intent, state, 'sync-output', request_id=request_id,
+                                   timeout=lifecycle.timeout(deadline, 120 if request_id else 12))
+    require(value.get('status') == 'synchronized' and value.get('session_id') == intent['session_id']
+            and value.get('request_id') == request_id, 'AWS output synchronization belongs to another request')
+
+
+def closure_proof(intent, launch, proof):
+    if session_provider.name(intent) == 'aws':
+        return session_provider.closed(proof, launch)
+    require(proof.get('status') == 'closed' and proof.get('instance') == launch['instance']
+            and proof.get('os_id') == launch['provider']['os_id'] and proof.get('exact_worker_absent') is True
+            and proof.get('exact_os_absent_active_and_trash') is True,
+            'Exact private MSA worker and temporary disk cleanup is not confirmed')
+    return proof
 
 
 def provider(args):
@@ -147,6 +178,10 @@ def retained_host_keys(path, job_path, job):
 def register_launch(state, job_path, remote_out, known_hosts=None):
     state = state.resolve(); intent = session.load(state/"intent.json"); job = session.load(job_path)
     require(state.name == intent["session_id"] and job["model"] == "msa", "Wrong session launch")
+    if 'search_profile' in intent:
+        require(isinstance(job.get('search_profile'), dict)
+                and search_profile.resolve(job['search_profile']) == search_profile.resolve(intent['search_profile']),
+                'Worker launch differs from the registered MSA search profile')
     require(os.environ.get("INVOCATION_ID") and os.environ.get("BIO_MSA_SESSION_ID") == intent["session_id"],
             "Session must launch under its managed systemd unit")
     live = unit_state(intent["unit"])
@@ -154,7 +189,8 @@ def register_launch(state, job_path, remote_out, known_hosts=None):
             "Session launcher unit identity changed")
     require(Path(remote_out).is_absolute() and str(remote_out).startswith("/mnt/bio-shared/runs/msa-")
             and Path(remote_out).name == "out", "Invalid session result path")
-    proof = provider_check(Path(intent["tools"]), job["instance"], job["ip"])
+    require(job.get('provider_name', 'verda') == session_provider.name(intent), 'Worker provider differs from frozen session')
+    proof = check_session_provider(state, intent, job)
     # The successful readiness connection already negotiated/authenticated this
     # key. Do not replace it with a separate forced-algorithm discovery probe.
     known = state/"known_hosts"
@@ -178,9 +214,14 @@ def ready_session(root, deadline=None):
     live = unit_state(intent["unit"], timeout=lifecycle.timeout(deadline, 15))
     require(live["LoadState"] == "loaded" and live["ActiveState"] == "active"
             and live["InvocationID"] == launch["invocation_id"], "Managed private MSA session is not active")
-    provider_check(Path(intent["tools"]), launch["instance"], launch["ip"], deadline=deadline)
+    check_session_provider(state, intent, launch, deadline=deadline)
+    sync_output(state, intent, deadline=deadline)
     ready_path = Path(launch["remote_out"])/"session-ready.json"
     ready = session.load(ready_path); digest = session.sha(ready_path)
+    if 'search_profile' in intent:
+        require(isinstance(ready.get('search_profile'), dict)
+                and search_profile.resolve(ready['search_profile']) == search_profile.resolve(intent['search_profile']),
+                'Session readiness differs from the registered MSA search profile')
     require(ready["session_id"] == intent["session_id"] and ready["owner"]["boot_id"] == launch["boot_id"]
             and ready["output"] == launch["remote_out"] and ready["endpoint"] == "http://127.0.0.1:8080"
             and ready["deadline_epoch"] <= launch["provider"]["reservation_deadline"], "Session readiness identity differs")
@@ -201,6 +242,8 @@ def ready_session(root, deadline=None):
 
 
 def adopt(args):
+    require(session_provider.selected(getattr(args, 'provider', None)) == 'verda',
+            'AWS sessions must start through their managed provider lifecycle')
     """Register a separately supervised spool on an already managed worker."""
     root=args.root.resolve();root.mkdir(mode=0o700,parents=True,exist_ok=True)
     ready=session.load(args.ready);require(ready["lifecycle"]=="borrowed-api", "Explicit borrowed API readiness is required")
@@ -225,6 +268,9 @@ def adopt(args):
         intent=dict(schema=1,kind="managed-private-msa-session",lifecycle="borrowed-api",session_id=ident,unit=args.owner_unit,
                     created_epoch=time.time(),tools=str(tools),sources=session.sources(tools),
                     timeout_seconds=max(0,ready["deadline_epoch"]-time.time()),no_resources_allocated=True)
+        if 'search_profile' in ready:
+            require(isinstance(ready['search_profile'], dict), 'Borrowed MSA search profile receipt is missing')
+            intent['search_profile'] = search_profile.resolve(ready['search_profile'])
         known=state/"known_hosts";source=Path(args.known_hosts)
         require(session.sha(source)==args.known_hosts_sha256,"Borrowed worker host key changed")
         shutil.copyfile(source,known);os.chmod(known,0o600)
@@ -249,23 +295,42 @@ def _start_locked(args, deadline=None):
     session.finite(args.timeout, "session timeout", 120, 85500)
     session.finite(args.idle_seconds, "idle timeout", 60, 86400)
     capacity_wait = capacity.wait_seconds(getattr(args, 'capacity_wait_seconds', None))
+    provider_binding = session_provider.launch_binding(getattr(args, 'provider', None))
+    aws = provider_binding['provider_name'] == 'aws'
+    requested_profile = getattr(args, 'search_profile', None)
+    if aws:
+        require(requested_profile in (None, search_profile.LEGACY_PROFILE), 'AWS MSA requires the qualified resident profile')
+        require(getattr(args, 'warm', None) in (None, 'prefetch'), 'AWS MSA requires full index prefetch')
+        require(args.idle_seconds == 900 and not args.spot, 'AWS MSA requires 15-minute idle and on-demand compute')
+        require(args.worker in (None, 'r6a.32xlarge'), 'The configured AWS MSA pool requires r6a.32xlarge')
+        profile = search_profile.resolve(search_profile.LEGACY_PROFILE)
+        warm = 'prefetch'
+    else:
+        profile = search_profile.resolve(requested_profile or os.environ.get(search_profile.ENVIRONMENT_KEY))
+        warm = search_profile.warm_mode(profile, getattr(args, 'warm', None))
+    source = args.tools.resolve()
+    profile_source = source/'msa/search_profile.py'
+    require(profile_source.is_file()
+            and session.sha(profile_source) == session.sha(Path(search_profile.__file__)),
+            'Selected tool snapshot cannot launch this MSA search profile')
     root = args.root.absolute()
     require(not os.path.lexists(root/"active.json"), "A session registration exists; inspect/close it before another start")
     ident = uuid.uuid4().hex; state = root/ident; state.mkdir(mode=0o700)
-    submit = shutil.which("bio-submit"); require(submit, "bio-submit is unavailable")
+    submit = provider_binding['provider_helper'] if aws else shutil.which("bio-submit")
+    require(submit, "bio-submit is unavailable")
     unit = "bio-msa-session-"+ident+".service"
     cap = float(os.environ.get("DC_MAX_INSTANCE_HOURLY", "13"))
     session.finite(cap, "instance hourly ceiling", 0, 1e9)
-    source = args.tools.resolve()
     tools = state/"tools"
     shutil.copytree(source, tools, symlinks=False, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    argv = [str(Path(submit).resolve()), "msa", "--sub", "session", "--timeout", str(args.timeout)]
-    if args.worker: argv += ["--worker", args.worker]
-    if args.spot: argv += ["--spot"]
+    argv = ([str(Path(submit).resolve()), 'launch-session', '--state', str(state), '--tools', str(tools)] if aws else
+            [str(Path(submit).resolve()), "msa", "--sub", "session", "--timeout", str(args.timeout)])
+    if args.worker and not aws: argv += ["--worker", args.worker]
+    if args.spot and not aws: argv += ["--spot"]
     intent = dict(schema=1, kind="managed-private-msa-session", session_id=ident, unit=unit,
                   created_epoch=time.time(), timeout_seconds=args.timeout, idle_seconds=args.idle_seconds,
-                  capacity_wait_seconds=capacity_wait,
-                  warm=args.warm, tools=str(tools), sources=session.sources(tools),
+                  capacity_wait_seconds=capacity_wait, **provider_binding, requested_worker=args.worker,
+                  warm=warm, search_profile=profile, tools=str(tools), sources=session.sources(tools),
                   submit_sha256=session.sha(Path(submit).resolve()), argv=argv)
     session.atomic(state/"intent.json", intent, exclusive=True)
     session.atomic(root/"active.json", dict(session_id=ident, intent_sha256=session.sha(state/"intent.json")), exclusive=True)
@@ -276,11 +341,13 @@ def _start_locked(args, deadline=None):
                "--setenv=BIO_TOOLS_SRC="+str(tools), "--setenv=BIO_MSA_SESSION_ID="+ident,
                "--setenv=BIO_MSA_SESSION_STATE="+str(state),
                "--setenv=BIO_MSA_SESSION_IDLE_SECONDS="+str(args.idle_seconds),
-               "--setenv=BIO_MSA_SESSION_WARM="+args.warm,
+               "--setenv=BIO_MSA_SESSION_WARM="+warm,
+               "--setenv=BIO_MSA_SEARCH_PROFILE="+profile['profile_id'],
                "--setenv=DC_MAX_INSTANCE_HOURLY="+str(min(cap, 13)), *argv]
     # The caller's deadline includes a separate unpaid capacity allowance;
     # it never increases the paid reservation passed to bio-submit/dc.
     command.insert(-len(argv), '--setenv=BIO_MSA_CAPACITY_WAIT_SECONDS='+str(capacity_wait))
+    command.insert(-len(argv), '--setenv=BIO_MSA_PROVIDER='+provider_binding['provider_name'])
     if deadline is not None:
         capacity_deadline = time.time() + max(0, deadline-time.monotonic()-60)
         command.insert(-len(argv), '--setenv=BIO_MSA_CAPACITY_DEADLINE_EPOCH='+str(capacity_deadline))
@@ -373,7 +440,9 @@ def observe_session(root, deadline=None):
                     'message': 'Waiting for the previous private MSA worker and its temporary disk to finish cleanup'}
         if lifecycle.document(output / 'session-ready.json', optional=True) is None:
             return {'state': 'warming', 'session_id': ident,
-                    'message': 'Private MSA worker is registered; loading the full database indexes and starting its search service'}
+                    'message': ('Private MSA worker is registered; mapping the full database indexes and starting its search service'
+                                if intent.get('search_profile', {}).get('profile_id') == search_profile.MAPPED_PROFILE
+                                else 'Private MSA worker is registered; loading the full database indexes and starting its search service')}
         return {'state': 'ready', 'session_id': ident, 'ready': ready_session(Path(root), deadline=deadline)}
     except lifecycle.SessionError:
         raise
@@ -416,11 +485,8 @@ def _retire_locked(root, observed, deadline=None):
     live = unit_state(intent['unit'], timeout=lifecycle.timeout(deadline, 15))
     require(_terminal_unit(live) and (live.get('LoadState') == 'not-found'
             or live.get('InvocationID') == launch['invocation_id']), 'MSA unit is still live or was replaced')
-    proof = provider_check(Path(intent['tools']), launch['instance'], launch['ip'], launch['provider']['os_id'], deadline=deadline)
-    require(proof.get('status') == 'closed' and proof.get('instance') == launch['instance']
-            and proof.get('os_id') == launch['provider']['os_id'] and proof.get('exact_worker_absent') is True
-            and proof.get('exact_os_absent_active_and_trash') is True,
-            'Exact private MSA worker and temporary disk cleanup is not confirmed')
+    proof = check_session_provider(state, intent, launch, closing=True, deadline=deadline)
+    closure_proof(intent, launch, proof)
     receipt = dict(schema=1, session_id=intent['session_id'], closed_epoch=time.time(),
                    intent_sha256=observed['intent_sha256'], launch_sha256=observed['launch_sha256'], proof=proof)
     if not (state / 'closed.json').exists():
@@ -502,6 +568,7 @@ def prepare(args):
         require(value["status"] == "complete" and value["request_id"] == ident
                 and value["request_sha256"] == request_sha and value["ready_sha256"] == digest,
                 "Preparation response binding differs")
+        sync_output(state, intent, request_id=ident, deadline=deadline)
         bundle = Path(launch["remote_out"])/"requests"/ident/"prepared"
         require(value["bundle"] == str(bundle), "Unexpected prepared bundle location")
         manifest = bundle/("search.json" if args.model == "rf3" else "manifest.json")
@@ -577,7 +644,8 @@ def stop(root):
             require(closed["session_id"]==intent["session_id"] and closed["borrowed_api_preserved"] is True,"Borrowed session shutdown unconfirmed")
             proof=dict(borrowed_api_preserved=True,original_worker_cleanup_owner=intent["unit"],spool_closed=closed)
         else:
-            proof=provider_check(Path(intent["tools"]),launch["instance"],launch["ip"],launch["provider"]["os_id"])
+            proof=check_session_provider(state,intent,launch,closing=True)
+            if session_provider.name(intent)=='aws':closure_proof(intent,launch,proof)
         if not(state/"closed.json").exists():session.atomic(state/"closed.json",dict(closed_epoch=time.time(),proof=proof),exclusive=True)
         (root/"active.json").unlink()
         fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
@@ -594,6 +662,8 @@ def main(argv=None):
     p.add_argument("--root", type=Path, default=DEFAULT_ROOT); p.add_argument("--tools", type=Path, default=TOOLS)
     p.add_argument("--state", type=Path); p.add_argument("--job", type=Path); p.add_argument("--remote-out")
     p.add_argument("--instance"); p.add_argument("--ip"); p.add_argument("--worker"); p.add_argument("--spot", action="store_true")
+    p.add_argument('--provider', choices=['verda','aws'], default=None,
+                   help='Provider for a new session; existing sessions retain their frozen provider')
     p.add_argument("--timeout", type=int, default=7200); p.add_argument("--idle-seconds", type=int, default=900)
     p.add_argument('--session-timeout', type=int, default=7200,
                    help='Runtime limit for a newly started on-demand worker session; capacity waiting is separate')
@@ -601,7 +671,11 @@ def main(argv=None):
                    help='Wait for qualifying private MSA capacity (default BIO_MSA_CAPACITY_WAIT_SECONDS or 7200 / two hours; 0 checks once)')
     p.add_argument('--require-session', action='store_true',
                    help='Preparation only: require an already-ready session and never start compute')
-    p.add_argument("--warm", choices=["report", "prefetch", "lock"], default="prefetch")
+    p.add_argument('--search-profile', choices=[search_profile.LEGACY_PROFILE, search_profile.MAPPED_PROFILE],
+                   default=None,
+                   help='Execution profile for a new session; existing sessions keep their frozen configuration')
+    p.add_argument("--warm", choices=["report", "prefetch", "lock"], default=None,
+                   help='Override index residency policy; mapped 128 GB sessions support report only')
     p.add_argument("--model", choices=sorted(session.MODELS)); p.add_argument("--fasta", type=Path)
     p.add_argument("--json", type=Path); p.add_argument("--name"); p.add_argument("--bundle-result", type=Path)
     p.add_argument("--os-id");p.add_argument("--ready",type=Path);p.add_argument("--owner-unit");p.add_argument("--owner-invocation")

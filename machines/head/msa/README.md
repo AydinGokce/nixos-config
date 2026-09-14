@@ -7,9 +7,78 @@ This component installs the complete classic CPU database reference onto the man
 
 The immutable candidate pins are ColabFold `c35de0221f4d297a39edf4cf292ba2832e321edc`, MMseqs2 release 18 `8cc5ce367b5638c4306c2d7cfc652dd099a4643f`, and MMseqs2-App backend `01365aa4735539ba95b417f73fb5326c77410394`. These combine the published release-18 CPU guidance with the pinned official backend. They are **not an attestation of the current public service's deployed binary**. CPU ordering follows classic TSV conversion (`FAST_PREBUILT_DATABASES=0`); upstream warns that its newer fast prebuilt databases can change CPU results. The complete backend-generated MsaJob and PairJob commands remain unchanged. [ColabFold guidance](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/README.md), [database setup](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/setup_databases.sh), [backend pipelines](https://github.com/soedinglab/MMseqs2-App/blob/01365aa4735539ba95b417f73fb5326c77410394/backend/worker.go).
 
-Run installation on a preparation worker with the dedicated database volume mounted read/write. The 16 GB head is unsuitable. The installer rejects less than 120 GiB **available** RAM; this is a minimum preflight, not a guarantee that every index fits. Managed installation, preparation and serving automatically select available FIN-02 x86 compute with at least 768 GiB RAM and an instance-price ceiling of $13/hour; spot offers are eligible. `--spot` restricts selection to spot offers, and `--worker TYPE` overrides automatic selection. The launch rechecks the price and project budget. Full API preparation also checks available RAM on the worker because upstream's much smaller batch-RAM guidance does not describe this API's complete `.idx`/mmap execution. A cold-disk, lower-RAM API deployment requires separate measurement without changing the search. Source archives total about 242 GB before extraction. Serial working allowances are conservative planning estimates, not measured final footprints; actual free-space checks stop before exhaustion and require additional storage rather than reduced datasets. [Official MSA server](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/README.md).
+With `BIO_MSA_PROVIDER=aws`, ordinary `bio-msa prepare` and shared sessions use an
+AWS CPU worker in `us-east-1`. The preferred type is `r6a.32xlarge` (1,024 GiB RAM,
+128 vCPUs). X-family alternatives are future options requiring explicit provider
+implementation/configuration and their own quota; no silent fallback selects one.
+AWS uses `resident-768gib-v1`, 16 native/OpenMP threads, one API job at a time,
+serial database stages and full-index prefetch. The complete pinned search
+commands, templates, pairing and database bytes remain unchanged. API readiness
+requires the full indexes to be resident; local code tests alone do not qualify
+the AWS deployment or establish prediction quality.
 
-Automatic worker selection waits up to **two hours** for qualifying capacity,
+AWS qualification status on 2026-09-14: native AWS qualification is still pending.
+The account's `us-east-1` Standard On-Demand vCPU quota was observed at 0 after
+an earlier value of 512; the configured worker requires at least 128. The latest
+preparation refused before reserving or starting compute. The existing 1 TiB
+`r6a.32xlarge` is stopped, with its 100 GiB OS and 1,300 GiB data volumes retained.
+Database preparation on EBS remains incomplete and unpublished. The verified
+runtime archive alone does not establish runtime or search readiness. Quota
+restoration must precede completing preparation and native qualification; the
+canonical source, full database contents and pinned native parameters remain
+unchanged. Completed implementation and offline tests are not a live qualification.
+
+The AWS copy lives on a retained 1,300 GiB gp3 volume configured for 2,000 MiB/s
+and 8,000 IOPS. These are provisioned limits, not measured application throughput.
+One-time `bio-aws-msa prepare` copies and validates the published database and
+runtime under a separate bounded preparation lease. It does not expose a native
+search session. Normal sessions have a two-hour maximum lifetime and a 15-minute
+idle timeout. Idle shutdown **stops** the EC2 instance, retaining its OS and data
+volumes for a later start. Stopping loses RAM residency, so the indexes must be
+loaded again before the next session becomes ready. Disk storage continues
+billing while compute is stopped. See [SESSIONS.md](SESSIONS.md).
+
+Initial database transfer splits regular files of at least 4 GiB across 32
+independent SSH connections, one large file at a time. Four separate rsync
+shards copy the remaining files and internal aliases; the two file sets must
+cover the published snapshot exactly without overlap. Transfer progress reports
+actual bytes and rates. Its ETA covers transfer work, with checksum verification,
+runtime restoration and native search readiness remaining separate stages. Every
+database file still needs a complete source hash and destination readback before
+publication. A completed large file can be reused after checking the owned
+filesystem and current source identity, then reading the entire existing file
+and matching its SHA256 against the sealed source. Size and timestamps only
+identify candidates for that readback. Verified reused bytes are reported
+separately from newly transferred bytes and transfer rates. Interrupted large
+files are recopied; partial bytes never qualify the database for search.
+
+The production profile default is resident even on the older Verda routes.
+`mapped-128gb-v1` is retained only as an explicit, **unqualified experiment**.
+Its full-database trial on a larger host under a 96 GiB cap preserved
+short-query output, but the 1,726-residue editor hit the native one-hour timeout
+over NFS. It is not the production path for large editors. Opting in explicitly
+uses at least 128 decimal GB advertised RAM, guest floors of 110 GiB total and
+100 GiB available, four threads, a 96 GiB cgroup with no swap and report-only
+index residency. Full indexes stay mapped with native `--db-load-mode 2`;
+no database or scientific setting is reduced. Prefetch/lock is rejected there.
+
+`bio-msa install`, `convert`, `panel` and `serve` remain standalone **Verda**
+operator routes; setting the AWS session provider does not redirect them.
+Installation and index building require at least 768 GiB available RAM and a
+read/write mount of the canonical database; the 16 GB head is unsuitable.
+Verda automatic selection uses supported FIN-02 x86 hosts at at most $13/hour,
+including regular/spot offers. `--worker` and `--spot` do not bypass guest,
+quote or combined project budget checks. The actual guest must support AVX2.
+
+Profile receipts, thread environment and configuration bind the search namespace
+and readiness. Existing saved sessions retain their frozen provider, sources and
+execution limits. Selecting AWS or changing the default does not reconfigure an
+already-running worker. The mapped memory cap applies only when that experimental
+profile is explicitly selected; resident AWS sessions have no 96 GiB cap.
+
+Source archives total about 242 GB before extraction. Serial working allowances are conservative planning estimates, not measured final footprints; actual free-space checks stop before exhaustion and require additional storage rather than reduced datasets. [Official MSA server](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/README.md).
+
+The standalone Verda selector waits up to **two hours** for qualifying capacity,
 rechecking regular and spot offers after each **30-second** pause. Provider query
 latency adds to the interval. `BIO_MSA_CAPACITY_WAIT_SECONDS` accepts 0–7200 seconds
 (0 checks once); `BIO_MSA_CAPACITY_POLL_SECONDS` accepts 1–300 seconds. For a shared
@@ -27,19 +96,24 @@ remains two, and a request can hold a permit while its shared MSA session starts
 Already-started sessions retain their frozen policy, including a previous
 30-minute wait; the two-hour default applies to new session starts.
 
-RF3 preparation cache keys pin the complete frontend source. This orchestration
-update changes that source pin, so a new request can capture a fresh search once;
-older captured inputs remain retained, and subsequent requests under the updated
-source reuse the new cache entry. Search settings and database contents are unchanged.
+RF3 preparation cache keys pin the complete frontend source. The AWS provider
+adapter does not alter that scientific frontend. Captured inputs and their
+original provenance remain retained; no cache hit is presented as a fresh search.
 
-Managed shared sessions retain an immutable startup attempt and write an
-allocation marker before calling `dc launch`. A terminal failure with a verified
+Verda managed shared sessions retain an immutable startup attempt and write an
+allocation marker before calling `dc launch`. AWS sessions instead use the
+separately bound `bio-aws-msa` helper and its retained pool/lease records. A terminal failure with a verified
 `no-allocation.json` receipt can be retired by the next request or by
 `bio-msa session stop`; callers already waiting on that failed generation receive
 the original failure without starting another worker. Recovery retains the audit
 records. Missing receipts, changed identities, or a possibly submitted allocation
 remain fenced for inspection. Historical failures predating this protocol require
 an explicit audit of their original launcher, unit, logs, and provider inventory.
+New AWS shared-session launches use that same pinned startup protocol before
+configuration, asset and quota checks. The allocation marker precedes the first
+lease or reservation write. A synchronous failure before that boundary can be
+retired after the exact unit ends; a lease, job or uncertain cleanup receipt
+prevents a no-allocation claim. This does not retroactively qualify old failures.
 
 ```sh
 # Application code comes from the orchestrator's verified worker-local bundle.
@@ -78,7 +152,7 @@ Downloads resume and verify exact source length and the upstream-published MD5 w
 
 `server.py config` validates the installation and writes a localhost-only configuration (`127.0.0.1:8080`, no URL prefix, one local worker, serial stages), a sibling `.provenance.json`, and JSON containing `config`, `namespace`, and the exact server `command`. Database receipts, executable hashes and configuration determine the persistent results namespace, because upstream ticket IDs alone do not encode that provenance. Both `/ticket/msa` and `/ticket/pair` work; environmental pairing stays disabled as in the published server configuration. Template retrieval includes selected A3M profiles and current/obsolete mmCIF coordinates. Keep raw result tarballs, generated `msa.sh`/`pair.sh`, template bundles and model-native prepared files: row ordering, insertions, chain mapping and templates are part of any parity comparison. [Official configuration](https://github.com/sokrypton/ColabFold/blob/c35de0221f4d297a39edf4cf292ba2832e321edc/MsaServer/config.json).
 
-Export `MMSEQS_NUM_THREADS` before generating configuration and starting the backend; the effective count and relevant OpenMP environment also participate in the namespace and provenance. Release 18 reads this variable and then calls `omp_set_num_threads`, so `OMP_NUM_THREADS` alone does not replace it. The managed recipe limits API searches to 16 threads; index creation may use a separate thread count. [Pinned parameter handling](https://github.com/soedinglab/MMseqs2/blob/8cc5ce367b5638c4306c2d7cfc652dd099a4643f/src/commons/Parameters.cpp).
+Export `MMSEQS_NUM_THREADS` before generating configuration and starting the backend; the effective count and relevant OpenMP environment also participate in the namespace and provenance. Release 18 reads this variable and then calls `omp_set_num_threads`, so `OMP_NUM_THREADS` alone does not replace it. The mapped profile fixes API searches at four threads; the resident profile uses 16. Both also set `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT` and `OMP_DYNAMIC=FALSE`. Index creation keeps its separate thread count. [Pinned parameter handling](https://github.com/soedinglab/MMseqs2/blob/8cc5ce367b5638c4306c2d7cfc652dd099a4643f/src/commons/Parameters.cpp).
 
 Offline checks: `python3 -m unittest discover -s machines/head/msa -p test_databases.py -v`. Local miniature UniRef/environmental fixtures also exercised conversion-only, repeated conversion and subsequent full CPU indexing with the exact pinned binary: both reported two representatives and two members totaling 152 residues each, and full hashes confirmed that indexing left every converted file unchanged. The unmodified official API separately completed environmental/unpaired and paired searches and template retrieval on a miniature full index. These fixtures validate runtime compatibility only; they do not create a production receipt, qualify the full corpus, or establish public/private scientific parity. Production installation and target-specific comparison remain required.
 

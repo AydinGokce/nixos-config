@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded, read-only Verda capacity evidence for the native Console.
+"""Bounded, read-only MSA and separate Verda GPU capacity evidence.
 
 The credential-loading wrapper supplies the same API credentials as dc. Only
 the four GETs below are made through its API client (plus OAuth authentication).
@@ -16,7 +16,10 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 ENDPOINTS = {
@@ -74,7 +77,7 @@ def availability(value, names):
     return result, broken
 
 
-def snapshot(responses, selector, policy, *, current=None):
+def snapshot(responses, selector, *, current=None, profile=None):
     current = time.time() if current is None else current
     result = {'schema': 1, 'state': 'error', 'observed_epoch': current,
               'msa_available': None, 'msa_message': 'MSA availability is unknown; provider evidence is incomplete',
@@ -85,7 +88,7 @@ def snapshot(responses, selector, policy, *, current=None):
     try:
         require(isinstance(catalog, list) and len(catalog) <= LIMIT)
         selector['evidence'](catalog, empty, empty)
-        require(policy['MAX_PRICE'] == selector['MAX_HOURLY'])
+        profile = selector['search_profile'](selector['DEFAULT_PROFILE'] if profile is None else profile)
     except Exception:
         result['error'] = 'Verda instance catalog is unavailable or invalid'
         return result
@@ -109,14 +112,15 @@ def snapshot(responses, selector, policy, *, current=None):
         try:
             chosen = selector['choose'](catalog,
                 [{'location_code': region, 'availabilities': offers['regular'][region]}],
-                [{'location_code': region, 'availabilities': offers['spot'][region]}])
+                [{'location_code': region, 'availabilities': offers['spot'][region]}], profile=profile)
             result['msa_available'] = True
             result['msa_message'] = ('Compatible private MSA capacity is available in ' + region
                 + (' (CPU worker)' if chosen['cpu'] else ''))
         except selector['Unavailable']:
             result['msa_available'] = False
             result['msa_message'] = (f'No {region} worker meets the private MSA policy: '
-                f'{selector["MIN_GIB"]} GiB RAM, supported image and ${selector["MAX_HOURLY"]}/hour ceiling')
+                f'{selector["memory_requirement"](profile)}, supported image and '
+                f'${selector["MAX_HOURLY"]}/hour ceiling')
         except Exception:
             errors.append('MSA selection')
     else:
@@ -133,31 +137,17 @@ def snapshot(responses, selector, policy, *, current=None):
                 if count == 0:
                     continue
                 try:
-                    ram = selector['numeric'](row['memory']['size_in_gigabytes'], 'host RAM')
-                    price = selector['numeric'](row['spot_price' if contract == 'spot' else 'price_per_hour'],
-                                                'hourly price', positive=True)
+                    offer = selector['assess_offer'](row, spot=contract == 'spot',
+                                                     location=region, profile=profile)
                     gpu_memory = (row.get('gpu_memory') or {}).get('size_in_gigabytes')
                     gpu_memory = (None if gpu_memory is None else
                         selector['numeric'](gpu_memory, 'GPU memory') * GB_TO_GIB)
-                    one = [{'location_code': selector['LOCATION'], 'availabilities': [kind]}]
-                    selected = policy['choose']([row], one if contract == 'regular' else empty,
-                                                one if contract == 'spot' else empty)
-                    eligible = region == selector['LOCATION'] and selected is not None
-                    if eligible:
-                        reason = 'Eligible for private MSA'
-                    elif region != selector['LOCATION']:
-                        reason = 'Private MSA databases are in ' + selector['LOCATION']
-                    elif ram * GB_TO_GIB < selector['MIN_GIB']:
-                        reason = f'Requires at least {selector["MIN_GIB"]} GiB host RAM'
-                    elif price > selector['MAX_HOURLY']:
-                        reason = f'Exceeds ${selector["MAX_HOURLY"]}/hour MSA ceiling'
-                    else:
-                        reason = 'Worker family or required image is unsupported for private MSA'
                     result['gpus'].append({'instance_type': kind,
                         'name': row['name'] if label(row.get('name')) else kind,
                         'location': region, 'contract': contract, 'gpu_count': count,
-                        'gpu_memory_gib': gpu_memory, 'ram_gib': ram * GB_TO_GIB,
-                        'price_hourly': price, 'msa_eligible': eligible, 'reason': reason})
+                        'gpu_memory_gib': gpu_memory, 'ram_gib': offer['conservative_gib'],
+                        'price_hourly': offer['price_per_hour'], 'msa_eligible': offer['eligible'],
+                        'reason': offer['reason']})
                 except Exception:
                     errors.append('GPU metadata')
     result['gpus'].sort(key=lambda row: (row['location'], not row['msa_eligible'],
@@ -170,7 +160,7 @@ def snapshot(responses, selector, policy, *, current=None):
     return result
 
 
-def collect(api, selector, policy, *, current=None):
+def collect(api, selector, *, current=None, profile=None):
     """One shared API client deduplicates OAuth using its existing auth lock."""
     def request(endpoint):
         try:
@@ -180,20 +170,65 @@ def collect(api, selector, policy, *, current=None):
     with ThreadPoolExecutor(max_workers=len(ENDPOINTS)) as executor:
         futures = {key: executor.submit(request, endpoint) for key, endpoint in ENDPOINTS.items()}
         responses = {key: future.result() for key, future in futures.items()}
-    return snapshot(responses, selector, policy, current=current)
+    return snapshot(responses, selector, current=current, profile=profile)
+
+
+def aws_snapshot():
+    """The AWS helper owns quota, asset and retained-pool readiness checks."""
+    helper = shutil.which('bio-aws-msa')
+    require(helper is not None)
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+        completed = subprocess.run([helper, 'capacity'], stdout=output, stderr=error,
+                                   timeout=18, check=False)
+        require(completed.returncode == 0 and output.tell() <= 1024*1024)
+        output.seek(0)
+        value = json.loads(output.read(1024*1024+1))
+    require(isinstance(value, dict) and value.get('provider') == 'aws'
+            and value.get('msa_provider') == 'aws' and value.get('region') == 'us-east-1')
+    return value
+
+
+def verda_snapshot(tools):
+    require(bool(os.environ.get('DATACRUNCH_CLIENT_ID')) and bool(os.environ.get('DATACRUNCH_CLIENT_SECRET')))
+    selector = runpy.run_path(str(tools / 'msa/worker.py'))
+    client = runpy.run_path(str(tools / 'dc-budget.py'))['API']()
+    return collect(client, selector)
+
+
+def combined(aws, verda):
+    """Verda prediction inventory cannot override the selected AWS MSA status."""
+    if aws is None:
+        aws = {'schema': 1, 'state': 'error', 'observed_epoch': time.time(),
+               'msa_available': None, 'msa_message': 'AWS CPU MSA availability is unknown; provider check failed',
+               'msa_provider': 'aws', 'compute_kind': 'cpu', 'region': 'us-east-1', 'cpus': [],
+               'error': 'AWS CPU capacity check is unavailable'}
+    result = dict(aws)
+    result['gpus'] = [] if verda is None else verda.get('gpus', [])
+    if verda is None or verda.get('state') != 'ready':
+        result['gpu_error'] = 'Verda GPU inventory is unavailable or incomplete; AWS MSA status is independent'
+    return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tools-root', type=Path, default=Path('/etc/bio-tools'))
     args = parser.parse_args(argv)
-    try:
-        require(bool(os.environ.get('DATACRUNCH_CLIENT_ID')) and bool(os.environ.get('DATACRUNCH_CLIENT_SECRET')))
-        selector = runpy.run_path(str(args.tools_root / 'msa/worker.py'))
-        policy = runpy.run_path(str(args.tools_root / 'msa/build-queue.py'))
-        client = runpy.run_path(str(args.tools_root / 'dc-budget.py'))['API']()
-        value = collect(client, selector, policy)
-    except Exception:
+    def observed(function, *arguments):
+        try:
+            return function(*arguments)
+        except Exception:
+            return None
+    selected = os.environ.get('BIO_MSA_PROVIDER', 'verda')
+    if selected == 'aws':
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            aws = executor.submit(observed, aws_snapshot)
+            verda = executor.submit(observed, verda_snapshot, args.tools_root)
+            value = combined(aws.result(), verda.result())
+    elif selected == 'verda':
+        value = observed(verda_snapshot, args.tools_root)
+    else:
+        value = None
+    if value is None:
         value = {'schema': 1, 'state': 'error', 'observed_epoch': time.time(),
                  'msa_available': None, 'msa_message': 'MSA availability is unknown; provider check failed',
                  'gpus': [], 'error': 'Verda capacity check is unavailable'}

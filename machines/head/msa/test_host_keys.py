@@ -25,7 +25,8 @@ class HostKeyTests(unittest.TestCase):
         self.root=self.fixture.root
         self.job_path=self.root/'job'/'job.json';self.job_path.parent.mkdir()
         self.known=self.job_path.parent/'worker-known-hosts'
-        self.job={'job':'msa-fixture','model':'msa','instance':'exact-worker','ip':'192.0.2.1'}
+        self.job={'job':'msa-fixture','model':'msa','instance':'exact-worker','ip':'192.0.2.1',
+                  'search_profile':client.search_profile.resolve(client.search_profile.MAPPED_PROFILE)}
 
     def key(self,algorithm='ed25519',ip='192.0.2.1'):
         raw=(ip+' '+KEYS[algorithm]+'\n').encode()
@@ -103,6 +104,24 @@ class HostKeyTests(unittest.TestCase):
              mock.patch.object(client.subprocess,'check_output') as ssh,self.assertRaisesRegex(ValueError,'bytes changed'):
             client.register_launch(state,self.job_path,'/mnt/bio-shared/runs/msa-fixture/out',self.known)
         ssh.assert_not_called();self.assertFalse((state/'launch.json').exists())
+
+    def test_new_registration_rejects_missing_or_different_profile_before_provider_or_ssh(self):
+        self.key()
+        with mock.patch.object(client.shutil,'which',return_value=str(self.fixture.submit)), \
+             mock.patch.object(client.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'','')):
+            started=client.start(self.fixture.args)
+        state=Path(started['state'])
+        for profile in (None, client.search_profile.resolve(client.search_profile.LEGACY_PROFILE)):
+            with self.subTest(profile=profile):
+                if profile is None: self.job.pop('search_profile',None)
+                else: self.job['search_profile']=profile
+                session.atomic(self.job_path,self.job)
+                with mock.patch.object(client,'provider_check') as provider, \
+                     mock.patch.object(client.subprocess,'check_output') as ssh, \
+                     self.assertRaisesRegex(ValueError,'search profile'):
+                    client.register_launch(state,self.job_path,'/mnt/bio-shared/runs/msa-fixture/out',self.known)
+                provider.assert_not_called();ssh.assert_not_called()
+                self.assertFalse((state/'launch.json').exists())
 
 
 if __name__=='__main__':unittest.main()

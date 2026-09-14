@@ -92,6 +92,9 @@ def normalize_status(value, current=None):
               'controls': controls, 'shutdown_reason': text(value.get('shutdown_reason'), 'Unknown'),
               'active_request_id': value.get('active_request_id') if progress.label(value.get('active_request_id'), 128) else None,
               'queued_requests': value.get('queued_requests') if type(value.get('queued_requests')) is int and 0 <= value['queued_requests'] <= 100000 else None}
+    if value.get('provider_name') in ('aws', 'verda'):
+        result['provider_name'] = value['provider_name']
+        result['compute_kind'] = 'cpu'
     for key in ('shutdown_epoch', 'hard_deadline_epoch', 'idle_deadline_epoch'):
         result[key] = epoch(value.get(key))
     if type(value.get('idle_credit_seconds')) is int and 0 <= value['idle_credit_seconds'] <= 86400:

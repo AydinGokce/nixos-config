@@ -53,13 +53,13 @@ class Clock:
 
 class AuthorizedCeilingTests(unittest.TestCase):
     def test_environment_cannot_raise_authorized_project_ceiling(self):
-        for requested, expected in (("500", 500), ("750", 750), ("1000000", 750)):
+        for requested, expected in (("500", 500), ("750", 750), ("1000", 1000), ("1000000", 1000)):
             with self.subTest(requested=requested), patch.dict(os.environ, DC_BUDGET_CEILING=requested):
                 self.assertEqual(dc.Controller(None, None).ceiling, expected)
 
-    def test_default_is_750_without_resetting_the_ledger(self):
+    def test_default_is_1000_without_resetting_the_ledger(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(dc.Controller(None, None).ceiling, 750)
+            self.assertEqual(dc.Controller(None, None).ceiling, 1000)
 
 
 class FakeAPI:
@@ -166,13 +166,16 @@ class BudgetTests(unittest.TestCase):
 
     def allocated_database(self, profile="rfaa"):
         ident = "11234567-89ab-4cde-8fab-0123456789ab"
-        name = ("bio-rfaa-db-" if profile == "rfaa" else "bio-colabfold-db-") + "a" * 32
+        prefixes = {"rfaa": "bio-rfaa-db-", "colabfold": "bio-colabfold-db-",
+                    "msa-block-cache": "bio-msa-block-cache-"}
+        name = prefixes[profile] + "a" * 32
         row = volume(ident, self.clock(), .9, name=name)
-        row.update(type="NVMe_Shared", is_os_volume=False)
+        row.update(type="NVMe" if profile == "msa-block-cache" else "NVMe_Shared", is_os_volume=False)
         self.api.volumes.append(row)
         intent = dict(version=1, profile=profile, status="allocated", volume_id=ident, name=name,
                       verified=dict(id=ident, name=name, created_at=row["created_at"], base_hourly_cost=.9))
-        filename = "rfaa-storage-intent.json" if profile == "rfaa" else "msa-storage-intent.json"
+        filename = {"rfaa": "rfaa-storage-intent.json", "colabfold": "msa-storage-intent.json",
+                    "msa-block-cache": "msa-block-cache-intent.json"}[profile]
         path = self.store.root / filename
         path.write_text(json.dumps(intent))
         path.chmod(0o600)
@@ -189,6 +192,73 @@ class BudgetTests(unittest.TestCase):
             token = next(iter(state["jobs"]))
             state["jobs"][token]["status"] = "closed"
         return token, self.api.trash[0]
+
+    def cache_launch(self, status="launching"):
+        row, intent = self.allocated_database("msa-block-cache")
+        lease_id, generation = "c" * 32, "d" * 64
+        intent.update(cache_id="e" * 32, cache_generation=generation,
+                      filesystem_uuid="31234567-89ab-4cde-8fab-0123456789ab")
+        lease = dict(intent, schema=1, lease_id=lease_id, mode="serve", status=status,
+                     worker_name="bio-msa-cache-" + lease_id)
+        for name, value in (("msa-block-cache-intent.json", intent),
+                            ("msa-block-cache-lease.json", dict(schema=1, lease_id=lease_id)),
+                            ("msa-block-cache-lease-" + lease_id + ".json", lease)):
+            path = self.store.root / name
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+        args = self.args()
+        args.volume.append(row["id"])
+        args.name = lease["worker_name"]
+        args.loc = "FIN-02"
+        return row, args, {"BIO_MSA_CACHE_LEASE_ID": lease_id, "BIO_MSA_CACHE_GENERATION": generation}
+
+    def test_cache_lease_is_durable_before_post_and_cache_survives_worker_cleanup(self):
+        row, args, environment = self.cache_launch()
+        self.init()
+        request = self.api.request
+        observed = []
+
+        def inspect_post(method, path, body=None):
+            if method == "POST" and path == "/instances":
+                job = next(iter(self.state()["jobs"].values()))
+                self.assertEqual(job["cache_lease_id"], environment["BIO_MSA_CACHE_LEASE_ID"])
+                self.assertEqual(job["cache_generation"], environment["BIO_MSA_CACHE_GENERATION"])
+                self.assertIn(row["id"], job["volumes"])
+                observed.append(path)
+            return request(method, path, body)
+
+        with patch.dict(os.environ, environment), patch.object(self.api, "request", side_effect=inspect_post):
+            ident = self.c.launch(args)
+            self.c.remove(ident)
+        self.assertEqual(observed, ["/instances"])
+        self.assertIn(row, self.api.volumes)
+
+    def test_cache_volume_cannot_launch_without_exact_launching_lease(self):
+        row, args, environment = self.cache_launch(status="bound")
+        self.init()
+        with patch.dict(os.environ, environment):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "active cache lease"):
+                self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_same_cache_lease_cannot_launch_two_workers(self):
+        row, args, environment = self.cache_launch()
+        self.init()
+        with patch.dict(os.environ, environment):
+            self.c.launch(args)
+            with self.assertRaisesRegex(dc.LaunchBlocked, "still owns or may own"):
+                self.c.launch(args)
+        self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 1)
+
+    def test_cache_generation_mismatch_refuses_before_reservation(self):
+        row, args, environment = self.cache_launch()
+        self.init()
+        environment["BIO_MSA_CACHE_GENERATION"] = "f" * 64
+        with patch.dict(os.environ, environment):
+            with self.assertRaisesRegex(dc.LaunchBlocked, "mismatched cache lease"):
+                self.c.launch(args)
+        self.assertFalse(self.state()["jobs"])
 
     def test_baseline_includes_head_shared_os_and_old_closed_gpu_and_trash(self):
         (Path(self.tmp.name) / "ledger.tsv").write_text("old\tGPU\t2\t96400\t100000\n")
@@ -891,6 +961,42 @@ class BudgetTests(unittest.TestCase):
         resource = self.state()["resources"]["volume:" + row["id"]]
         self.assertTrue(resource["active"])
         self.assertAlmostEqual(resource["cost"], .9)
+        with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
+            self.c.launch(self.args())
+
+    def test_block_cache_allocation_keeps_cost_through_inventory_gap(self):
+        row, _ = self.allocated_database("msa-block-cache")
+        self.api.volumes.remove(row)
+        self.init()
+        state = self.state()
+        self.assertAlmostEqual(state["resources"]["volume:" + row["id"]]["cost"], .9)
+        self.assertEqual(state["expected_database_volumes"][row["id"]]["profile"], "msa-block-cache")
+        with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
+            self.c.launch(self.args())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_uncertain_block_cache_allocation_blocks_new_compute(self):
+        self.init()
+        path = self.store.root / "msa-block-cache-intent.json"
+        path.write_text(json.dumps(dict(version=1, profile="msa-block-cache", status="uncertain")))
+        path.chmod(0o600)
+        with self.assertRaisesRegex(dc.LaunchBlocked, "Unresolved msa-block-cache"):
+            self.c.launch(self.args())
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_canonical_database_retirement_cannot_retire_block_cache(self):
+        row, _ = self.allocated_database("msa-block-cache")
+        self.init()
+        self.api.volumes.remove(row)
+        receipt = self.store.root / "msa-storage.json"
+        receipt.write_text(json.dumps(dict(version=1, profile="colabfold", volume_id=row["id"],
+            name=row["name"], created_at=row["created_at"], status="complete",
+            completed_at=stamp(self.clock()), retention="persistent", expires_at=None)))
+        receipt.chmod(0o600)
+        self.c.watchdog()
+        allocation = self.state()["expected_database_volumes"][row["id"]]
+        self.assertNotIn("retired_at", allocation)
+        self.assertTrue(self.state()["resources"]["volume:" + row["id"]]["active"])
         with self.assertRaisesRegex(dc.LaunchBlocked, "storage accounting is unresolved"):
             self.c.launch(self.args())
 

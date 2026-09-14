@@ -1,10 +1,14 @@
 # Private panel preparation
 
-`bio-msa panel` prepares a frozen list of cases on one temporary large-RAM worker.
-It starts the pinned official API once, uses the complete read-only database
-snapshot, then runs the existing native model clients serially. It performs no
-model inference. Public MSA remains the prediction default; a successful private
-preparation does not establish public-server or prediction-quality equivalence.
+`bio-msa panel` is a standalone **Verda** operator route; it is not redirected by
+`BIO_MSA_PROVIDER=aws`. It prepares a frozen list on one temporary worker with the
+resident profile by default. For ordinary AWS preparation, use the shared
+`bio-msa prepare` session described in [SESSIONS.md](SESSIONS.md).
+
+The panel starts the pinned official API once, uses the complete read-only
+snapshot, then runs model clients serially without inference. The Console's MSA
+default is private; low-level `bio-submit` defaults to public. Successful private
+preparation alone does not establish public-server or prediction equivalence.
 
 ```json
 {
@@ -26,23 +30,29 @@ rejected. The complete manifest is checked before rental, again after waiting fo
 the MSA lock, and on the worker with its canonical SHA256.
 
 ```sh
-bio-msa panel --json frozen-panel.json --timeout 21600
+BIO_MSA_SEARCH_PROFILE=resident-768gib-v1 bio-msa panel --json frozen-panel.json --timeout 21600
 # Explicitly select a sufficiently large host if the default CPU type is unavailable:
 bio-msa panel --json frozen-panel.json --worker TYPE --spot --timeout 21600
 # Install a complete corpus, then prepare this panel on the same worker:
 bio-msa install --json frozen-panel.json --worker TYPE --spot --timeout 21600
 ```
 
-Automatic selection chooses available FIN-02 x86 compute with at least 768 GiB
-RAM and an instance-price ceiling of $13/hour, including spot offers. `--spot`
-restricts selection to spot offers; `--worker TYPE` selects a specific host type.
-The launch rechecks the price and project budget, and the full-search guard
-requires at least 768 GiB available RAM on the worker. The full
-`.msa-databases.json` receipt and configured active
-storage are required before rental. Pinned model environments must already exist
-on shared storage. No sequence database, index, search setting or target is reduced
-to fit a smaller worker. Panel jobs use the existing independent MSA submission
-lock and managed budget, storage tracking and worker cleanup.
+Automatic selection uses FIN-02 x86 hosts meeting the resident profile's
+768 GiB advertised and actual available-RAM requirement, at no more than
+$13/hour. `--spot` restricts offers; `--worker TYPE` selects a host explicitly.
+The launcher still rechecks price, storage identity and the combined project
+budget. Installation always retains the resident build profile.
+
+The `mapped-128gb-v1` profile is explicit opt-in and **unqualified**. Its complete
+NFS-backed editor trial exceeded the native one-hour limit. Its four-thread,
+96 GiB/no-swap and report-only mechanics remain available for separately reviewed
+experiments; they are not a production performance claim. Neither profile
+reduces databases, indexes, sensitivity, templates or requested targets.
+
+The full `.msa-databases.json` receipt and configured active storage are required
+before rental. Pinned model environments must exist on shared storage. Panel jobs
+retain the independent MSA submission lock, managed budget, storage tracking and
+temporary-worker cleanup.
 
 Combined `install --json` validates the entire manifest before rental even when
 the full database receipt does not exist yet. It retains the install worker's

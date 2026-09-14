@@ -1,12 +1,18 @@
-# Resumable private database build queue
+# Resumable Verda database build queue
+
+This is the retained Verda installation/validation operator route, not the AWS
+shared-session launcher. `BIO_MSA_PROVIDER=aws` does not redirect its timer or
+commands. AWS reuses the published database via a separate bounded initial copy;
+ordinary preparation then uses [managed AWS sessions](SESSIONS.md).
 
 `build-queue.py` provides one bounded head-side tick for the full ColabFold
 installation. It waits for completed head downloads, selects currently available
 large-memory compute, and runs the existing guarded `bio-msa` wrapper. It does
 not allocate storage, remove volumes, switch the prediction default, or claim
 public/private scientific parity. Persistent storage continues billing under its
-explicit retention policy; the existing $500 controller guards new compute and
-reservations rather than deleting persistent data at that amount.
+explicit retention policy. The combined **$1,000 gross AWS + Verda** guard
+accounts for compute, persistent storage and reservations. Promotional credits do
+not reduce this accounting or authorize deleting retained data at the ceiling.
 
 The helper is implemented and tested offline. The head configuration ships its
 wrapper and 15-minute timer; `ConditionPathExists` makes ticks inert until an
@@ -100,7 +106,11 @@ A tick first reconciles any previous attempt. New work then requires all of:
   `ubuntu-24.04-cuda-12.8-open-docker` for GPU. Unsupported images, ARM/Grace and
   confidential variants are excluded. The price must be at most $13/hour.
   Advertised memory is only admission evidence: the worker still requires
-  768 GiB of actual `MemAvailable` before installation/search.
+  768 GiB of actual `MemAvailable` before installation and its attached validation
+  searches. This queue retains the resident build profile; ordinary searches and
+  sessions now also default to the resident profile. The unqualified mapped
+  128 GB experiment requires explicit opt-in and is never selected as an
+  automatic fallback.
 
 A missing source archive is allowed **only** if its exact owning promoted
 component passes the existing complete structural/file validator, its internal

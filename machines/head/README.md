@@ -141,42 +141,56 @@ and confidentiality requirements explicitly.
 
 ## Private MSA preparation
 
-The separate 3000 GiB ColabFold volume has persistent retention. It holds the
-complete classic CPU sequence databases, pairing taxonomy and template data.
-`bio-msa install` provisions that snapshot on a transient high-memory worker;
-installation is explicit and must finish before preparation can succeed.
+The canonical complete CPU sequence/pairing/template snapshot remains on the
+persistently retained 3000 decimal GB Verda database volume. AWS uses a verified
+copy of all published components on a separate retained 1300 GiB gp3 volume;
+it does not rebuild smaller indexes or substitute a different corpus.
+
+With `BIO_MSA_PROVIDER=aws`, shared preparation uses a 1 TiB AWS CPU instance in
+`us-east-1`, normally `r6a.32xlarge`, with the `resident-768gib-v1` profile:
+16 native threads, one API job, serial stages and full-index prefetch. Readiness
+requires all full index pages to be resident. The configured gp3 throughput and
+IOPS are limits, not measured MSA performance. A separate managed one-time
+preparation copies and validates database/runtime assets before normal sessions.
 
 ```bash
-# On the head, reuse one bounded search session across requests:
-bio-msa session start --timeout 14400
-bio-msa prepare --model openfold3 --fasta protein.fasta --timeout 14400
+# On the configured head, reuse one bounded CPU session across requests:
+bio-msa session start --timeout 7200
+bio-msa prepare --model openfold3 --fasta protein.fasta --timeout 7200
 bio-submit openfold3 --fasta protein.fasta --msa-backend private
 # From the updated workstation wrapper:
 bio-fold boltz2 --fasta protein.fasta --msa-backend private --render
 bio-fold rf3 --assembly enzyme-oligo --msa-backend private --render
 ```
 
-Private submissions first run preparation against a localhost-only MSA API.
-The default selects available FIN-02 compute with at least 768 GiB RAM and an
-instance price of at most $13/hour, including spot offers. Searches still use the
-pinned CPU pipeline when the available host also has GPUs. `--worker TYPE`
-overrides selection, and `--spot` restricts it to spot offers. The fresh launch
-quote and total project budget are checked separately before allocation.
-An active managed MSA session serves successive preparation requests without
-reloading the database indexes. Without a session, the existing per-request
-preparation path still applies. Submissions retain and validate their input
-bundle, then use compatible resident prediction workers or temporary GPUs.
-See [managed MSA sessions](msa/SESSIONS.md) for idle shutdown, index residency and
-explicit stop commands. An explicit private
-request fails if preparation is unavailable; it never switches to the public
-server. Retained bundles bind their exact sequences, native inputs and database
-provenance. The full RFAA HHsuite pipeline stays separate.
+Normal AWS sessions have a two-hour hard lifetime and a 15-minute idle timeout.
+Shutdown **stops** the owned instance while retaining its OS/database disks for
+the next start. Stopped compute loses RAM, so index prefetch repeats; storage
+remains billable. Worker metadata and exact completed request outputs are copied
+to the head before the original native manifest validation. The public/private
+choice and scientific frontend stay unchanged; private requests never silently
+switch to a public service. Predictions continue on the independent Verda GPUs.
+
+The production default is resident on the older Verda routes too. The optional
+`mapped-128gb-v1` profile is **unqualified** and explicit opt-in: short-query raw
+outputs matched, but the 1,726-aa editor hit the native one-hour timeout over NFS
+under its 96 GiB cap. Existing sessions retain their frozen policy. Standalone
+`bio-msa install/convert/panel/serve` still use Verda; changing the session provider
+does not redirect these operator commands. See [managed MSA sessions](msa/SESSIONS.md)
+for stop/start, residency, output transfer and exact recovery semantics.
+
+Retained prepared bundles bind exact sequences, native inputs and database
+provenance; reusing one starts no MSA worker. A working transport or unit test
+does not prove full AWS runtime readiness or scientific equivalence. Large-editor
+and complex benchmarks remain separate from infrastructure setup. The full RFAA
+HHsuite pipeline stays separate.
 RF3 searches all distinct protein-chain sequences together, retains the raw
 unpaired and paired responses, and binds each chain's A3M to its typed input.
 Server-paired rows receive explicit synthetic RF3 pairing keys; these are
 documented as pairing identifiers, not biological taxonomy annotations.
 
-Public remains the default until comparisons establish suitable alignment,
+Public remains the low-level `bio-submit` default; the Console selects private.
+Comparisons must separately establish suitable alignment,
 pairing, template-feature and prediction quality. Miniature API tests and native
 bundle replay tests establish compatibility only. The current matched quality
 panel has 12 single chains of 88–502 residues. It does not qualify large base
@@ -252,20 +266,26 @@ teardown; the timer is not an absolute billing cutoff.
 
 ## Budget and cleanup
 
-The configured ceiling is $750. `dc` estimates observed compute **and storage**
-spending, imports the previous GPU ledger, reserves each job's maximum duration,
+The configured ceiling is **$1,000 combined gross AWS + Verda spending**. AWS
+promotional/investor credits do not subtract from the guard. The coordinated
+controllers account for compute, persistent storage and outstanding reservations.
+`dc` retains the previous GPU ledger and reserves each job's maximum duration,
 and requires a healthy watchdog before launching. The watchdog runs every minute
 and deletes expired managed workers. Worker OS disks are included in confirmed
-cleanup; shared databases and the head are protected.
+cleanup; shared databases and the head are protected. AWS cleanup instead stops
+the exact persistent worker, verifies its stopped state and releases compute
+reservation while retaining its OS/database IDs; its watchdog enforces the
+managed lease and accounts for continuing storage.
 The head waits three minutes after confirmed managed cleanup before another
 launch, across submission controllers. `DC_LAUNCH_COOLDOWN_SECONDS` overrides
 this delay; removal and watchdog actions never wait on it.
 
 This is an estimated guard, not a provider-enforced billing cap. Protected
 persistent storage continues billing after GPU work stops, so expensive databases
-have an explicit retention policy. Both databases are retained persistently at
-approximately $41.42/day combined; the head and expanded runtime storage bring
-the observed background to about $44.22/day before temporary compute. See [BUDGET.md](BUDGET.md) for formulas,
+have an explicit retention policy. The earlier Verda-only background observation was about $44.22/day, including
+the retained databases, head and runtime storage. The AWS copy adds its own
+persistent gp3/OS costs, even while stopped; consult the current combined ledger
+for the current total rather than treating the older estimate as a quote. See [BUDGET.md](BUDGET.md) for formulas,
 limitations and recovery commands. Automatic account top-ups do not reset spending.
 
 ```bash

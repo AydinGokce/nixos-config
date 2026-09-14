@@ -9,6 +9,7 @@ from unittest import mock
 
 import session
 import session_client as client
+import search_profile
 
 
 class ClientTests(unittest.TestCase):
@@ -18,9 +19,10 @@ class ClientTests(unittest.TestCase):
         for name in ["msa/session.py", "msa/session_client.py", "msa/panel.py", "msa/prepared.py", "msa/server.py",
                      "msa/databases.py", "recipes/_common.sh", "rf3/msa.py"]:
             path = self.tools/name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(name)
+        self.tools.joinpath('msa/search_profile.py').write_bytes(Path(search_profile.__file__).read_bytes())
         self.submit = self.root/"bio-submit"; self.submit.write_text("fixture")
         self.args = argparse.Namespace(root=self.root/"sessions", tools=self.tools, timeout=300,
-            idle_seconds=60, warm="report", worker=None, spot=False)
+            idle_seconds=60, warm="report", worker=None, spot=False, search_profile=search_profile.MAPPED_PROFILE)
 
     def tearDown(self): self.tmp.cleanup()
 
@@ -36,10 +38,78 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(intent['timeout_seconds'], 300)
         self.assertEqual(intent['capacity_wait_seconds'], 7200)
         self.assertIn("--setenv=DC_MAX_INSTANCE_HOURLY=13.0", command)
+        self.assertEqual(intent['search_profile'], search_profile.resolve(search_profile.MAPPED_PROFILE))
+        self.assertIn('--setenv=BIO_MSA_SEARCH_PROFILE=mapped-128gb-v1', command)
+        self.assertIn('--setenv=BIO_MSA_SESSION_WARM=report', command)
+        self.assertFalse(any('MemoryMax' in word or 'MemorySwapMax' in word for word in command))
         self.assertEqual(command[-6:], [str(self.submit), "msa", "--sub", "session", "--timeout", "300"])
         self.tools.joinpath("msa/session.py").write_text("changed later")
         self.assertNotEqual(session.sources(self.tools), intent["sources"])
         self.assertEqual(session.sources(state/"tools"), intent["sources"])
+
+    def test_unconfigured_verda_session_uses_resident_prefetch(self):
+        del self.args.search_profile
+        self.args.warm = None
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(client.shutil, 'which', return_value=str(self.submit)), \
+             mock.patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([],0,'','')):
+            result = client.start(self.args)
+        intent = session.load(Path(result['state'])/'intent.json')
+        self.assertEqual(intent['search_profile'], search_profile.resolve(search_profile.LEGACY_PROFILE))
+        self.assertEqual(intent['warm'], 'prefetch')
+
+    def test_mapped_prefetch_and_unbound_tools_fail_before_registration(self):
+        for change in ('prefetch', 'missing', 'changed'):
+            with self.subTest(change=change):
+                self.args.warm = 'prefetch' if change == 'prefetch' else None
+                path = self.tools/'msa/search_profile.py'
+                if change == 'missing': path.unlink()
+                if change == 'changed': path.write_text('different policy')
+                with mock.patch.object(client.subprocess, 'run') as run, self.assertRaises(ValueError):
+                    client.start(self.args)
+                run.assert_not_called()
+                self.assertFalse((self.args.root/'active.json').exists())
+
+    def test_explicit_resident_profile_preserves_prefetch(self):
+        self.args.search_profile = search_profile.LEGACY_PROFILE
+        self.args.warm = 'prefetch'
+        with mock.patch.object(client.shutil, 'which', return_value=str(self.submit)), \
+             mock.patch.object(client.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            result = client.start(self.args)
+        intent = session.load(Path(result['state'])/'intent.json')
+        self.assertEqual(intent['search_profile'], search_profile.resolve(search_profile.LEGACY_PROFILE))
+        self.assertIn('--setenv=BIO_MSA_SESSION_WARM=prefetch', run.call_args.args[0])
+
+    def test_readiness_must_match_profile_but_old_frozen_intents_remain_valid(self):
+        state, intent, launch = self.registered()
+        launch['boot_id'] = 'boot-fixture'
+        launch['provider']['reservation_deadline'] = 10000
+        session.atomic(state/'launch.json', launch)
+        ready = dict(session_id=intent['session_id'], owner=dict(boot_id=launch['boot_id']),
+                     output=launch['remote_out'], endpoint='http://127.0.0.1:8080', deadline_epoch=9000,
+                     sources=intent['sources'], tools='/tmp/tools', state='/tmp/bio-msa-session-'+intent['session_id'])
+        live = dict(LoadState='loaded', ActiveState='active', InvocationID=launch['invocation_id'])
+        for candidate in (None, search_profile.resolve(search_profile.LEGACY_PROFILE), search_profile.resolve(search_profile.MAPPED_PROFILE)):
+            with self.subTest(candidate=candidate):
+                if candidate is None: ready.pop('search_profile', None)
+                else: ready['search_profile'] = candidate
+                session.atomic(Path(launch['remote_out'])/'session-ready.json', ready)
+                with mock.patch.object(client, 'unit_state', return_value=live), \
+                     mock.patch.object(client, 'provider_check'), mock.patch.object(client, 'ssh', return_value=['ssh']), \
+                     mock.patch.object(client.subprocess, 'check_output', return_value=json.dumps(ready)) as remote:
+                    if candidate == search_profile.resolve(search_profile.MAPPED_PROFILE):
+                        self.assertEqual(client.ready_session(self.args.root)[3], ready)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'search profile'): client.ready_session(self.args.root)
+                        remote.assert_not_called()
+        intent.pop('search_profile'); ready.pop('search_profile')
+        session.atomic(state/'intent.json', intent)
+        session.atomic(self.args.root/'active.json', dict(session_id=intent['session_id'], intent_sha256=session.sha(state/'intent.json')))
+        session.atomic(Path(launch['remote_out'])/'session-ready.json', ready)
+        with mock.patch.object(client, 'unit_state', return_value=live), mock.patch.object(client, 'provider_check'), \
+             mock.patch.object(client, 'ssh', return_value=['ssh']), \
+             mock.patch.object(client.subprocess, 'check_output', return_value=json.dumps(ready)):
+            self.assertEqual(client.ready_session(self.args.root)[3], ready)
 
     def test_uncertain_start_is_not_repeated(self):
         with mock.patch.object(client.shutil, "which", return_value=str(self.submit)), \

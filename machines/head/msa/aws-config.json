@@ -1,0 +1,17 @@
+{
+  "account_id": "147997164104",
+  "region": "us-east-1",
+  "availability_zone": "us-east-1a",
+  "subnet_id": "subnet-01781b5f42aeb9ee6",
+  "vpc_id": "vpc-0038045915e5853cf",
+  "ssh_cidr": "31.56.109.100/32",
+  "ssh_key": "/root/.ssh/datacrunch_ed25519",
+  "instance_type": "r6a.32xlarge",
+  "ami": "ami-025d99823a4caad37",
+  "source_database": "/mnt/bio-msa-databases/colabfold",
+  "source_manifest_sha256": "f71e020640757b7fdba3b2dab95cc94e3f2a18effbece74e1ee09c4274b20534",
+  "source_receipt_sha256": "da72d2ee17cad30680d23c0e6f76fdb298a8fd611f130b283f91d6dd1bf645af",
+  "runtime_plan": "/var/lib/bio-runs/msa-128gb-loader-20260913/qualification/build-06/runtime-plan.json",
+  "runtime_plan_sha256": "600fd9dc9344326573cc11e958ce72982a7321522d524d3f1bb281545be27dca",
+  "runtime_archive": "/mnt/bio-shared/runtime-packages/v1/3f56849c9bb0e8786ebaa9a1d91020d18b9df797163e71eb36d4e27d2be4ae35/runtime.tar.zst"
+}

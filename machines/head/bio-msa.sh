@@ -18,49 +18,61 @@ case "${1:---help}" in
     shift; exec python3 /etc/bio-tools/msa/prepared.py compare "$@" ;;
   --help|-h)
     cat <<'HELP'
-bio-msa install [--worker TYPE --timeout SECONDS]
-bio-msa install --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
-bio-msa convert [--worker TYPE --timeout SECONDS]
-bio-msa panel --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
-bio-msa session start [--worker TYPE --timeout SECONDS --idle-seconds SECONDS --warm report|prefetch|lock --capacity-wait-seconds SECONDS]
+bio-msa session start [--provider aws|verda --worker TYPE --timeout SECONDS]
 bio-msa session status
 bio-msa session stop
 bio-msa prepare --model openfold3|boltz2|protenix --fasta FILE [--require-session]
 bio-msa prepare --model rf3 --json CHAIN_QUERIES.json [--require-session]
+bio-msa install [--json MANIFEST.json --worker TYPE --timeout SECONDS --spot]
+bio-msa convert [--worker TYPE --timeout SECONDS]
+bio-msa panel --json MANIFEST.json [--worker TYPE --timeout SECONDS --spot]
 bio-msa serve [--worker TYPE --timeout SECONDS]
 bio-msa status
 bio-msa compare --help
 
-Private preparation starts a budgeted session when needed and waits for its
-database API to become ready. Concurrent requests share that session; existing
-prepared inputs remain reusable without starting a worker. --require-session
-disables automatic startup. Private preparation never falls back to a public
-endpoint. A session keeps its full database API alive across requests until its
-idle or lifetime limit (defaults: 15 minutes idle, two hours maximum);
-the database volume persists after its managed worker is removed. Index prefetch
-is the default; report only measures residency, while lock requires sufficient
-RAM headroom and a suitable memory-lock limit. Readiness records the actual mode.
+BIO_MSA_PROVIDER=aws routes shared session/prepare to the managed AWS CPU pool
+in us-east-1. It requires resident-768gib-v1, full index prefetch, 16 native
+threads and on-demand compute. Normal limits are two hours maximum and 15 minutes
+idle. Idle shutdown STOPS the exact EC2 instance and retains its OS/database
+disks; the next start reloads RAM. Persistent disks continue billing while stopped.
+One-time database/runtime copying uses a separately bounded bio-aws-msa prepare
+operation under an exact supervised head unit; it is not a native search session.
 
-Installation and standalone panel/serving use temporary high-memory compute. Conversion
-defaults to CPU.16V.64G and creates sequence databases without full search indexes;
-it does not make the databases ready for preparation. Database volumes and
-prepared inputs remain after compute is removed. To prepare then predict:
+Private preparation joins one shared session, starts it when needed, and waits
+for verified readiness. --require-session disables automatic startup. Existing
+prepared inputs need no worker. Private never falls back to a public endpoint.
+Completed AWS outputs are copied to the head before original native validation.
+Uncertain transfers or launch replies retain their exact request for recovery.
+
+The production profile default is resident-768gib-v1 for Verda too. The explicit
+--search-profile mapped-128gb-v1 experiment is UNQUALIFIED: the large-editor NFS
+trial hit the native one-hour timeout. It uses 4 threads, a 96 GiB cap, no swap
+and --warm report, with complete indexes paged on demand. AWS rejects that profile.
+An existing session retains its original provider/profile and is not reconfigured.
+
+install/convert/panel/serve remain standalone Verda operator routes even when
+BIO_MSA_PROVIDER=aws. Resident install/search requires 768 GiB available RAM.
+Conversion defaults to CPU.16V.64G and creates databases without full search indexes;
+it does not make the databases ready for preparation.
+FIN-02 selection enforces supported hosts/images, a $13/hour instance ceiling,
+current quotes and the combined gross $1000 AWS+Verda project guard. Credits do
+not reduce counted spending. --spot applies only to Verda. An AWS --worker
+override must match r6a.32xlarge; neither bypasses budget or guest validation.
+
+Verda selection may wait up to two hours with 30-second pauses before renting.
+--capacity-wait-seconds 0..7200 on session start/prepare changes that window
+(0 checks once). Waiting never extends the paid worker or native search limits.
+A confirmed pre-allocation failure can recover on a later request; uncertain
+allocations keep their registration. The native API limits each ticket to one hour.
+
+To prepare then predict:
   bio-submit openfold3 --fasta FILE --msa-backend private
-The command-line default remains public; Bio Workbench defaults to private MSA.
-Session start, installation and standalone serving select FIN-02 compute with at least 768 GiB RAM and a
-$13/hour instance-price ceiling, including spot capacity. --spot selects only
-spot offers; --worker TYPE overrides automatic selection. dc rechecks the quote
-and total project budget before launch. Conversion keeps its smaller CPU default.
-Automatic selection waits up to two hours for capacity, with a 30-second pause
-between checks; no compute is rented while waiting. --capacity-wait-seconds on
-session start/prepare overrides the wait (0..7200; 0 checks once). Private preparation
-and Console supervision allow this unpaid wait in addition to the work timeout;
-native search limits and paid worker lifetimes stay unchanged. Confirmed pre-allocation failures recover
-on the next request; uncertain allocations retain their registration for review.
-Panel preparation keeps one private API worker for all manifest targets, runs
-them serially without inference, and records failures without dropping targets.
-Install with --json prepares that panel after installation on the same worker,
-using the remaining original timeout. Plain install only installs databases.
+GC Protein Engineering Console defaults to private MSA; low-level bio-submit
+keeps its public default. Verda GPU prediction workers have separate lifetimes.
+Standalone panel runs targets serially without inference and retains failures.
+install --json prepares its full panel on the same worker within the original
+timeout. Plain install only installs databases.
+
 HELP
     ;;
   *) echo 'bio-msa: unknown command; use --help' >&2; exit 2 ;;

@@ -45,6 +45,14 @@ class WorkerApiTests(unittest.TestCase):
         self.api = API(self.store, 'harrison', worker_config=self.config)
         self.params = {'request_key': uid(), 'target': deepcopy(TARGET)}
 
+    def test_selected_provider_is_displayed_without_exposing_internal_ownership(self):
+        for provider in ('aws', 'verda'):
+            value = observed(provider_name=provider, account='private', db_volume_id='private')
+            result = worker_api.normalize_status(value, current=1000)
+            self.assertEqual(result['provider_name'], provider)
+            self.assertEqual(result['compute_kind'], 'cpu')
+            self.assertNotIn('account', result); self.assertNotIn('db_volume_id', result)
+
     def test_status_is_read_only_bounded_and_omits_internal_information(self):
         value = observed(provider_credentials='secret', argv=['private'], remote_out='/private')
         with patch('workbench.worker_api.invoke', return_value=value) as call, patch('workbench.worker_api.time.time', return_value=1000):

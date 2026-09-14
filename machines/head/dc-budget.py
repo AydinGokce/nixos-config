@@ -45,7 +45,7 @@ import uuid
 
 # Project-wide authorization, cumulative across folding, MD, head and storage.
 # Environment settings may make a launch more conservative, never raise this.
-PROJECT_BUDGET_CEILING = 750.0
+PROJECT_BUDGET_CEILING = 1000.0
 
 
 class Error(RuntimeError):
@@ -391,6 +391,67 @@ def reconcile(state, inventory, now):
     state["last_inventory"] = now
 
 
+def aws_summary(state, now, persistent_hours=24):
+    """Include the AWS controller's locked subledger without querying either API.
+
+    Missing observations never stop billing. Only the AWS controller records a
+    confirmed stop/deletion; the Verda inventory cannot retire AWS resources.
+    Credits are intentionally excluded until their applicability is verified.
+    """
+    empty = dict(spent=0.0, hourly=0.0, reserved=0.0, background_reserve=0.0,
+                 background_hourly=0.0, uncertain=False)
+    aws = state.get('aws')
+    if aws is None:
+        return empty
+    if (not isinstance(aws, dict) or aws.get('version') != 1
+            or not re.fullmatch(r'[0-9]{12}', aws.get('account_id', ''))
+            or not isinstance(aws.get('resources'), dict)
+            or not isinstance(aws.get('reservations'), dict)):
+        raise Error('AWS accounting is invalid; refusing to omit cloud spending')
+    result = dict(empty)
+    horizon = persistent_hours * 3600
+    managed = set()
+    for token, job in aws['reservations'].items():
+        if job.get('status') not in {'pending', 'running', 'uncertain', 'closed'}:
+            raise Error('AWS reservation state is invalid')
+        if job['status'] == 'closed':
+            continue
+        created = number(job.get('created'), 'AWS reservation creation')
+        deadline = number(job.get('deadline'), 'AWS reservation deadline')
+        rate = number(job.get('compute_hourly'), 'AWS compute quote')
+        storage = number(job.get('pending_storage_hourly'), 'AWS unbound storage quote')
+        left = max(0, deadline - now)
+        horizon = max(horizon, left)
+        result['reserved'] += rate * left / 3600
+        result['uncertain'] |= job['status'] in {'pending', 'uncertain'} or deadline <= now
+        if job.get('instance_id'):
+            key = 'instance:' + job['instance_id']
+            if key not in aws['resources']:
+                raise Error('AWS reservation lacks its retained compute cost record')
+            managed.add(key)
+        else:
+            # Creation/start may have succeeded before its response arrived.
+            result['spent'] += rate * max(0, now - created) / 3600
+            result['hourly'] += rate
+        result['spent'] += storage * max(0, now - created) / 3600
+        result['hourly'] += storage
+        result['background_hourly'] += storage
+    for key, row in aws['resources'].items():
+        if row.get('kind') not in {'instance', 'volume'} or type(row.get('active')) is not bool:
+            raise Error('AWS resource accounting is invalid')
+        result['spent'] += number(row.get('cost'), 'AWS accrued resource cost')
+        rate = number(row.get('rate'), 'AWS resource rate')
+        if row['active']:
+            result['spent'] += rate * max(0, now - number(row.get('last'), 'AWS billing timestamp')) / 3600
+            result['hourly'] += rate
+            if key not in managed:
+                result['background_hourly'] += rate
+                if row['kind'] == 'instance':
+                    result['uncertain'] = True
+    result['background_reserve'] = result['background_hourly'] * horizon / 3600
+    return result
+
+
 def summary(state, now, persistent_hours=24):
     spent = state["historical_correction"]
     active_rate = 0.0
@@ -419,9 +480,12 @@ def summary(state, now, persistent_hours=24):
                 spent += rate * max(0, now - job["created"]) / 3600
     background_rate = sum(row["rate"] for key, row in state["resources"].items()
                           if row["active"] and key not in managed)
-    return {"spent": spent, "hourly": active_rate, "reserved": reserved,
-            "background_reserve": background_rate * horizon / 3600,
-            "background_hourly": background_rate, "uncertain": uncertain,
+    aws = aws_summary(state, now, horizon / 3600)
+    return {"spent": spent + aws['spent'], "hourly": active_rate + aws['hourly'],
+            "reserved": reserved + aws['reserved'],
+            "background_reserve": background_rate * horizon / 3600 + aws['background_reserve'],
+            "background_hourly": background_rate + aws['background_hourly'],
+            "uncertain": uncertain or aws['uncertain'], "aws": aws,
             "storage_uncertain": bool(state.get("unresolved_database_volumes") or
                                       state.get("database_allocation_errors"))}
 
@@ -519,6 +583,7 @@ def allocation_intents(root):
     for profile, filename, override in (
         ("rfaa", "rfaa-storage-intent.json", "RFAA_STORAGE_INTENT"),
         ("colabfold", "msa-storage-intent.json", "MSA_STORAGE_INTENT"),
+        ("msa-block-cache", "msa-block-cache-intent.json", "MSA_BLOCK_CACHE_INTENT"),
     ):
         path = Path(os.environ.get(override, str(Path(root) / filename)))
         try:
@@ -560,6 +625,11 @@ def remember_database_allocations(state, root, now):
         errors.append(str(exc))
     for ident, allocation in expected.items():
         profile = allocation["profile"]
+        if profile == "msa-block-cache":
+            # The cache has its own allocation identity. Canonical database
+            # retirement receipts never retire this separate block volume;
+            # normal provider reconciliation still observes its deletion.
+            continue
         filename, override = (("rfaa-storage.json", "RFAA_STORAGE_RECEIPT") if profile == "rfaa"
                               else ("msa-storage.json", "MSA_STORAGE_RECEIPT"))
         try:
@@ -622,6 +692,43 @@ def check_storage_lifetime(root, volumes, now):
             raise LaunchBlocked(f"Invalid {label} storage receipt: {exc}") from None
         if blocked:
             raise LaunchBlocked(f"{label} database storage is expired or retiring; launch refused")
+
+
+def cache_launch_context(root, args, state):
+    """Bind a block-cache lease to its reservation before the provider POST.
+
+    Called under the existing launch-admission and budget locks. A closed
+    rejected attempt may retry the same lease; a live or uncertain attempt
+    prevents a second VM from trying to attach the single-writer volume.
+    """
+    intent = allocation_intents(root).get("msa-block-cache")
+    lease_id = os.environ.get("BIO_MSA_CACHE_LEASE_ID")
+    if intent is None or intent.get("volume_id") not in args.volume:
+        if lease_id:
+            raise LaunchBlocked("MSA cache lease supplied without its allocated volume")
+        return {}
+    generation = os.environ.get("BIO_MSA_CACHE_GENERATION", "")
+    try:
+        if (intent["status"] != "allocated" or not re.fullmatch(r"[0-9a-f]{32}", lease_id or "")
+                or not re.fullmatch(r"[0-9a-f]{64}", generation)
+                or generation != intent["cache_generation"]):
+            raise ValueError("missing or mismatched cache lease identity")
+        active = private_json(Path(root) / "msa-block-cache-lease.json")
+        lease = private_json(Path(root) / ("msa-block-cache-lease-" + lease_id + ".json"))
+        if (not active or active.get("schema") != 1 or active.get("lease_id") != lease_id
+                or not lease or lease.get("schema") != 1 or lease.get("lease_id") != lease_id
+                or lease.get("status") != "launching" or lease.get("mode") not in {"populate", "serve"}
+                or args.name != "bio-msa-cache-" + lease_id or lease.get("worker_name") != args.name
+                or args.loc != "FIN-02"
+                or any(lease.get(key) != intent.get(key) for key in
+                       ("cache_id", "volume_id", "filesystem_uuid", "cache_generation"))):
+            raise ValueError("active cache lease does not authorize this worker")
+        if any(job.get("status") != "closed" and intent["volume_id"] in job.get("volumes", [])
+               for job in state["jobs"].values()):
+            raise ValueError("a managed worker still owns or may own the cache volume")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise LaunchBlocked(f"Invalid MSA block-cache launch: {exc}") from None
+    return dict(cache_lease_id=lease_id, cache_generation=generation)
 
 
 class Controller:
@@ -726,6 +833,7 @@ class Controller:
                         if launch_not_before(state, cooldown) > now:
                             continue  # Cleanup advanced while admission waited.
                         check_storage_lifetime(self.store.root, args.volume, now)
+                        cache_context = cache_launch_context(self.store.root, args, state)
                         if cost_scope is not None:
                             committed_cost, previous_limit = scoped_job_cost(state, cost_scope, now)
                             effective_limit = min(maximum_job_cost, previous_limit) if previous_limit is not None else maximum_job_cost
@@ -737,6 +845,7 @@ class Controller:
                         reserve(state, token, rate, os_rate, args.max_hours, now,
                                 self.ceiling, self.margin, self.persistent_hours)
                         state["jobs"][token]["volumes"] = list(args.volume)
+                        state["jobs"][token].update(cache_context)
                         if maximum_job_cost is not None:
                             state['jobs'][token].update(max_cost_usd=maximum_job_cost,
                                                        quoted_reservation_cost_usd=reservation_cost)
