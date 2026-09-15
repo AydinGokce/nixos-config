@@ -137,6 +137,11 @@ editable names and colors, visibility toggles, removal and Undo/Redo. Colors app
 to every rendering style and the viewer's sequence strip. They are saved with
 each structure tab, so duplicate tabs can use independent domain colors.
 
+Enabled annotations number the residues above the sequence strip, starting at 1
+for each annotation. Numbering follows the visible annotation color where layers
+overlap and counts included structure residues across all of that annotation's
+ranges. Hover a residue to see its original structure identifier as well.
+
 Click a residue in the structure or sequence, then Shift-click another to select
 the inclusive range in that protein chain. **Create annotation…** opens the name
 and color editor with those positions prefilled. Clicking in 3D also centers that

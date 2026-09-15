@@ -301,6 +301,77 @@ fn sequence_scroll_area<R>(
     })
 }
 
+struct SequenceNumbering {
+    font: egui::FontId,
+    width: f32,
+    number_height: f32,
+    button_height: f32,
+}
+
+impl SequenceNumbering {
+    fn new(ui: &egui::Ui, largest_position: usize) -> Self {
+        let font = egui::FontId::monospace(egui::TextStyle::Small.resolve(ui.style()).size);
+        let number =
+            ui.painter()
+                .layout_no_wrap(largest_position.to_string(), font.clone(), Color32::WHITE);
+        let letter = ui.painter().layout_no_wrap(
+            "M".into(),
+            egui::TextStyle::Monospace.resolve(ui.style()),
+            Color32::WHITE,
+        );
+        Self {
+            font,
+            width: (number.size().x + 4.)
+                .max(letter.size().x + 2. * ui.spacing().button_padding.x)
+                .max(9.),
+            number_height: number.size().y,
+            button_height: (letter.size().y + 2. * ui.spacing().button_padding.y)
+                .max(ui.spacing().interact_size.y)
+                .max(17.),
+        }
+    }
+}
+
+fn sequence_residue_button(
+    ui: &mut egui::Ui,
+    button: egui::Button<'_>,
+    numbering: Option<&SequenceNumbering>,
+    annotation: Option<domain_state::ResidueAnnotation<'_>>,
+) -> egui::Response {
+    let Some(numbering) = numbering else {
+        return ui.add(button);
+    };
+    ui.allocate_ui_with_layout(
+        Vec2::new(
+            numbering.width,
+            numbering.number_height + ui.spacing().item_spacing.y + numbering.button_height,
+        ),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            let (rect, response) = ui.allocate_exact_size(
+                Vec2::new(numbering.width, numbering.number_height),
+                egui::Sense::hover(),
+            );
+            if let Some(annotation) = annotation {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    annotation.position.to_string(),
+                    numbering.font.clone(),
+                    // Keep ordinals readable even for dark custom domain colors.
+                    ui.visuals().text_color(),
+                );
+                response.on_hover_text(format!(
+                    "{} · annotation residue {} of {} (resolved structure residues)",
+                    annotation.layer.label, annotation.position, annotation.length,
+                ));
+            }
+            ui.add_sized([numbering.width, numbering.button_height], button)
+        },
+    )
+    .inner
+}
+
 struct StructureTabs<'a> {
     views: &'a mut BTreeMap<usize, ui_views::View>,
     loading: &'a BTreeMap<usize, String>,
@@ -512,6 +583,14 @@ impl TabViewer for StructureTabs<'_> {
         });
         let mut sequence_pick = None;
         let scroll_target = view.selection_range.take_scroll_target();
+        let annotations = view.domains.residue_annotations(&view.molecule);
+        let numbering = annotations
+            .iter()
+            .zip(&view.molecule.residues)
+            .filter(|(_, residue)| view.chains[residue.chain])
+            .filter_map(|(annotation, _)| annotation.map(|annotation| annotation.position))
+            .max()
+            .map(|largest_position| SequenceNumbering::new(ui, largest_position));
         sequence_scroll_area(
             ui,
             egui::ScrollArea::horizontal().id_salt(("sequence", *slot)),
@@ -538,28 +617,43 @@ impl TabViewer for StructureTabs<'_> {
                         } else {
                             view.molecule.chains[residue.chain].color
                         };
-                        let response = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(residue.letter.to_string())
-                                        .monospace()
-                                        .color(text_color),
-                                )
-                                .fill(if hotspot {
-                                    Color32::from_rgb(145, 66, 31)
-                                } else if let Some(color) = domain {
-                                    // Selection keeps its outline without hiding the
-                                    // annotation underneath a cleared hotspot.
-                                    color
-                                } else if selected {
-                                    ui.visuals().selection.bg_fill
-                                } else {
-                                    ui.visuals().widgets.inactive.bg_fill
-                                })
-                                .min_size(Vec2::new(9., 17.))
-                                .selected(selected),
+                        let annotation = annotations[residue_index];
+                        let response = sequence_residue_button(
+                            ui,
+                            egui::Button::new(
+                                RichText::new(residue.letter.to_string())
+                                    .monospace()
+                                    .color(text_color),
                             )
-                            .on_hover_text(residue.key.to_string());
+                            .fill(if hotspot {
+                                Color32::from_rgb(145, 66, 31)
+                            } else if let Some(color) = domain {
+                                // Selection keeps its outline without hiding the
+                                // annotation underneath a cleared hotspot.
+                                color
+                            } else if selected {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                ui.visuals().widgets.inactive.bg_fill
+                            })
+                            .min_size(Vec2::new(9., 17.))
+                            .selected(selected),
+                            numbering.as_ref(),
+                            annotation,
+                        )
+                        .on_hover_text(
+                            if let Some(annotation) = annotation {
+                                format!(
+                                    "{}\n{} · annotation residue {} of {}",
+                                    residue.key,
+                                    annotation.layer.label,
+                                    annotation.position,
+                                    annotation.length,
+                                )
+                            } else {
+                                residue.key.to_string()
+                            },
+                        );
                         if scroll_target.as_ref() == Some(&residue.key) {
                             scroll_rect = Some(response.rect);
                         }
@@ -789,6 +883,7 @@ mod tests {
         time: f64,
         count: usize,
         width: f32,
+        numbered: bool,
     }
 
     impl StripHarness {
@@ -807,6 +902,7 @@ mod tests {
                 time: 0.,
                 count,
                 width,
+                numbered: false,
             }
         }
 
@@ -827,6 +923,17 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let previous_floating = ui.spacing().scroll.floating;
                         let previous_wheel = ui.style().always_scroll_the_only_direction;
+                        let layer = domain_state::Layer {
+                            id: "test".into(),
+                            label: "Long domain".into(),
+                            color: domain_state::palette(0),
+                            enabled: true,
+                            spans: vec![],
+                            origin: Value::Null,
+                        };
+                        let numbering = self
+                            .numbered
+                            .then(|| SequenceNumbering::new(ui, self.count));
                         let scoped = sequence_scroll_area(
                             ui,
                             egui::ScrollArea::horizontal().id_salt("strip-wheel-proof"),
@@ -834,9 +941,18 @@ mod tests {
                                 let mut selected = None;
                                 let row = ui.horizontal(|ui| {
                                     for index in 0..self.count {
-                                        let response = ui.add(
+                                        let response = sequence_residue_button(
+                                            ui,
                                             egui::Button::new(RichText::new("A").monospace())
                                                 .min_size(Vec2::new(9., 17.)),
+                                            numbering.as_ref(),
+                                            self.numbered.then_some(
+                                                domain_state::ResidueAnnotation {
+                                                    layer: &layer,
+                                                    position: index + 1,
+                                                    length: self.count,
+                                                },
+                                            ),
                                         );
                                         if index == 300 {
                                             selected = Some(response.rect);
@@ -911,38 +1027,109 @@ mod tests {
     #[test]
     fn residue_strip_gutter_stays_below_complete_blocks_at_large_fonts_and_small_widths() {
         for (font, width, scale) in [(12., 380., 1.), (28., 180., 1.), (40., 220., 2.)] {
-            let mut harness = StripHarness::new(400, width, font, scale);
-            for _ in 0..4 {
-                let frame = harness.frame(vec![], false);
-                assert!(
-                    frame.row.bottom() + 10. <= frame.outer.bottom(),
-                    "{frame:?}"
-                );
-                assert!(frame.outer.height() >= frame.row.height() + 10.);
-                assert!(frame.outer.bottom() <= 160.);
+            for numbered in [false, true] {
+                let mut harness = StripHarness::new(1100, width, font, scale);
+                harness.numbered = numbered;
+                for _ in 0..4 {
+                    let frame = harness.frame(vec![], false);
+                    assert!(
+                        frame.row.bottom() + 10. <= frame.outer.bottom(),
+                        "{frame:?}"
+                    );
+                    assert!(frame.outer.height() >= frame.row.height() + 10.);
+                    assert!(frame.outer.bottom() <= 160.);
+                }
             }
         }
     }
 
     #[test]
     fn residue_strip_wheel_moves_after_one_3d_recenter_without_snapping_back() {
-        let mut harness = StripHarness::new(400, 380., 14., 1.);
-        harness.frame(vec![], false);
-        harness.frame(vec![], true);
-        for _ in 0..8 {
+        for numbered in [false, true] {
+            let mut harness = StripHarness::new(400, 380., 14., 1.);
+            harness.numbered = numbered;
             harness.frame(vec![], false);
+            harness.frame(vec![], true);
+            for _ in 0..8 {
+                harness.frame(vec![], false);
+            }
+            let centered = harness.frame(vec![], false);
+            assert!(centered.offset > 1000.);
+            let hover = egui::pos2(centered.outer.center().x, centered.row.center().y);
+            let moved = harness.wheel(hover, Vec2::new(0., -24.));
+            assert!(
+                moved.offset > centered.offset,
+                "centered={centered:?} moved={moved:?}"
+            );
+            for _ in 0..8 {
+                let later = harness.frame(vec![], false);
+                assert!(later.offset >= moved.offset);
+            }
         }
-        let centered = harness.frame(vec![], false);
-        assert!(centered.offset > 1000.);
-        let hover = egui::pos2(centered.outer.center().x, centered.row.center().y);
-        let moved = harness.wheel(hover, Vec2::new(0., -24.));
-        assert!(
-            moved.offset > centered.offset,
-            "centered={centered:?} moved={moved:?}"
-        );
-        for _ in 0..8 {
-            let later = harness.frame(vec![], false);
-            assert!(later.offset >= moved.offset);
+    }
+
+    #[test]
+    fn annotation_numbers_fit_above_each_residue_including_four_digits() {
+        for scale in [1., 2.] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let layer = domain_state::Layer {
+                id: "domain".into(),
+                label: "Example domain".into(),
+                color: domain_state::palette(0),
+                enabled: true,
+                spans: vec![],
+                origin: Value::Null,
+            };
+            let mut buttons = Vec::new();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let numbering = SequenceNumbering::new(ui, 1000);
+                    ui.horizontal(|ui| {
+                        for position in [Some(1), Some(999), Some(1000), None] {
+                            buttons.push(
+                                sequence_residue_button(
+                                    ui,
+                                    egui::Button::new(RichText::new("A").monospace()),
+                                    Some(&numbering),
+                                    position.map(|position| domain_state::ResidueAnnotation {
+                                        layer: &layer,
+                                        position,
+                                        length: 1000,
+                                    }),
+                                )
+                                .rect,
+                            );
+                        }
+                    });
+                });
+            });
+            for (index, number) in ["1", "999", "1000"].iter().enumerate() {
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|clipped| {
+                        if let egui::Shape::Text(text) = &clipped.shape {
+                            (text.galley.text() == *number).then_some(text)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("annotation number is painted");
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                let button = buttons[index];
+                assert!((rect.center().x - button.center().x).abs() <= 1.);
+                assert!(rect.bottom() <= button.top());
+                assert!(rect.left() >= button.left() && rect.right() <= button.right());
+            }
+            // Unannotated residues reserve a blank number row, keeping all
+            // amino-acid blocks aligned and leaving the gutter below them.
+            assert!(
+                buttons.windows(2).all(|pair| pair[0].top() == pair[1].top()
+                    && pair[0].bottom() == pair[1].bottom()
+                    && pair[0].right() < pair[1].left()),
+                "scale={scale} buttons={buttons:?}"
+            );
         }
     }
 

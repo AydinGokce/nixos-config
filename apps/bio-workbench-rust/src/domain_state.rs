@@ -22,6 +22,13 @@ pub struct Layer {
     pub origin: Value,
 }
 
+#[derive(Clone, Copy)]
+pub struct ResidueAnnotation<'a> {
+    pub layer: &'a Layer,
+    pub position: usize,
+    pub length: usize,
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Data {
@@ -135,6 +142,33 @@ impl Editor {
             }
         }
         colors
+    }
+
+    /// Number included structure residues before chain visibility or overlapping
+    /// layers are applied. The last enabled layer owns both color and numbering.
+    pub fn residue_annotations(
+        &self,
+        molecule: &scene::Molecule,
+    ) -> Vec<Option<ResidueAnnotation<'_>>> {
+        let mut annotations = vec![None; molecule.residues.len()];
+        for layer in self.data.layers.iter().filter(|layer| layer.enabled) {
+            let length = layer.spans.iter().map(|span| span.end - span.start).sum();
+            let mut position = 0;
+            for span in &layer.spans {
+                for annotation in annotations
+                    .get_mut(span.start..span.end)
+                    .unwrap_or_default()
+                {
+                    position += 1;
+                    *annotation = Some(ResidueAnnotation {
+                        layer,
+                        position,
+                        length,
+                    });
+                }
+            }
+        }
+        annotations
     }
 }
 
@@ -405,6 +439,96 @@ mod tests {
         assert_eq!(
             parse_ranges("2-3,1,3", 4).unwrap(),
             vec![Span { start: 0, end: 3 }]
+        );
+    }
+    #[test]
+    fn annotation_ordinals_cross_gaps_and_restore_after_same_color_overlap() {
+        let raw = [
+            ("ALA", 101, ' '),
+            ("CYS", 101, 'A'),
+            ("ASP", 101, 'B'),
+            ("GLU", 109, ' '),
+            ("PHE", 210, ' '),
+            ("GLY", 211, ' '),
+            ("HIS", 900, ' '),
+            ("ILE", 901, ' '),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, (name, number, insertion))| {
+            format!(
+                "ATOM  {:5}  CA  {:3} A{:4}{}   {:8.3}{:8.3}{:8.3}  1.00 20.00           C  \n",
+                i + 1,
+                name,
+                number,
+                insertion,
+                i as f32 * 3.8,
+                0.,
+                0.
+            )
+        })
+        .collect::<String>();
+        let molecule = scene::Molecule::parse(raw.as_bytes(), "pdb", "insertions").unwrap();
+        assert_eq!(molecule.residues.len(), 8);
+        assert_eq!(molecule.residues[1].key.sequence, "101");
+        assert_eq!(molecule.residues[1].key.insertion, "A");
+        assert_eq!(molecule.residues[2].key.sequence, "101");
+        assert_eq!(molecule.residues[2].key.insertion, "B");
+        assert_eq!(molecule.residues[6].key.sequence, "900");
+
+        let mut editor = Editor::new(&molecule, "bytes");
+        let mut data = editor.data.clone();
+        data.layers = vec![
+            manual_layer(&molecule, 0, "2-3,6-8", "underlying", palette(0)).unwrap(),
+            manual_layer(&molecule, 0, "3,6-7", "overlap", palette(0)).unwrap(),
+        ];
+        editor.replace(data, &molecule).unwrap();
+        let colors_with_overlap = editor.colors(&molecule);
+        {
+            let annotations = editor.residue_annotations(&molecule);
+            let labels: Vec<_> = annotations
+                .iter()
+                .map(|annotation| {
+                    annotation.map(|a| (a.layer.label.as_str(), a.position, a.length))
+                })
+                .collect();
+            assert_eq!(
+                labels,
+                vec![
+                    None,
+                    Some(("underlying", 1, 5)),
+                    Some(("overlap", 1, 3)),
+                    None,
+                    None,
+                    Some(("overlap", 2, 3)),
+                    Some(("overlap", 3, 3)),
+                    Some(("underlying", 5, 5)),
+                ]
+            );
+        }
+
+        let mut data = editor.data.clone();
+        data.layers[1].enabled = false;
+        editor.replace(data, &molecule).unwrap();
+        // Identical colors cannot determine which annotation owns the numbering.
+        assert_eq!(editor.colors(&molecule), colors_with_overlap);
+        let annotations = editor.residue_annotations(&molecule);
+        let labels: Vec<_> = annotations
+            .iter()
+            .map(|annotation| annotation.map(|a| (a.layer.label.as_str(), a.position, a.length)))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                None,
+                Some(("underlying", 1, 5)),
+                Some(("underlying", 2, 5)),
+                None,
+                None,
+                Some(("underlying", 3, 5)),
+                Some(("underlying", 4, 5)),
+                Some(("underlying", 5, 5)),
+            ]
         );
     }
     #[test]
