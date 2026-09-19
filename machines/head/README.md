@@ -266,7 +266,7 @@ teardown; the timer is not an absolute billing cutoff.
 
 ## Budget and cleanup
 
-The configured ceiling is **$1,000 combined gross AWS + Verda spending**. AWS
+The configured ceiling is **$1,500 combined gross AWS + Verda spending**. AWS
 promotional/investor credits do not subtract from the guard. The coordinated
 controllers account for compute, persistent storage and outstanding reservations.
 `dc` retains the previous GPU ledger and reserves each job's maximum duration,

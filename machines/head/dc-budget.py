@@ -45,7 +45,7 @@ import uuid
 
 # Project-wide authorization, cumulative across folding, MD, head and storage.
 # Environment settings may make a launch more conservative, never raise this.
-PROJECT_BUDGET_CEILING = 1000.0
+PROJECT_BUDGET_CEILING = 1500.0
 
 
 class Error(RuntimeError):

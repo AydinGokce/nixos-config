@@ -49,17 +49,17 @@ class BudgetTests(unittest.TestCase):
 
     def test_authorized_ceiling_preserves_prior_history(self):
         before = self.read()
-        self.assertEqual(self.reserve()['ceiling'], 1000)
+        self.assertEqual(self.reserve()['ceiling'], 1500)
         after = self.read()
         for key in before:
             if key != 'aws':
                 self.assertEqual(before[key], after[key])
         with patch.dict(os.environ, DC_BUDGET_CEILING='5000'):
-            self.assertEqual(module.Budget(self.root).ceiling, 1000)
+            self.assertEqual(module.Budget(self.root).ceiling, 1500)
 
     def test_shared_ceiling_counts_verda_history_and_aws_commitments(self):
         state = self.read()
-        state['historical_correction'] = 955
+        state['historical_correction'] = 1455
         self.budget.store.save(state)
         with self.assertRaisesRegex(module.Error, 'BUDGET HALT'):
             self.reserve()

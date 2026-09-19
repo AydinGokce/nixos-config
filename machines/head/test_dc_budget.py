@@ -53,13 +53,13 @@ class Clock:
 
 class AuthorizedCeilingTests(unittest.TestCase):
     def test_environment_cannot_raise_authorized_project_ceiling(self):
-        for requested, expected in (("500", 500), ("750", 750), ("1000", 1000), ("1000000", 1000)):
+        for requested, expected in (("500", 500), ("750", 750), ("1000", 1000), ("1500", 1500), ("1000000", 1500)):
             with self.subTest(requested=requested), patch.dict(os.environ, DC_BUDGET_CEILING=requested):
                 self.assertEqual(dc.Controller(None, None).ceiling, expected)
 
-    def test_default_is_1000_without_resetting_the_ledger(self):
+    def test_default_is_1500_without_resetting_the_ledger(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(dc.Controller(None, None).ceiling, 1000)
+            self.assertEqual(dc.Controller(None, None).ceiling, 1500)
 
 
 class FakeAPI:

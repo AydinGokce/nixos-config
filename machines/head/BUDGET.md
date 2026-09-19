@@ -1,14 +1,15 @@
 # Cloud spending guard
 
-The head's `dc` command enforces a **$750 estimated project spending ceiling**
+The head's `dc` command enforces a **$1,500 estimated project spending ceiling**
 for launches it manages. It reserves the complete requested runtime before
 creating an instance, and a systemd watchdog removes workers that exceed their
 deadline or reach the spending cutoff. **This is not a provider-enforced billing
 cap.** The persistent head and shared data are retained and keep accruing costs
 after temporary workers are removed.
 
-The authorization was raised to $750 on 2026-09-07 for the combined folding and
-MD project. Existing accrued spending and reservations were preserved. The
+The authorization was raised to $1,500 on 2026-09-18 for combined gross AWS
+and Verda spending across the folding and MD project. Existing accrued spending
+and reservations are preserved; promotional credits do not reduce the estimate. The
 `DC_BUDGET_CEILING` environment variable can lower this ceiling, but a larger
 value is clamped to the project authorization in the installed code.
 
@@ -55,7 +56,7 @@ See [Verda's storage deletion documentation](https://docs.verda.com/storage/dele
 
 ## Launch reservations and deadlines
 
-A launch proceeds only when this sum is **less than $750**:
+A launch proceeds only when this sum is **less than $1,500**:
 
 ```text
 estimated accrued project spending
@@ -197,7 +198,7 @@ before resolving it; the guard intentionally keeps that uncertainty blocking.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `DC_BUDGET_CEILING` | `750` | Lower cumulative ceiling; capped at the authorized $750 |
+| `DC_BUDGET_CEILING` | `1500` | Lower cumulative ceiling; capped at the authorized $1,500 |
 | `DC_BUDGET_MARGIN` | `10` | Unallocated safety cushion in USD |
 | `DC_PERSISTENT_RESERVE_HOURS` | `24` | Future head/storage/unmanaged resource allowance |
 | `DC_MAX_JOB_HOURS` | `4` | Default lifetime for direct `dc launch`/`dc run` |
@@ -210,7 +211,7 @@ Keep budget settings consistent between interactive launches and the systemd
 watchdog. A shell-only environment override does not configure an already
 running systemd service. The credentials file is sourced by both entry points;
 exported budget settings there are one way to share settings. Keep the approved
-$750 ceiling unless the user changes the spending authorization. No additional
+$1,500 ceiling unless the user changes the spending authorization. No additional
 API key is required for the guard.
 
 The estimate cannot reconstruct previously deleted resources that were never
@@ -226,4 +227,4 @@ can postpone enforcement. Persistent resources continue charging even after all
 workers have stopped, so retaining a large RFAA database needs its own storage
 and retention decision. The 24-hour reserve is an allowance for that ongoing
 cost, not an automatic storage expiration or a guarantee that the total invoice
-can never exceed $750.
+can never exceed $1,500.
