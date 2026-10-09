@@ -53,6 +53,12 @@ The cause of AWS's account restrictions remains unconfirmed.
   assignments that a stolen cached SSO token could assume. Provisioning is
   separate from the inspection/fixed-worker operator role; never broaden that
   role to AdministratorAccess, EC2FullAccess, IAM writes, PassRole, or SSM commands.
+- The user also authorized a separate `gc-provision` identity for resource
+  creation. Keep that identity and its cached SSO session separate from
+  `gc-migration`; scope each provisioning grant to reviewed resources, types,
+  Region, tags, and an absolute expiry. Do not grant provisioning to the routine
+  identity. Creation permission does not waive the existing budget, finite
+  operation limits, or independent shutdown requirements.
 
 See [the AWS operations runbook](docs/aws-operations.md) for the recovery sequence
 and the current implementation's limitations. User instructions in the session

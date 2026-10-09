@@ -1,10 +1,30 @@
 # Temporary access for the AWS migration
 
-Use a dedicated IAM Identity Center identity, permission set, and local profile.
+Use separate IAM Identity Center identities for routine access and provisioning.
 Do not create a root key, attach administrator access, or copy AWS credentials
 onto the transfer worker. Policy generation is offline. The separate inspection
 command below makes only its explicitly requested, bounded reads; it does not
 enable the disabled launchers or polling services.
+
+Create two users, `gc-migration` and `gc-provision`, each using an email address
+or alias you control. Accept their invitations and register MFA. Neither user
+belongs to administrator groups. The routine user's assignment below is ready
+now; leave the provisioning user unassigned until its resource-specific policy
+has been generated after inspection. A human administrator assigns these limited
+policies; the agent does not receive that administrator's credentials.
+
+If Identity Center is not enabled, use an **organization instance** with
+multi-account permissions enabled, even when assigning only this one account.
+Reuse an existing organization instance if present. For a new deployment, a
+single-Region instance avoids creating optional replication/KMS infrastructure.
+Enabling an organization instance on a standalone account creates an AWS
+organization; review the console's account-plan notice before enabling it.
+[AWS's enablement instructions](https://docs.aws.amazon.com/singlesignon/latest/userguide/enable-identity-center.html)
+explain the account and organization options. For the built-in Identity Center
+directory, MFA enrollment is configured under **Settings → Authentication →
+Multi-factor authentication**; require device registration at sign-in. If an
+external identity provider is already in use, manage the users and MFA there.
+[AWS's MFA instructions](https://docs.aws.amazon.com/singlesignon/latest/userguide/how-to-configure-mfa-device-enforcement.html)
 
 ## 1. Start with inspection only
 
@@ -24,13 +44,16 @@ federated MFA.
 On the local workstation, the user runs:
 
 ```sh
-aws configure sso --profile gc-migration
-aws sso login --profile gc-migration
+aws configure sso --profile gc-migration --no-browser
 ```
 
-Use the organization's actual SSO start URL and Identity Center Region. That
+Use SSO session name `gc-migration`, the organization's actual SSO start URL, and Identity Center Region. That
 Region may differ from the EC2 Region. Select account `147997164104`, role
 `GCMigrationInspect`, default CLI Region `us-east-1`, and output `json`.
+Open the printed authorization link in a private browser window on this same
+computer and sign in as `gc-migration`, not as the administrator. Configuration
+includes an SSO login; when it expires, log in again using
+`aws sso login --profile gc-migration --no-browser`.
 Credentials stay in the local CLI cache; do not paste them into chat or upload
 the SSO cache. [AWS documents this SSO configuration flow](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html).
 
@@ -72,15 +95,69 @@ checks. An offering listing does not establish live capacity. Tags, user data,
 raw responses, session identifiers, and credential values are omitted. This
 command does not start the retained legacy CPU instance or any other resource.
 
-## 2. Provision through the human-controlled console
+## 2. Use the separate provisioning identity
 
-After inspection, an administrator provisions the approved transfer worker and
-handles any required EBS enlargement or attachment outside this role. The intended
+The user authorized the agent to create migration resources through a separate
+limited identity. After inspection, generate a provisioning policy for the
+reviewed AMI, subnet, security group, SSH key, existing data volume, encryption key,
+Availability Zone and an absolute expiry. An administrator creates the custom
+`GCMigrationProvision` permission set with that policy, a one-hour role session,
+and no broad managed policies, and assigns it only to the **different**
+`gc-provision` user. Keep it unassigned until the generated policy is ready.
+
+Configure `aws configure sso --profile gc-provision --no-browser` with SSO session
+name `gc-provision`; open the authorization link in a separate private browser
+session and sign in as that user. Use the same portal, Identity Center Region,
+account and default EC2 Region, selecting `GCMigrationProvision`. Two profile or
+session names for the same SSO user would not isolate its role entitlements.
+
+The provisioning policy permits only the reviewed migration resources and
+limited EC2-mediated encryption-key use. It does not grant IAM administration,
+PassRole, Systems Manager commands, disk deletion, or unrestricted EC2 access.
+Launching a VM does permit guest code execution through user data and access to
+the disks attached to it. Revoke or let the provisioning write grant expire after
+bootstrap, and use the fixed-worker role for the copy. Do not treat the lack of
+SSM or snapshot permissions as protection against reading attached files.
+IAM restrictions on type, size and tags do **not** cap the number of
+resources or total spend. A bounded execution plan and budget still apply.
+Do not reuse this migration policy for future GPU/production provisioning; review
+the required resources for that separate task.
+
+[build_provisioning_policy.py](build_provisioning_policy.py) generates the policy
+offline. It requires a complete inspection from within the past hour, pins
+account `147997164104` and Region `us-east-1`, and accepts these explicit inputs:
+
+```text
+--inspection-report --ami-id --subnet-id --security-group-id --key-name
+--retained-volume-id --availability-zone --kms-key-arn --run-id
+--expires-at --output
+```
+
+AMI, SSH key and encryption-key identity need separate review; the initial five
+inspection calls do not verify all three. Use an approved existing KMS key,
+including the AWS-managed EBS key if appropriate; this role cannot create keys.
+All mutating permissions have an absolute UTC expiry within 24 hours of policy
+generation. New instances, interfaces and disks must carry exactly
+`GCMigration=<run-id>` and `Project=gc-migration` tags. Launch-created disks must
+be encrypted 20 GiB gp3; the separate blank data disk must be encrypted 3,072 GiB
+gp3, both capped at 3,000 IOPS and 125 MiB/s. Only this run's tagged worker may
+receive the new disks or the exact approved retained database disk.
+
+The generated policy is intended as an Identity Center **inline policy**. It is
+larger than the limit for one customer-managed IAM policy, so do not use it
+unchanged as a managed permissions boundary. No live IAM validation or AWS
+provisioning is performed by this generator. The checks use the official
+[EC2 action/resource matrix](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html),
+[tagging authorization rules](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/supported-iam-actions-tagging.html),
+and [EBS encryption requirements](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-encryption-requirements.html).
+
+The intended
 worker is **c7i.xlarge (4 vCPU, 8 GiB)** in `us-east-1`, in the existing data
 volume's Availability Zone, with the approved existing security group and SSH
 key. Confirm the actual instance ID and storage attachments before granting
-operator access. This bundle neither assumes provisioning is complete nor grants
-permission to perform it.
+routine operator access. This bundle does not assume provisioning is complete.
+Operations absent from the generated policy, such as detaching an old volume,
+remain deliberate administrator actions; do not broaden the routine identity.
 
 Give the copy worker **no IAM instance profile**. SSH file transfer requires no
 AWS API credentials. Stock Ubuntu/Amazon Linux images retrieve the launch SSH
@@ -123,7 +200,7 @@ access on the file-copy worker itself. Start/stop permission is not a call-count
 duration, or spending limit: use a reviewed finite job and independent shutdown
 mechanism before starting it.
 
-An administrator may also install the **same policy as a permissions boundary**
+An administrator may also install the **same fixed-worker operator policy as a permissions boundary**
 on the corresponding role (or configure the matching customer-managed boundary
 in the permission set). A boundary limits the permissions identity policies may
 grant; **it grants nothing by itself**. Keep the inline permission policy as well.
@@ -134,7 +211,7 @@ permissions. [AWS explains permissions boundaries](https://docs.aws.amazon.com/I
 
 ```sh
 cd machines/head/aws-migration
-python3 -m unittest test_policy test_inspection
+python3 -m unittest test_policy test_inspection test_provisioning_policy
 ```
 
 These checks enforce the action allowlist, Region/account/instance restrictions,

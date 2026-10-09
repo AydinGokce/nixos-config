@@ -13,7 +13,9 @@ the old recurring AWS watchdog is prohibited.
   changes have been made during this retirement work yet.
 - The latest independently verified library archive contains 287 immutable
   revisions and 1,422 files. A larger private local head backup is also underway;
-  that archive is not complete or restore-verified until its receipt says so.
+  that 7.84 GB archive has now passed full archive integrity, a 287-revision library
+  restore test, and Workbench artifact hash checks. This does not establish a
+  complete AWS copy or authorize source deletion.
 - The previous AWS MSA transfer is incomplete. Source hashing completed, but
   copying was only roughly 53% at the last retained observation. The separate
   21.61 GB runtime archive completed. Neither proves a complete MSA installation.
@@ -69,8 +71,11 @@ ledger and obtain a specific budget exception or updated ceiling before paid wor
    Its identity must have no administrator assignments. Do not fall back to the
    legacy static credentials. Make one bounded inspection, not a polling loop.
 2. Review the exact existing disks, attachments, quota, network, AMI and quote.
-   A human administrator performs one-time provisioning separately; the agent's
-   migration role does not receive creation, resize, IAM or command-execution powers.
+   The user authorized a separate limited `gc-provision` SSO identity for resource
+   creation. Generate its resource-specific, expiring policy after inspection;
+   the administrator assigns it separately. The routine migration identity does
+   not receive creation, resize, IAM or command-execution powers. Neither identity
+   receives administrator access or long-lived access keys.
 3. Generate the fixed-instance operator policy only after the actual ID is known.
    It permits only inspection and start/stop of that worker, not other instances.
 4. Transfer and inspect progress over SSH. An expiring SSO session need not stop
