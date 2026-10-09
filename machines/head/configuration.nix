@@ -55,13 +55,15 @@ in
     structureRenderer
     (pkgs.writeShellScriptBin "dc" ''
       export PATH=${lib.makeBinPath (with pkgs; [ curl jq openssh coreutils gawk util-linux gnugrep gnused python3 ])}''${PATH:+:$PATH}
+      # Never inherit a frozen pre-retirement helper from an old job environment.
+      export DC_HELPER=/etc/bio-tools/dc-budget.py
       # Let provider cleanup settle across all submission controllers.
       export DC_LAUNCH_COOLDOWN_SECONDS="''${DC_LAUNCH_COOLDOWN_SECONDS-180}"
       ${builtins.readFile ./dc.sh}
     '')
     (pkgs.writeShellScriptBin "bio-submit" ''
       export PATH=${lib.makeBinPath (with pkgs; [ rsync openssh coreutils gawk gnugrep gnused util-linux python3 gnutar gzip zstd ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       ${builtins.readFile ./bio-submit.sh}
     '')
@@ -72,7 +74,7 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-workbench" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       umask 077
       exec ${pkgs.python3}/bin/python3 /etc/bio-tools/workbench/cli.py "$@"
@@ -90,6 +92,7 @@ in
     (pkgs.writeShellScriptBin "bio-inference" ''
       set -euo pipefail
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd openssh rsync coreutils util-linux ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export DC_HELPER=/etc/bio-tools/dc-budget.py
       export BIO_INFERENCE_CONTROL_SOURCE=nfs.fin-02.datacrunch.io:/bio-shared-G523CVN6KYMH/inference-control
       for inference_arg in "$@"; do
         if [ "$inference_arg" = worker-start ]; then
@@ -107,6 +110,7 @@ in
     (pkgs.writeShellScriptBin "bio-rfaa-storage" ''
       set -euo pipefail
       export PATH=${lib.makeBinPath (with pkgs; [ python3 systemd util-linux coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
+      export DC_HELPER=/etc/bio-tools/dc-budget.py
       # Local receipt checks need no credentials; lifecycle operations use the
       # same private credential file as dc and never print its contents.
       case "''${1:-}" in
@@ -129,7 +133,7 @@ in
     '')
     (pkgs.writeShellScriptBin "bio-msa" ''
       export PATH=${lib.makeBinPath (with pkgs; [ python3 coreutils ])}:/run/current-system/sw/bin''${PATH:+:$PATH}
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       ${builtins.readFile ./bio-msa.sh}
     '')
@@ -151,9 +155,9 @@ in
       set -euo pipefail
       # Read provider capacity without opening a worker or changing its lease.
       # Credentials remain on the head and never enter the desktop RPC reply.
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
-      if [ -r "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}" ]; then
+      if [ "$BIO_MSA_PROVIDER" = verda ] && [ -r "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}" ]; then
         source "''${DC_CREDENTIALS_FILE:-/root/.config/datacrunch/credentials.env}"
         export DATACRUNCH_CLIENT_ID DATACRUNCH_CLIENT_SECRET
       fi
@@ -209,16 +213,17 @@ in
       export MSA_DB_VOLUME=${lib.escapeShellArg msaStorage.volumeId}
       export MSA_DB_NFS=${lib.escapeShellArg msaStorage.nfs}
       export MSA_DB_ROOT=/mnt/bio-msa-databases/colabfold
-      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-verda}"
+      export BIO_MSA_PROVIDER="''${BIO_MSA_PROVIDER:-aws}"
       export BIO_MSA_SEARCH_PROFILE="''${BIO_MSA_SEARCH_PROFILE:-mapped-prefetch-128gb-v1}"
       export BIO_MSA_DEFAULT_BACKEND=public
       export BIO_PUBLIC_MSA_LOCK=/mnt/bio-shared/coordination/public-msa.lock
     '';
   };
 
-  # The launcher refuses new jobs if this monitor stops running. It reconciles
-  # provider inventory/cost estimates and removes expired managed GPU workers.
+  # Verda is retired. Mask background account access and allocation queues;
+  # retained accounting and resource receipts remain available for migration.
   systemd.services.dc-budget-watchdog = {
+    enable = false;
     description = "Reconcile cloud spending and expire temporary compute";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -231,6 +236,7 @@ in
     };
   };
   systemd.timers.dc-budget-watchdog = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnBootSec = "30s";
@@ -240,6 +246,9 @@ in
   };
 
   systemd.services.bio-aws-msa-watchdog = {
+    # User prohibits unattended AWS polling. A disabled NixOS unit is masked,
+    # so neither reboots nor a stray start can restore the old minute loop.
+    enable = false;
     description = "Reconcile AWS MSA spending and stop expired CPU workers";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -251,6 +260,7 @@ in
     };
   };
   systemd.timers.bio-aws-msa-watchdog = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnBootSec = "30s";
@@ -262,6 +272,7 @@ in
   # No receipt means no work. Once an allocation is registered, the persistent
   # timer catches overdue storage after a reboot and retries incomplete cleanup.
   systemd.services.rfaa-storage-expiry = {
+    enable = false;
     description = "Expire the registered RFAA database volume";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -272,6 +283,7 @@ in
     };
   };
   systemd.timers.rfaa-storage-expiry = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnCalendar = "*-*-* *:*:00";
@@ -280,6 +292,7 @@ in
     };
   };
   systemd.services.msa-storage-expiry = {
+    enable = false;
     description = "Reconcile explicit retirement of ColabFold database storage";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -290,6 +303,7 @@ in
     };
   };
   systemd.timers.msa-storage-expiry = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnCalendar = "*-*-* *:*:00";
@@ -301,6 +315,7 @@ in
   # Explicit queue initialization freezes the requested panel and volume. Until
   # then the timer is inert; downloads, capacity and cleanup gate every rental.
   systemd.services.bio-msa-build-queue = {
+    enable = false;
     description = "Advance the registered private MSA database build and panel";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
@@ -314,6 +329,7 @@ in
     };
   };
   systemd.timers.bio-msa-build-queue = {
+    enable = false;
     wantedBy = [ "timers.target" ];
     timerConfig = {
       OnCalendar = "*-*-* *:00/15:00";
@@ -364,6 +380,8 @@ in
   ];
 
   systemd.services.bio-inference = {
+    # Preserve queued requests while their provider/runtime data is migrated.
+    enable = false;
     description = "Dispatch durable model requests and CPU postprocessing";
     restartTriggers = [ ./inference ];
     wantedBy = [ "multi-user.target" ];
@@ -403,13 +421,15 @@ in
   };
 
   systemd.services.bio-workbench = {
+    # RPC/library reads stay available; automatic job dispatch is paused.
+    enable = false;
     description = "Durable desktop and Harrison molecular model jobs";
     restartTriggers = [ ./workbench ./library ./md ./recipes ./msa ../../modules/bio/py ./bio-submit.sh ./bio-msa.sh workbenchConfig ];
     wantedBy = [ "multi-user.target" ];
     after = [ "network-online.target" "systemd-tmpfiles-setup.service" "bio-public-msa-proxy.service" ];
     wants = [ "network-online.target" "bio-public-msa-proxy.service" ];
     environment.BIO_WORKBENCH_CONFIG = "/etc/bio-tools/workbench-config.json";
-    environment.BIO_MSA_PROVIDER = "verda";
+    environment.BIO_MSA_PROVIDER = "aws";
     environment.BIO_MSA_SEARCH_PROFILE = "mapped-prefetch-128gb-v1";
     serviceConfig = {
       Type = "simple";

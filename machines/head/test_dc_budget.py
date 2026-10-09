@@ -1440,6 +1440,130 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(self.store.path.read_text(), "broken")
 
 
+class VerdaRetirementTests(unittest.TestCase):
+    INSTANCE = '01234567-89ab-4cde-8fab-0123456789ab'
+    VOLUME = '11234567-89ab-4cde-8fab-0123456789ab'
+
+    def grant(self, requests=None, *, clock=None, max_requests=8, expires_at=None):
+        clock = time.time if clock is None else clock
+        return dc.CleanupAuthorization(purpose='Explicit retirement test',
+            expires_at=clock()+60 if expires_at is None else expires_at,
+            max_requests=max_requests, clock=clock,
+            allowed_requests=requests or [('GET', '/instances', None)])
+
+    def delete_body(self):
+        return dict(id=self.INSTANCE, action='delete', volume_ids=[self.VOLUME], delete_permanently=False)
+
+    @staticmethod
+    def response(value):
+        class Response:
+            status, headers = 200, {}
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return json.dumps(value).encode()
+        return Response()
+
+    def test_all_unscoped_calls_fail_before_auth_even_with_credentials_and_env_flags(self):
+        requests = [('GET', '/instances', None), ('GET', '/volumes', None),
+                    ('GET', '/volumes/trash', None), ('GET', '/instance-types', None),
+                    ('POST', '/instances', {}), ('POST', '/volumes', {}),
+                    ('PUT', '/instances', self.delete_body()),
+                    ('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': True})]
+        with patch.dict(os.environ, DATACRUNCH_CLIENT_ID='fixture', DATACRUNCH_CLIENT_SECRET='fixture',
+                        VERDA_ENABLED='1', DC_ALLOW_API='1', BIO_MSA_PROVIDER='verda'), \
+                patch.object(dc.urllib.request, 'urlopen', side_effect=AssertionError('No network')) as network:
+            api = dc.API()
+            for method, path, body in requests:
+                with self.subTest(method=method, path=path), self.assertRaisesRegex(dc.Error, 'Verda is retired'):
+                    api.request(method, path, body)
+            with self.assertRaisesRegex(dc.Error, 'Verda is retired'):
+                api.request('POST', '/oauth2/token', {}, authenticate=False)
+            api.token, api.token_expires = 'already-loaded-fixture', float('inf')
+            with self.assertRaisesRegex(dc.Error, 'Verda is retired'): api.inventory()
+            network.assert_not_called()
+
+    def test_cleanup_scope_cannot_authorize_creation_start_attach_or_other_api_reads(self):
+        for request in [('POST', '/instances', {}), ('POST', '/volumes', {}),
+                        ('GET', '/instance-types', None), ('GET', '/volumes?limit=100', None),
+                        ('PUT', '/instances', dict(self.delete_body(), action='start')),
+                        ('PUT', '/volumes', {'id': self.VOLUME, 'action': 'attach'}),
+                        ('DELETE', '/volumes/trash', {'is_permanent': True}),
+                        ('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': 1})]:
+            with self.subTest(request=request), self.assertRaises(dc.Error): self.grant([request])
+        for invalid in (True, {}, 'enabled'):
+            with self.assertRaises(dc.Error): dc.API(cleanup_authorization=invalid)
+
+    def test_scope_is_exact_and_denials_do_not_authenticate_or_consume_requests(self):
+        grant = self.grant([('PUT', '/instances', self.delete_body()),
+                            ('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': True})])
+        api = dc.API(cleanup_authorization=grant)
+        with patch.object(dc.urllib.request, 'urlopen', side_effect=AssertionError('No network')) as network:
+            requests = [('GET', '/instances', None),
+                        ('PUT', '/instances', dict(self.delete_body(), id=self.VOLUME)),
+                        ('PUT', '/instances', dict(self.delete_body(), volume_ids=[])),
+                        ('PUT', '/instances', dict(self.delete_body(), delete_permanently=True)),
+                        ('DELETE', '/volumes/'+self.INSTANCE, {'is_permanent': True}),
+                        ('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': False})]
+            for method, path, body in requests:
+                with self.subTest(method=method, path=path), self.assertRaises(dc.Error):
+                    api.request(method, path, body)
+            network.assert_not_called()
+        self.assertEqual(grant.remaining, 8)
+
+    def test_authorized_inventory_counts_oauth_and_stops_exactly_at_call_limit(self):
+        grant = self.grant(max_requests=2)
+        api = dc.API(cleanup_authorization=grant)
+        responses = [self.response({'access_token': 'fixture-token', 'expires_in': 3600}), self.response([])]
+        with patch.dict(os.environ, DATACRUNCH_CLIENT_ID='fixture', DATACRUNCH_CLIENT_SECRET='fixture'), \
+                patch.object(dc.urllib.request, 'urlopen', side_effect=responses) as network:
+            self.assertEqual(api.request('GET', '/instances'), [])
+            with self.assertRaisesRegex(dc.Error, 'expired/exhausted'): api.request('GET', '/instances')
+        self.assertEqual(network.call_count, 2); self.assertEqual(grant.remaining, 0)
+        self.assertEqual([call.args[0].method for call in network.call_args_list], ['POST', 'GET'])
+
+    def test_allowed_deletion_sends_only_the_exact_authorized_payload(self):
+        body = self.delete_body()
+        grant = self.grant([('PUT', '/instances', body),
+                            ('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': True})], max_requests=2)
+        api = dc.API(cleanup_authorization=grant)
+        api.token, api.token_expires = 'fixture-token', float('inf')
+        with patch.object(dc.urllib.request, 'urlopen', side_effect=[self.response(None), self.response(None)]) as network:
+            api.request('PUT', '/instances', body)
+            api.request('DELETE', '/volumes/'+self.VOLUME, {'is_permanent': True})
+        self.assertEqual(network.call_count, 2)
+        self.assertEqual(json.loads(network.call_args_list[0].args[0].data), body)
+        self.assertEqual(json.loads(network.call_args_list[1].args[0].data), {'is_permanent': True})
+
+    def test_expiry_is_rechecked_after_authentication_before_resource_request(self):
+        clock = Clock(); grant = self.grant(clock=clock, expires_at=clock()+1)
+        api = dc.API(cleanup_authorization=grant)
+        def auth_only(*args, **kwargs):
+            clock.now += 2
+            return self.response({'access_token': 'fixture-token', 'expires_in': 3600})
+        with patch.object(dc.urllib.request, 'urlopen', side_effect=auth_only) as network:
+            with self.assertRaisesRegex(dc.Error, 'expired/exhausted'): api.request('GET', '/instances')
+        self.assertEqual(network.call_count, 1)
+
+    def test_authorizations_require_finite_short_expiry_and_count(self):
+        for expires in (float('inf'), float('nan'), 100000, 100901, True):
+            with self.subTest(expires=expires), self.assertRaises(dc.Error):
+                self.grant(clock=Clock(), expires_at=expires)
+        for limit in (0, -1, 129, True, float('inf')):
+            with self.subTest(limit=limit), self.assertRaises(dc.Error): self.grant(max_requests=limit)
+
+    def test_concurrent_consumption_cannot_exceed_request_budget(self):
+        grant = self.grant(max_requests=2)
+        api = dc.API(cleanup_authorization=grant)
+        api.token, api.token_expires = 'fixture-token', float('inf')
+        def request(_):
+            try: api.request('GET', '/instances'); return True
+            except dc.Error: return False
+        with patch.object(dc.urllib.request, 'urlopen', side_effect=lambda *a, **kw: self.response([])) as network, \
+                ThreadPoolExecutor(max_workers=8) as executor:
+            successes = list(executor.map(request, range(8)))
+        self.assertEqual(sum(successes), 2); self.assertEqual(network.call_count, 2)
+
+
 class APIErrorTests(unittest.TestCase):
     def test_create_accepts_only_json_or_strict_plain_uuid(self):
         ident = FakeAPI.ID
@@ -1462,14 +1586,16 @@ class APIErrorTests(unittest.TestCase):
             "Unsupported os_volume policy; client secret example-secret",
             "Bearer access-example; password=other-secret\nsecond line"],
             "jupyter_token": "never-display-this", "details": {"raw": "also-private"}}).encode()
-        api = dc.API()
+        grant = dc.CleanupAuthorization(purpose='Offline diagnostic test', expires_at=time.time()+60,
+            max_requests=1, allowed_requests=[('GET', '/instances', None)])
+        api = dc.API(cleanup_authorization=grant)
         api.token = "access-example"
         api.token_expires = float("inf")
         failure = dc.urllib.error.HTTPError(api.base + "/instances", 400, "Bad request", {}, io.BytesIO(body))
         with patch.dict(os.environ, DATACRUNCH_CLIENT_SECRET="example-secret"), \
              patch.object(dc.urllib.request, "urlopen", side_effect=failure):
             with self.assertRaises(dc.APIError) as caught:
-                api.request("POST", "/instances", {})
+                api.request("GET", "/instances")
         message = str(caught.exception)
         self.assertIn("HTTP 400", message)
         self.assertIn("Unsupported os_volume policy", message)
@@ -1483,15 +1609,19 @@ class APIErrorTests(unittest.TestCase):
         self.assertEqual(dc.error_detail(json.dumps({"access_token": "private"})), "")
 
     def test_rate_limit_exposes_bounded_retry_delay_without_repeating_request(self):
-        api = dc.API()
-        api.token, api.token_expires = "test-token", float("inf")
-        for method, path in (("POST", "/instances"), ("PUT", "/instances"), ("GET", "/volumes")):
+        deletion = dict(id=FakeAPI.ID, action='delete', volume_ids=[], delete_permanently=False)
+        for method, path, body in (("PUT", "/instances", deletion), ("GET", "/volumes", None),
+                                   ('DELETE', '/volumes/'+FakeAPI.ID, {'is_permanent': True})):
             with self.subTest(method=method):
+                grant = dc.CleanupAuthorization(purpose='Offline diagnostic test', expires_at=time.time()+60,
+                    max_requests=1, allowed_requests=[(method, path, body)])
+                api = dc.API(cleanup_authorization=grant)
+                api.token, api.token_expires = "test-token", float("inf")
                 failure = dc.urllib.error.HTTPError(api.base + path, 429, "Too Many Requests",
                     {"Retry-After": "49"}, io.BytesIO(b'{"code":"rate_limit_exceeded"}'))
                 with patch.object(dc.urllib.request, "urlopen", side_effect=failure) as request:
                     with self.assertRaisesRegex(dc.APIError, "429.*retry after 49s"):
-                        api.request(method, path, {} if method != "GET" else None)
+                        api.request(method, path, body)
                 self.assertEqual(request.call_count, 1)
 
 

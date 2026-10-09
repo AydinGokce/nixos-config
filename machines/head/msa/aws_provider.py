@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""One persistent, budgeted AWS CPU MSA worker; credentials remain on the head.
+"""AWS MSA is offline by default; credentials remain on the head.
 
-Allocation requests are retained before AWS calls and use fixed client tokens.
-Closing a session stops compute and retains both EBS volumes. Nothing here
-terminates an instance, deletes a volume, or changes native search settings.
+capacity and watchdog inspect no cloud state. Only an explicitly requested
+inspect performs a bounded, read-only check: at most five single-page requests
+within 60 seconds, with no retries. Inspect never enables a background monitor.
+Job lifecycle operations remain disabled pending review of bounded job scopes.
+Retained allocation/cleanup implementation is not exposed by this CLI.
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ import argparse
 import base64
 from contextlib import contextmanager
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import ipaddress
@@ -48,6 +50,13 @@ METADATA = ('session-starting.json', 'session-ready.json', 'session-closed.json'
             'msa-server.json', 'msa-server.provenance.json', 'warm-index.json')
 WRITES = {'create-volume', 'run-instances', 'start-instances', 'stop-instances',
           'attach-volume', 'create-security-group', 'authorize-security-group-ingress', 'import-key-pair'}
+INSPECT_READS = frozenset({('sts', 'get-caller-identity'), ('ec2', 'describe-instances'),
+                         ('ec2', 'describe-volumes'), ('service-quotas', 'get-service-quota'),
+                         ('ec2', 'describe-instance-type-offerings')})
+INSPECT_SECONDS = 60
+INSPECT_CALLS = 5
+OFFLINE_MESSAGE = 'AWS is offline: automatic requests are disabled; request a bounded manual inspect explicitly'
+LIFECYCLE_DISABLED = 'AWS bounded job lifecycle is not enabled pending review; no cloud request was made'
 
 
 class Error(ValueError):
@@ -137,31 +146,117 @@ def creation_epoch(row):
     return parsed.timestamp()
 
 
+class OperationAuthorization:
+    """Ephemeral scope: never loaded from environment, a receipt, or a saved lease."""
+    def __init__(self, *, purpose, deadline, call_limit, clock=time.monotonic):
+        require(purpose == 'manual-inspect', 'Unsupported AWS authorization purpose')
+        require(type(deadline) in (int, float) and math.isfinite(deadline)
+                and 0 < deadline-clock() <= INSPECT_SECONDS, 'Invalid AWS authorization deadline')
+        require(type(call_limit) is int and 1 <= call_limit <= INSPECT_CALLS,
+                'Invalid AWS authorization call limit')
+        self.purpose, self.deadline, self.call_limit = purpose, deadline, call_limit
+        self.clock, self.calls, self.revoked = clock, 0, False
+        self.lock = threading.Lock()
+
+    def consume(self, service, operation):
+        with self.lock:
+            require(not self.revoked, 'AWS operation authorization is revoked')
+            require(self.clock() < self.deadline, 'AWS operation authorization expired')
+            require(self.calls < self.call_limit, 'AWS operation call budget exhausted')
+            require((service, operation) in INSPECT_READS, 'Unsupported operation for AWS manual inspection')
+            self.calls += 1
+            return min(50, self.deadline-self.clock())
+
+    def revoke(self):
+        with self.lock:
+            self.revoked = True
+
+
+def action_audit(path, *, purpose, service, operation, call_id, outcome):
+    """Durable attempt/outcome journal; deliberately excludes arguments and responses."""
+    require(path is not None, 'AWS manual inspection requires a durable action audit')
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+                'AWS action audit must be a private, owned regular file')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        row = dict(schema=1, timestamp=datetime.now(timezone.utc).isoformat(),
+                   purpose=purpose, service=service, operation=operation,
+                   call_id=call_id, outcome=outcome)
+        value = canonical(row)+b'\n'
+        require(os.write(fd, value) == len(value), 'Incomplete AWS action audit write')
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 class AWS:
-    """Fixed official CLI/profile/region; no arbitrary endpoints or shell calls."""
-    def __init__(self, executable='aws', runner=subprocess.run):
+    """Deny every real request unless a finite in-memory scope was supplied."""
+    def __init__(self, executable='aws', runner=subprocess.run, *, authorization=None, audit_path=None):
         self.executable, self.runner = executable, runner
+        self.authorization, self.audit_path = authorization, audit_path
 
     def call(self, service, operation, request=None):
-        require(service in ('ec2', 'sts', 'service-quotas'), 'Unsupported AWS service')
-        allowed = operation.startswith('describe-') or (service, operation) in {
-            ('sts', 'get-caller-identity'), ('service-quotas', 'get-service-quota')}
-        require(allowed or service == 'ec2' and operation in WRITES, 'Unsupported AWS operation')
-        argv = [self.executable, '--profile', 'bio-aws', '--region', REGION, '--output', 'json',
-                '--no-cli-pager', '--cli-connect-timeout', '10', '--cli-read-timeout', '30', service, operation]
+        require(isinstance(self.authorization, OperationAuthorization), OFFLINE_MESSAGE)
+        timeout = self.authorization.consume(service, operation)
+        call_id = uuid.uuid4().hex
+        def audit(outcome):
+            action_audit(self.audit_path, purpose=self.authorization.purpose,
+                         service=service, operation=operation, call_id=call_id, outcome=outcome)
+        argv = [self.executable, '--profile', 'gc-migration', '--region', REGION, '--output', 'json',
+                '--no-cli-pager', '--no-paginate', '--cli-connect-timeout', '10',
+                '--cli-read-timeout', '30', service, operation]
         if request:
             argv += ['--cli-input-json', canonical(request).decode()]
-        environment = dict(os.environ, AWS_MAX_ATTEMPTS='1' if operation in WRITES else '3', AWS_PAGER='')
-        result = self.runner(argv, capture_output=True, timeout=50, env=environment)
-        if result.returncode:
-            # AWS stderr may contain request details. Never echo credentials or complete argv.
-            error = re.search(rb'\(([A-Za-z][A-Za-z0-9.]+)\)', result.stderr or b'')
-            code = error.group(1).decode() if error else 'RequestFailed'
-            raise Error('AWS '+operation+' failed or is uncertain ('+code+'); retained intent prevents duplicate allocation')
-        require(len(result.stdout) <= 16*1024*1024, 'Oversized AWS response')
-        value = json.loads(result.stdout)
-        require(isinstance(value, dict), 'Invalid AWS response')
-        return value
+        environment = dict(os.environ, AWS_MAX_ATTEMPTS='1', AWS_PAGER='',
+                           AWS_CLI_AUTO_PROMPT='off', AWS_EC2_METADATA_DISABLED='true')
+        started = False
+        try:
+            audit('started'); started = True
+            # Audit writes may block: check expiry again before invoking any client.
+            timeout = min(timeout, self.authorization.deadline-self.authorization.clock())
+            require(timeout > 0 and not self.authorization.revoked, 'AWS operation authorization expired or revoked')
+            result = self.runner(argv, capture_output=True, timeout=timeout, env=environment)
+            if result.returncode:
+                # Never echo stderr, responses, credential values, or complete argv.
+                error = re.search(rb'\(([A-Za-z][A-Za-z0-9.]+)\)', result.stderr or b'')
+                known = {'AccessDenied', 'AccessDeniedException', 'AuthFailure', 'UnauthorizedOperation',
+                         'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException', 'SignatureDoesNotMatch',
+                         'RequestLimitExceeded', 'Throttling', 'ThrottlingException'}
+                code = error.group(1).decode() if error and error.group(1).decode() in known else 'RequestFailed'
+                raise Error('AWS '+operation+' failed ('+code+'); manual authorization revoked')
+            require(len(result.stdout) <= 16*1024*1024, 'Oversized AWS response')
+            value = json.loads(result.stdout)
+            require(isinstance(value, dict), 'Invalid AWS response')
+            require(not any(value.get(key) for key in ('NextToken', 'nextToken', 'Marker', 'NextMarker')),
+                    'AWS result requires another page; bounded inspection stops with incomplete inventory')
+            audit('succeeded')
+            return value
+        except BaseException as error:
+            self.authorization.revoke()
+            if started:
+                audit('failed')
+            if isinstance(error, (Error, KeyboardInterrupt, SystemExit)):
+                raise
+            raise Error('AWS bounded inspection failed; manual authorization revoked') from None
+
+
+def offline_status(action='capacity'):
+    observed = time.time()
+    return dict(schema=1, provider='aws', msa_provider='aws', compute='cpu', compute_kind='cpu',
+                region=REGION, account=ACCOUNT, state='error', status='disabled', offline=True,
+                server_epoch=observed, observed_epoch=observed, checked_epoch=None,
+                stale_after_seconds=120, msa_available=None, msa_message=OFFLINE_MESSAGE,
+                error=OFFLINE_MESSAGE, action=action, gpus=[], cpus=[])
 
 
 def configuration(path=None, *, require_assets=True):
@@ -1258,51 +1353,37 @@ def startup_proof(state, tools):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('capacity', 'prepare', 'launch-session', 'provider-check', 'provider-close', 'sync-output', 'watchdog'))
+    parser.add_argument('action', choices=('capacity', 'inspect', 'prepare', 'launch-session', 'provider-check', 'provider-close', 'sync-output', 'watchdog'),
+                        help='capacity/watchdog are offline; inspect is an explicit manual read-only check; lifecycle actions are disabled')
     parser.add_argument('--state', type=Path); parser.add_argument('--tools', type=Path)
     parser.add_argument('--instance'); parser.add_argument('--ip'); parser.add_argument('--os-id'); parser.add_argument('--request-id')
     parser.add_argument('--config'); parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--timeout', type=float, default=21600)
     parser.add_argument('--owner-unit')
     args = parser.parse_args(argv)
-    if args.action == 'launch-session':
-        require(args.state and args.tools, 'AWS launch requires the frozen state and tools paths')
-        with startup_proof(args.state, args.tools) as before_reservation:
-            dispatch(args, before_reservation=before_reservation)
-    else:
-        dispatch(args)
+    dispatch(args)
 
 
 def dispatch(args, *, before_reservation=None):
+    # Fail before configuration, systemd startup proof, budget heartbeat, or any
+    # subprocess. Older frozen helper copies require separate service shutdown;
+    # changing this entrypoint cannot retrofit their authorization boundary.
+    if args.action in ('capacity', 'watchdog'):
+        print(json.dumps(offline_status(args.action), sort_keys=True)); return
+    require(args.action == 'inspect', LIFECYCLE_DISABLED)
+    config = configuration(args.config, require_assets=False)
+    authorization = OperationAuthorization(purpose='manual-inspect',
+        deadline=time.monotonic()+INSPECT_SECONDS, call_limit=INSPECT_CALLS)
+    api = AWS(authorization=authorization, audit_path=args.root/'manual-actions.jsonl')
     try:
-        config = configuration(args.config, require_assets=args.action in ('prepare', 'launch-session', 'capacity'))
-    except (ValueError, OSError, KeyError):
-        if args.action != 'capacity':
-            raise
-        result = dict(schema=1, provider='aws', msa_provider='aws', compute='cpu', compute_kind='cpu',
-            account=ACCOUNT, region=REGION, server_epoch=time.time(), observed_epoch=time.time(), checked_epoch=None, state='error',
-            stale_after_seconds=120, msa_available=None, msa_message='AWS MSA configuration/assets are not ready', gpus=[], cpus=[])
-        print(json.dumps(result, sort_keys=True)); return
-    from aws_budget import Budget
-    controller = Controller(AWS(), Budget(state_root='/var/lib/dc', account_id=ACCOUNT, region=REGION), config, args.root)
-    if args.action == 'capacity':
-        result = controller.capacity()
-    elif args.action in ('launch-session', 'prepare'):
-        require(args.state and args.tools, 'AWS launch requires the frozen state and tools paths')
-        if args.action == 'prepare':
-            prepare_intent(args.state, args.tools, args.timeout, args.owner_unit)
-        result = Launcher(controller, args.state, args.tools, prepare=args.action == 'prepare',
-                          before_reservation=before_reservation).run()
-    elif args.action == 'watchdog':
-        result = controller.watchdog()
-    else:
-        require(args.state, 'AWS operation requires the exact session state')
-        if args.action == 'provider-check':
-            result = controller.provider_check(args.state, dict(instance=args.instance, ip=args.ip, os_id=args.os_id))
-        elif args.action == 'provider-close':
-            result = controller.close(args.state)
-        else:
-            result = sync_output(controller, args.state, args.request_id)
+        # capacity performs the five fixed reads. It neither refreshes a budget
+        # heartbeat nor reserves, launches, stops, or enables a monitor.
+        result = Controller(api, None, config, args.root).capacity()
+        result.update(manual=True, requests_attempted=authorization.calls,
+                      lifecycle_enabled=False, automatic_requests_enabled=False)
+        atomic(args.root/'manual-inspection.json', result)
+    finally:
+        authorization.revoke()
     print(json.dumps(result, sort_keys=True))
 
 

@@ -7,9 +7,9 @@ estimates for existing resources, and the old GPU ledger. Previously deleted,
 unobserved resources, historical price changes, tax and other services are not
 recoverable. DC_PRIOR_SPEND_USD adds a known correction at first initialization.
 
-Run `dc watchdog` every minute. Only managed ephemeral instances and their OS
-disks are deleted. The head/shared data remain and keep accruing costs after GPU
-cutoff. This is NOT a provider hard spending cap; outages can delay teardown.
+Verda is retired: real API requests are denied unless an explicitly constructed,
+short-lived cleanup authorization permits them. Background watchdogs are masked.
+Retained accounting remains available; this is NOT a provider hard spending cap.
 DC_MAX_INSTANCE_HOURLY optionally caps each fresh instance quote before launch;
 OS/storage charges still count toward the separate overall spending guard.
 DC_LAUNCH_COOLDOWN_SECONDS optionally waits after confirmed managed cleanup
@@ -127,14 +127,89 @@ def epoch(value):
         raise Error("Missing/invalid resource creation time; cannot initialize cost") from None
 
 
+class CleanupAuthorization:
+    """Finite in-memory permission for exact retirement reads/deletions only.
+
+    No CLI option, credential file or environment variable constructs this grant.
+    Requests are (method, path, body) triples; OAuth is charged to the same bound.
+    """
+    INVENTORY = frozenset(('/instances', '/volumes', '/volumes/trash'))
+    UUID = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+
+    def __init__(self, *, purpose, expires_at, max_requests, allowed_requests, clock=time.time):
+        current = clock()
+        if (not isinstance(purpose, str) or not 1 <= len(purpose) <= 200 or not purpose.isprintable()
+                or type(expires_at) not in (int, float) or not math.isfinite(expires_at)
+                or not 0 < expires_at - current <= 900
+                or type(max_requests) is not int or not 1 <= max_requests <= 128):
+            raise Error('Invalid Verda cleanup authorization; expiry and request count must be bounded')
+        if not isinstance(allowed_requests, (list, tuple)) or not 1 <= len(allowed_requests) <= 128:
+            raise Error('Verda cleanup requires a finite exact request allowlist')
+        allowed = []
+        for request in allowed_requests:
+            if not isinstance(request, (list, tuple)) or len(request) != 3:
+                raise Error('Invalid exact Verda cleanup request')
+            method, path, body = request
+            if not self.cleanup_request(method, path, body):
+                raise Error('Verda cleanup permits inventory and exact resource deletion only')
+            allowed.append(self.signature(method, path, body))
+        self.purpose, self.expires_at, self.remaining = purpose, expires_at, max_requests
+        self.allowed, self.clock, self.lock = frozenset(allowed), clock, threading.Lock()
+
+    @classmethod
+    def cleanup_request(cls, method, path, body):
+        if not isinstance(method, str) or not isinstance(path, str):
+            return False
+        if method == 'GET':
+            return path in cls.INVENTORY and body is None
+        if method == 'DELETE':
+            return (re.fullmatch('/volumes/' + cls.UUID, path) is not None
+                    and isinstance(body, dict) and set(body) == {'is_permanent'}
+                    and type(body['is_permanent']) is bool)
+        if method == 'PUT' and path == '/instances' and isinstance(body, dict):
+            return (set(body) == {'id', 'action', 'volume_ids', 'delete_permanently'}
+                    and isinstance(body['id'], str) and re.fullmatch(cls.UUID, body['id']) is not None
+                    and body['action'] == 'delete' and type(body['delete_permanently']) is bool
+                    and isinstance(body['volume_ids'], list) and len(body['volume_ids']) <= 128
+                    and all(isinstance(value, str) and re.fullmatch(cls.UUID, value) is not None
+                            for value in body['volume_ids']))
+        return False
+
+    @staticmethod
+    def signature(method, path, body):
+        return method, path, json.dumps(body, sort_keys=True, separators=(',', ':'))
+
+    def check(self, method, path, body, *, authenticate, consume=False):
+        auth = (method == 'POST' and path == '/oauth2/token' and authenticate is False
+                and isinstance(body, dict) and set(body) == {'grant_type', 'client_id', 'client_secret'}
+                and body.get('grant_type') == 'client_credentials'
+                and all(isinstance(body.get(key), str) for key in ('client_id', 'client_secret')))
+        permitted = auth or (authenticate is True and self.cleanup_request(method, path, body)
+                            and self.signature(method, path, body) in self.allowed)
+        with self.lock:
+            if not permitted or self.clock() >= self.expires_at or self.remaining <= 0:
+                raise Error('Verda is retired; cleanup request is outside its exact authorization or has expired/exhausted')
+            if consume:
+                self.remaining -= 1
+
+
 class API:
-    def __init__(self):
+    def __init__(self, *, cleanup_authorization=None):
+        if cleanup_authorization is not None and type(cleanup_authorization) is not CleanupAuthorization:
+            raise Error('Verda cleanup requires an explicit in-memory authorization')
+        self.cleanup_authorization = cleanup_authorization
         self.base = os.environ.get("DC_API_URL", "https://api.datacrunch.io/v1").rstrip("/")
         self.token = None
         self.token_expires = 0
         self.auth_lock = threading.Lock()
 
     def request(self, method, path, body=None, *, authenticate=True):
+        authorization = self.cleanup_authorization
+        if authorization is None:
+            raise Error('Verda is retired; API access and new allocations are disabled. Explicit bounded cleanup authorization is required')
+        # Deny before loading credentials/authentication. Recheck the deadline
+        # and consume one request immediately before each actual HTTP attempt.
+        authorization.check(method, path, body, authenticate=authenticate)
         if authenticate:
             with self.auth_lock:
                 if self.token is None or time.time() + 60 >= self.token_expires:
@@ -152,6 +227,7 @@ class API:
             headers["Authorization"] = "Bearer " + self.token
         payload = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(self.base + path, data=payload, headers=headers, method=method)
+        authorization.check(method, path, body, authenticate=authenticate, consume=True)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()

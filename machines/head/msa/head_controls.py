@@ -159,7 +159,12 @@ def worker_status(root, deadline=None):
         if live.get('ActiveState') == 'deactivating' or (Path(launch['remote_out'])/'session-closed.json').exists():
             value.update(state='closing', control_reason='Shared worker cleanup is in progress'); return value
         session.require(live.get('ActiveState') == 'active', 'Shared worker is not active')
-        client.sync_output(state, intent, deadline=deadline)
+        # AWS progress is mirrored by the explicitly managed launcher. A UI
+        # status read must not call sync_output: its provider validation can
+        # query the AWS account. Read retained metadata and let stale heartbeat
+        # checks disable controls instead of initiating a cloud refresh.
+        if client.session_provider.name(intent) != 'aws':
+            client.sync_output(state, intent, deadline=deadline)
         output = Path(launch['remote_out'])
         starting = lifecycle.document(output/'session-starting.json', optional=True)
         if starting:

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Bounded, read-only MSA and separate Verda GPU capacity evidence.
 
-The credential-loading wrapper supplies the same API credentials as dc. Only
-the four GETs below are made through its API client (plus OAuth authentication).
+For Verda, the credential-loading wrapper supplies the same API credentials as
+dc. Only the four GETs below are made through its client (plus OAuth
+authentication). The AWS branch is local-only and reports unknown availability.
 This helper never opens the budget ledger or invokes a launch/ensure operation.
 The calling bridge kills this isolated process after 20 seconds, including any
 provider request threads. Provider response bodies/exceptions are never logged.
@@ -16,10 +17,7 @@ import os
 from pathlib import Path
 import re
 import runpy
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 
 ENDPOINTS = {
@@ -30,6 +28,8 @@ ENDPOINTS = {
 }
 GB_TO_GIB = 10**9 / 1024**3
 LIMIT = 1024
+AWS_OFFLINE_MESSAGE = ('AWS availability is unknown; automatic checks are disabled. '
+                       'A controlled manual check is required; the Refresh button reads cached data only.')
 
 
 def require(value):
@@ -177,19 +177,13 @@ def collect(api, selector, *, current=None, profile=None):
     return snapshot(responses, selector, current=current, profile=profile)
 
 
-def aws_snapshot():
-    """The AWS helper owns quota, asset and retained-pool readiness checks."""
-    helper = shutil.which('bio-aws-msa')
-    require(helper is not None)
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
-        completed = subprocess.run([helper, 'capacity'], stdout=output, stderr=error,
-                                   timeout=18, check=False)
-        require(completed.returncode == 0 and output.tell() <= 1024*1024)
-        output.seek(0)
-        value = json.loads(output.read(1024*1024+1))
-    require(isinstance(value, dict) and value.get('provider') == 'aws'
-            and value.get('msa_provider') == 'aws' and value.get('region') == 'us-east-1')
-    return value
+def aws_snapshot(current=None):
+    """UI capacity observation never authorizes an AWS account request."""
+    current = time.time() if current is None else current
+    return dict(schema=1, provider='aws', msa_provider='aws', compute_kind='cpu',
+                region='us-east-1', state='error', observed_epoch=current,
+                msa_available=None, msa_message=AWS_OFFLINE_MESSAGE, gpus=[], cpus=[],
+                error=AWS_OFFLINE_MESSAGE)
 
 
 def verda_snapshot(tools):
@@ -224,10 +218,9 @@ def main(argv=None):
             return None
     selected = os.environ.get('BIO_MSA_PROVIDER', 'verda')
     if selected == 'aws':
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            aws = executor.submit(observed, aws_snapshot)
-            verda = executor.submit(observed, verda_snapshot, args.tools_root)
-            value = combined(aws.result(), verda.result())
+        # Even an uncached/direct helper invocation is offline. Ordinary UI
+        # refresh requests are not authorization for cloud account queries.
+        value = aws_snapshot()
     elif selected == 'verda':
         value = observed(verda_snapshot, args.tools_root)
     else:

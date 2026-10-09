@@ -11,6 +11,7 @@ import tempfile
 import time
 
 from .common import atomic, canonical, digest, keys, no_links, parse, require
+from .capacity_provider import AWS_OFFLINE_MESSAGE, aws_snapshot
 from .worker_api import configuration
 
 CACHE_SECONDS = 5
@@ -88,6 +89,8 @@ def normalize(value):
 
 
 def invoke(config):
+    if os.environ.get('BIO_MSA_PROVIDER', 'verda') == 'aws':
+        return normalize(aws_snapshot())
     command = [config.get('capacity_helper', '/run/current-system/sw/bin/bio-msa-capacity'),
                '--tools-root', str(config['tools_dir'])]
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
@@ -140,6 +143,19 @@ def envelope(record, current, *, refreshing=False):
     return result
 
 
+def aws_cached(record, current):
+    """Retain observation dates/hardware without refreshing or claiming live capacity."""
+    result = envelope(record, current)
+    result.update(msa_provider='aws', compute_kind='cpu', region='us-east-1',
+                  state='error', msa_available=None, msa_message=AWS_OFFLINE_MESSAGE,
+                  error=AWS_OFFLINE_MESSAGE, refreshing=False, offline=True,
+                  refresh_after_seconds=ERROR_CACHE_SECONDS)
+    result['cpus'] = [dict(row, availability='unknown', msa_eligible=False,
+                          reason='Cached hardware information; live availability requires a controlled manual check')
+                      for row in result.get('cpus', [])]
+    return result
+
+
 def capacity(api, params, *, bridge=None, clock=None):
     keys(params, optional=('refresh',))
     require(type(params.get('refresh', False)) is bool, 'refresh must be a boolean')
@@ -153,6 +169,10 @@ def capacity(api, params, *, bridge=None, clock=None):
     lock_path = no_links(api.store.root / 'worker-capacity.lock')
     current = clock()
     record = read_cache(path, identity)
+    if os.environ.get('BIO_MSA_PROVIDER', 'verda') == 'aws':
+        # Includes an empty, invalid or expired cache and refresh=True. The
+        # generic UI refresh flag must never enable recurring AWS requests.
+        return aws_cached(record, current)
     ttl = CACHE_SECONDS if record and record['snapshot']['state'] == 'ready' else ERROR_CACHE_SECONDS
     if (not params.get('refresh', False) and record
             and 0 <= current - record['attempt_epoch'] < ttl):

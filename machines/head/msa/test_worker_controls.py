@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -149,6 +150,48 @@ class HeadControlTests(unittest.TestCase):
         status=head.worker_status(self.root)
         self.assertEqual(status['state'],'ready');self.assertFalse(status['can_extend'])
         self.assertIsNone(status['idle_deadline_epoch'])
+
+    def test_aws_status_repeated_reads_use_only_retained_metadata(self):
+        self.intent['provider_name'] = 'aws'
+        session.atomic(self.state/'intent.json', self.intent)
+        session.atomic(self.root/'active.json', {'session_id': self.intent['session_id'],
+                                                'intent_sha256': session.sha(self.state/'intent.json')})
+        output = Path(self.ready['output'])
+        status_path = output/'worker-status.json'
+        original = status_path.read_bytes()
+        with mock.patch.object(client, 'sync_output', side_effect=AssertionError('No AWS synchronization')) as sync, \
+                mock.patch.object(client, 'check_session_provider', side_effect=AssertionError('No provider check')) as provider, \
+                mock.patch.object(subprocess, 'run', side_effect=AssertionError('No subprocess allowed')) as process, \
+                mock.patch.object(subprocess, 'check_output', side_effect=AssertionError('No subprocess allowed')) as check, \
+                mock.patch.object(socket, 'create_connection', side_effect=AssertionError('No network allowed')) as network:
+            for _ in range(3):
+                value = head.worker_status(self.root)
+                self.assertEqual(value['provider_name'], 'aws'); self.assertEqual(value['state'], 'idle')
+                self.assertTrue(value['can_extend'])
+            self.assertEqual(status_path.read_bytes(), original)
+            stale = session.load(status_path); stale['checked_epoch'] = time.time()-60
+            session.atomic(status_path, stale)
+            for _ in range(3):
+                value = head.worker_status(self.root)
+                self.assertEqual(value['state'], 'uncertain'); self.assertFalse(value['can_shutdown'])
+                self.assertIn('stale', value['control_reason'])
+            status_path.unlink()
+            for _ in range(3):
+                value = head.worker_status(self.root)
+                self.assertEqual(value['state'], 'uncertain'); self.assertFalse(value['can_extend'])
+            (output/'session-ready.json').unlink()
+            self.assertEqual(head.worker_status(self.root)['state'], 'warming')
+            (self.root/'active.json').unlink()
+            with mock.patch.dict(os.environ, BIO_MSA_PROVIDER='aws'):
+                self.assertEqual(head.worker_status(self.root)['state'], 'absent')
+            sync.assert_not_called(); provider.assert_not_called(); process.assert_not_called()
+            check.assert_not_called(); network.assert_not_called()
+
+    def test_verda_status_preserves_its_existing_sync_path(self):
+        with mock.patch.object(client, 'sync_output') as sync:
+            value = head.worker_status(self.root)
+        self.assertEqual(value['state'], 'idle')
+        sync.assert_called_once()
 
     def test_normal_terminal_closures_are_offline_without_stale_timers_or_progress(self):
         output=Path(self.ready['output'])

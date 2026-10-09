@@ -2,6 +2,7 @@
 import copy
 import base64
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -278,18 +279,22 @@ class ProviderTests(unittest.TestCase):
         self.assertAlmostEqual(aws.ROOT_HOURLY*730, 8)
         self.assertAlmostEqual(aws.COMPUTE_HOURLY, 7.2626)
 
-    def test_cli_does_not_expose_credentials_or_retry_writes(self):
+    def test_cli_does_not_expose_credentials_or_retry_reads(self):
         calls = []
         def runner(argv, **kwargs):
             calls.append((argv, kwargs))
             return subprocess.CompletedProcess(argv, 1, b'', b'An error occurred (AccessDenied): secret-client-token-DO-NOT-PRINT')
-        client = aws.AWS(runner=runner)
+        authorization = aws.OperationAuthorization(purpose='manual-inspect', deadline=1060,
+                                                  call_limit=5, clock=lambda:1000)
+        client = aws.AWS(runner=runner, authorization=authorization, audit_path=self.base/'actions.jsonl')
         with self.assertRaisesRegex(aws.Error, 'AccessDenied') as raised:
-            client.call('ec2', 'create-volume', {'ClientToken':'a'*32})
+            client.call('sts', 'get-caller-identity')
         self.assertNotIn('DO-NOT-PRINT', str(raised.exception))
         self.assertEqual(calls[0][1]['env']['AWS_MAX_ATTEMPTS'], '1')
-        self.assertIn('bio-aws', calls[0][0]); self.assertIn(aws.REGION, calls[0][0])
-        with self.assertRaisesRegex(aws.Error, 'Unsupported'): client.call('ec2', 'delete-volume')
+        self.assertIn('gc-migration', calls[0][0]); self.assertNotIn('bio-aws', calls[0][0])
+        self.assertIn(aws.REGION, calls[0][0])
+        with self.assertRaisesRegex(aws.Error, 'revoked'): client.call('sts', 'get-caller-identity')
+        self.assertEqual(len(calls), 1)
 
     def test_state_receipt_symlinks_rejected(self):
         destination = self.base/'foreign.json'; destination.write_text('{}')
@@ -577,6 +582,158 @@ class ProviderTests(unittest.TestCase):
                 self.assertNotIn('database-range-0-initialize', [call.args[1] for call in local.call_args_list])
 
 
+class ManualOperationTests(unittest.TestCase):
+    """Every AWS subprocess here is a fake; no credentials or network required."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.now, self.calls = 1000, []
+        self.result = dict(Account=aws.ACCOUNT)
+        self.returncode, self.stderr = 0, b''
+
+    def grant(self, limit=5):
+        return aws.OperationAuthorization(purpose='manual-inspect', deadline=self.now+60,
+                                          call_limit=limit, clock=lambda:self.now)
+
+    def runner(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, self.returncode, aws.canonical(self.result), self.stderr)
+
+    def client(self, grant=None):
+        return aws.AWS(runner=self.runner, authorization=grant or self.grant(),
+                       audit_path=self.root/'actions.jsonl')
+
+    def test_default_deny_ignores_environment_toggle_and_saved_receipts(self):
+        aws.atomic(self.root/'aws-lease.json', dict(status='running', authorized=True))
+        with patch.dict(os.environ, BIO_AWS_ENABLED='1', AWS_MANUAL_AUTHORIZED='true'):
+            client = aws.AWS(runner=self.runner, audit_path=self.root/'actions.jsonl')
+            for service, operation in [('sts', 'get-caller-identity'), ('ec2', 'stop-instances')]:
+                with self.assertRaisesRegex(aws.Error, 'offline'): client.call(service, operation)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.root/'actions.jsonl').exists())
+
+    def test_expiry_and_call_cap_precede_subprocess(self):
+        grant = self.grant(limit=1); client = self.client(grant)
+        client.call('sts', 'get-caller-identity')
+        with self.assertRaisesRegex(aws.Error, 'budget exhausted'): client.call('sts', 'get-caller-identity')
+        self.assertEqual(len(self.calls), 1)
+        client = self.client(); self.now += 60
+        with self.assertRaisesRegex(aws.Error, 'expired'): client.call('sts', 'get-caller-identity')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_invalid_unbounded_or_unknown_authorizations_rejected(self):
+        for values in ({'purpose':'job'}, {'deadline':float('inf')}, {'deadline':float('nan')},
+                       {'deadline':1061}, {'deadline':1000}, {'call_limit':0}, {'call_limit':6}, {'call_limit':True}):
+            with self.subTest(values=values), self.assertRaises(aws.Error):
+                aws.OperationAuthorization(**dict(dict(purpose='manual-inspect', deadline=1060,
+                    call_limit=5, clock=lambda:self.now), **values))
+
+    def test_inspection_scope_cannot_write_or_expand_describe_allowlist(self):
+        client = self.client()
+        for operation in ('run-instances', 'stop-instances', 'describe-security-groups'):
+            with self.assertRaisesRegex(aws.Error, 'Unsupported'): client.call('ec2', operation)
+        self.assertEqual(self.calls, [])
+
+    def test_authentication_failure_revokes_all_remaining_calls(self):
+        self.returncode, self.stderr = 255, b'An error occurred (InvalidClientTokenId): NEVER-PRINT-THIS'
+        client = self.client()
+        with self.assertRaisesRegex(aws.Error, 'InvalidClientTokenId') as raised:
+            client.call('sts', 'get-caller-identity')
+        with self.assertRaisesRegex(aws.Error, 'revoked'): client.call('ec2', 'describe-instances')
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn('NEVER-PRINT-THIS', str(raised.exception))
+
+    def test_single_attempt_single_page_and_finite_subprocess_timeout(self):
+        self.client().call('sts', 'get-caller-identity')
+        argv, options = self.calls[0]
+        self.assertIn('--no-paginate', argv)
+        self.assertEqual(options['env']['AWS_MAX_ATTEMPTS'], '1')
+        self.assertEqual(options['env']['AWS_EC2_METADATA_DISABLED'], 'true')
+        self.assertLessEqual(options['timeout'], 60)
+        self.assertGreater(options['timeout'], 0)
+
+    def test_incomplete_pagination_fails_closed_and_revokes(self):
+        client = self.client(); self.result = dict(Volumes=[], NextToken='NEVER-PRINT-TOKEN')
+        with self.assertRaisesRegex(aws.Error, 'incomplete inventory'):
+            client.call('ec2', 'describe-volumes')
+        with self.assertRaisesRegex(aws.Error, 'revoked'): client.call('sts', 'get-caller-identity')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_transport_failure_does_not_leak_exception_or_retry(self):
+        client = self.client()
+        def failed(*args, **kwargs):
+            self.calls.append(True)
+            raise subprocess.TimeoutExpired('SECRET-ARGV-NEVER-PRINT', 5, output=b'SECRET-RESPONSE')
+        client.runner = failed
+        with self.assertRaisesRegex(aws.Error, 'authorization revoked') as raised:
+            client.call('sts', 'get-caller-identity')
+        self.assertNotIn('SECRET', str(raised.exception))
+        with self.assertRaisesRegex(aws.Error, 'revoked'): client.call('sts', 'get-caller-identity')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_audit_is_private_redacted_and_contains_attempt_and_outcome(self):
+        self.result = dict(Account=aws.ACCOUNT, secret='SECRET-RESPONSE')
+        self.client().call('sts', 'get-caller-identity', {'ignored':'SECRET-ARGUMENT'})
+        path = self.root/'actions.jsonl'
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([row['outcome'] for row in rows], ['started', 'succeeded'])
+        self.assertEqual(rows[0]['call_id'], rows[1]['call_id'])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn('SECRET', path.read_text())
+        self.assertEqual(set(rows[0]), {'schema','timestamp','purpose','service','operation','call_id','outcome'})
+
+    def test_missing_or_unsafe_audit_blocks_before_subprocess(self):
+        client = self.client(); client.audit_path = None
+        with self.assertRaises(aws.Error): client.call('sts', 'get-caller-identity')
+        self.assertTrue(client.authorization.revoked)
+        (self.root/'actions.jsonl').symlink_to(self.root/'elsewhere')
+        with self.assertRaises(aws.Error): self.client().call('sts', 'get-caller-identity')
+        self.assertEqual(self.calls, [])
+
+    def test_offline_cli_never_reads_configuration_budget_or_cloud(self):
+        with patch.object(aws, 'configuration', side_effect=AssertionError('configuration read')), \
+             patch.object(aws, 'Controller', side_effect=AssertionError('controller constructed')), \
+             patch.object(aws, 'startup_proof', side_effect=AssertionError('startup attempted')):
+            for action in ('capacity', 'watchdog'):
+                with self.subTest(action=action), patch('sys.stdout', new_callable=io.StringIO) as output:
+                    aws.main([action, '--root', str(self.root)])
+                    value = json.loads(output.getvalue())
+                self.assertTrue(value['offline'])
+                self.assertIsNone(value['checked_epoch'])
+                self.assertIsNone(value['msa_available'])
+            for action in ('prepare', 'launch-session', 'provider-check', 'provider-close', 'sync-output'):
+                with self.subTest(action=action), self.assertRaisesRegex(aws.Error, 'not enabled pending review'):
+                    aws.main([action])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_manual_inspect_is_five_reads_with_no_heartbeat_or_followup_permission(self):
+        config = dict(availability_zone='us-east-1a')
+        fake = API(self.root, config)
+        constructed = []
+        original = aws.AWS
+        def factory(**kwargs):
+            def runner(argv, **options):
+                self.calls.append((argv, options))
+                service_index = argv.index('--cli-read-timeout')+2
+                service, operation = argv[service_index:service_index+2]
+                request = json.loads(argv[argv.index('--cli-input-json')+1]) if '--cli-input-json' in argv else None
+                return subprocess.CompletedProcess(argv, 0, aws.canonical(fake.call(service, operation, request)), b'')
+            client = original(runner=runner, **kwargs); constructed.append(client)
+            return client
+        with patch.object(aws, 'configuration', return_value=config), patch.object(aws, 'AWS', side_effect=factory), \
+             patch.object(Budget, 'heartbeat', side_effect=AssertionError('heartbeat')), \
+             patch('sys.stdout', new_callable=io.StringIO) as output:
+            aws.main(['inspect', '--root', str(self.root)])
+        value = json.loads(output.getvalue())
+        self.assertEqual(value['requests_attempted'], 5)
+        self.assertFalse(value['automatic_requests_enabled'])
+        self.assertFalse(value['lifecycle_enabled'])
+        self.assertEqual(len(self.calls), 5)
+        self.assertFalse([operation for operation, _ in fake.calls if operation in aws.WRITES])
+        self.assertTrue(constructed[0].authorization.revoked)
+        self.assertTrue((self.root/'manual-inspection.json').exists())
+
+
 class AWSStartupProofTests(unittest.TestCase):
     """Real pinned helper subprocesses and client retirement; no cloud calls."""
     def setUp(self):
@@ -631,11 +788,14 @@ class AWSStartupProofTests(unittest.TestCase):
         pool = self.controller.new_pool(); pool['ready_receipt_sha256']='c'*64; self.controller.save(pool)
 
     def launch(self):
-        import aws_budget
-        with patch.object(aws, 'AWS', return_value=self.api), \
-             patch.object(aws_budget, 'Budget', return_value=self.budget):
-            aws.main(['launch-session', '--state', str(self.state), '--tools', str(self.tools),
-                      '--root', str(self.root), '--config', str(self.config_file)])
+        # Retained lifecycle proofs exercise the fake controller directly. The
+        # public CLI now rejects lifecycle work before even opening these files.
+        with aws.startup_proof(self.state, self.tools) as before_reservation:
+            config = aws.configuration(str(self.config_file))
+            controller = aws.Controller(self.api, self.budget, config, self.root,
+                                        clock=lambda:1000, sleep=lambda _:None)
+            aws.Launcher(controller, self.state, self.tools,
+                         before_reservation=before_reservation).run()
 
     def terminal(self):
         self.live.update(ActiveState='failed', MainPID='0')

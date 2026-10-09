@@ -6,6 +6,7 @@ import io
 import json
 import os
 import runpy
+import socket
 import subprocess
 import tempfile
 import threading
@@ -88,21 +89,20 @@ class AwsCapacityTests(unittest.TestCase):
         value = aws_observed(); value['cpus'][0]['price_hourly'] = None
         self.assertIsNone(cache.normalize(value)['cpus'][0]['price_hourly'])
 
-    def test_read_only_aws_command_and_redacted_independent_failure(self):
-        def run(command, **kwargs):
-            self.assertEqual(command, ['/trusted/bio-aws-msa', 'capacity'])
-            kwargs['stdout'].write(canonical(aws_observed()))
-            return subprocess.CompletedProcess(command, 0)
-        with patch.object(provider.shutil, 'which', return_value='/trusted/bio-aws-msa'), \
-             patch.object(provider.subprocess, 'run', side_effect=run):
-            self.assertEqual(provider.aws_snapshot()['provider'], 'aws')
+    def test_aws_helper_and_direct_bridge_never_query_cloud(self):
         with patch.dict(os.environ, BIO_MSA_PROVIDER='aws'), \
-             patch.object(provider, 'aws_snapshot', return_value=aws_observed()), \
-             patch.object(provider, 'verda_snapshot', side_effect=RuntimeError('private-secret')), \
+             patch.object(subprocess, 'run', side_effect=AssertionError('No subprocess allowed')) as process, \
+             patch.object(socket, 'create_connection', side_effect=AssertionError('No network allowed')) as network, \
+             patch.object(provider, 'verda_snapshot', side_effect=AssertionError('AWS UI must stay offline')) as verda, \
              patch('sys.stdout', new_callable=io.StringIO) as output:
+            for _ in range(3):
+                result = provider.aws_snapshot()
+                self.assertIsNone(result['msa_available'])
+                self.assertEqual(cache.invoke({'tools_dir': '/unused'})['msa_message'], provider.AWS_OFFLINE_MESSAGE)
             self.assertEqual(provider.main([]), 0)
-        self.assertNotIn('private-secret', output.getvalue())
+        process.assert_not_called(); network.assert_not_called(); verda.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())['msa_provider'], 'aws')
+        self.assertIn('controlled manual check', json.loads(output.getvalue())['msa_message'])
 
     def test_aws_bridge_failure_keeps_selected_provider_visible(self):
         with patch.dict(os.environ, BIO_MSA_PROVIDER='aws'):
@@ -113,7 +113,7 @@ class AwsCapacityTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
-    def entrypoint(self, profile=None, *, selected='verda', aws=None):
+    def entrypoint(self, profile=None, *, selected='verda'):
         candidate = machine('1H100.80S.32V', ram=128, count=1, regular=3.25)
         data = evidence(catalog=[candidate])
         requests, loaded = [], []
@@ -133,12 +133,14 @@ class ProviderTests(unittest.TestCase):
             environment['BIO_MSA_SEARCH_PROFILE'] = profile
         with patch.dict(os.environ, environment, clear=True), \
              patch.object(provider.runpy, 'run_path', side_effect=source), \
-             patch.object(provider, 'aws_snapshot', return_value=aws), \
              patch('sys.stdout', new_callable=io.StringIO) as output:
             self.assertEqual(provider.main(['--tools-root', str(HEAD)]), 0)
-        self.assertIn(HEAD / 'msa/worker.py', loaded)
-        self.assertIn(HEAD / 'msa/search_profile.py', loaded)
-        self.assertEqual(sorted(requests), sorted(('GET', path) for path in provider.ENDPOINTS.values()))
+        if selected == 'aws':
+            self.assertEqual(loaded, []); self.assertEqual(requests, [])
+        else:
+            self.assertIn(HEAD / 'msa/worker.py', loaded)
+            self.assertIn(HEAD / 'msa/search_profile.py', loaded)
+            self.assertEqual(sorted(requests), sorted(('GET', path) for path in provider.ENDPOINTS.values()))
         return json.loads(output.getvalue()), data
 
     def test_entrypoint_propagates_mapped_profile_to_selection_and_128gb_gpu_rows(self):
@@ -167,21 +169,16 @@ class ProviderTests(unittest.TestCase):
                 self.assertEqual(result['error'], 'Configured private MSA search profile is invalid')
                 self.assertNotIn('invalid-private-profile', json.dumps(result))
 
-    def test_entrypoint_aws_status_stays_independent_of_verda_profile(self):
-        aws = aws_observed(); aws['msa_available'] = False
-        for profile, gpu in ((SELECTOR['MAPPED_PROFILE'], True),
-                             (SELECTOR['PROFILES']['PREFETCH_PROFILE'], True),
-                             (SELECTOR['LEGACY_PROFILE'], False), ('invalid', None)):
+    def test_entrypoint_aws_is_offline_regardless_of_verda_profile(self):
+        for profile in (SELECTOR['MAPPED_PROFILE'], SELECTOR['PROFILES']['PREFETCH_PROFILE'],
+                        SELECTOR['LEGACY_PROFILE'], 'invalid'):
             with self.subTest(profile=profile):
-                result, _ = self.entrypoint(profile, selected='aws', aws=aws)
+                result, _ = self.entrypoint(profile, selected='aws')
                 self.assertEqual(result['msa_provider'], 'aws')
-                self.assertFalse(result['msa_available'])
-                self.assertEqual(result['cpus'], aws['cpus'])
-                if gpu is None:
-                    self.assertEqual(result['gpus'], [])
-                    self.assertIn('gpu_error', result)
-                else:
-                    self.assertEqual(result['gpus'][0]['msa_eligible'], gpu)
+                self.assertIsNone(result['msa_available'])
+                self.assertEqual(result['state'], 'error')
+                self.assertEqual(result['cpus'], []); self.assertEqual(result['gpus'], [])
+                self.assertIn('automatic checks are disabled', result['msa_message'])
 
     def test_other_gpu_families_share_mapped_admission_and_base_image_support(self):
         for kind, ram in [('4A6000.40V', 240), ('4L40S.80V', 240),
@@ -380,10 +377,55 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(self.capacity()['msa_available'])
         self.current += 1
         with patch.dict(os.environ, BIO_MSA_PROVIDER='aws'):
-            value = self.capacity(bridge=lambda config: aws_observed(self.current))
+            value = self.capacity(bridge=lambda config: self.fail('Provider selection must not query AWS'))
         self.assertEqual(value['msa_provider'], 'aws')
         self.assertIsNone(value['msa_available'])
-        self.assertEqual(value['checked_epoch'], self.current)
+        self.assertIsNone(value['checked_epoch'])
+
+    def test_aws_empty_or_invalid_cache_stays_offline_across_polls_and_refresh(self):
+        path = self.store.root / 'worker-capacity.json'
+        with patch.dict(os.environ, BIO_MSA_PROVIDER='aws'), \
+                patch.object(cache, 'invoke', side_effect=AssertionError('No helper allowed')) as helper, \
+                patch.object(subprocess, 'run', side_effect=AssertionError('No subprocess allowed')) as process, \
+                patch.object(socket, 'create_connection', side_effect=AssertionError('No network allowed')) as network:
+            for invalid in (False, True):
+                if invalid: path.write_text('{broken')
+                for self.current in (1000, 1005, 1031, 1121, 10000):
+                    for refresh in (False, True):
+                        with self.subTest(invalid=invalid, time=self.current, refresh=refresh):
+                            result = cache.capacity(self.api, {'refresh': refresh}, clock=lambda: self.current)
+                            self.assertIsNone(result['msa_available']); self.assertIsNone(result['checked_epoch'])
+                            self.assertEqual(result['state'], 'error'); self.assertTrue(result['offline'])
+                            self.assertFalse(result['refreshing']); self.assertIn('controlled manual check', result['msa_message'])
+                if invalid: self.assertEqual(path.read_text(), '{broken')
+                else: self.assertFalse(path.exists())
+            helper.assert_not_called(); process.assert_not_called(); network.assert_not_called()
+            self.assertFalse((self.store.root / 'worker-capacity.lock').exists())
+
+    def test_aws_cached_hardware_is_retained_without_live_claims_or_refresh(self):
+        identity = cache.digest({'schema': 1, 'tools_dir': str(HEAD),
+            'capacity_helper': self.config['capacity_helper'], 'msa_provider': 'aws'})
+        snapshot = aws_observed(); snapshot['msa_available'] = True
+        path = self.store.root / 'worker-capacity.json'
+        path.write_bytes(canonical(dict(identity=identity, snapshot=snapshot,
+                                        attempt_epoch=1000, checked_epoch=1000)))
+        original = path.read_bytes()
+        with patch.dict(os.environ, BIO_MSA_PROVIDER='aws'), \
+                patch.object(cache, 'invoke', side_effect=AssertionError('No helper allowed')) as helper, \
+                patch.object(subprocess, 'run', side_effect=AssertionError('No subprocess allowed')) as process, \
+                patch.object(socket, 'create_connection', side_effect=AssertionError('No network allowed')) as network:
+            for self.current in (1001, 1005, 1121, 10000):
+                for refresh in (False, True):
+                    result = cache.capacity(self.api, {'refresh': refresh}, clock=lambda: self.current)
+                    self.assertEqual(result['checked_epoch'], 1000)
+                    self.assertEqual(result['observed_epoch'], 1000)
+                    self.assertIsNone(result['msa_available']); self.assertFalse(result['refreshing'])
+                    self.assertEqual(result['cpus'][0]['ram_gib'], 1024)
+                    self.assertEqual(result['cpus'][0]['availability'], 'unknown')
+                    self.assertFalse(result['cpus'][0]['msa_eligible'])
+                    self.assertEqual(result['stale'], self.current > 1120)
+            helper.assert_not_called(); process.assert_not_called(); network.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)
 
     def test_error_preserves_last_success_time_is_unknown_and_backs_off(self):
         self.capacity(); self.current = 1005
