@@ -141,3 +141,17 @@ These checks enforce the action allowlist, Region/account/instance restrictions,
 type restriction for starts, and safe local generation. They do not contact AWS
 or replace AWS policy validation. The action/resource model is documented in the
 [EC2 service authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html).
+
+## If credentials are exposed
+
+Use the separate administrator login to disable the affected identity/access,
+revoke its sessions, and investigate the recorded operations. Deleting a local
+SSO cache or enabling MFA afterwards does not neutralize an already stolen role
+session. AWS documents [disabling temporary-session permissions](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_control-access_disable-perms.html).
+Deactivate the old `gc-msa` long-lived keys in the console after replacement
+access is confirmed; do not keep them as a fallback. A leaked migration session
+still creates an availability risk for the one start/stop-enabled worker, but
+these policies grant no fleet provisioning, disk deletion, snapshot export,
+IAM modification, or remote command execution. Limited access reduces the
+damage possible from a leak; it does not guarantee AWS will never review or
+restrict the account.
